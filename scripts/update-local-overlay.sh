@@ -18,20 +18,47 @@ if [[ ! -d node_modules ]]; then
 fi
 
 git fetch origin master --tags
-git rebase origin/master
+GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-TRAE CLI}" \
+GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-noreply@bytedance.com}" \
+GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-TRAE CLI}" \
+GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-noreply@bytedance.com}" \
+  git rebase origin/master
 
 bun_cmd=(npx --yes bun@1.4.0)
 "${bun_cmd[@]}" run test -- \
+  test/api-only-mode-wiring.test.ts \
   test/ask-card.test.ts \
   test/ask-broker.test.ts \
   test/ask-api.test.ts \
+  test/ask-args.test.ts \
+  test/ask-cli.test.ts \
   test/ask-receipt.test.ts \
+  test/ask-receipt-authority-boundary.test.ts \
+  test/ask-receipt-command.test.ts \
+  test/ask-receipt-key.test.ts \
+  test/ask-receipt-startup-order.test.ts \
   test/ask-card-event-claim-store.test.ts \
+  test/ask-persist-store-atomicity.test.ts \
+  test/ask-resume-restart.test.ts \
   test/ask-s1-daemon-route.test.ts \
   test/ask-ordinary-daemon-route.test.ts \
+  test/bot-registry.test.ts \
+  test/daemon-discovery.test.ts \
+  test/device-isolation-activation-client.test.ts \
+  test/device-isolation-daemon-ipc.test.ts \
+  test/device-isolation-daemon.test.ts \
+  test/device-isolation-roster.test.ts \
   test/event-dispatcher.test.ts \
+  test/fleet-supervisor.integration.test.ts \
+  test/fs-policy.test.ts \
+  test/platform-device-isolation.test.ts \
   test/plugin-card-action-gateway.test.ts \
-  test/plugin-card-action-gateway.integration.test.ts
+  test/plugin-card-action-gateway.integration.test.ts \
+  test/read-isolation.test.ts \
+  test/restart-true-readiness.test.ts \
+  test/secure-host-file.test.ts \
+  test/setup-bots-store.test.ts \
+  test/shutdown-supervisor-contract.test.ts
 "${bun_cmd[@]}" run build
 
 upstream_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
