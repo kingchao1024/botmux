@@ -27,6 +27,12 @@ import {
   DEVICE_CREDENTIAL_FILE,
   DEVICE_ENROLLMENT_JOURNAL_FILE,
 } from '../../platform/device-paths.js';
+import {
+  ASK_RECEIPT_AUTHORITY_DIRECTORY,
+  askCardEventClaimDirectory,
+  askPersistDirectory,
+  askReceiptSigningKeyPath,
+} from '../../core/ask-receipt-paths.js';
 
 /** Normalize a path for the deny/allow lists: require ABSOLUTE, strip trailing
  *  slashes, reject `..` traversal. Returns null for anything unusable so the
@@ -156,8 +162,13 @@ export function isCredentialIsolationReservedBasename(name: string): boolean {
 export function credentialIsolationRequired(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  askReceiptSigningKeyExists: boolean;
+  askCardEventLedgerExists?: boolean;
+  askPersistStoreExists?: boolean;
 }): boolean {
-  return input.markerExists || input.deviceCredentialExists;
+  return input.markerExists || input.deviceCredentialExists
+    || input.askReceiptSigningKeyExists || input.askCardEventLedgerExists === true
+    || input.askPersistStoreExists === true;
 }
 
 export type CredentialOnlyIsolationGate =
@@ -167,11 +178,15 @@ export type CredentialOnlyIsolationGate =
   | { required: true; mode: 'seatbelt' | 'bwrap' }
   | { required: true; mode: 'blocked'; failClosedReason: string };
 
-/** Mandatory device-credential isolation is independent of the optional bot
- * sandbox toggle: once enrolled, every local child must be confined. */
+/** Mandatory host-authority isolation is independent of the optional bot
+ * sandbox toggle: once device or Ask signing authority exists, every local
+ * child must be confined. */
 export function evaluateCredentialOnlyIsolationGate(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  askReceiptSigningKeyExists: boolean;
+  askCardEventLedgerExists?: boolean;
+  askPersistStoreExists?: boolean;
   remoteBackend: boolean;
   platform: string;
   mechanismAvailable: boolean;
@@ -204,16 +219,80 @@ export interface CredentialIsolationContext {
   homeDir: string;
   botmuxHome: string;
   defaultBotmuxHome?: string;
+  sessionDataDir: string;
+}
+
+export interface AskAuthorityActivationPaths {
+  signingKeys: string[];
+  callbackLedgers: string[];
+  askStores: string[];
+}
+
+/** Every host location that can activate the mandatory Ask authority boundary.
+ * Keep the default roots even when SESSION_DATA_DIR points elsewhere: an old
+ * daemon/key/ledger under ~/.botmux is still sensitive host state and must not
+ * become visible merely because the active runtime moved to a custom root. */
+export function askAuthorityActivationPaths(
+  ctx: CredentialIsolationContext,
+): AskAuthorityActivationPaths {
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const botmuxHome = ctx.botmuxHome.replace(/\/+$/, '');
+  const defaultBotmuxHome = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
+  const roots = dedupe([defaultBotmuxHome, botmuxHome]);
+  const dataRoots = dedupe([
+    `${defaultBotmuxHome}/data`,
+    ctx.sessionDataDir.replace(/\/+$/, ''),
+  ]);
+  return {
+    signingKeys: roots.map(askReceiptSigningKeyPath),
+    callbackLedgers: dataRoots.map(askCardEventClaimDirectory),
+    askStores: dataRoots.map(askPersistDirectory),
+  };
+}
+
+/** Probe activation through an injected no-follow existence predicate. Keeping
+ * candidate selection here gives the worker and focused tests the same source
+ * of truth, including the default-ledger fallback under a custom data root. */
+export function detectAskAuthorityPresence(
+  ctx: CredentialIsolationContext,
+  existsNoFollow: (path: string) => boolean,
+): Pick<
+  Parameters<typeof credentialIsolationRequired>[0],
+  'askReceiptSigningKeyExists' | 'askCardEventLedgerExists' | 'askPersistStoreExists'
+> {
+  const paths = askAuthorityActivationPaths(ctx);
+  return {
+    askReceiptSigningKeyExists: paths.signingKeys.some(existsNoFollow),
+    askCardEventLedgerExists: paths.callbackLedgers.some(existsNoFollow),
+    askPersistStoreExists: paths.askStores.some(existsNoFollow),
+  };
 }
 
 function escapeForRegex(p: string): string {
   return p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Host-only Ask authorities: the signing namespace under every plausible
+ * Botmux config root and the callback replay ledger under both the default and
+ * active data roots. A sandboxed CLI needs neither surface to verify receipts. */
+export function askReceiptHostAuthorityPaths(ctx: CredentialIsolationContext): string[] {
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
+  const roots = dedupe([defaultBh, bh]);
+  const dataRoots = dedupe([`${defaultBh}/data`, ctx.sessionDataDir.replace(/\/+$/, '')]);
+  return dedupe([
+    ...roots.map(root => `${root}/${ASK_RECEIPT_AUTHORITY_DIRECTORY}`),
+    ...dataRoots.map(askCardEventClaimDirectory),
+    ...dataRoots.map(askPersistDirectory),
+  ]);
+}
+
 /** Legacy credential-only Seatbelt/bwrap rule shape. Full fs-policy sessions
  * consume the same authority paths through buildFsPolicy instead. */
 export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): {
   roots: string[];
+  askReceiptAuthorityPaths: string[];
   denyPaths: string[];
   denyRegexes: string[];
   denyWritePaths: string[];
@@ -225,6 +304,7 @@ export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): 
   const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
   const roots = dedupe([defaultBh, bh]);
   const credentialPaths = roots.flatMap(hostDeviceAuthorityPaths);
+  const askReceiptAuthorityPaths = askReceiptHostAuthorityPaths(ctx);
   const markerPath = `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
   const denyRegexes = roots.flatMap(root =>
     HOST_DEVICE_CREDENTIAL_FILES.map(file =>
@@ -234,9 +314,10 @@ export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): 
   );
   return {
     roots,
-    denyPaths: dedupe([...credentialPaths, markerPath]),
+    askReceiptAuthorityPaths,
+    denyPaths: dedupe([...credentialPaths, ...askReceiptAuthorityPaths, markerPath]),
     denyRegexes: dedupe(denyRegexes),
-    denyWritePaths: dedupe([...credentialPaths, markerPath]),
+    denyWritePaths: dedupe([...credentialPaths, ...askReceiptAuthorityPaths, markerPath]),
     denyWriteRegexes: dedupe(denyRegexes),
     denyWriteLiterals: roots,
   };
@@ -350,18 +431,20 @@ export function buildSeatbeltProfile(
 //     cold-spawn ONCE under the new pending→commit contract — closing the INSTALLED
 //     BASE risk, not just new spawns. (A legacy no-state marker is now version-
 //     rejected, so validators no longer need to tolerate `state===undefined`.)
-//   · 11 → 12: sandboxed Codex receives a host-selected SSL_CERT_FILE so npm
+//   · 11 → 12: Ask receipt signing + callback-ledger authority become mandatory
+//     credential boundaries. Existing panes lack those Seatbelt/bwrap masks, so
+//     they must cold-spawn before being trusted with another turn.
+//   · 12 → 13: isolated panes gain the session-scoped plugin-card selector
+//     snapshot introduced by v3.18.13. Both changes originally used version 12
+//     independently, so the combined contract must advance once more.
+//   · 13 → 14: sandboxed Codex receives a host-selected SSL_CERT_FILE so npm
 //     Codex's Rust TLS stack can use a stable CA bundle inside Seatbelt. Warm
 //     reattach would keep the old process environment and continue to fail on
 //     UnknownIssuer, so existing panes must cold-spawn once.
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
-// cold-spawns under the current contract rather than bypassing a migration. Version
-// 12 adds the session-scoped plugin-card selector snapshot to the pane contract; 13
-// adds the host CA bundle startup env a sandboxed Codex pane needs — a pane spawned
-// before it keeps its ORIGINAL environment, so it would never see SSL_CERT_FILE and
-// would keep failing TLS on UnknownIssuer with no output at all.
-export const ISOLATION_PANE_MARKER_VERSION = 13;
+// cold-spawns under the current contract rather than bypassing a migration.
+export const ISOLATION_PANE_MARKER_VERSION = 14;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

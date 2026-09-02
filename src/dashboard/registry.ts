@@ -1,6 +1,5 @@
-import { readdirSync, readFileSync, watch, type FSWatcher } from 'node:fs';
-import { join } from 'node:path';
-import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
+import { watch, type FSWatcher } from 'node:fs';
+import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 
 export interface DaemonInfo {
   larkAppId: string;
@@ -105,17 +104,20 @@ export class DaemonRegistry {
   }
 
   private refresh(): void {
-    let names: string[] = [];
-    try { names = readdirSync(this.dir); } catch { return; }
     const next = new Map<string, DaemonInfo>();
-    for (const n of names) {
-      if (!n.endsWith('.json')) continue;
-      try {
-        const d = JSON.parse(readFileSync(join(this.dir, n), 'utf8')) as DaemonInfo;
-        next.set(d.larkAppId, d);
-      } catch {
-        // Skip malformed / partially-written files
+    try {
+      // Discovery returns modern generations before legacy descriptors and
+      // newest first within each class. Dashboard is a one-row-per-App view,
+      // so retain the first while the activation safety collector consumes all.
+      for (const daemon of listOnlineDaemons({ registryDir: this.dir })) {
+        if (!next.has(daemon.larkAppId)) {
+          next.set(daemon.larkAppId, daemon as DaemonInfo);
+        }
       }
+    } catch {
+      // A fresh tampered modern descriptor is fail-closed: preserve the last
+      // coherent snapshot instead of publishing a partial roster.
+      return;
     }
     this.items = next;
     const online = this.list();

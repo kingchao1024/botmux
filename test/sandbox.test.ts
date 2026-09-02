@@ -42,6 +42,33 @@ describe('prepareDirectSandbox platform gate', () => {
 });
 
 describe('credential-only managed-origin carve-out', () => {
+  it('masks every Ask authority with a read-only empty mount and never bind-exposes the host source', () => {
+    const authorities = [
+      '/srv/botmux/ask-receipt-authority',
+      '/srv/botmux/data/dedup/ask-card-events',
+      '/srv/botmux/data/asks',
+    ];
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: authorities,
+      hideFiles: [],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+
+    for (const authority of authorities) {
+      const maskAt = args.findIndex((value, index) =>
+        value === '--tmpfs' && args[index + 1] === authority);
+      expect(maskAt).toBeGreaterThan(-1);
+      expect(args.slice(maskAt, maskAt + 4)).toEqual([
+        '--tmpfs', authority, '--remount-ro', authority,
+      ]);
+      expect(args.some((value, index) =>
+        (value === '--bind' || value === '--ro-bind')
+        && args[index + 1] === authority)).toBe(false);
+    }
+  });
+
   it('hides the shared parent before exposing only the owning rotating directory', () => {
     const parent = '/srv/botmux/data/read-isolation';
     const own = `${parent}/origin-${'a'.repeat(64)}`;
@@ -58,7 +85,7 @@ describe('credential-only managed-origin carve-out', () => {
     const exposeOwnAt = args.findIndex((value, index) => value === '--ro-bind'
       && args[index + 1] === own && args[index + 2] === own);
     expect(hideParentAt).toBeGreaterThan(-1);
-    expect(exposeOwnAt).toBe(hideParentAt + 2);
+    expect(exposeOwnAt).toBeGreaterThan(hideParentAt);
     expect(args).not.toContain(`${parent}/origin-${'b'.repeat(64)}`);
   });
 

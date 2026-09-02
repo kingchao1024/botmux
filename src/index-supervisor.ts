@@ -55,22 +55,27 @@ scrubDetachedRestartEnvRefresh(process.env);
 
 async function main(): Promise<void> {
   const { FleetSupervisor } = await import('./core/fleet-supervisor.js');
-  const { fleetStatePath, fleetDistDir, fleetLogDir, fleetCommandPath, resolveFleetBots, resolveFleetMembers, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
+  const { fleetStatePath, fleetDistDir, fleetLogDir, fleetCommandPath, resolveFleetMembers, resolveFleetDaemonEnv, fleetDaemonNodeArgs, validateSupervisorLaunchPlan } = await import('./core/fleet-runtime.js');
+  const { decodeFleetLaunchPlan, FLEET_LAUNCH_PLAN_ENV } = await import('./core/fleet-launch-plan.js');
   const { drainFleetCommands } = await import('./core/fleet-command-queue.js');
   const { logger } = await import('./utils/logger.js');
 
-  // Every supervised member: the bot daemons from bots.json PLUS the dashboard.
+  // Every supervised member: the bot daemons from the validated immutable
+  // launch plan PLUS the dashboard.
   // The dashboard is always present (mirrors the old pm2 ecosystem, which always
   // pushed a botmux-dashboard app), so the supervisor stays up to run it even
   // with zero bots configured — that's exactly the state where an operator opens
   // the dashboard to add their first bot.
-  const members = resolveFleetMembers();
-  const botCount = resolveFleetBots().length;
+  const encodedPlan = process.env[FLEET_LAUNCH_PLAN_ENV];
+  delete process.env[FLEET_LAUNCH_PLAN_ENV];
+  const launchPlan = validateSupervisorLaunchPlan(decodeFleetLaunchPlan(encodedPlan));
+  const members = resolveFleetMembers(launchPlan);
+  const botCount = launchPlan.bots.length;
 
   const supervisor = new FleetSupervisor({
     statePath: fleetStatePath(),
     distDir: fleetDistDir(),
-    daemonEnv: resolveFleetDaemonEnv(),
+    daemonEnv: resolveFleetDaemonEnv(process.env, { status: 'missing' }, false, launchPlan),
     cwd: configDir,
     daemonNodeArgs: fleetDaemonNodeArgs(),
     logDir: fleetLogDir(),

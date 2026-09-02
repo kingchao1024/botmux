@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -13,8 +14,10 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   readSecureHostFileSync,
+  type AsyncSecureHostParentHandle,
   type SecureHostParentHandle,
   unlinkSecureHostFileSync,
+  withSecureHostParent,
   withSecureHostParentSync,
   writeSecureHostFileSync,
 } from '../src/platform/secure-host-file.js';
@@ -29,6 +32,51 @@ function tempRoot(): string {
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe('withSecureHostParent (async)', () => {
+  it('pins, locks, reads, and durably replaces a strict authority leaf', async () => {
+    const file = join(tempRoot(), '.botmux', 'claims.json');
+    await withSecureHostParent(file, async (parent) => parent.withLeafLock(async () => {
+      expect(await parent.readLeaf()).toBeNull();
+      await parent.writeLeaf('{"version":1}\n');
+      expect(await parent.readLeaf()).toBe('{"version":1}\n');
+    }), { exactParentMode: 0o700 });
+    expect(lstatSync(file).mode & 0o777).toBe(process.platform === 'win32' ? lstatSync(file).mode & 0o777 : 0o600);
+  });
+
+  it('invalidates an escaped async handle after the callback', async () => {
+    const file = join(tempRoot(), '.botmux', 'claims.json');
+    let leaked!: AsyncSecureHostParentHandle;
+    await withSecureHostParent(file, async (parent) => {
+      leaked = parent;
+      await parent.writeLeaf('inside');
+    }, { exactParentMode: 0o700 });
+    await expect(leaked.readLeaf()).rejects.toThrow(/句柄已释放/);
+    await expect(leaked.writeLeaf('outside')).rejects.toThrow(/句柄已释放/);
+    await expect(leaked.withLeafLock(async () => 0)).rejects.toThrow(/句柄已释放/);
+  });
+
+  it('fails closed on a symlink leaf and a non-0700 parent', async () => {
+    if (process.platform === 'win32') return;
+    const root = tempRoot();
+    const dir = join(root, '.botmux');
+    mkdirSync(dir, { mode: 0o700 });
+    const victim = join(root, 'victim');
+    writeFileSync(victim, 'keep', { mode: 0o600 });
+    const file = join(dir, 'claims.json');
+    symlinkSync(victim, file);
+    await expect(withSecureHostParent(file, async parent => parent.writeLeaf('replace'), {
+      exactParentMode: 0o700,
+    })).rejects.toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep');
+
+    rmSync(file);
+    chmodSync(dir, 0o750);
+    await expect(withSecureHostParent(file, async parent => parent.writeLeaf('x'), {
+      exactParentMode: 0o700,
+    })).rejects.toThrow(/0700/);
+  });
 });
 
 describe('secure host authority files', () => {
@@ -169,6 +217,34 @@ describe('withSecureHostParentSync', () => {
 
     expect(() => withSecureHostParentSync(file, (parent) => parent.writeLeaf('replace'))).toThrow();
     expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
+  it('metadata-only cleanup removes oversized 0600 files but rejects symlinks and wrong modes', () => {
+    if (process.platform === 'win32') return;
+    const root = tempRoot();
+    const dir = join(root, '.botmux');
+    mkdirSync(dir, { mode: 0o700 });
+    const anchor = join(dir, '.anchor');
+    const oversized = join(dir, 'oversized.json');
+    writeFileSync(oversized, 'x'.repeat(1024 * 1024 + 1), { mode: 0o600 });
+
+    withSecureHostParentSync(anchor, (parent) => {
+      expect(parent.unlinkNamedRegularFile('oversized.json')).toBe(true);
+    }, { exactParentMode: 0o700 });
+    expect(existsSync(oversized)).toBe(false);
+
+    const victim = join(root, 'victim');
+    writeFileSync(victim, 'keep', { mode: 0o600 });
+    symlinkSync(victim, join(dir, 'linked.json'));
+    expect(() => withSecureHostParentSync(anchor, (parent) =>
+      parent.unlinkNamedRegularFile('linked.json'), { exactParentMode: 0o700 })).toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep');
+
+    const lax = join(dir, 'lax.json');
+    writeFileSync(lax, 'keep', { mode: 0o644 });
+    expect(() => withSecureHostParentSync(anchor, (parent) =>
+      parent.unlinkNamedRegularFile('lax.json'), { exactParentMode: 0o700 })).toThrow(/0600/);
+    expect(readFileSync(lax, 'utf8')).toBe('keep');
   });
 
   it('fails closed when a leaked handle is used after the call returns', () => {

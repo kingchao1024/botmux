@@ -270,6 +270,10 @@ import {
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
+import {
+  awaitAskReceiptAuthorityBootstrapInventory,
+  buildDeviceIsolationInventory,
+} from './core/device-isolation-daemon.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
   cancelSessionReadyAck,
@@ -340,7 +344,13 @@ import {
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { fillNativeTopicId } from './core/native-topic-id.js';
-import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
+import {
+  findOnlineDaemon,
+  listOnlineDaemons,
+  publishDaemonDescriptor,
+  removeDaemonDescriptorPublication,
+  type DaemonDescriptorPublication,
+} from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
@@ -488,6 +498,11 @@ let selfDaemonLarkAppId: string | undefined;
  * healed value back to stale. One daemon per bot, so a single ref is correct.
  */
 let selfDaemonDescriptor: DaemonDescriptor | undefined;
+let selfDaemonDescriptorPublication: DaemonDescriptorPublication | undefined;
+/** False until startup owns the host-wide isolation lock and has atomically
+ * published the descriptor. Detached startup callbacks may update the in-memory
+ * descriptor before then, but must never make a lock-blocked daemon discoverable. */
+let selfDaemonDescriptorPublished = false;
 
 /**
  * Patch the live descriptor's `resolvedAllowedUsers` (ou_ only) and rewrite it.
@@ -497,6 +512,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   const desc = selfDaemonDescriptor;
   if (!desc || desc.larkAppId !== larkAppId) return;
   desc.resolvedAllowedUsers = resolved.filter(u => u.startsWith('ou_'));
+  if (!selfDaemonDescriptorPublished) return;
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
@@ -544,13 +560,51 @@ import {
   setCardDispatcher as setAskCardDispatcher,
   setCanTalkChecker as setAskCanTalkChecker,
   setAskPersistStore as setAskPersistStoreBroker,
+  setAskReceiptRedeemer,
   registerAsk as registerAskBroker,
+  recoverS1ControllerAsk,
+  askSignedAuthorityAvailable,
   restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
   submitCustomReply,
 } from './core/ask-broker.js';
+import { askCardEventClaimDirectory, askReceiptSigningKeyPath } from './core/ask-receipt-paths.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
-import { parseAskBody } from './core/ask-api.js';
+import { resolveBotmuxConfigDir } from './core/config-dir.js';
+import { withBotsJsonLock } from './setup/bots-store.js';
+import {
+  ASK_CARD_EVENT_CLAIM_LOCK_WAIT_MS,
+  createAskCardEventClaimStore,
+} from './services/ask-card-event-claim-store.js';
+import {
+  adoptDeviceIsolationStartupReservation,
+  clearDeviceIsolationStartupIntent,
+  publishDeviceIsolationStartupIntent,
+} from './services/device-isolation-startup-intent-store.js';
+import {
+  readDeviceIsolationRosterSnapshot,
+  sameDeviceIsolationRoster,
+} from './services/device-isolation-roster.js';
+import {
+  DeviceIsolationActivationError,
+  collectAskReceiptAuthorityLiveSiblings,
+  decideAskReceiptAuthorityBootstrap,
+  deviceCredentialIsolationMarkerEnablesAskReceiptAuthority,
+  deviceCredentialIsolationSupported,
+  readDeviceCredentialIsolationMarker,
+  withDeviceCredentialIsolationActivationLock,
+} from './platform/device-isolation.js';
+import {
+  createAskAnswerProvenanceAuthority,
+  loadOrCreateAskReceiptSigner,
+} from './daemon/ask-receipt-authority.js';
+import { askOriginKindForPath, parseAskBody, type AskApiOrdinaryBody } from './core/ask-api.js';
+import {
+  classifyS1ControllerRegisterThrownError,
+  registerAskS1ControllerIpcRoutes,
+  type AskS1ControllerParsedBody,
+  selectS1ControllerBinding,
+} from './core/ask-s1-controller-route.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -748,10 +802,12 @@ function scheduleRestoredStreamingCardPinRecovery(larkAppId: string): void {
 async function restoreSessionsAndScheduleStartupRecovery(opts: {
   larkAppId: string;
   restoreSessions: () => Promise<void>;
+  afterRestore?: () => Promise<void>;
   markSessionsRestored: () => void;
 }): Promise<void> {
   await opts.restoreSessions();
   scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
+  if (opts.afterRestore) await opts.afterRestore();
   opts.markSessionsRestored();
 }
 /** Once-per-daemon guard for the mojo containment boot reconciliation. The store
@@ -4132,10 +4188,8 @@ function removePidFile(): void {
 }
 
 // ─── Daemon descriptor (dashboard registry) ─────────────────────────────────
-// Each per-bot daemon publishes a self-descriptor JSON at
-// <resolvedDataDir>/dashboard-daemons/<larkAppId>.json so the dashboard sibling
-// process can discover all running daemons. The file is touched every 30s as a
-// heartbeat (mtime drives offline detection) and removed on graceful exit.
+// Each per-bot daemon publishes a generation-keyed descriptor JSON so rolling
+// restart predecessors remain visible until their exact process exits.
 
 const DAEMON_REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 
@@ -4151,11 +4205,17 @@ interface DaemonDescriptor {
   pid: number;
   /** Kernel/OS process-birth identity; prevents fresh stale PID reuse. */
   processStartIdentity: string;
+  /** Full bots-config revision proven before this daemon admitted startup. */
+  rosterRevision: string;
   startedAt: number;
   /** Public, random audience that changes on every daemon process start. */
   bootInstanceId: string;
   /** Full-envelope Workflow mutation protocol supported by this process. */
   workflowIpcProtocol: 'v1';
+  /** Ask receipt authority protocol published only when a valid ACTIVE marker is present. */
+  receiptAuthorityProtocolVersion?: number;
+  /** Ask receipt activation epoch published only when a valid ACTIVE marker is present. */
+  receiptAuthorityActivationEpoch?: string;
   /** Exact supervisor protocol this in-memory daemon will execute on signal.
    * Absent until the SIGTERM/SIGINT handlers and all captured state are ready. */
   supervisorShutdownProtocol?: SupervisorShutdownProtocol;
@@ -4169,25 +4229,18 @@ interface DaemonDescriptor {
   resolvedAllowedUsers: string[];
 }
 
-function writeDaemonDescriptor(d: DaemonDescriptor): void {
-  mkdirSync(DAEMON_REGISTRY_DIR, { recursive: true });
-  const fp = join(DAEMON_REGISTRY_DIR, `${d.larkAppId}.json`);
-  // 原子写：dashboard 进程并发轮询读这些描述符（30s 心跳高频重写）。
-  atomicWriteFileSync(fp, JSON.stringify(d), { mode: 0o600 });
+function writeDaemonDescriptor(
+  d: DaemonDescriptor,
+  options: { publish?: boolean } = {},
+): void {
+  if (!selfDaemonDescriptorPublished && options.publish !== true) return;
+  selfDaemonDescriptorPublication = publishDaemonDescriptor(DAEMON_REGISTRY_DIR, d);
+  if (options.publish === true) selfDaemonDescriptorPublished = true;
 }
 
-function removeDaemonDescriptor(larkAppId: string, ownBootInstanceId: string): void {
-  const fp = join(DAEMON_REGISTRY_DIR, `${larkAppId}.json`);
-  if (!existsSync(fp)) return;
-  try {
-    // Restart overlap: the successor may already have republished this file
-    // while we were still tearing down. Its descriptor is not ours to remove —
-    // unlinking it would hide a live daemon from IPC discovery for up to one
-    // heartbeat while its occupancy lease says the store is held.
-    const current = JSON.parse(readFileSync(fp, 'utf-8')) as { bootInstanceId?: unknown };
-    if (typeof current.bootInstanceId === 'string' && current.bootInstanceId !== ownBootInstanceId) return;
-  } catch { /* unreadable: treat as ours */ }
-  try { unlinkSync(fp); } catch { /* ignore */ }
+function removeDaemonDescriptor(): void {
+  removeDaemonDescriptorPublication(selfDaemonDescriptorPublication);
+  selfDaemonDescriptorPublication = undefined;
 }
 
 /**
@@ -5718,7 +5771,8 @@ const cardActionPluginGateway = createPluginCardActionGateway({
     getBot(larkAppId).config,
     readGlobalConfig(),
   ),
-  fallback: (data, larkAppId) => handleCardAction(data, cardDeps, larkAppId),
+  fallback: (data, larkAppId, askReceiptProvenance) =>
+    handleCardAction(data, cardDeps, larkAppId, askReceiptProvenance),
 });
 
 const LEGACY_WORKFLOW_API_RETIRED = {
@@ -6305,7 +6359,9 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
-ipcRoute('POST', '/api/asks', async (req, res) => {
+for (const askRoutePath of ['/api/asks', '/api/asks/hook'] as const) ipcRoute('POST', askRoutePath, async (req, res) => {
+  const routeOriginKind = askOriginKindForPath(askRoutePath);
+  if (!routeOriginKind) return jsonRes(res, 404, { ok: false, error: 'not_found' });
   let raw: unknown;
   try {
     raw = await readJsonBody<unknown>(req);
@@ -6314,8 +6370,14 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   }
   const parsed = parseAskBody(raw);
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
+  if ('phase' in parsed) return jsonRes(res, 400, { ok: false, error: 'unexpected_field' });
+  const ordinaryAsk = parsed as AskApiOrdinaryBody;
+  const originKind = askRoutePath === '/api/asks'
+    && ordinaryAsk.deprecatedOriginKindHint === 'hook'
+    ? 'hook'
+    : routeOriginKind;
 
-  const askSession = findActiveBySessionId(parsed.sessionId);
+  const askSession = findActiveBySessionId(ordinaryAsk.sessionId);
   // Startup window (codex P1-2): IPC is listening but sessions aren't restored
   // yet, so a reconnecting ask hook's session lookup misses and would otherwise
   // get a permanent 403. Return a RETRYABLE 503 so the hook keeps waiting
@@ -6331,7 +6393,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   })) {
     return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
   }
-  let boundAsk = parsed;
+  let boundAsk = ordinaryAsk;
   if (!isTrustedHostIpcRequest(req)) {
     const body = raw && typeof raw === 'object' && !Array.isArray(raw)
       ? raw as Record<string, unknown>
@@ -6346,7 +6408,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       sessionExists: !!askSession,
       receiverSession: !!askSession?.session.vcMeetingReceiver,
       allowReceiver: false,
-      sessionId: parsed.sessionId,
+      sessionId: ordinaryAsk.sessionId,
       liveOrigin: askSession?.managedTurnOrigin,
       claimedCapability: typeof body.originCapability === 'string'
         ? body.originCapability
@@ -6415,9 +6477,13 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     questions: boundAsk.questions,
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
-    // Invocation identity (from the hook; enables cross-restart re-attach).
+    // The route, which is covered by the IPC HMAC/current-turn capability, is
+    // the authority for origin. Caller JSON may supply only requestId and can
+    // never affect session/chat/root binding. For rolling ordinary-client
+    // compatibility only, `/api/asks` may treat a validated deprecated hook
+    // hint as hook; `/api/asks/hook` remains path-authoritative hook.
     requestId: boundAsk.requestId,
-    originKind: boundAsk.originKind,
+    originKind,
     // Authoritative persistence gate (codex P1-4): derive resumability from the
     // authenticated session's FROZEN backend, not the client's origin string. A
     // PTY-backed session dies with the daemon, so its ask must NOT persist; only
@@ -6433,20 +6499,20 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   if (result.kind === 'answered') {
     let cocoDs: DaemonSession | undefined;
     for (const ds of activeSessions.values()) {
-      if (ds.session.sessionId === parsed.sessionId) { cocoDs = ds; break; }
+      if (ds.session.sessionId === ordinaryAsk.sessionId) { cocoDs = ds; break; }
     }
     if (cocoDs?.session.cliId === 'coco' && cocoDs.worker) {
       try {
         // 单题：picker 选完直接提交（无 Review）；多题：最后一题之后才出 Review，需补提交。
-        const needsReviewSubmit = parsed.questions.length > 1;
+        const needsReviewSubmit = ordinaryAsk.questions.length > 1;
         const comment = result.comment;
         let navKeys: string[];
         if (comment && comment.trim()) {
           // 自由文本：把光标移到第一题 "Type something" 行（= 选项数个 Down）。
-          const optionCount = parsed.questions[0]?.options.length ?? 0;
+          const optionCount = ordinaryAsk.questions[0]?.options.length ?? 0;
           navKeys = Array<string>(optionCount).fill('Down');
         } else {
-          navKeys = computeCocoPickerKeys(parsed.questions, result.answers).navKeys;
+          navKeys = computeCocoPickerKeys(ordinaryAsk.questions, result.answers).navKeys;
         }
         sendWorkerSessionInput(cocoDs, {
           type: 'coco_drive_picker',
@@ -6462,6 +6528,57 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   }
 
   return jsonRes(res, 200, result);
+});
+
+registerAskS1ControllerIpcRoutes({
+  selectBinding(input) {
+    return selectS1ControllerBinding(input, {
+      listActiveSessions: () => [...new Set(activeSessions.values())].filter((candidate) =>
+        larkTransportEnabled({
+          chatId: candidate.chatId,
+          apiOnly: getBot(candidate.larkAppId).config.apiOnly,
+        })),
+      findActiveBySessionId,
+      getLiveOrigin: (selected) => selected.managedTurnOrigin,
+      hasLarkTransport: (candidate) => larkTransportEnabled({
+        chatId: candidate.chatId,
+        apiOnly: getBot(candidate.larkAppId).config.apiOnly,
+      }),
+    });
+  },
+  async register({ ask }) {
+    if (!askSignedAuthorityAvailable()) return { ok: false, error: 'authority_unavailable' };
+    try {
+      const result = await registerAskBroker(ask);
+      if (result.kind === 'invalidated' && result.reason === 'ask persistence unavailable') {
+        return { ok: false, error: 'store_unavailable' };
+      }
+      return { ok: true, result };
+    } catch (err) {
+      const classified = classifyS1ControllerRegisterThrownError(err);
+      if (classified) return { ok: false, error: classified };
+      return { ok: false, error: 'store_unavailable' };
+    }
+  },
+  recover({ body, binding, now }) {
+    if (!askSignedAuthorityAvailable()) return { ok: false, error: 'store_unavailable' };
+    const recovered = recoverS1ControllerAsk({
+      larkAppId: binding.larkAppId,
+      sessionId: binding.sessionId,
+      chatId: binding.chatId,
+      rootMessageId: binding.rootMessageId,
+      requestId: body.requestId,
+      questions: body.questions,
+      notBeforeMs: body.notBeforeMs,
+      expiresAtMs: body.expiresAtMs,
+      now,
+    });
+    if (recovered.ok) return { ok: true, result: recovered.answeredResult };
+    if (recovered.reason === 'missing') return { ok: false, error: 'receipt_not_found' };
+    if (recovered.reason === 'mismatch') return { ok: false, error: 'binding_mismatch' };
+    if (recovered.reason === 'expired') return { ok: false, error: 'recovery_expired' };
+    return { ok: false, error: 'store_unavailable' };
+  },
 });
 
 // ─── attention IPC route (internal: set needs-you state) ─────────────────────
@@ -21927,6 +22044,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     botConfigs = loadBotConfigs();
     cfg = loadBotConfigAtIndex(idx);
   }
+  const startupRoster = readDeviceIsolationRosterSnapshot();
+  const expectedAppId = process.env.BOTMUX_EXPECTED_APP_ID;
+  const expectedRosterRevision = process.env.BOTMUX_ROSTER_REVISION;
+  if (botIndex !== undefined && (
+    !expectedAppId
+    || expectedAppId !== cfg.larkAppId
+    || !expectedRosterRevision
+    || expectedRosterRevision !== startupRoster.revision
+    || !startupRoster.members.some(member => member.index === idx && member.larkAppId === expectedAppId)
+  )) {
+    throw new Error(`Supervisor roster identity drifted at BOTMUX_BOT_INDEX=${idx}`);
+  }
   // 这里曾经有一次「给本 bot 播种默认会议角色预设」的启动写盘。已退役：角色预设
   // 改成全 fleet 共享目录 + 读路径内置默认（services/vc-meeting-shared-consumer-
   // catalog.ts），没有任何 bot 还需要自己那份 per-bot 拷贝。退役的两个理由：
@@ -22082,6 +22211,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
+  let askReceiptProvenanceIssuer: import('./core/ask-receipt.js').AskAnswerProvenanceIssuer | undefined;
   // Honour the bot's canTalk gate for `botmux ask` answers: a clicker who may
   // address the bot in this chat may answer an implicit-approver ask.
   //
@@ -22094,20 +22224,107 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     evaluateAskAnswerTalk(appId, chatId, openId, chatType, actor),
   );
 
-  // Resume pending `botmux ask` cards that outlived a daemon restart. Each is
-  // restored as a DORMANT ask (card still live in Feishu, no waiter yet). The
-  // surviving CLI hook — whose /api/asks connection dropped on restart and is
-  // retrying — re-registers the same ask by its stable key and re-attaches a
-  // waiter, so the answer flows back through the normal hook directive instead
-  // of the CLI falling into a stuck native picker. Scoped to this daemon's bot.
-  try {
-    // Bind the durable store to the real data dir (dependency-injected so unit
-    // tests use a temp dir and never touch live data — codex P1-4).
-    setAskPersistStoreBroker(createAskPersistStore(join(config.session.dataDir, 'asks')));
-    restorePersistedAsksBroker(Date.now(), cfg.larkAppId);
-  } catch (e) {
-    logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
+  const activateAskReceiptAuthorityAfterRestore = async (): Promise<void> => {
+    // Phase 1 is restoreActiveSessions(), which reconciles any surviving legacy
+    // persistent panes against the current isolation contract. Only once that
+    // pass has proven them gone or cold-spawned under current masks do we load
+    // or create the ask receipt signing key and publish the daemon-owned
+    // receipt/provenance authority.
+    askReceiptProvenanceIssuer = undefined;
+    setAskReceiptRedeemer(null);
+    const restoreAt = Date.now();
+    try {
+      setAskPersistStoreBroker(createAskPersistStore(join(config.session.dataDir, 'asks')));
+      restorePersistedAsksBroker(restoreAt, cfg.larkAppId);
+    } catch (e) {
+      setAskPersistStoreBroker(null);
+      logger.warn(`[ask] unsigned restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    let marker: ReturnType<typeof readDeviceCredentialIsolationMarker> | 'invalid' | null = null;
+    try {
+      marker = readDeviceCredentialIsolationMarker();
+    } catch (error) {
+      if (error instanceof DeviceIsolationActivationError) marker = 'invalid';
+      else throw error;
+    }
+    if (marker !== 'invalid' && marker?.state === 'active' && marker.askReceiptAuthorityProof) {
+      desc.receiptAuthorityProtocolVersion = marker.askReceiptAuthorityProof.protocolVersion;
+      desc.receiptAuthorityActivationEpoch = marker.askReceiptAuthorityProof.activationEpoch;
+      try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+    } else {
+      delete desc.receiptAuthorityProtocolVersion;
+      delete desc.receiptAuthorityActivationEpoch;
+    }
+    const discoveredDaemons = listOnlineDaemons();
+    const selfReceiptAuthorityProtocolVersion =
+      marker !== 'invalid' && marker?.state === 'active' && marker.askReceiptAuthorityProof
+        ? marker.askReceiptAuthorityProof.protocolVersion
+        : undefined;
+    const selfReceiptAuthorityActivationEpoch =
+      marker !== 'invalid' && marker?.state === 'active' && marker.askReceiptAuthorityProof
+        ? marker.askReceiptAuthorityProof.activationEpoch
+        : undefined;
+    const { liveSiblings, protocolCompatible: liveSiblingProtocolCompatible } =
+      collectAskReceiptAuthorityLiveSiblings({
+        discoveredDaemons,
+        self: {
+          larkAppId: cfg.larkAppId,
+          bootInstanceId: desc.bootInstanceId,
+          pid: process.pid,
+          processStartIdentity: daemonProcessStartIdentity!,
+          rosterRevision: startupRoster.revision,
+        },
+        receiptAuthorityProtocolVersion: selfReceiptAuthorityProtocolVersion,
+        receiptAuthorityActivationEpoch: selfReceiptAuthorityActivationEpoch,
+      });
+    const receiptAuthorityGate = decideAskReceiptAuthorityBootstrap({
+      marker,
+      liveSiblings,
+      liveSiblingProtocolCompatible,
+      inventory: await awaitAskReceiptAuthorityBootstrapInventory(),
+    });
+    if (!receiptAuthorityGate.enabled) {
+      logger.info(
+        `[ask] signed receipt authority disabled during startup: ${receiptAuthorityGate.reason}`,
+      );
+      return;
+    }
+    try {
+      // Bind the durable store to the real data dir (dependency-injected so unit
+      // tests use a temp dir and never touch live data — codex P1-4).
+      const askReceiptSigner = loadOrCreateAskReceiptSigner(
+        askReceiptSigningKeyPath(resolveBotmuxConfigDir()),
+      );
+      const askCardEventClaims = createAskCardEventClaimStore(
+        askCardEventClaimDirectory(config.session.dataDir),
+        { instanceId: getDaemonBootId(), maxWaitMs: ASK_CARD_EVENT_CLAIM_LOCK_WAIT_MS },
+      );
+      const askPersistStore = createAskPersistStore(join(config.session.dataDir, 'asks'), askReceiptSigner);
+      const askReceiptProvenance = createAskAnswerProvenanceAuthority({
+        signer: askReceiptSigner,
+        daemonBootId: getDaemonBootId(),
+        claimEvent: askCardEventClaims.claim,
+        completeEvent: askCardEventClaims.complete,
+      });
+      askReceiptProvenanceIssuer = {
+        issue: askReceiptProvenance.issue,
+        wasRedeemed: askReceiptProvenance.wasRedeemed,
+        complete: askReceiptProvenance.complete,
+        revoke: askReceiptProvenance.redeemer.revoke,
+      };
+      setAskReceiptRedeemer(askReceiptProvenance.redeemer);
+      setAskPersistStoreBroker(askPersistStore);
+      restorePersistedAsksBroker(restoreAt, cfg.larkAppId);
+    } catch (e) {
+      // Signed receipts are optional for ordinary Ask, but their authority must
+      // fail closed: never leave a signer/redeemer from an earlier bot
+      // bootstrap installed after key initialization fails. Ordinary unsigned
+      // ask persistence stays available through the store installed above.
+      askReceiptProvenanceIssuer = undefined;
+      setAskReceiptRedeemer(null);
+      logger.warn(`[ask] signed restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
 
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
@@ -22141,6 +22358,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     ipcPort,
     pid: process.pid,
     processStartIdentity: daemonProcessStartIdentity,
+    rosterRevision: startupRoster.revision,
     startedAt: Date.now(),
     bootInstanceId: getDaemonBootId(),
     workflowIpcProtocol: 'v1',
@@ -22154,6 +22372,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Expose the live descriptor module-level so the deferred allowedUsers resolve
   // retry can republish healed open_ids coherently (see republishResolvedAllowedUsers).
   selfDaemonDescriptor = desc;
+  selfDaemonDescriptorPublished = false;
   // Let runtime allowedUsers mutations (set / revoke, in the services layer)
   // republish the descriptor through the same path without importing daemon
   // internals. Registered once per daemon; one daemon per bot.
@@ -22521,6 +22740,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   setDeviceIsolationDaemonIdentity({
     larkAppId: cfg.larkAppId,
     bootInstanceId: desc.bootInstanceId,
+    botsConfigPath: startupRoster.requestedConfigPath,
+    rosterRevision: startupRoster.revision,
   });
   selfV3LarkAppId = cfg.larkAppId; // scope v3 humanGate cold-attach / start to this bot
   selfV3BootInstanceId = desc.bootInstanceId;
@@ -22580,20 +22801,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // /healthz AND the public control routes (trigger/result/insight) return 503,
   // so riff never triggers into a racing durable restore (codex P1).
 
-  // Publish the IPC descriptor after bind, then first-load the session store
-  // under BEGIN IMMEDIATE (a plain SELECT would not wait for an in-flight
-  // offline writer). Occupancy is claimed in that same load transaction —
-  // the descriptor is discovery only. An offline writer either sees the
-  // lease and yields, or already holds the write exclusion; in the latter
-  // case this load waits and sees its atomic mutation.
-  //
-  // The first load may already have happened above (the idempotency reconcile
-  // reads the store), so the claim inside it can predate this point by the
-  // whole reconcile; claim again now rather than waiting for the first tick.
-  // The claim doubles as renew, so a lease lost to an overlapping boot is
-  // re-acquired on the next tick once that boot releases or lapses.
-  desc.lastHeartbeat = Date.now();
-  writeDaemonDescriptor(desc);
+  // Load the session store after IPC binds. The descriptor is intentionally
+  // NOT published yet: startup must first acquire the host-wide isolation lock.
+  // Otherwise an activation coordinator holding that lock can discover this
+  // daemon and call prepare, whose IPC handler waits on ipcReady while startup
+  // waits on the same lock — a cross-process deadlock. The descriptor and ready
+  // barrier are committed together inside the startup critical section below.
   sessionStore.listSessions();
   let occupancyState: sessionStore.OccupancyClaimResult | 'error' | undefined;
   const claimOccupancy = (): void => {
@@ -22618,6 +22831,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   };
   claimOccupancy();
   const descriptorHeartbeat = setInterval(() => {
+    if (!selfDaemonDescriptorPublished) return;
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
     claimOccupancy();
@@ -22875,9 +23089,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Build the dispatcher now for authorization replay, but start it only
     // after restore has published every durable route owner.
     const botEventHandlers: EventHandlers = {
-      handleCardAction: (data, appId) => withBotTurnAdmission(
+      handleCardAction: (data, appId, askReceiptProvenance) => withBotTurnAdmission(
         appId,
-        () => cardActionPluginGateway.dispatch(data, appId),
+        () => cardActionPluginGateway.dispatch(data, appId, askReceiptProvenance),
       ),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
@@ -22923,6 +23137,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         cfg.larkAppSecret,
         botEventHandlers,
         normalizeBrand(cfg.brand),
+        askReceiptProvenanceIssuer,
       ));
     }
 
@@ -22947,17 +23162,98 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // See reapOrphanWorkers() in worker-pool.ts.
   reapOrphanWorkers();
 
-  // Restore active sessions from previous run
-  // Restore active sessions from previous run
-  await restoreSessionsAndScheduleStartupRecovery({
-    larkAppId: cfg.larkAppId,
-    restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),
-    // Restore complete → /api/asks may now safely 403 unknown sessions again; a
-    // reconnecting ask hook that raced the restore got retryable 503s until here.
-    markSessionsRestored: () => {
-      sessionsRestored = true;
-    },
-  });
+  const reservationId = process.env.BOTMUX_STARTUP_RESERVATION_ID;
+  const reservationToken = process.env.BOTMUX_STARTUP_RESERVATION_TOKEN;
+  if ((reservationId === undefined) !== (reservationToken === undefined)) {
+    throw new Error('incomplete supervisor startup reservation');
+  }
+  let startupIntent: ReturnType<typeof publishDeviceIsolationStartupIntent> | undefined;
+  try {
+    // Fixed order shared with activation and fleet start: exact bots-config
+    // writer lock first, then the host activation gate. Both stay held through
+    // restore, authority bootstrap, readiness, intent clear, and publication.
+    await withBotsJsonLock(startupRoster.requestedConfigPath, (lockedConfigPath, assertTargetStable) =>
+      withDeviceCredentialIsolationActivationLock(async () => {
+        const lockedRoster = readDeviceIsolationRosterSnapshot({ configPath: lockedConfigPath });
+        if (!sameDeviceIsolationRoster(startupRoster, lockedRoster)) {
+          throw new Error('Bot roster changed before startup admission');
+        }
+        startupIntent = reservationId && reservationToken
+          ? adoptDeviceIsolationStartupReservation({
+              intentId: reservationId,
+              reservationToken,
+              larkAppId: cfg.larkAppId,
+              bootInstanceId: desc.bootInstanceId,
+              rosterRevision: startupRoster.revision,
+            })
+          : publishDeviceIsolationStartupIntent({
+              larkAppId: cfg.larkAppId,
+              bootInstanceId: desc.bootInstanceId,
+            });
+        // ACTIVE is a spawn-time policy. Read and validate it before restore so
+        // every surviving pane is either proven isolated or torn down/cold-spawned
+        // by restore's existing persistent-pane migration state machine.
+        const startupIsolationMarker = readDeviceCredentialIsolationMarker();
+        if (deviceCredentialIsolationMarkerEnablesAskReceiptAuthority(startupIsolationMarker)
+            && !deviceCredentialIsolationSupported()) {
+          throw new Error('ACTIVE device isolation cannot be enforced during daemon restore');
+        }
+        delete process.env.BOTMUX_STARTUP_RESERVATION_ID;
+        delete process.env.BOTMUX_STARTUP_RESERVATION_TOKEN;
+        // Restore active sessions while both the config and activation locks are
+        // held, then publish only after authority and readiness are complete.
+        await restoreSessionsAndScheduleStartupRecovery({
+          larkAppId: cfg.larkAppId,
+          restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),
+          afterRestore: activateAskReceiptAuthorityAfterRestore,
+          markSessionsRestored: () => {
+            sessionsRestored = true;
+          },
+        });
+        // Linearize alias identity before this daemon becomes externally ready.
+        // The lock helper also checks again after the full callback returns.
+        assertTargetStable();
+        sessionsRestored = true;
+        markIpcReady();
+        clearDeviceIsolationStartupIntent({
+          intentId: startupIntent.intentId,
+          processIdentity: {
+            pid: startupIntent.pid,
+            processStartIdentity: startupIntent.processStartIdentity,
+          },
+          ...(reservationToken ? { reservationToken } : {}),
+        });
+        desc.lastHeartbeat = Date.now();
+        assertTargetStable();
+        writeDaemonDescriptor(desc, { publish: true });
+      }));
+  } catch (error) {
+    // A failed startup must not leave a fresh discoverable descriptor whose IPC
+    // readiness promise can never resolve, and it must withdraw only THIS
+    // daemon's exact startup intent. A hard kill skips this path, leaving the
+    // intent behind for stale-proof reclaim by activation.
+    const descriptorPublishedByThisStartup = selfDaemonDescriptorPublished;
+    selfDaemonDescriptorPublished = false;
+    if (descriptorPublishedByThisStartup) removeDaemonDescriptor();
+    if (startupIntent) {
+      clearDeviceIsolationStartupIntent({
+        intentId: startupIntent.intentId,
+        processIdentity: {
+          pid: startupIntent.pid,
+          processStartIdentity: startupIntent.processStartIdentity,
+        },
+        ...(reservationToken ? { reservationToken } : {}),
+      });
+    } else if (reservationId && reservationToken) {
+      clearDeviceIsolationStartupIntent({
+        intentId: reservationId,
+        reservationToken,
+      });
+    }
+    throw error;
+  }
+  // Restore complete → /api/asks may now safely 403 unknown sessions again; a
+  // reconnecting ask hook that raced the restore got retryable 503s until here.
 
   // Close CoT thinking bubbles orphaned by the previous daemon generation
   // (created mid-turn, never settled — their in-memory state died with the
@@ -22981,10 +23277,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   for (const bot of getAllBots()) {
     markForwardFollowupsSessionsReady(bot.config.larkAppId);
   }
-  // The descriptor was intentionally published before restore so offline CLI
-  // mutations delegate to this daemon.  Release those queued IPC calls only
-  // after every durable owner is visible in the canonical registry.
-  markIpcReady();
+  // The descriptor and readiness fence were committed atomically under the
+  // host-wide activation lock above, so activation cannot discover a daemon
+  // whose prepare route is still waiting on this barrier.
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();
 
@@ -23606,7 +23901,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // heartbeat is stopped) and release it only at the very end, so an offline
     // writer cannot slip a commit under a write-back that is still coming.
     claimOccupancy();
-    removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
+    removeDaemonDescriptor();
     ipcHandle.close().catch(() => { /* swallow */ });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
@@ -23821,7 +24116,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
-    removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
+    removeDaemonDescriptor();
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the
     // graceful shutdown above. flushIdentityCacheSync is synchronous and
     // idempotent — safe to call here as a belt-and-suspenders save.

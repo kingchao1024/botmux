@@ -20,7 +20,14 @@ import { containmentSessionIds, hasUnprovenContainment } from './mojo-containmen
 import { config } from '../config.js';
 import { isMojoFullyRemote } from '../adapters/backend/sandbox.js';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
+import {
+  ASK_RECEIPT_AUTHORITY_PROTOCOL_VERSION,
+  ASK_RECEIPT_AUTHORITY_VERSION,
+  deviceCredentialIsolationMarkerState,
+  MAX_MARKER_BYTES,
+} from '../platform/device-isolation.js';
 import * as sessionStore from '../services/session-store.js';
+import { readDeviceIsolationRosterSnapshot } from '../services/device-isolation-roster.js';
 import type { Session } from '../types.js';
 import { logger } from '../utils/logger.js';
 import {
@@ -165,6 +172,8 @@ export interface DeviceIsolationInventory {
 export interface DeviceIsolationDaemonIdentity {
   larkAppId: string;
   bootInstanceId: string;
+  botsConfigPath: string;
+  rosterRevision: string;
 }
 
 export interface DeviceIsolationDaemonDependencies {
@@ -182,6 +191,7 @@ export interface DeviceIsolationDaemonDependencies {
   ) => void;
   closeWorker: (session: DeviceIsolationRuntimeSession) => void;
   readMarker: () => string | null;
+  readRosterRevision: (configPath: string) => string;
   sleep: (ms: number) => Promise<void>;
   dataDir: () => string;
 }
@@ -191,9 +201,15 @@ export type DeviceIsolationDaemonResult = {
   body: Record<string, unknown>;
 };
 
+export interface AskReceiptAuthorityBootstrapBarrierOptions {
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
 interface ActivationTransaction {
   lease: DeviceIsolationFreezeLease;
   inventory: DeviceIsolationInventory;
+  rosterRevision: string;
   phase: 'prepared' | 'committed';
   pendingMarkerSha256?: string;
 }
@@ -405,7 +421,18 @@ export function mergePersistedDeviceIsolationSessions(
   runtimeSessions: readonly DeviceIsolationRuntimeSession[],
   persistedSessions: readonly Session[],
 ): DeviceIsolationRuntimeSession[] {
-  const merged = [...runtimeSessions];
+  const persistedById = new Map(persistedSessions.map(session => [session.sessionId, session]));
+  const merged = runtimeSessions.map((runtime) => {
+    const persisted = persistedById.get(runtime.sessionId);
+    if (runtime.unregisteredPid !== undefined
+        || !persisted || typeof persisted.pid !== 'number' || persisted.pid <= 0) {
+      return runtime;
+    }
+    // Preserve the durable PID evidence through restore. A newly-created
+    // workerless runtime row must not shadow a legacy process that has merely
+    // received SIGTERM but is still alive.
+    return { ...runtime, unregisteredPid: persisted.pid };
+  });
   const runtimeIds = new Set(runtimeSessions.map(session => session.sessionId));
   for (const session of persistedSessions) {
     if (
@@ -622,8 +649,9 @@ const defaultDependencies: DeviceIsolationDaemonDependencies = {
   },
   readMarker: () => readSecureHostFileSync(
     deviceCredentialIsolationMarkerPath(homedir()),
-    4 * 1024,
+    MAX_MARKER_BYTES,
   ),
+  readRosterRevision: configPath => readDeviceIsolationRosterSnapshot({ configPath }).revision,
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   dataDir: () => config.session.dataDir,
 };
@@ -749,6 +777,16 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
     : undefined;
 
   if (!session.workerPresent) {
+    // A persisted PTY PID is not made safe merely because restore has already
+    // installed a workerless runtime row. Until that exact PID is proven gone,
+    // keep the row blocking so signer bootstrap cannot race a surviving legacy
+    // process group.
+    if (session.unregisteredPid !== undefined) {
+      let gone = false;
+      try { gone = !dependencies.processExists(session.unregisteredPid); }
+      catch { /* an unavailable probe is not proof of death */ }
+      if (!gone) return blockerEntry(session, backendType, 'process_identity_unavailable');
+    }
     if (!persistent || persistent.probe === 'missing') {
       return {
         sessionId: session.sessionId,
@@ -848,6 +886,27 @@ export function buildDeviceIsolationInventory(): DeviceIsolationInventory {
   };
 }
 
+function bootstrapInventoryBarrierSatisfied(inventory: DeviceIsolationInventory): boolean {
+  return inventory.blockers.length === 0
+    && !inventory.entries.some(entry =>
+      entry.disposition === 'owned_local' && entry.credentialIsolated !== true
+    );
+}
+
+export async function awaitAskReceiptAuthorityBootstrapInventory(
+  options: AskReceiptAuthorityBootstrapBarrierOptions = {},
+): Promise<DeviceIsolationInventory> {
+  const timeoutMs = Math.max(0, options.timeoutMs ?? 1_500);
+  const pollIntervalMs = Math.max(10, options.pollIntervalMs ?? 50);
+  const deadline = dependencies.now() + timeoutMs;
+  let inventory = buildDeviceIsolationInventory();
+  while (!bootstrapInventoryBarrierSatisfied(inventory) && dependencies.now() < deadline) {
+    await dependencies.sleep(Math.min(pollIntervalMs, Math.max(0, deadline - dependencies.now())));
+    inventory = buildDeviceIsolationInventory();
+  }
+  return inventory;
+}
+
 function sha256(raw: string): string {
   return createHash('sha256').update(raw, 'utf8').digest('hex');
 }
@@ -885,11 +944,14 @@ function baseResponse(
     body: {
       ok: true,
       activationVersion: DEVICE_ISOLATION_ACTIVATION_VERSION,
+      receiptAuthorityVersion: ASK_RECEIPT_AUTHORITY_VERSION,
+      receiptAuthorityProtocolVersion: ASK_RECEIPT_AUTHORITY_PROTOCOL_VERSION,
       nonce: lease.nonce,
       leaseId: lease.leaseId,
       daemon: {
         larkAppId: daemonIdentity.larkAppId,
         bootInstanceId: daemonIdentity.bootInstanceId,
+        rosterRevision: daemonIdentity.rosterRevision,
         pid: process.pid,
         procStart,
         dataDir,
@@ -900,32 +962,15 @@ function baseResponse(
   };
 }
 
-function markerState(raw: string): 'pending' | 'active' | 'invalid' {
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (parsed.version !== 1 || typeof parsed.enabledAt !== 'string') return 'invalid';
-    if (new Date(parsed.enabledAt).toISOString() !== parsed.enabledAt) return 'invalid';
-    // Legacy v1 markers without state are deliberately pending: they enforce
-    // isolation for new workers but cannot prove the daemon transaction ended.
-    if (parsed.state === undefined || parsed.state === 'pending') return 'pending';
-    if (
-      parsed.state === 'active'
-      && typeof parsed.activatedAt === 'string'
-      && new Date(parsed.activatedAt).toISOString() === parsed.activatedAt
-    ) return 'active';
-    return 'invalid';
-  } catch {
-    return 'invalid';
-  }
-}
-
 function readAndMatchMarker(
   expectedSha256: string,
   expectedState: 'pending' | 'active',
 ): DeviceIsolationDaemonResult | { raw: string } {
   try {
     const raw = dependencies.readMarker();
-    if (raw === null || sha256(raw) !== expectedSha256 || markerState(raw) !== expectedState) {
+    if (raw === null
+        || sha256(raw) !== expectedSha256
+        || deviceCredentialIsolationMarkerState(raw) !== expectedState) {
       return stableError(409, 'marker_mismatch');
     }
     return { raw };
@@ -951,6 +996,23 @@ function currentTransaction(input: {
   ) return null;
   transaction.lease = lease;
   return transaction;
+}
+
+function rosterRevisionMatches(
+  requestedRevision: unknown,
+  active?: ActivationTransaction,
+): boolean {
+  if (!daemonIdentity || !validDigest(requestedRevision)) return false;
+  if (requestedRevision !== daemonIdentity.rosterRevision) return false;
+  if (active && (
+    active.rosterRevision !== requestedRevision
+    || active.lease.rosterRevision !== requestedRevision
+  )) return false;
+  try {
+    return dependencies.readRosterRevision(daemonIdentity.botsConfigPath) === requestedRevision;
+  } catch {
+    return false;
+  }
 }
 
 function processIdentityGone(identity: ProcessIdentity): 'gone' | 'alive' | 'unknown' {
@@ -1040,22 +1102,33 @@ async function quiesceOwnedSessions(
 export function setDeviceIsolationDaemonIdentity(
   identity: DeviceIsolationDaemonIdentity | null,
 ): void {
-  daemonIdentity = identity && identity.larkAppId && identity.bootInstanceId
+  daemonIdentity = identity
+    && identity.larkAppId
+    && identity.bootInstanceId
+    && identity.botsConfigPath
+    && validDigest(identity.rosterRevision)
     ? { ...identity }
     : null;
 }
 
 export function prepareDeviceIsolationActivation(body: unknown): DeviceIsolationDaemonResult {
   const input = body as Record<string, unknown> | null;
-  if (!input || !validVersion(input.activationVersion) || !validNonce(input.nonce)) {
+  if (!input
+      || !validVersion(input.activationVersion)
+      || !validNonce(input.nonce)
+      || !validDigest(input.rosterRevision)) {
     return stableError(409, 'invalid_request');
   }
   if (!daemonIdentity || !dependencies.processStart(process.pid) || !dependencies.dataDir()) {
     return stableError(503, 'daemon_identity_unavailable');
   }
+  if (!rosterRevisionMatches(input.rosterRevision)) {
+    return stableError(409, 'roster_revision_mismatch');
+  }
 
   const acquired = acquireDeviceIsolationFreeze({
     nonce: input.nonce,
+    rosterRevision: input.rosterRevision as string,
     inventoryGeneration: 'pending',
     now: dependencies.now(),
   });
@@ -1067,6 +1140,9 @@ export function prepareDeviceIsolationActivation(body: unknown): DeviceIsolation
     && transaction.lease.leaseId === acquired.lease.leaseId
     && transaction.lease.nonce === input.nonce
   ) {
+    if (!rosterRevisionMatches(input.rosterRevision, transaction)) {
+      return stableError(409, 'roster_revision_mismatch');
+    }
     const response = baseResponse(acquired.lease, transaction.inventory.generation);
     if (response.status === 200) {
       response.body.phase = transaction.phase;
@@ -1082,6 +1158,7 @@ export function prepareDeviceIsolationActivation(body: unknown): DeviceIsolation
     releaseDeviceIsolationFreeze({
       nonce: input.nonce,
       leaseId: acquired.lease.leaseId,
+      rosterRevision: input.rosterRevision as string,
       now: dependencies.now(),
     });
     return stableError(503, 'inventory_unavailable');
@@ -1090,6 +1167,7 @@ export function prepareDeviceIsolationActivation(body: unknown): DeviceIsolation
     releaseDeviceIsolationFreeze({
       nonce: input.nonce,
       leaseId: acquired.lease.leaseId,
+      rosterRevision: input.rosterRevision as string,
       now: dependencies.now(),
     });
     transaction = null;
@@ -1101,11 +1179,17 @@ export function prepareDeviceIsolationActivation(body: unknown): DeviceIsolation
   const bound = bindDeviceIsolationFreezeInventoryGeneration({
     nonce: input.nonce,
     leaseId: acquired.lease.leaseId,
+    rosterRevision: input.rosterRevision as string,
     inventoryGeneration: inventory.generation,
     now: dependencies.now(),
   });
   if (!bound) return stableError(409, 'lease_expired');
-  transaction = { lease: bound, inventory, phase: 'prepared' };
+  transaction = {
+    lease: bound,
+    inventory,
+    rosterRevision: input.rosterRevision as string,
+    phase: 'prepared',
+  };
   const response = baseResponse(bound, inventory.generation);
   if (response.status === 200) {
     response.body.phase = 'prepared';
@@ -1121,10 +1205,14 @@ export async function commitDeviceIsolationActivation(body: unknown): Promise<De
     || !validVersion(input.activationVersion)
     || !validNonce(input.nonce)
     || !validLeaseId(input.leaseId)
+    || !validDigest(input.rosterRevision)
     || !validDigest(input.markerSha256)
   ) return stableError(409, 'invalid_request');
   const active = currentTransaction({ nonce: input.nonce, leaseId: input.leaseId });
   if (!active) return stableError(409, 'lease_mismatch');
+  if (!rosterRevisionMatches(input.rosterRevision, active)) {
+    return stableError(409, 'roster_revision_mismatch');
+  }
   if (active.phase === 'committed') {
     if (active.pendingMarkerSha256 !== input.markerSha256) {
       return stableError(409, 'marker_mismatch');
@@ -1153,6 +1241,11 @@ export async function commitDeviceIsolationActivation(body: unknown): Promise<De
     after.blockers.length > 0
     || after.entries.some(entry => entry.disposition === 'owned_local')
   ) return stableError(409, 'unsafe_local_process');
+  // Quiescing awaits process shutdown. Re-check the pinned configuration after
+  // that await and before making the transaction irreversibly committed.
+  if (!rosterRevisionMatches(input.rosterRevision, active)) {
+    return stableError(409, 'roster_revision_mismatch');
+  }
 
   active.phase = 'committed';
   active.pendingMarkerSha256 = input.markerSha256;
@@ -1160,6 +1253,7 @@ export async function commitDeviceIsolationActivation(body: unknown): Promise<De
   const rebound = bindDeviceIsolationFreezeInventoryGeneration({
     nonce: input.nonce,
     leaseId: input.leaseId,
+    rosterRevision: input.rosterRevision as string,
     inventoryGeneration: after.generation,
     now: dependencies.now(),
   });
@@ -1177,15 +1271,20 @@ export function releaseDeviceIsolationActivation(body: unknown): DeviceIsolation
     || !validVersion(input.activationVersion)
     || !validNonce(input.nonce)
     || !validLeaseId(input.leaseId)
+    || !validDigest(input.rosterRevision)
   ) return stableError(409, 'invalid_request');
   const active = currentTransaction({ nonce: input.nonce, leaseId: input.leaseId });
   if (!active) return stableError(409, 'lease_mismatch');
+  if (!rosterRevisionMatches(input.rosterRevision, active)) {
+    return stableError(409, 'roster_revision_mismatch');
+  }
 
   if (input.abort === true) {
     if (active.phase === 'committed') return stableError(409, 'activation_committed');
     if (!releaseDeviceIsolationFreeze({
       nonce: input.nonce,
       leaseId: input.leaseId,
+      rosterRevision: input.rosterRevision as string,
       now: dependencies.now(),
     })) {
       return stableError(409, 'lease_mismatch');
@@ -1214,6 +1313,7 @@ export function releaseDeviceIsolationActivation(body: unknown): DeviceIsolation
   if (!releaseDeviceIsolationFreeze({
     nonce: input.nonce,
     leaseId: input.leaseId,
+    rosterRevision: input.rosterRevision as string,
     now: dependencies.now(),
   })) {
     return stableError(409, 'lease_mismatch');

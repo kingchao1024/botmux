@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import type { CardActionData } from '../../../im/lark/card-handler.js';
+import type { AskAnswerProvenanceToken } from '../../ask-receipt.js';
 import { loopbackFetch, type LoopbackFetchInit } from '../../loopback-fetch.js';
 import { logger } from '../../../utils/logger.js';
 import { isBotmuxCardAction } from '../../card-action-namespace.js';
@@ -31,7 +32,11 @@ export interface PluginCardActionGatewayLogger {
 
 export interface PluginCardActionGatewayOptions {
   resolvePluginIds(larkAppId: string): readonly string[];
-  fallback?: (data: CardActionData, larkAppId: string) => unknown | Promise<unknown>;
+  fallback?: (
+    data: CardActionData,
+    larkAppId: string,
+    askReceiptProvenance?: AskAnswerProvenanceToken,
+  ) => unknown | Promise<unknown>;
   readRegistry?: () => PluginRegistryFile;
   readServiceState?: (pluginId: string) => PluginServiceState | undefined;
   readToken?: (pluginId: string) => string;
@@ -271,7 +276,13 @@ const dispatchPluginCardAction = async (
   options: ResolvedPluginCardActionGatewayOptions,
   data: CardActionData,
   larkAppId: string,
+  askReceiptProvenance?: AskAnswerProvenanceToken,
 ): Promise<unknown> => {
+  const fallback = (): unknown | Promise<unknown> | undefined => (
+    askReceiptProvenance
+      ? options.fallback?.(data, larkAppId, askReceiptProvenance)
+      : options.fallback?.(data, larkAppId)
+  );
   // key/root_id are Botmux's legacy session-routing discriminators. Plugin
   // cards are prohibited from emitting them, so their presence unambiguously
   // belongs to the built-in handler even when action.name happens to collide
@@ -280,14 +291,16 @@ const dispatchPluginCardAction = async (
   if (
     typeof actionValue?.key === 'string'
     || typeof actionValue?.root_id === 'string'
-  ) return options.fallback?.(data, larkAppId);
+  ) return fallback();
   const actionName = pluginCardActionName(data);
-  if (!actionName) return options.fallback?.(data, larkAppId);
+  if (!actionName) return fallback();
   // Core owns these selectors even if an older/tampered registry contains a
   // colliding plugin declaration. Keep this runtime fence in addition to the
   // install-time scanner so upgrades cannot leave existing Botmux cards
   // shadowed until every plugin is reinstalled.
-  if (isBotmuxCardAction(actionName)) return options.fallback?.(data, larkAppId);
+  if (isBotmuxCardAction(actionName)) {
+    return fallback();
+  }
 
   let route: PluginCardActionRouteResolution;
   let records: PluginCardActionRoutingRecord[];
@@ -305,7 +318,7 @@ const dispatchPluginCardAction = async (
     return undefined;
   }
 
-  if (route.kind === 'unmatched') return options.fallback?.(data, larkAppId);
+  if (route.kind === 'unmatched') return fallback();
   if (route.kind === 'conflict') {
     options.log.error(
       `[plugin-card-action] app=${safeLogField(larkAppId)} action=${safeLogField(actionName)} `
@@ -345,7 +358,11 @@ const dispatchPluginCardAction = async (
 export const createPluginCardActionGateway = (options: PluginCardActionGatewayOptions) => {
   const resolved = resolveGatewayOptions(options);
   return {
-    dispatch: (data: CardActionData, larkAppId: string) => dispatchPluginCardAction(resolved, data, larkAppId),
+    dispatch: (
+      data: CardActionData,
+      larkAppId: string,
+      askReceiptProvenance?: AskAnswerProvenanceToken,
+    ) => dispatchPluginCardAction(resolved, data, larkAppId, askReceiptProvenance),
   };
 };
 

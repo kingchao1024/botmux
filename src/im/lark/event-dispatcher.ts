@@ -78,6 +78,8 @@ import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/g
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
+import { snapshotAskCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
+import type { AskCardActionOutcome } from './ask-card.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -967,6 +969,7 @@ export function rawMessageIngressAnchor(larkAppId: string, message: any): string
 // The per-bot cutoff defaults to 2500ms, preserving headroom for the WS frame
 // round-trip inside the 3s window. It is resolved for every callback so a
 // `/botconfig` update takes effect without reconnecting the dispatcher.
+const ASK_PROVENANCE_CLAIM_TIMEOUT_MS = 2000;
 const CARD_ACTION_TIMEOUT = Symbol('card-action-timeout');
 const cardActionInFlight = new Set<string>();
 
@@ -1035,9 +1038,74 @@ function shapeCardActionResult(result: any): any {
   return {};
 }
 
+function unwrapAskCardActionOutcome(result: any): { response: any; mutationApplied: boolean } {
+  if (result?.kind === 'botmux.ask-card-action-outcome.v1'
+      && typeof result.mutationApplied === 'boolean'
+      && Object.prototype.hasOwnProperty.call(result, 'response')) {
+    const outcome = result as AskCardActionOutcome;
+    return { response: outcome.response, mutationApplied: outcome.mutationApplied };
+  }
+  return { response: result, mutationApplied: false };
+}
+
 function serializeRawCardForPatch(cardData: any): string | undefined {
   if (cardData === undefined || cardData === null) return undefined;
   return typeof cardData === 'string' ? cardData : JSON.stringify(cardData);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function safeQuestionIndex(value: unknown): boolean {
+  const parsed = typeof value === 'number' ? value
+    : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+  return Number.isSafeInteger(parsed) && parsed >= 0;
+}
+
+function validateAskCallbackShape(data: unknown): boolean {
+  if (!isPlainRecord(data)) return false;
+  const event = data;
+  const actionRecord = isPlainRecord(event.action) ? event.action : undefined;
+  const valueRecord = isPlainRecord(actionRecord?.value) ? actionRecord.value : undefined;
+  const action = typeof valueRecord?.action === 'string' ? valueRecord.action : undefined;
+  if (action !== 'ask_select' && action !== 'ask_toggle' && action !== 'ask_submit') return false;
+  if (!actionRecord || !valueRecord) return false;
+  if (!nonEmptyString(valueRecord.ask_id) || !nonEmptyString(valueRecord.nonce)) return false;
+
+  if (action === 'ask_select') {
+    return exactKeys(actionRecord, ['value'])
+      && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
+      && nonEmptyString(valueRecord.key);
+  }
+  if (action === 'ask_toggle') {
+    return exactKeys(actionRecord, ['value'])
+      && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
+      && nonEmptyString(valueRecord.key)
+      && safeQuestionIndex(valueRecord.question_index);
+  }
+  const expectedValueKeys = Object.prototype.hasOwnProperty.call(valueRecord, 'confirm_empty')
+    ? ['action', 'ask_id', 'nonce', 'confirm_empty']
+    : ['action', 'ask_id', 'nonce'];
+  const formValueOwn = Object.prototype.hasOwnProperty.call(actionRecord, 'form_value');
+  const formValue = actionRecord.form_value;
+  return exactKeys(actionRecord, formValueOwn ? ['value', 'form_value'] : ['value'])
+    && exactKeys(valueRecord, expectedValueKeys)
+    && (valueRecord.confirm_empty === undefined
+      || valueRecord.confirm_empty === true
+      || valueRecord.confirm_empty === 'true')
+    && (!formValueOwn || isPlainRecord(formValue));
 }
 
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
@@ -1050,8 +1118,63 @@ async function patchTimedOutCardActionResult(larkAppId: string, data: any, shape
   await updateMessage(larkAppId, messageId, body);
 }
 
-async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: EventHandlers): Promise<any> {
-  const eventId = eventIdForKey(data), key = cardActionKey(larkAppId, data);
+async function handleCardActionAckSafe(
+  data: any,
+  larkAppId: string,
+  handlers: EventHandlers,
+  askReceiptProvenanceIssuer?: AskAnswerProvenanceIssuer,
+): Promise<any> {
+  let callbackData: any;
+  try {
+    callbackData = snapshotAskCallbackData(data);
+    if (!isPlainRecord(callbackData)) throw new Error('card callback root must be an object');
+  } catch {
+    logger.warn('[card-action] malformed callback rejected before handler');
+    return { toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } };
+  }
+  data = callbackData;
+  const ackStartedAt = Date.now();
+  const ackTimeoutMs = resolveCardActionAckTimeoutMs(getBot(larkAppId).config.cardActionAckTimeoutMs);
+  const eventId = eventIdForKey(data);
+  const key = cardActionKey(larkAppId, data);
+  const askAction = data?.action?.value?.action;
+  const isAskAction = askAction === 'ask_select' || askAction === 'ask_toggle' || askAction === 'ask_submit';
+  if (isAskAction && !validateAskCallbackShape(data)) {
+    logger.warn('[ask-receipt] malformed ask callback rejected before handler');
+    return { toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } };
+  }
+  let issued: AskAnswerProvenanceIssue = { kind: 'not_ask' };
+  if (isAskAction && askReceiptProvenanceIssuer) {
+      let claimTimedOut = false;
+      let timer: NodeJS.Timeout | undefined;
+      const issuePromise = Promise.resolve()
+        .then(() => askReceiptProvenanceIssuer.issue(larkAppId, data))
+        .then((result) => {
+          if (claimTimedOut && result.kind === 'issued') askReceiptProvenanceIssuer.revoke(result.token);
+          return result;
+        })
+        .catch(() => ({ kind: 'rejected', reason: 'storage_error' } as const));
+      const timeoutPromise = new Promise<AskAnswerProvenanceIssue>((resolve) => {
+        timer = setTimeout(() => {
+          claimTimedOut = true;
+          resolve({ kind: 'rejected', reason: 'storage_error' });
+        }, Math.min(ASK_PROVENANCE_CLAIM_TIMEOUT_MS, ackTimeoutMs));
+        timer.unref?.();
+      });
+      issued = await Promise.race([issuePromise, timeoutPromise]);
+      if (!claimTimedOut && timer) clearTimeout(timer);
+  }
+  if (issued?.kind === 'rejected') {
+    logger.warn(`[ask-receipt] card callback rejected before mutation: ${issued.reason}`);
+    return { toast: {
+      type: issued.reason === 'duplicate' ? 'info' : 'error',
+      content: issued.reason === 'duplicate'
+        ? t('toast.action_received_no_repeat', undefined, localeForBot(larkAppId))
+        : '无法安全确认此次操作，请稍后重试',
+    } };
+  }
+  const provenance = issued?.kind === 'issued' ? issued.token : undefined;
+
   // Durable dedupe ONLY when the platform gave a stable per-interaction id:
   // suppresses a same-interaction redelivery over the long-connection so a
   // non-idempotent action (restart/close) can't double-fire after the first
@@ -1059,7 +1182,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   // would miss that. We deliberately do NOT durably claim the payload-based
   // fallback key: distinct clicks of the same button (e.g. toggling stream
   // on/off) legitimately repeat and must not be pinned for the whole TTL.
-  if (eventId && !claimEventOnce(key)) {
+  if (!provenance && eventId && !claimEventOnce(key)) {
     logger.info(`[event-dedupe] duplicate card action ignored (claimed): app=${larkAppId}`);
     return { toast: { type: 'info', content: t('toast.action_received_no_repeat', undefined, localeForBot(larkAppId)) } };
   }
@@ -1069,10 +1192,17 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
     return { toast: { type: 'info', content: t('toast.action_in_progress', undefined, localeForBot(larkAppId)) } };
   }
 
-  const ackTimeoutMs = resolveCardActionAckTimeoutMs(getBot(larkAppId).config.cardActionAckTimeoutMs);
   cardActionInFlight.add(key);
   let timedOut = false;
-  const work = handlers.handleCardAction(data, larkAppId)
+  let mutationApplied = false;
+  const work = (provenance
+    ? handlers.handleCardAction(data, larkAppId, provenance)
+    : handlers.handleCardAction(data, larkAppId))
+    .then(result => {
+      const outcome = unwrapAskCardActionOutcome(result);
+      mutationApplied = outcome.mutationApplied;
+      return outcome.response;
+    })
     .then(shapeCardActionResult)
     .then(result => {
       if (!result?.deferredCard) return result;
@@ -1102,10 +1232,31 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
     return patchTimedOutCardActionResult(larkAppId, data, result)
       .catch(err => logger.warn(`Failed to patch timed-out card action result: ${err}`));
   }).finally(() => {
+    if (provenance && askReceiptProvenanceIssuer) {
+      let redeemed = false;
+      try { redeemed = askReceiptProvenanceIssuer.wasRedeemed(provenance); }
+      catch (err) { logger.warn(`[ask-receipt] failed to inspect callback redemption: ${err}`); }
+      if (mutationApplied && redeemed) {
+        // The authority completes only a capability that the Ask broker
+        // actually redeemed for a mutation/settlement. A resolved stale or
+        // unauthorized toast therefore leaves the durable claim in
+        // `processing`, just like an exception. Under strict at-most-once
+        // semantics neither state may be reclaimed during retention.
+        void Promise.resolve().then(() => askReceiptProvenanceIssuer.complete(provenance))
+          .catch(err => logger.warn(`[ask-receipt] failed to mark callback completed: ${err}`))
+          .finally(() => askReceiptProvenanceIssuer.revoke(provenance));
+      } else {
+        askReceiptProvenanceIssuer.revoke(provenance);
+      }
+    }
     cardActionInFlight.delete(key);
   });
 
-  const timeout = new Promise(resolve => setTimeout(resolve, ackTimeoutMs, CARD_ACTION_TIMEOUT));
+  // Claim persistence and handler execution share Lark's single callback ACK
+  // budget. Do not accidentally grant the handler a fresh timeout window after a
+  // slow (but accepted) durable claim.
+  const ackRemainingMs = Math.max(0, ackTimeoutMs - (Date.now() - ackStartedAt));
+  const timeout = new Promise(resolve => setTimeout(resolve, ackRemainingMs, CARD_ACTION_TIMEOUT));
   const result = await Promise.race([work, timeout]);
   if (result === CARD_ACTION_TIMEOUT) {
     timedOut = true;
@@ -2572,7 +2723,7 @@ export function markForwardFollowupsSessionsReady(larkAppId: string): void {
 }
 
 export interface EventHandlers {
-  handleCardAction: (data: any, larkAppId: string) => Promise<any>;
+  handleCardAction: (data: any, larkAppId: string, askReceiptProvenance?: AskAnswerProvenanceToken) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
   /** 主动开工 — 场景①: fired when this bot is added to a chat
@@ -3452,7 +3603,13 @@ function createLarkWsAgent(): ProxyAgent | undefined {
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
  */
-export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers, brand: Brand = 'feishu'): Lark.WSClient {
+export function startLarkEventDispatcher(
+  larkAppId: string,
+  larkAppSecret: string,
+  handlers: EventHandlers,
+  brand: Brand = 'feishu',
+  askReceiptProvenanceIssuer?: AskAnswerProvenanceIssuer,
+): Lark.WSClient {
   const forwardFollowups = new ForwardFollowupBuffer<PendingForwardTopicPayload>(
     config.daemon.forwardFollowupWaitMs,
     err => logger.error(`Error flushing delayed topic seed: ${err}`),
@@ -4589,7 +4746,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_ended', VC_BOT_MEETING_ENDED_EVENT),
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
-    'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
+    'card.action.trigger': (data: any) => handleCardActionAckSafe(
+      data,
+      larkAppId,
+      handlers,
+      askReceiptProvenanceIssuer,
+    ),
     // 表情回复事件——一旦在开发者后台订阅了 reaction，SDK 每收到一次都会因
     // 没有 handler 打 "no im.message.reaction.created_v1 handle" 警告刷屏。
     // botmux 不消费表情事件，注册显式 no-op 把这条噪声静默掉。
