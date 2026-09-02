@@ -48,6 +48,9 @@ export type AskResult =
       /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
       comment: string | null;
       timedOut: false;
+      /** Present only when the answer has S1-grade Lark-card provenance. Text
+       *  replies and trusted-host/desktop answers intentionally remain unsigned. */
+      receipt?: import('./ask-receipt.js').SignedAskReceiptV1;
     }
   | {
       kind: 'timedOut';
@@ -79,6 +82,9 @@ export interface AskJsonOutput {
   /** 自定义回复原文；按钮选择 / 超时 / 失效时为 null。 */
   comment: string | null;
   timedOut: boolean;
+  /** Canonical Ed25519 proof for an S1-grade Lark card answer; null for text,
+   *  desktop, timeout, invalidation, or legacy daemon responses. */
+  receipt: import('./ask-receipt.js').SignedAskReceiptV1 | null;
 }
 
 /** Input accepted by broker.registerAsk. Caller (CLI subcommand → daemon IPC
@@ -113,9 +119,17 @@ export interface CreateAskInput {
   backendSurvivesRestart?: boolean;
   /** 问题列表，调用方保证每问 `options.length ≥ 2` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
-  /** Absolute deadline; computed by caller from `--timeout`. Broker won't
-   *  re-compute. */
+  /** Relative lifetime in milliseconds. The broker independently enforces the
+   *  shared 1s..24h bound before computing its absolute deadline. */
   timeoutMs: number;
+  /** Trusted daemon-derived absolute deadline for S1 controller calls. It is
+   * never accepted directly from an unbound client. Retries keep this exact
+   * value so identity does not drift as the remaining window shrinks. */
+  deadlineAt?: number;
+  /** Exact controller-issued activation window. Both are required for S1 asks
+   * and absent for ordinary/hook asks; they are immutable recovery identity. */
+  notBeforeMs?: number;
+  expiresAtMs?: number;
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
   chatType?: 'group' | 'p2p';

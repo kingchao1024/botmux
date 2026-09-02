@@ -43,8 +43,14 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...orig,
     existsSync: vi.fn(() => false),
+    lstatSync: vi.fn(() => ({ isSymbolicLink: () => false })),
+    realpathSync: vi.fn((path: any) => path),
     readFileSync: vi.fn(() => ''),
-    statSync: vi.fn(() => ({ mtimeMs: 0 })),
+    statSync: vi.fn(() => ({
+      mtimeMs: 0,
+      isFile: () => true,
+      isDirectory: () => false,
+    })),
   };
 });
 
@@ -1803,7 +1809,7 @@ describe('isChatOncallBoundForAnyBot', () => {
   it('sees oncall chats bound to a sibling bot in the shared config file', () => {
     process.env.BOTS_CONFIG = '/tmp/bots.json';
     fsMock.existsSync.mockReturnValue(true);
-    fsMock.statSync.mockReturnValue({ mtimeMs: 100 });
+    fsMock.statSync.mockReturnValue({ mtimeMs: 100, isFile: () => true });
     fsMock.readFileSync.mockReturnValue(JSON.stringify([
       { larkAppId: 'app_a', larkAppSecret: 'sa' },
       { larkAppId: 'app_b', larkAppSecret: 'sb', oncallChats: [{ chatId: 'oc_oncall', workingDir: '/repo' }] },
@@ -1822,6 +1828,7 @@ describe('isChatOncallBoundForAnyBot', () => {
     process.env.BOTS_CONFIG = '/tmp/bots.json';
     fsMock.existsSync.mockReturnValue(true);
     fsMock.statSync
+      .mockReturnValueOnce({ mtimeMs: 1, isFile: () => true })
       .mockReturnValueOnce({ mtimeMs: 1 })
       .mockReturnValueOnce({ mtimeMs: 2 })
       .mockReturnValueOnce({ mtimeMs: 2 });
@@ -1862,7 +1869,7 @@ describe('loadBotConfigs', () => {
     fsMock.existsSync.mockReset();
     fsMock.readFileSync.mockReset();
     fsMock.statSync.mockReset();
-    fsMock.statSync.mockReturnValue({ mtimeMs: 0 });
+    fsMock.statSync.mockReturnValue({ mtimeMs: 0, isFile: () => true });
     // Clean env
     delete process.env.BOTS_CONFIG;
     delete process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;

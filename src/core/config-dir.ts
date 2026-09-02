@@ -51,7 +51,8 @@
  */
 
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { lstatSync, realpathSync, statSync } from 'node:fs';
 
 export interface ResolveBotmuxConfigDirOptions {
   /**
@@ -135,6 +136,88 @@ export function resolveBotsConfigFile(
   const explicit = env[BOTS_CONFIG_ENV]?.trim();
   if (explicit) return resolve(explicit);
   return join(resolveBotmuxConfigDir(options), 'bots.json');
+}
+
+export class BotsConfigTargetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BotsConfigTargetError';
+  }
+}
+
+export interface CanonicalBotsConfigTarget {
+  /** User/configured leaf. May itself be a symlink. */
+  requestedPath: string;
+  /** Real regular file used for reads, writes and `<target>.lock`. */
+  targetPath: string;
+  requestedWasSymlink: boolean;
+  existed: boolean;
+}
+
+/**
+ * Resolve one registry authority to a stable filesystem target. Existing leaves
+ * (including BOTS_CONFIG symlinks) must resolve to a regular file. A missing
+ * ordinary leaf may be created under an existing canonical directory; dangling
+ * symlinks, directory targets and special files fail closed.
+ */
+export function resolveCanonicalBotsConfigTarget(
+  path: string,
+  options: { allowMissing?: boolean } = {},
+): CanonicalBotsConfigTarget {
+  const requestedPath = resolve(path);
+  try {
+    const leaf = lstatSync(requestedPath);
+    const requestedWasSymlink = leaf.isSymbolicLink();
+    let targetPath: string;
+    try { targetPath = realpathSync(requestedPath); }
+    catch {
+      throw new BotsConfigTargetError(`BOTS_CONFIG symlink/target is dangling or unreadable: ${requestedPath}`);
+    }
+    let target;
+    try { target = statSync(targetPath); }
+    catch { throw new BotsConfigTargetError(`BOTS_CONFIG target is unreadable: ${targetPath}`); }
+    if (!target.isFile()) {
+      throw new BotsConfigTargetError(`BOTS_CONFIG target is not a regular file: ${targetPath}`);
+    }
+    return { requestedPath, targetPath, requestedWasSymlink, existed: true };
+  } catch (error) {
+    if (error instanceof BotsConfigTargetError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new BotsConfigTargetError(`cannot inspect BOTS_CONFIG: ${requestedPath}`);
+    }
+    if (options.allowMissing !== true) {
+      throw new BotsConfigTargetError(`BOTS_CONFIG file not found: ${requestedPath}`);
+    }
+    const parentPath = dirname(requestedPath);
+    let parentTarget: string;
+    try { parentTarget = realpathSync(parentPath); }
+    catch { throw new BotsConfigTargetError(`BOTS_CONFIG parent is missing or unreadable: ${parentPath}`); }
+    if (!statSync(parentTarget).isDirectory()) {
+      throw new BotsConfigTargetError(`BOTS_CONFIG parent is not a directory: ${parentTarget}`);
+    }
+    return {
+      requestedPath,
+      targetPath: join(parentTarget, basename(requestedPath)),
+      requestedWasSymlink: false,
+      existed: false,
+    };
+  }
+}
+
+/** Re-resolve after acquiring target.lock. Symlink retarget/removal is drift. */
+export function assertCanonicalBotsConfigTargetStable(
+  target: CanonicalBotsConfigTarget,
+): void {
+  const current = resolveCanonicalBotsConfigTarget(target.requestedPath, {
+    allowMissing: !target.existed,
+  });
+  if (
+    current.targetPath !== target.targetPath
+    || current.requestedWasSymlink !== target.requestedWasSymlink
+    || current.existed !== target.existed
+  ) {
+    throw new BotsConfigTargetError(`BOTS_CONFIG target changed during operation: ${target.requestedPath}`);
+  }
 }
 
 /**

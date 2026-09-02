@@ -23,7 +23,7 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...actual,
     existsSync: vi.fn(() => true),
-    statSync: vi.fn(() => ({ isDirectory: () => true })),
+    statSync: vi.fn(() => ({ isDirectory: () => true, isFile: () => true })),
     mkdirSync: vi.fn(),
     readFileSync: vi.fn((p: any, ...rest: any[]) => {
       if (typeof p === 'string' && p.includes('bots-info.json')) return JSON.stringify(BOTS_INFO);
@@ -1643,7 +1643,7 @@ describe('handleCommand', () => {
     // without always restoring, and the schedule workingDir validation depends
     // on them — pin the factory defaults so tests pass in any order (shuffle).
     vi.mocked(existsSync).mockReturnValue(true);
-    vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
+    vi.mocked(statSync).mockReturnValue({ isDirectory: () => true, isFile: () => true } as any);
     vi.mocked(deleteMessage).mockResolvedValue(true);
     vi.mocked(sendMessage).mockResolvedValue('card-msg-id');
     vi.mocked(replyMessage).mockResolvedValue('picker-card-msg-id');

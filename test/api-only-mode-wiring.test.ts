@@ -554,7 +554,7 @@ describe('API-only bot mode — riff env re-freeze + VC listener exclusion (sour
       expect(preflightBlock, `preflight must not touch ${forbidden}`).not.toContain(`${forbidden}:`);
     }
     // 唯一允许的落盘字段。
-    const writeBlock = region(preflightBlock, 'await withFileLock(', '\n    });');
+    const writeBlock = region(preflightBlock, 'await withBotsJsonLock(', '\n    });');
     expect(writeBlock).toContain('next.larkCliProfile = targetAppId;');
     expect(writeBlock).not.toMatch(/next\.(?!larkCliProfile\b)[A-Za-z]+\s*=/u);
   });

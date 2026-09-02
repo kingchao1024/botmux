@@ -707,6 +707,19 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(src).toContain("if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);");
   });
 
+  it('WIRING GUARD: worker always denies the Ask receipt signing authority to chat CLIs', () => {
+    const src = readFileSync(resolve('src/worker.ts'), 'utf8');
+    expect(src).toContain('detectAskAuthorityPresence,');
+    expect(src).toContain('} = detectAskAuthorityPresence({');
+    expect(src).toContain('}, hostEntryExistsNoFollow);');
+    expect(src).toContain('const askReceiptAuthorityPaths = [...new Set(askReceiptHostAuthorityPaths({');
+    expect(src).toContain('sessionDataDir: canonical(dataDir),');
+    expect(src).toContain('}).map(canonicalNearestAncestor))]');
+    expect(src).toContain('mandatoryDenyPaths.push(...askReceiptAuthorityPaths)');
+    expect(src).toContain('sealedDenyPaths: askReceiptAuthorityPaths,');
+    expect(src).not.toContain('mandatoryReadOnlyPaths.push(join(canonical(root), ASK_RECEIPT_AUTHORITY_DIRECTORY))');
+  });
+
   it('WIRING GUARD: worker pre-creates and carves the same effective OMP sid used by launch/resume args', () => {
     const src = readFileSync(resolve('src/worker.ts'), 'utf8');
     expect(src).toContain("import { ompSessionDir } from './adapters/cli/oh-my-pi.js';");
@@ -788,6 +801,186 @@ describe('buildFsPolicy (baseline + net)', () => {
     expect(buildFsPolicy(ctx()).net).toBe(true);
     expect(buildFsPolicy(ctx({ net: false })).net).toBe(false);
   });
+});
+
+describe('mandatory deny ceilings', () => {
+  const signingAuthority = '/home/u/.botmux/ask-receipt-authority';
+  const claimAuthority = '/home/u/.botmux/data/dedup/ask-card-events';
+  const configuredSigningAuthority = '/srv/botmux-runtime/ask-receipt-authority';
+  const configuredClaimAuthority = '/srv/botmux-runtime/data/dedup/ask-card-events';
+  const authorities = [
+    signingAuthority,
+    claimAuthority,
+    configuredSigningAuthority,
+    configuredClaimAuthority,
+  ];
+  const signingKey = `${signingAuthority}/signing-key.json`;
+  const linuxCtx = (userPaths: FsPolicyContext['userPaths']) => ctx({
+    platform: 'linux',
+    homeDir: '/home/u',
+    botmuxHome: '/home/u/.botmux',
+    sessionDataDir: '/home/u/.botmux/data',
+    workingDir: '/home/u/proj',
+    botHome: '/home/u/.botmux/bots/cli_self',
+    mandatoryDenyPaths: authorities,
+    sealedDenyPaths: authorities,
+    userPaths,
+  });
+
+  it.each(['readOnly', 'readWrite'] as const)(
+    'does not let a deeper user %s grant reopen host authority',
+    access => {
+      const outside = `/home/u/public-${access}`;
+      const signingExport = `${signingAuthority}/export`;
+      const claimShard = `${claimAuthority}/aa`;
+      const configuredKey = `${configuredSigningAuthority}/signing-key.json`;
+      const configuredClaimShard = `${configuredClaimAuthority}/bb`;
+      const p = buildFsPolicy(linuxCtx({
+        [access]: [
+          signingKey, signingExport, claimShard, configuredKey, configuredClaimShard, outside,
+        ],
+      }));
+
+      expect(p.rules).not.toContainEqual(expect.objectContaining({ path: signingKey, access }));
+      expect(p.rules).not.toContainEqual(expect.objectContaining({ path: signingExport, access }));
+      expect(p.rules).not.toContainEqual(expect.objectContaining({ path: claimShard, access }));
+      expect(accessForPath(p.rules, signingKey).access).toBe('deny');
+      expect(accessForPath(p.rules, `${signingExport}/rotated-key.json`).access).toBe('deny');
+      expect(accessForPath(p.rules, `${claimShard}/event.json`).access).toBe('deny');
+      expect(accessForPath(p.rules, configuredKey).access).toBe('deny');
+      expect(accessForPath(p.rules, `${configuredClaimShard}/event.json`).access).toBe('deny');
+      expect(accessForPath(p.rules, `${outside}/file`).access).toBe(access);
+    },
+  );
+
+  it.each([
+    ['workingDir', { workingDir: `${signingAuthority}/workspace` }, `${signingAuthority}/workspace/file`],
+    ['authPaths', { authPaths: [`${signingAuthority}/adapter-auth`] }, `${signingAuthority}/adapter-auth/token`],
+    ['cliDataPaths', {
+      cliDataPaths: [`${claimAuthority}/cli-data`], redirectedCliData: false,
+    }, `${claimAuthority}/cli-data/state`],
+    ['readonlyRoots', { readonlyRoots: [`${signingAuthority}/runtime`] }, `${signingAuthority}/runtime/tool`],
+    ['extraWritePaths', { extraWritePaths: [`${claimAuthority}/scratch`] }, `${claimAuthority}/scratch/file`],
+    ['serviceCredentialReadOnlyPaths', {
+      serviceCredentialReadOnlyPaths: [`${claimAuthority}/service-token`],
+    }, `${claimAuthority}/service-token`],
+    ['botmuxInstallRoot', {
+      botmuxInstallRoot: `${signingAuthority}/runtime`,
+    }, `${signingAuthority}/runtime/dist/cli.js`],
+    ['roleLibrarySubtree', {
+      roleLibrarySubtree: `${claimAuthority}/roles/cli_self`,
+    }, `${claimAuthority}/roles/cli_self/CLAUDE.md`],
+  ] as const)('suppresses sealed-authority descendants from %s', (_name, override, probe) => {
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      sealedDenyPaths: authorities,
+      ...override,
+    }));
+    expect(accessForPath(p.rules, probe).access).toBe('deny');
+  });
+
+  it('suppresses late mandatory read-only carve-outs beneath sealed authority', () => {
+    const carveout = `${signingAuthority}/supposed-carveout`;
+    const p = buildFsPolicy(ctx({
+      sealedDenyPaths: authorities,
+      mandatoryReadOnlyPaths: [carveout],
+    }));
+    expect(accessForPath(p.rules, `${carveout}/file`).access).toBe('deny');
+    expect(p.finalReadOnlyPaths).not.toContain(carveout);
+  });
+
+  it('suppresses implicit internal grants when their fixed paths fall below a sealed authority', () => {
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: `${claimAuthority}/session-data`,
+      sessionId: 's',
+      workingDir: '/home/u/proj',
+      botHome: `${signingAuthority}/bot-home`,
+      outbox: `${claimAuthority}/outbox`,
+      sealedDenyPaths: authorities,
+    }));
+    for (const path of [
+      `${signingAuthority}/bot-home/state`,
+      `${claimAuthority}/outbox/request`,
+      `${claimAuthority}/session-data/sessions-cli_self.json`,
+      `${claimAuthority}/session-data/attachments/cli_self/file`,
+      `${claimAuthority}/session-data/prompt-ctx/s/context.json`,
+      `${claimAuthority}/session-data/turn-sends/s.jsonl`,
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('deny');
+    }
+  });
+
+  it('re-emits a sealed deny after late Seatbelt exceptions', () => {
+    const p = buildFsPolicy(ctx({
+      platform: 'darwin',
+      sealedDenyPaths: authorities,
+      mandatoryReadOnlyPaths: ['/home/u/.botmux'],
+      writeRegexes: ['^/home/u/\.botmux/ask-receipt-authority/.*$'],
+    }));
+    const profile = compileToSeatbelt(p);
+    const lateReadAllow = profile.lastIndexOf('(allow file-read* (subpath "/home/u/.botmux"))');
+    const lateWriteAllow = profile.lastIndexOf('(allow file-write* (regex #"^/home/u/\.botmux/ask-receipt-authority/.*$"))');
+    const finalReadDeny = profile.lastIndexOf(`(deny file-read* (subpath "${signingAuthority}"))`);
+    const finalWriteDeny = profile.lastIndexOf(`(deny file-write* (subpath "${signingAuthority}"))`);
+
+    expect(finalReadDeny).toBeGreaterThan(lateReadAllow);
+    expect(finalWriteDeny).toBeGreaterThan(lateWriteAllow);
+  });
+
+  it.each(['readOnly', 'readWrite'] as const)(
+    'Seatbelt keeps the authority denied despite a deeper user %s request',
+    access => {
+      const p = buildFsPolicy(linuxCtx({
+        [access]: ['/home/u/.botmux', '/srv/botmux-runtime', signingKey],
+      }));
+      const profile = compileToSeatbelt(p);
+      const parentAllow = profile.indexOf('(allow file-read* (subpath "/home/u/.botmux"))');
+      const authorityReadDeny = profile.indexOf(`(deny file-read* (subpath "${signingAuthority}"))`);
+      const authorityWriteDeny = profile.indexOf(`(deny file-write* (subpath "${signingAuthority}"))`);
+
+      expect(authorityReadDeny).toBeGreaterThan(parentAllow);
+      expect(authorityWriteDeny).toBeGreaterThan(parentAllow);
+      expect(profile).not.toContain(`(allow file-read* (subpath "${signingKey}"))`);
+      expect(profile).not.toContain(`(allow file-write* (subpath "${signingKey}"))`);
+      expect(profile).toContain(`(deny file-read* (subpath "${claimAuthority}"))`);
+      expect(profile).toContain(`(deny file-read* (subpath "${configuredSigningAuthority}"))`);
+      expect(profile).toContain(`(deny file-read* (subpath "${configuredClaimAuthority}"))`);
+    },
+  );
+
+  it.each(['readOnly', 'readWrite'] as const)(
+    'bwrap keeps the authority as a leaf deny despite a deeper user %s request',
+    access => {
+      const p = buildFsPolicy(linuxCtx({
+        [access]: ['/home/u/.botmux', '/srv/botmux-runtime', signingKey],
+      }));
+      const { args, maskMounts } = compileToBwrap(p, {
+        emptyDir: '/sbx/empty',
+        emptiesDir: '/sbx/empties',
+        chdir: '/home/u/proj',
+      });
+      const authorityAt = args.indexOf(signingAuthority);
+
+      expect(args.slice(authorityAt - 2, authorityAt + 1)).toEqual([
+        '--ro-bind', '/sbx/empty', signingAuthority,
+      ]);
+      expect(args).not.toContain(signingKey);
+      expect(args.findIndex((value, index) => value === signingAuthority
+        && args[index - 1] === '--remount-ro')).toBe(-1);
+      expect(maskMounts).toContainEqual({ path: signingAuthority, kind: 'dir' });
+      expect(maskMounts).toContainEqual({ path: claimAuthority, kind: 'dir' });
+      expect(maskMounts).toContainEqual({ path: configuredSigningAuthority, kind: 'dir' });
+      expect(maskMounts).toContainEqual({ path: configuredClaimAuthority, kind: 'dir' });
+    },
+  );
 });
 
 describe('ancestorsNeedingTraverse', () => {

@@ -88,8 +88,11 @@ describe('graceful shutdown supervisor contract', () => {
     const firstAwait = restart.indexOf('await ');
     const consume = restart.indexOf('consumeRestartIntentTo(');
     const writeIntent = restart.indexOf('writeRestartAttemptIntentTo(', consume);
-    const restartFleet = restart.indexOf('restartFleet({ refreshPersistedEnv, readFailureFallback })', writeIntent);
-    const health = restart.indexOf('waitFleetOnline(', restartFleet);
+    const restartFleet = restart.indexOf(
+      'restartFleet(launchPlan, { refreshPersistedEnv, readFailureFallback })',
+      writeIntent,
+    );
+    const health = restart.indexOf('waitFleetReady(', restartFleet);
     const removeOnFail = restart.indexOf('removeRestartIntentAttemptTo(', health);
     const commit = restart.indexOf('commitRestartIntentAttemptTo(', health);
     expect(consumeRefresh).toBeGreaterThanOrEqual(0);
@@ -130,8 +133,8 @@ describe('graceful shutdown supervisor contract', () => {
     const start = cli.indexOf('async function cmdStart()');
     const end = cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors', start);
     const region = cli.slice(start, end);
-    expect(region).toContain('startFleetViaSupervisor()');
-    expect(region).toContain("result.action === 'already-running'");
+    expect(region).toContain('startFleetViaSupervisor(launchPlan)');
+    expect(region).toContain("launched.action === 'already-running'");
     expect(region).not.toContain('readAndAssertConfiguredFleetOnline(');
     expect(region).not.toContain('runBoundedPm2StartTransaction(');
   });
@@ -153,9 +156,11 @@ describe('graceful shutdown supervisor contract', () => {
       cli.indexOf('async function ensureBotDaemonStopped('),
       cli.indexOf('/**\n * Bring a SINGLE bot'),
     );
-    expect(cmdStart).toContain('startFleetViaSupervisor()');
-    expect(cmdRestart).toContain('restartFleet({ refreshPersistedEnv, readFailureFallback })');
-    expect(startBot).toContain('startBotViaSupervisor(');
+    expect(cmdStart).toContain('startFleetViaSupervisor(launchPlan)');
+    expect(cmdRestart).toContain(
+      'restartFleet(launchPlan, { refreshPersistedEnv, readFailureFallback })',
+    );
+    expect(startBot).toContain('startBotSpecViaSupervisor(');
     expect(stopBot).toContain('stopBotViaSupervisor(');
     for (const [label, region] of [['start', cmdStart], ['restart', cmdRestart], ['start-bot', startBot], ['stop-bot', stopBot]] as const) {
       expect(region, label).not.toContain('runBoundedPm2StartTransaction(');
@@ -172,7 +177,7 @@ describe('graceful shutdown supervisor contract', () => {
     expect(region).toContain('activationPending');
     expect(region).toContain('is still deactivating');
     expect(region).toContain('conflicting activation markers');
-    expect(region).toContain('startBotViaSupervisor(');
+    expect(region).toContain('startBotSpecViaSupervisor(');
   });
 
   it('serializes every fleet mutation surface on one async fleet lock', () => {

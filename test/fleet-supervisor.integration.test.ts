@@ -1,11 +1,16 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, realpathSync, readdirSync, readlinkSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { EventEmitter } from 'node:events';
 import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
 import { readFleetState, mutateFleetState } from '../src/core/fleet-state-store.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { drainFleetCommands, enqueueFleetCommand } from '../src/core/fleet-command-queue.js';
+import { spawnTsEvalWithRepoImports, spawnTsScript } from './helpers/ts-runner.js';
+import { readDeviceIsolationRosterSnapshot } from '../src/services/device-isolation-roster.js';
+import { listBlockingDeviceIsolationStartupIntents } from '../src/services/device-isolation-startup-intent-store.js';
 
 const dirs: string[] = [];
 const hostProcs: ChildProcess[] = [];
@@ -54,6 +59,22 @@ process.on('SIGTERM', () => process.exit(90));
 setInterval(() => {}, 1000);
 `;
 
+function authoritativeSpec(
+  root: string,
+  appId: string,
+  overrides: Record<string, unknown> = {},
+): { path: string; spec: FleetBotSpec } {
+  const configDir = join(root, '.botmux');
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  const path = join(configDir, 'bots.json');
+  writeFileSync(path, `${JSON.stringify([{ larkAppId: appId, larkAppSecret: 's1', ...overrides }])}\n`, { mode: 0o600 });
+  const roster = readDeviceIsolationRosterSnapshot({ configPath: path });
+  return {
+    path,
+    spec: { name: 'botmux-0', appId, botIndex: 0, botsConfigPath: path, rosterRevision: roster.revision },
+  };
+}
+
 const bots: FleetBotSpec[] = [
   { name: 'botmux-0', appId: 'cli_a', botIndex: 0 },
   { name: 'botmux-1', appId: 'cli_b', botIndex: 1 },
@@ -65,7 +86,301 @@ async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
   return fn();
 }
 
+function processHasOpenFdFor(path: string): boolean {
+  if (process.platform !== 'linux') return false;
+  for (const name of readdirSync('/proc/self/fd')) {
+    try {
+      if (readlinkSync(join('/proc/self/fd', name)) === path) return true;
+    } catch { /* fd closed during enumeration */ }
+  }
+  return false;
+}
+
+function spawnIsolationGateHolder(homeDir: string, acquiredPath: string, releasePath: string): ChildProcess {
+  const moduleUrl = pathToFileURL(resolve('src/platform/device-isolation.ts')).href;
+  const source = `
+    const { existsSync, writeFileSync } = await import('node:fs');
+    const { withDeviceCredentialIsolationActivationLock } = await import(${JSON.stringify(moduleUrl)});
+    await withDeviceCredentialIsolationActivationLock(async () => {
+      writeFileSync(${JSON.stringify(acquiredPath)}, 'acquired');
+      while (!existsSync(${JSON.stringify(releasePath)})) {
+        await new Promise(resolvePromise => setTimeout(resolvePromise, 10));
+      }
+    }, { homeDir: ${JSON.stringify(homeDir)} });
+  `;
+  const child = spawnTsEvalWithRepoImports(source, {
+    cwd: process.cwd(), stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  hostProcs.push(child);
+  return child;
+}
+
 describe('FleetSupervisor (live, integration)', () => {
+  it('retries a contended startup gate without leaking log fds or consuming a crash generation', async () => {
+    const root = tmp();
+    const homeDir = join(root, 'home');
+    const configDir = join(homeDir, '.botmux');
+    const botsConfigPath = join(configDir, 'bots.json');
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    const startedPath = join(root, 'started.jsonl');
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    writeFileSync(botsConfigPath, `${JSON.stringify([{
+      larkAppId: 'cli_gate', larkAppSecret: 'test-secret',
+    }])}\n`, { mode: 0o600 });
+    const roster = readDeviceIsolationRosterSnapshot({ configPath: botsConfigPath });
+    const distDir = fakeDist(root, `
+require('fs').appendFileSync(${JSON.stringify(startedPath)}, JSON.stringify({
+  revision: process.env.BOTMUX_ROSTER_REVISION,
+}) + String.fromCharCode(10));
+process.on('SIGTERM', () => process.exit(90));
+setInterval(() => {}, 1000);
+`);
+    const acquiredPath = join(root, 'gate-acquired');
+    const releasePath = join(root, 'gate-release');
+    const holder = spawnIsolationGateHolder(homeDir, acquiredPath, releasePath);
+    expect(await waitFor(() => existsSync(acquiredPath), 5_000)).toBe(true);
+
+    const logs: string[] = [];
+    const spec: FleetBotSpec = {
+      name: 'botmux-0', appId: 'cli_gate', botIndex: 0,
+      botsConfigPath: roster.configPath, rosterRevision: roster.revision,
+    };
+    const sup = new FleetSupervisor({
+      statePath, distDir, daemonEnv: {}, cwd: root, logDir,
+      startupAdmissionHomeDir: homeDir, startupAdmissionLockWaitMs: 40,
+      startupAdmissionRetryMs: 20, log: message => logs.push(message),
+    });
+
+    expect(() => sup.start([spec])).not.toThrow();
+    await delay(140);
+    expect(existsSync(startedPath)).toBe(false);
+    expect(existsSync(join(logDir, 'daemon-0-out.log'))).toBe(false);
+    expect(logs.some(message => message.includes('startup admission busy'))).toBe(true);
+
+    writeFileSync(releasePath, 'release');
+    expect(await waitFor(() => holder.exitCode !== null || holder.signalCode !== null, 5_000)).toBe(true);
+    expect(await waitFor(() => existsSync(startedPath), 5_000)).toBe(true);
+    await delay(150);
+    const starts = readFileSync(startedPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(starts).toEqual([{ revision: roster.revision }]);
+    expect(readFleetState(statePath)?.procs).toEqual([expect.objectContaining({
+      name: spec.name, status: 'online', generation: 1, restarts: 0,
+    })]);
+    expect(processHasOpenFdFor(join(logDir, 'daemon-0-out.log'))).toBe(false);
+    expect(processHasOpenFdFor(join(logDir, 'daemon-0-err.log'))).toBe(false);
+    await sup.stopAll();
+  });
+
+  it('drains queued R1 after a same-target R2 edit and spawns the fresh full revision', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const commandPath = join(root, 'fleet-commands.json');
+    const startedPath = join(root, 'started.jsonl');
+    const { path, spec: r1 } = authoritativeSpec(root, 'cli_refresh');
+    const sup = new FleetSupervisor({
+      statePath,
+      distDir: fakeDist(root, `
+require('fs').appendFileSync(${JSON.stringify(startedPath)}, process.env.BOTMUX_ROSTER_REVISION + String.fromCharCode(10));
+process.on('SIGTERM', () => process.exit(90)); setInterval(() => {}, 1000);
+`),
+      daemonEnv: {}, cwd: root, startupAdmissionHomeDir: root, log: () => {},
+    });
+    sup.start([r1]);
+    expect(await waitFor(() => existsSync(startedPath), 5_000)).toBe(true);
+    await sup.stopOneBot(r1.name);
+    enqueueFleetCommand(commandPath, {
+      id: 'queued-r1', op: 'start-bot', name: r1.name, appId: r1.appId, botIndex: r1.botIndex,
+      botsConfigPath: r1.botsConfigPath, rosterRevision: r1.rosterRevision, at: new Date().toISOString(),
+    });
+    writeFileSync(path, `${JSON.stringify([{
+      larkAppId: 'cli_refresh', larkAppSecret: 's2', backendType: 'zellij', sandbox: true,
+    }])}\n`, { mode: 0o600 });
+    const r2 = readDeviceIsolationRosterSnapshot({ configPath: path });
+    const queued = drainFleetCommands(commandPath);
+    expect(queued).toEqual([expect.objectContaining({
+      name: r1.name, botsConfigPath: r1.botsConfigPath, rosterRevision: r1.rosterRevision,
+    })]);
+    await sup.drainCommands(queued);
+    expect(await waitFor(() => readFileSync(startedPath, 'utf8').trim().split('\n').length === 2, 5_000)).toBe(true);
+    expect(readFileSync(startedPath, 'utf8').trim().split('\n')).toEqual([r1.rosterRevision, r2.revision]);
+    expect(readFleetState(statePath)?.procs.find(row => row.name === r1.name)).toMatchObject({
+      status: 'online', generation: 2, restarts: 0,
+    });
+
+    // The accepted R2 must replace knownSpecs. Replaying the stale queued R1
+    // after stopping cannot authenticate against the now-pinned R2.
+    await sup.stopOneBot(r1.name);
+    await sup.drainCommands(queued);
+    await delay(150);
+    expect(readFileSync(startedPath, 'utf8').trim().split('\n')).toHaveLength(2);
+    expect(readFleetState(statePath)?.procs.find(row => row.name === r1.name)).toMatchObject({
+      status: 'errored', pid: 0, generation: 2,
+    });
+    await sup.stopAll();
+  });
+
+  it.each([
+    ['unknown name', { name: 'botmux-9' }],
+    ['different path', { botsConfigPath: '/tmp/not-the-pinned-bots.json' }],
+    ['different index', { botIndex: 1 }],
+    ['different App ID', { appId: 'cli_other' }],
+  ] as const)('fails closed for a queued R1 with %s', async (_case, change) => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const startedPath = join(root, 'started.jsonl');
+    const { spec: r1 } = authoritativeSpec(root, 'cli_guarded');
+    const sup = new FleetSupervisor({
+      statePath,
+      distDir: fakeDist(root, `
+require('fs').appendFileSync(${JSON.stringify(startedPath)}, 'started' + String.fromCharCode(10));
+process.on('SIGTERM', () => process.exit(90)); setInterval(() => {}, 1000);
+`),
+      daemonEnv: {}, cwd: root, startupAdmissionHomeDir: root, log: () => {},
+    });
+    sup.start([r1]);
+    expect(await waitFor(() => existsSync(startedPath), 5_000)).toBe(true);
+    await sup.stopOneBot(r1.name);
+
+    await sup.drainCommands([{
+      id: `mismatch-${_case}`, op: 'start-bot', name: r1.name, appId: r1.appId, botIndex: r1.botIndex,
+      botsConfigPath: r1.botsConfigPath, rosterRevision: r1.rosterRevision, at: new Date().toISOString(),
+      ...change,
+    }]);
+    await delay(150);
+    expect(readFileSync(startedPath, 'utf8').trim().split('\n')).toHaveLength(1);
+    expect(readFleetState(statePath)?.procs.some(row => row.status === 'online')).toBe(false);
+    await sup.stopAll();
+  });
+
+  it.each(['ENOENT', 'EACCES', 'EAGAIN'])(
+    'contains a pidless async spawn %s to one member and cleans its exact reservation',
+    async (code) => {
+      const root = tmp();
+      const statePath = join(root, 'fleet.json');
+      const logDir = join(root, 'logs');
+      const { spec } = authoritativeSpec(root, `cli_${code.toLowerCase()}`);
+      const peer: FleetBotSpec = {
+        name: `peer-${code.toLowerCase()}`, appId: '', botIndex: -1,
+        external: {
+          command: process.execPath,
+          args: ['-e', 'process.on(\"SIGTERM\",()=>process.exit(0));setInterval(()=>{},1000)'],
+        },
+      };
+      let failedSpawnCalls = 0;
+      const logs: string[] = [];
+      const sup = new FleetSupervisor({
+        statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir,
+        startupAdmissionHomeDir: root, policy: { maxRestarts: 2, restartDelayMs: 30 },
+        log: message => logs.push(message),
+        spawnProcess: (command, args, options) => {
+          if (args.some(arg => arg.endsWith('index-daemon.js'))) {
+            failedSpawnCalls += 1;
+            const child = new EventEmitter() as ChildProcess;
+            Object.assign(child, {
+              pid: undefined,
+              kill: () => true,
+            });
+            const error = Object.assign(new Error(`spawn ${code}`), { code });
+            queueMicrotask(() => {
+              child.emit('error', error);
+              child.emit('exit', null, null);
+            });
+            return child;
+          }
+          return spawn(command, args, options);
+        },
+      });
+
+      expect(() => sup.start([spec, peer])).not.toThrow();
+      expect(await waitFor(() =>
+        readFleetState(statePath)?.procs.find(row => row.name === peer.name)?.status === 'online',
+      )).toBe(true);
+      await delay(150);
+      const state = readFleetState(statePath)!;
+      expect(state.procs.find(row => row.name === spec.name)).toMatchObject({
+        status: 'errored', pid: 0, generation: 1, restarts: 0,
+      });
+      const peerRow = state.procs.find(row => row.name === peer.name)!;
+      expect(peerRow).toMatchObject({ status: 'online', restarts: 0 });
+      expect(pidAlive(peerRow.pid)).toBe(true);
+      expect(failedSpawnCalls).toBe(1);
+      expect(logs.filter(message => message.includes('startup admission failed'))).toHaveLength(1);
+      expect(listBlockingDeviceIsolationStartupIntents({ homeDir: root })).toEqual([]);
+      expect(processHasOpenFdFor(join(logDir, 'daemon-0-out.log'))).toBe(false);
+      expect(processHasOpenFdFor(join(logDir, 'daemon-0-err.log'))).toBe(false);
+      await sup.stopAll();
+    },
+  );
+
+  it.each(['invalid', 'removed'] as const)(
+    'refreshes R1 to R2 on crash restart and isolates %s config failure from peers',
+    async (failureMode) => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const revisionsPath = join(root, 'revisions.jsonl');
+    const configDir = join(root, '.botmux');
+    const path = join(configDir, 'bots.json');
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    const writeConfig = (secret: string) => writeFileSync(path, `${JSON.stringify([
+      { larkAppId: 'cli_refresh', larkAppSecret: secret },
+    ])}\n`, { mode: 0o600 });
+    writeConfig('s1');
+    const r1 = readDeviceIsolationRosterSnapshot({ configPath: path });
+    const bot: FleetBotSpec = {
+      name: 'botmux-0', appId: 'cli_refresh', botIndex: 0,
+      botsConfigPath: path, rosterRevision: r1.revision,
+    };
+    const peer: FleetBotSpec = {
+      name: 'peer', appId: '', botIndex: -1,
+      external: { command: process.execPath, args: ['-e', 'process.on("SIGTERM",()=>process.exit(0));setInterval(()=>{},1000)'] },
+    };
+    const sup = new FleetSupervisor({
+      statePath,
+      distDir: fakeDist(root, `
+require('fs').appendFileSync(${JSON.stringify(revisionsPath)}, process.env.BOTMUX_ROSTER_REVISION + String.fromCharCode(10));
+process.on('SIGTERM', () => process.exit(90)); setInterval(() => {}, 1000);
+`),
+      daemonEnv: {}, cwd: root, policy: { maxRestarts: 5, restartDelayMs: 80 },
+      startupAdmissionHomeDir: root, log: () => {},
+    });
+    sup.start([bot, peer]);
+    expect(await waitFor(() => (readFleetState(statePath)?.procs.filter(row => row.status === 'online').length ?? 0) === 2)).toBe(true);
+    expect(await waitFor(() => existsSync(revisionsPath), 5_000)).toBe(true);
+    const first = readFleetState(statePath)!.procs.find(row => row.name === bot.name)!;
+    const peerPid = readFleetState(statePath)!.procs.find(row => row.name === peer.name)!.pid;
+    writeConfig('s2');
+    const r2 = readDeviceIsolationRosterSnapshot({ configPath: path });
+    process.kill(first.pid, 'SIGKILL');
+    expect(await waitFor(() => {
+      const row = readFleetState(statePath)?.procs.find(item => item.name === bot.name);
+      return !!row && row.status === 'online' && row.pid !== first.pid;
+    }, 5_000)).toBe(true);
+    expect(await waitFor(() =>
+      existsSync(revisionsPath)
+      && readFileSync(revisionsPath, 'utf8').trim().split('\n').length === 2,
+    5_000)).toBe(true);
+    expect(readFileSync(revisionsPath, 'utf8').trim().split('\n')).toEqual([r1.revision, r2.revision]);
+
+    const restarted = readFleetState(statePath)!.procs.find(row => row.name === bot.name)!;
+    if (failureMode === 'invalid') writeFileSync(path, '{invalid', { mode: 0o600 });
+    else rmSync(path, { force: true });
+    process.kill(restarted.pid, 'SIGKILL');
+    expect(await waitFor(() => readFleetState(statePath)?.procs.find(row => row.name === bot.name)?.status === 'errored')).toBe(true);
+    await delay(250);
+    const final = readFleetState(statePath)!;
+    expect(final.procs.find(row => row.name === bot.name)).toMatchObject({
+      status: 'errored', pid: 0, generation: 2, restarts: 2,
+    });
+    expect(final.procs.find(row => row.name === peer.name)).toMatchObject({
+      status: 'online', pid: peerPid,
+    });
+    expect(pidAlive(peerPid)).toBe(true);
+    expect(readFileSync(revisionsPath, 'utf8').trim().split('\n')).toHaveLength(2);
+    await sup.stopAll();
+    },
+  );
+
   it('starts all bots online, idempotent re-start is a no-op', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');

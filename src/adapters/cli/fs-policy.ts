@@ -49,6 +49,8 @@ export interface FsPolicy {
   denyRegexes?: string[];
   /** Narrow read-only exceptions emitted after denyRegexes (macOS gateway socket). */
   finalReadOnlyPaths?: string[];
+  /** Absolute security ceilings re-emitted after every Seatbelt exception. */
+  finalDenyPaths?: string[];
   /** No-transport turns: caller-supplied allow paths (extraWrite / readonlyRoots /
    *  user RW+RO) that fell inside a Feishu-authority root and were dropped before
    *  merge (fail-closed). Empty/absent otherwise. The worker LOGS these so a
@@ -114,6 +116,9 @@ export interface FsPolicyContext {
   serviceCredentialReadOnlyPaths?: readonly string[];
   /** Host-owned boundaries that user policy may not override. */
   mandatoryDenyPaths?: readonly string[];
+  /** Host-authority boundaries that NO path allow may reopen. Unlike ordinary
+   *  mandatory denies, these have no trusted internal carve-outs. */
+  sealedDenyPaths?: readonly string[];
   mandatoryDenyRegexes?: readonly string[];
   mandatoryReadOnlyPaths?: readonly string[];
   net?: boolean;
@@ -669,6 +674,26 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       return true;
     });
   const serviceCredentialReadOnlyPaths = dropAuthority(ctx.serviceCredentialReadOnlyPaths);
+  // Every mandatory deny is a ceiling against USER policy. Source rank protects
+  // only SAME-path conflicts; under deepest-prefix semantics, a user allow at
+  // `<mandatory>/child` would otherwise re-open it on Seatbelt and bwrap. Some
+  // mandatory denies intentionally retain trusted internal carve-outs (for
+  // example the sandbox relay outbox); sealed denies below retain none.
+  const mandatoryDenyRoots = [
+    ...(ctx.mandatoryDenyPaths ?? []),
+    ...(ctx.sealedDenyPaths ?? []),
+  ]
+    .map(normalizeFsPath)
+    .filter((p): p is string => p !== null);
+  const sealedDenyRoots = (ctx.sealedDenyPaths ?? [])
+    .map(normalizeFsPath)
+    .filter((p): p is string => p !== null);
+  const isBelowAny = (roots: readonly string[], raw: string): boolean => {
+    const p = normalizeFsPath(raw);
+    return p === null || roots.some(root => coversPath(root, p));
+  };
+  const dropMandatoryDeniedUserAllows = (paths: readonly string[] | undefined): string[] =>
+    (paths ?? []).filter(raw => !isBelowAny(mandatoryDenyRoots, raw));
 
   // workingDir is the CLI's cwd — it MUST be granted, so we cannot silently drop
   // it. A workingDir that IS (or is inside) a Feishu-authority root — own BOT_HOME
@@ -905,10 +930,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // FAIL-CLOSED against the authority roots for a no-transport turn (a hostile
   // `sandboxPaths.readWrite ~/.lark-cli-bots/<self>` must not re-open the deny).
   // User DENY entries are always kept (they only tighten).
-  push(dropAuthority(ctx.userPaths?.readWrite), 'readWrite', 'user');
-  push(dropAuthority(ctx.userPaths?.readOnly), 'readOnly', 'user');
+  push(dropMandatoryDeniedUserAllows(dropAuthority(ctx.userPaths?.readWrite)), 'readWrite', 'user');
+  push(dropMandatoryDeniedUserAllows(dropAuthority(ctx.userPaths?.readOnly)), 'readOnly', 'user');
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
+  push(ctx.sealedDenyPaths, 'deny', 'mandatory');
   push(serviceCredentialReadOnlyPaths, 'readOnly', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
 
@@ -948,7 +974,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     // reaching sibling daemons, and the secret is the escalation vector.
   }
 
-  const rules = mergeFsRules(candidates);
+  // Sealed authority has no carve-outs: remove every descendant allow, no
+  // matter whether it came from user config, cwd, an adapter, or an internal
+  // convenience grant. Ancestor allows remain useful and are safely shadowed
+  // by the deeper sealed deny.
+  const rules = mergeFsRules(candidates).filter(rule =>
+    rule.access === 'deny' || !isBelowAny(sealedDenyRoots, rule.path));
 
   // Post-merge self-check for the loaded bots-config (codex P1). Being inside a
   // frozen authority root is necessary but NOT sufficient: this is a white-in-black
@@ -989,7 +1020,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     finalReadOnlyPaths: [
       ...serviceCredentialReadOnlyPaths,
       ...(ctx.mandatoryReadOnlyPaths ?? []),
-    ],
+    ].filter(path => !isBelowAny(sealedDenyRoots, path)),
+    finalDenyPaths: sealedDenyRoots,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
       : undefined,
@@ -1098,6 +1130,14 @@ export function compileToSeatbelt(policy: FsPolicy): string {
   }
   for (const path of policy.finalReadOnlyPaths ?? []) {
     lines.push(`(allow file-read* (subpath "${escSb(path)}"))`);
+    lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
+  }
+  // Sealed authority wins even over late regex writes or final read-only
+  // exceptions. This is intentionally duplicated from policy.rules: the first
+  // occurrence supplies normal deepest-prefix semantics and bwrap mounts; this
+  // final occurrence makes the same ceiling absolute under Seatbelt ordering.
+  for (const path of policy.finalDenyPaths ?? []) {
+    lines.push(`(deny file-read* (subpath "${escSb(path)}"))`);
     lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
   }
   return lines.join('\n') + '\n';

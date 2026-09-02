@@ -113,7 +113,8 @@ describe('dashboard launcher — source pins', () => {
 
   it('cmdRestart health-gates on fleet MEMBERS so a down dashboard fails the restart', () => {
     const cli = read('cli.ts');
-    expect(cli).toContain('fleetMemberNames');
+    expect(cli).toContain('waitFleetReady');
+    expect(cli).toContain('probeDashboardReadyWithin');
   });
 
   it('bot-onboarding.ts STATIC-imports qrcode vendor files so the compiled binary embeds them', () => {

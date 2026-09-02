@@ -219,6 +219,7 @@ describe('runHook', () => {
       expect(posted?.chatId).toBe('oc_real_chat');
       expect(posted?.larkAppId).toBe('cli_real_app');
       expect(posted?.rootMessageId).toBe('oc_real_root');
+      expect(posted).not.toHaveProperty('originKind');
     });
 
     it('opencode2 反查未命中（独立终端会话 + 陈旧完整 env）→ fail closed，postAsk 未调用且 stdout 为空', async () => {
@@ -489,6 +490,17 @@ describe('runHook', () => {
       };
       await runHook(claudeAskPayload, FULL_ENV, captureStub, 'claude-code');
       expect(capturedBody?.timeoutMs).toBe(86_400_000);
+    });
+
+    it('恰好 24h 可用，24h+1ms 回退到默认 24h', async () => {
+      const seen: number[] = [];
+      const captureStub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        seen.push(body.timeoutMs as number);
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      await runHook(claudeAskPayload, { ...FULL_ENV, BOTMUX_ASK_TIMEOUT_MS: '86400000' }, captureStub, 'claude-code');
+      await runHook(claudeAskPayload, { ...FULL_ENV, BOTMUX_ASK_TIMEOUT_MS: '86400001' }, captureStub, 'claude-code');
+      expect(seen).toEqual([86_400_000, 86_400_000]);
     });
   });
 

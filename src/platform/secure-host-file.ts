@@ -17,6 +17,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -26,7 +27,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { withFileLockSync } from '../utils/file-lock.js';
+import { withFileLock, withFileLockSync, type FileLockOptions } from '../utils/file-lock.js';
 
 export class UnsafeHostAuthorityFileError extends Error {
   constructor(message: string) {
@@ -100,12 +101,16 @@ function assertAncestorChainCannotReplace(canonicalParent: string): void {
   }
 }
 
-function canonicalSecureHostParent(filePath: string): string {
+function canonicalSecureHostParent(filePath: string, exactParentMode?: number): string {
   const parent = dirname(filePath);
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  mkdirSync(parent, { recursive: true, mode: exactParentMode ?? 0o700 });
   const canonicalParent = realpathSync(parent);
   const parentStats = statSync(canonicalParent);
   assertSecureParentStats(parentStats);
+  if (exactParentMode !== undefined && process.platform !== 'win32'
+      && (parentStats.mode & 0o777) !== exactParentMode) {
+    throw new UnsafeHostAuthorityFileError(`宿主凭证目录权限必须严格为 0${exactParentMode.toString(8)}`);
+  }
   return canonicalParent;
 }
 
@@ -130,8 +135,8 @@ interface SecureHostParent {
  * Other platforms retain the conservative ancestor-chain requirement until
  * they have an equivalent descriptor-relative primitive.
  */
-function acquireSecureHostParent(filePath: string): SecureHostParent {
-  const canonicalParent = canonicalSecureHostParent(filePath);
+function acquireSecureHostParent(filePath: string, exactParentMode?: number): SecureHostParent {
+  const canonicalParent = canonicalSecureHostParent(filePath, exactParentMode);
   if (process.platform !== 'linux') {
     assertAncestorChainCannotReplace(canonicalParent);
     return { path: canonicalParent };
@@ -180,6 +185,56 @@ function assertSecureFileStats(stats: import('node:fs').Stats, maxBytes: number)
   }
   if (stats.size < 0 || stats.size > maxBytes) {
     throw new UnsafeHostAuthorityFileError('宿主凭证文件大小异常');
+  }
+}
+
+function assertSecureRegularFileMetadata(stats: import('node:fs').Stats): void {
+  if (!stats.isFile()) {
+    throw new UnsafeHostAuthorityFileError('宿主凭证必须是普通文件');
+  }
+  assertOwnedByCurrentUser(stats, '宿主凭证文件');
+  if (process.platform !== 'win32' && (stats.mode & 0o777) !== 0o600) {
+    throw new UnsafeHostAuthorityFileError('宿主凭证文件权限必须严格为 0600');
+  }
+}
+
+function unlinkSecureRegularLeafFromParentSync(
+  parent: SecureHostParent,
+  leafName: string,
+): boolean {
+  const resolved = join(parent.path, leafName);
+  let fd: number;
+  try {
+    fd = openSync(
+      resolved,
+      process.platform === 'win32' ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if ((error as NodeJS.ErrnoException).code === 'ELOOP') {
+      throw new UnsafeHostAuthorityFileError('宿主凭证拒绝符号链接');
+    }
+    throw error;
+  }
+
+  try {
+    const opened = fstatSync(fd);
+    assertSecureRegularFileMetadata(opened);
+    const current = lstatSync(resolved);
+    if (current.isSymbolicLink() || !sameInode(opened, current)) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证路径在删除时发生变化');
+    }
+    unlinkSync(resolved);
+    if (process.platform !== 'win32') {
+      if (parent.fd !== undefined) fsyncSync(parent.fd);
+      else {
+        const directoryFd = openSync(parent.path, constants.O_RDONLY);
+        try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+      }
+    }
+    return true;
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -286,6 +341,7 @@ function writeSecureLeafFromParentSync(
   parent: SecureHostParent,
   leafName: string,
   data: string,
+  maxExistingBytes = 64 * 1024,
 ): void {
   const resolved = join(parent.path, leafName);
   let leafExists = false;
@@ -298,7 +354,7 @@ function writeSecureLeafFromParentSync(
   if (leafExists) {
     // Pin and validate the existing leaf before replacement. The final
     // rename never follows a leaf symlink.
-    readSecureHostFileFromParentSync(parent, leafName, 64 * 1024);
+    readSecureHostFileFromParentSync(parent, leafName, maxExistingBytes);
   }
   if (parent.fd !== undefined) {
     writePinnedSecureHostFileSync(parent, parent.fd, leafName, data);
@@ -312,12 +368,18 @@ function writeSecureLeafFromParentSync(
 }
 
 /** Strict, durable atomic replace that never follows a leaf symlink. */
-export function writeSecureHostFileSync(filePath: string, data: string): void {
+export function writeSecureHostFileSync(filePath: string, data: string, maxExistingBytes = 64 * 1024): void {
   const parent = acquireSecureHostParent(filePath);
   try {
-    writeSecureLeafFromParentSync(parent, basename(filePath), data);
+    writeSecureLeafFromParentSync(parent, basename(filePath), data, maxExistingBytes);
   } finally {
     releaseSecureHostParent(parent);
+  }
+}
+
+function assertPlainLeafName(name: string): void {
+  if (!name || name === '.' || name === '..' || basename(name) !== name || name.includes('/')) {
+    throw new UnsafeHostAuthorityFileError('宿主凭证叶子名非法');
   }
 }
 
@@ -345,8 +407,28 @@ export interface SecureHostParentHandle {
   readonly leafName: string;
   /** Read the pinned leaf (fail-closed on unsafe shapes); null if absent. */
   readLeaf(maxBytes?: number): string | null;
+  /** Read a sibling leaf under the same pinned parent. */
+  readNamedLeaf(name: string, maxBytes?: number): string | null;
   /** Durably, atomically replace the pinned leaf without following a symlink. */
   writeLeaf(data: string): void;
+  /** Durably, atomically replace a sibling leaf under the same pinned parent. */
+  writeNamedLeaf(name: string, data: string, maxExistingBytes?: number): void;
+  /** Strict durable unlink of a sibling leaf; false only when absent. */
+  unlinkNamedLeaf(name: string, maxBytes?: number): boolean;
+  /** Unlink a pinned sibling after metadata-only validation. This deliberately
+   * accepts oversized regular files and is intended for malformed-entry cleanup. */
+  unlinkNamedRegularFile(name: string): boolean;
+  /** Enumerate sibling leaf names under the same pinned parent. */
+  listLeafNames(): string[];
+  /** Run under a lock for a named sibling while retaining this pinned parent. */
+  withNamedLeafLock<R>(name: string, fn: () => NonThenable<R>): R;
+  /** Open/create a named child directory relative to this pinned parent and keep
+   * that child inode pinned for the synchronous callback. */
+  withChildDirectory<R>(
+    name: string,
+    fn: (child: SecureHostParentHandle) => NonThenable<R>,
+    options?: { create?: boolean; exactMode?: number },
+  ): R | undefined;
   /**
    * Run `fn` while holding a cross-process advisory lock on the pinned leaf,
    * serialized against other processes doing the same get-or-create. The lock
@@ -354,6 +436,149 @@ export interface SecureHostParentHandle {
    * reused after release. `fn` must be synchronous (see {@link NonThenable}).
    */
   withLeafLock<R>(fn: () => NonThenable<R>): R;
+}
+
+export interface AsyncSecureHostParentHandle {
+  readonly leafName: string;
+  readLeaf(maxBytes?: number): Promise<string | null>;
+  writeLeaf(data: string, maxExistingBytes?: number): Promise<void>;
+  withLeafLock<R>(fn: () => Promise<R>, options?: FileLockOptions): Promise<R>;
+}
+
+async function acquireSecureHostParentAsync(
+  filePath: string,
+  exactParentMode?: number,
+): Promise<{ path: string; handle?: import('node:fs/promises').FileHandle }> {
+  const parent = dirname(filePath);
+  await import('node:fs/promises').then(fs => fs.mkdir(parent, { recursive: true, mode: exactParentMode ?? 0o700 }));
+  const fsp = await import('node:fs/promises');
+  const canonicalParent = await fsp.realpath(parent);
+  const parentStats = await fsp.stat(canonicalParent);
+  assertSecureParentStats(parentStats);
+  if (exactParentMode !== undefined && process.platform !== 'win32'
+      && (parentStats.mode & 0o777) !== exactParentMode) {
+    throw new UnsafeHostAuthorityFileError(`宿主凭证目录权限必须严格为 0${exactParentMode.toString(8)}`);
+  }
+  // The canonical path contains no symlink components. On non-Linux, retain
+  // the existing conservative ancestor-chain rule.
+  if (process.platform !== 'linux') assertAncestorChainCannotReplace(canonicalParent);
+  if (process.platform !== 'linux') return { path: canonicalParent };
+  const handle = await fsp.open(canonicalParent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const opened = await handle.stat();
+  assertSecureParentStats(opened);
+  const anchored = `/proc/self/fd/${handle.fd}`;
+  try {
+    if (!sameInode(opened, await fsp.stat(anchored))) throw new UnsafeHostAuthorityFileError('宿主凭证目录句柄发生变化');
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+  return { path: anchored, handle };
+}
+
+async function readSecureLeafAsync(
+  parent: { path: string },
+  leafName: string,
+  maxBytes: number,
+): Promise<string | null> {
+  const fsp = await import('node:fs/promises');
+  const resolved = join(parent.path, leafName);
+  let handle: import('node:fs/promises').FileHandle;
+  try {
+    handle = await fsp.open(resolved, process.platform === 'win32' ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const before = await handle.stat();
+    assertSecureFileStats(before, maxBytes);
+    const pathStats = await fsp.lstat(resolved);
+    if (pathStats.isSymbolicLink() || !sameInode(before, pathStats)) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证路径在读取时发生变化');
+    }
+    const raw = await handle.readFile('utf8');
+    const after = await handle.stat();
+    if (!sameInode(before, after) || before.size !== after.size
+        || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证在读取时发生变化');
+    }
+    return raw;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeSecureLeafAsync(
+  parent: { path: string; handle?: import('node:fs/promises').FileHandle },
+  leafName: string,
+  data: string,
+  maxExistingBytes = 1024 * 1024,
+): Promise<void> {
+  const fsp = await import('node:fs/promises');
+  const resolved = join(parent.path, leafName);
+  if (await readSecureLeafAsync(parent, leafName, maxExistingBytes) !== null) {
+    // Existing leaf was validated above.
+  }
+  const tmp = join(parent.path, `${leafName}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  let handle: import('node:fs/promises').FileHandle | undefined;
+  try {
+    handle = await fsp.open(
+      tmp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+        | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW),
+      0o600,
+    );
+    await handle.writeFile(data, 'utf8');
+    await handle.chmod(0o600);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await fsp.rename(tmp, resolved);
+    if (process.platform !== 'win32') {
+      if (parent.handle) await parent.handle.sync();
+      else {
+        const directory = await fsp.open(parent.path, constants.O_RDONLY);
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
+    }
+  } catch (error) {
+    if (handle) { try { await handle.close(); } catch { /* best effort */ } }
+    try { await fsp.unlink(tmp); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
+/** Async variant for latency-sensitive authorization paths. */
+export async function withSecureHostParent<T>(
+  filePath: string,
+  fn: (handle: AsyncSecureHostParentHandle) => Promise<T>,
+  options: { exactParentMode?: number } = {},
+): Promise<T> {
+  const parent = await acquireSecureHostParentAsync(filePath, options.exactParentMode);
+  const leafName = basename(filePath);
+  const anchoredLeafPath = join(parent.path, leafName);
+  let released = false;
+  const assertActive = (): void => {
+    if (released) throw new UnsafeHostAuthorityFileError('宿主凭证目录句柄已释放，禁止在回调返回后继续使用');
+  };
+  try {
+    return await fn({
+      leafName,
+      readLeaf: async (maxBytes = 64 * 1024) => { assertActive(); return readSecureLeafAsync(parent, leafName, maxBytes); },
+      writeLeaf: async (data, maxExistingBytes) => {
+        assertActive();
+        await writeSecureLeafAsync(parent, leafName, data, maxExistingBytes);
+      },
+      withLeafLock: async (inner, lockOptions) => {
+        assertActive();
+        return withFileLock(anchoredLeafPath, async () => { assertActive(); return inner(); }, lockOptions);
+      },
+    });
+  } finally {
+    released = true;
+    if (parent.handle) await parent.handle.close();
+  }
 }
 
 /**
@@ -364,6 +589,142 @@ export interface SecureHostParentHandle {
  * {@link withSecureHostParentSync}.
  */
 type NonThenable<T> = T extends PromiseLike<unknown> ? never : T;
+
+function acquireSecureChildDirectorySync(
+  parent: SecureHostParent,
+  name: string,
+  options: { create?: boolean; exactMode?: number },
+): SecureHostParent {
+  const childPath = join(parent.path, name);
+  if (options.create) {
+    try { mkdirSync(childPath, { mode: options.exactMode ?? 0o700 }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+  const pathStats = lstatSync(childPath);
+  if (pathStats.isSymbolicLink() || !pathStats.isDirectory()) {
+    throw new UnsafeHostAuthorityFileError('宿主凭证子目录不是普通目录');
+  }
+  assertSecureParentStats(pathStats);
+  if (options.exactMode !== undefined && process.platform !== 'win32'
+      && (pathStats.mode & 0o777) !== options.exactMode) {
+    throw new UnsafeHostAuthorityFileError(
+      `宿主凭证目录权限必须严格为 0${options.exactMode.toString(8)}`,
+    );
+  }
+  if (process.platform !== 'linux') {
+    const canonical = realpathSync(childPath);
+    assertAncestorChainCannotReplace(canonical);
+    return { path: canonical };
+  }
+  const fd = openSync(childPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    const openedStats = fstatSync(fd);
+    assertSecureParentStats(openedStats);
+    if (!sameInode(pathStats, openedStats)) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证子目录在打开时发生变化');
+    }
+    const anchoredPath = `/proc/self/fd/${fd}`;
+    if (!sameInode(openedStats, statSync(anchoredPath))) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证子目录句柄发生变化');
+    }
+    if (parent.fd !== undefined) fsyncSync(parent.fd);
+    return { path: anchoredPath, fd };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function withAcquiredSecureHostParentSync<T>(
+  parent: SecureHostParent,
+  leafName: string,
+  fn: (handle: SecureHostParentHandle) => NonThenable<T>,
+): T {
+  const anchoredLeafPath = join(parent.path, leafName);
+  let released = false;
+  const assertActive = (): void => {
+    if (released) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证目录句柄已释放，禁止在回调返回后继续使用');
+    }
+  };
+  try {
+    const handle: SecureHostParentHandle = {
+      leafName,
+      readLeaf: (maxBytes = 64 * 1024) => {
+        assertActive();
+        return readSecureHostFileFromParentSync(parent, leafName, maxBytes);
+      },
+      readNamedLeaf: (name: string, maxBytes = 64 * 1024) => {
+        assertActive();
+        assertPlainLeafName(name);
+        return readSecureHostFileFromParentSync(parent, name, maxBytes);
+      },
+      writeLeaf: (data: string) => {
+        assertActive();
+        writeSecureLeafFromParentSync(parent, leafName, data);
+      },
+      writeNamedLeaf: (name: string, data: string, maxExistingBytes = 64 * 1024) => {
+        assertActive();
+        assertPlainLeafName(name);
+        writeSecureLeafFromParentSync(parent, name, data, maxExistingBytes);
+      },
+      unlinkNamedLeaf: (name: string, maxBytes = 64 * 1024) => {
+        assertActive();
+        assertPlainLeafName(name);
+        if (readSecureHostFileFromParentSync(parent, name, maxBytes) === null) return false;
+        unlinkSync(join(parent.path, name));
+        if (process.platform !== 'win32') {
+          if (parent.fd !== undefined) fsyncSync(parent.fd);
+          else {
+            const fd = openSync(parent.path, constants.O_RDONLY);
+            try { fsyncSync(fd); } finally { closeSync(fd); }
+          }
+        }
+        return true;
+      },
+      unlinkNamedRegularFile: (name: string) => {
+        assertActive();
+        assertPlainLeafName(name);
+        return unlinkSecureRegularLeafFromParentSync(parent, name);
+      },
+      listLeafNames: () => {
+        assertActive();
+        return readdirSync(parent.path)
+          .filter((name) => basename(name) === name && name !== '.' && name !== '..');
+      },
+      withNamedLeafLock: <R>(name: string, inner: () => NonThenable<R>): R => {
+        assertActive();
+        assertPlainLeafName(name);
+        return withFileLockSync(join(parent.path, name), inner);
+      },
+      withChildDirectory: <R>(
+        name: string,
+        inner: (child: SecureHostParentHandle) => NonThenable<R>,
+        childOptions: { create?: boolean; exactMode?: number } = {},
+      ): R | undefined => {
+        assertActive();
+        assertPlainLeafName(name);
+        let childParent: SecureHostParent;
+        try { childParent = acquireSecureChildDirectorySync(parent, name, childOptions); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
+        }
+        return withAcquiredSecureHostParentSync(childParent, '.pinned-child', inner);
+      },
+      withLeafLock: <R>(inner: () => NonThenable<R>): R => {
+        assertActive();
+        return withFileLockSync(anchoredLeafPath, inner);
+      },
+    };
+    return fn(handle);
+  } finally {
+    released = true;
+    releaseSecureHostParent(parent);
+  }
+}
 
 /**
  * Acquire the secure parent directory once and expose it to `fn` as a pinned
@@ -387,41 +748,11 @@ type NonThenable<T> = T extends PromiseLike<unknown> ? never : T;
 export function withSecureHostParentSync<T>(
   filePath: string,
   fn: (handle: SecureHostParentHandle) => NonThenable<T>,
+  options: { exactParentMode?: number } = {},
 ): T {
-  const parent = acquireSecureHostParent(filePath);
+  const parent = acquireSecureHostParent(filePath, options.exactParentMode);
   const leafName = basename(filePath);
-  // Kept in the closure only — never exposed as a string on the handle.
-  const anchoredLeafPath = join(parent.path, leafName);
-  let released = false;
-  const assertActive = (): void => {
-    if (released) {
-      throw new UnsafeHostAuthorityFileError('宿主凭证目录句柄已释放，禁止在回调返回后继续使用');
-    }
-  };
-  try {
-    const handle: SecureHostParentHandle = {
-      leafName,
-      readLeaf: (maxBytes = 64 * 1024) => {
-        assertActive();
-        return readSecureHostFileFromParentSync(parent, leafName, maxBytes);
-      },
-      writeLeaf: (data: string) => {
-        assertActive();
-        writeSecureLeafFromParentSync(parent, leafName, data);
-      },
-      withLeafLock: <R>(inner: () => NonThenable<R>): R => {
-        assertActive();
-        return withFileLockSync(anchoredLeafPath, inner);
-      },
-    };
-    return fn(handle);
-  } finally {
-    // Invalidate the handle BEFORE closing the fd so a post-return caller
-    // (leaked closure, or an async continuation that slipped past the type
-    // bound) can never act on a recycled descriptor.
-    released = true;
-    releaseSecureHostParent(parent);
-  }
+  return withAcquiredSecureHostParentSync(parent, leafName, fn);
 }
 
 /** Strict durable unlink. Returns false only if the leaf is absent. */
