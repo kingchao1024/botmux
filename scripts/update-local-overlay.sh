@@ -51,6 +51,7 @@ bun_cmd=(npx --yes bun@1.4.0)
   test/event-dispatcher.test.ts \
   test/fleet-supervisor.integration.test.ts \
   test/fs-policy.test.ts \
+  test/model-catalog.test.ts \
   test/platform-device-isolation.test.ts \
   test/plugin-card-action-gateway.test.ts \
   test/plugin-card-action-gateway.integration.test.ts \
