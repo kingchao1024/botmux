@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { publishDaemonDescriptor } from '../src/utils/daemon-discovery.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const tempDirs: string[] = [];
@@ -58,6 +59,42 @@ function runAsk(
 }
 
 describe('botmux ask — CLI boundary', () => {
+  it('discovers a fresh host daemon descriptor from a PID-isolated session', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
+    tempDirs.push(dataDir);
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        kind: 'answered',
+        answers: [['yes']],
+        by: 'ou_test',
+        comment: null,
+        timedOut: false,
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      publishDaemonDescriptor(join(dataDir, 'dashboard-daemons'), {
+        larkAppId: 'cli_test',
+        ipcPort: (server.address() as AddressInfo).port,
+        bootInstanceId: 'A'.repeat(43),
+        processStartIdentity: 'host-only-generation',
+        rosterRevision: 'a'.repeat(64),
+        pid: 999_999,
+        lastHeartbeat: Date.now(),
+      });
+
+      const result = await runAsk(dataDir, undefined, { BOTMUX_DAEMON_IPC_PORT: '' });
+      expect(result).toMatchObject({ status: 0, stdout: 'yes\n', stderr: '' });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => err ? reject(err) : resolve());
+      });
+    }
+  });
+
   it('--multi 发送多选问题并输出逗号分隔的 keys', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
     tempDirs.push(dataDir);

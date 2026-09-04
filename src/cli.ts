@@ -5514,9 +5514,17 @@ function listOnlineDaemons(opaqueProcessVisibility = false): DaemonDescriptorLit
   return listOnlineDaemonsIn(cliDaemonDiscoveryOptions(opaqueProcessVisibility));
 }
 
-function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
-  if (larkAppId) return findOnlineDaemon(larkAppId, cliDaemonDiscoveryOptions());
-  return listOnlineDaemons()[0] ?? null;
+function findDaemon(
+  larkAppId?: string,
+  opaqueProcessVisibility = false,
+): DaemonDescriptorLite | null {
+  if (larkAppId) {
+    return findOnlineDaemon(
+      larkAppId,
+      cliDaemonDiscoveryOptions(opaqueProcessVisibility),
+    );
+  }
+  return listOnlineDaemons(opaqueProcessVisibility)[0] ?? null;
 }
 
 function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
@@ -11589,8 +11597,12 @@ async function postAsk(
     Object.assign(new Error(message), { exitCode: 3, retryable });
 
   const larkAppId = body.larkAppId as string;
-  const daemon = findDaemon(larkAppId);
-  if (!daemon) {
+  const daemon = findDaemon(larkAppId, true);
+  const ipcPort = resolveDaemonIpcPort(
+    daemon?.ipcPort,
+    process.env.BOTMUX_DAEMON_IPC_PORT,
+  );
+  if (!ipcPort) {
     // No daemon record → it's (re)starting or momentarily gone → retryable.
     throw mkErr(`botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`, true);
   }
@@ -11622,12 +11634,12 @@ async function postAsk(
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
     }
     res = hostSecret
-      ? await fetchDaemonIpc(daemon.ipcPort, path, init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, init);
+      ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-    throw mkErr(`botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`, true);
+    throw mkErr(`botmux ask: 无法连接 daemon (port=${ipcPort}): ${msg}`, true);
   }
 
   if (!res.ok) {
