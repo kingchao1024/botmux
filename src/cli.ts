@@ -302,6 +302,7 @@ import {
   cleanupStaleDaemonDescriptorFiles,
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
+  parseDaemonIpcPort,
   resolveDaemonIpcPort,
   type OnlineDaemonInfo,
 } from './utils/daemon-discovery.js';
@@ -5465,12 +5466,23 @@ type DaemonDescriptorLite = OnlineDaemonInfo;
  *  copy of the descriptor parse and the 90s staleness cutoff. These two
  *  wrappers only pin it to THIS process's resolved data dir, so the liveness
  *  probe and the session store always read the same directory. */
+function cliDaemonDiscoveryOptions(): string | { registryDir: string; cleanupStale: false } {
+  const dataDir = resolveDataDir();
+  const sessionScoped = !!process.env.BOTMUX_SESSION_ID?.trim();
+  return sessionScoped
+    ? {
+        registryDir: join(dataDir, 'dashboard-daemons'),
+        cleanupStale: false,
+      }
+    : dataDir;
+}
+
 function listOnlineDaemons(): DaemonDescriptorLite[] {
-  return listOnlineDaemonsIn(resolveDataDir());
+  return listOnlineDaemonsIn(cliDaemonDiscoveryOptions());
 }
 
 function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
-  if (larkAppId) return findOnlineDaemon(larkAppId, resolveDataDir());
+  if (larkAppId) return findOnlineDaemon(larkAppId, cliDaemonDiscoveryOptions());
   return listOnlineDaemons()[0] ?? null;
 }
 
@@ -6071,8 +6083,11 @@ async function cmdTermLink(rest: string[]): Promise<void> {
     }
   }
 
-  const daemon = findDaemon(session.larkAppId);
-  if (!daemon) {
+  const currentSessionPort = process.env.BOTMUX_SESSION_ID === session.sessionId
+    ? parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT)
+    : undefined;
+  const daemonPort = currentSessionPort ?? findDaemon(session.larkAppId)?.ipcPort;
+  if (!daemonPort) {
     console.error('❌ 未找到在线 daemon。请确认 daemon 正在运行：botmux status');
     process.exit(1);
   }
@@ -6080,12 +6095,12 @@ async function cmdTermLink(rest: string[]): Promise<void> {
   let res: Response;
   try {
     res = await fetchDaemonIpc(
-      daemon.ipcPort,
+      daemonPort,
       `/api/sessions/${encodeURIComponent(session.sessionId)}/write-link-card`,
       { method: 'POST' },
     );
   } catch (err: any) {
-    console.error(`❌ 无法连接到 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    console.error(`❌ 无法连接到 daemon (port=${daemonPort}): ${err?.message ?? err}`);
     process.exit(1);
   }
 

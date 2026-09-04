@@ -48,6 +48,7 @@ bun_cmd=(npx --yes bun@1.4.0)
   test/device-isolation-daemon-ipc.test.ts \
   test/device-isolation-daemon.test.ts \
   test/device-isolation-roster.test.ts \
+  test/daemon-discovery.test.ts \
   test/event-dispatcher.test.ts \
   test/fleet-runtime.test.ts \
   test/fleet-runtime-spawn-env.test.ts \
@@ -62,6 +63,8 @@ bun_cmd=(npx --yes bun@1.4.0)
   test/read-isolation.test.ts \
   test/restart-true-readiness.test.ts \
   test/secure-host-file.test.ts \
+  test/session-delete-cli.test.ts \
+  test/session-ready-cli.test.ts \
   test/setup-bots-store.test.ts \
   test/shutdown-supervisor-contract.test.ts
 "${bun_cmd[@]}" run build
