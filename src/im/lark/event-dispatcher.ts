@@ -77,7 +77,7 @@ import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
-import { snapshotAskCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
+import { snapshotLarkCardActionCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
 import type { AskCardActionOutcome } from './ask-card.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
@@ -1125,7 +1125,7 @@ async function handleCardActionAckSafe(
 ): Promise<any> {
   let callbackData: any;
   try {
-    callbackData = snapshotAskCallbackData(data);
+    callbackData = snapshotLarkCardActionCallbackData(data);
     if (!isPlainRecord(callbackData)) throw new Error('card callback root must be an object');
   } catch {
     logger.warn('[card-action] malformed callback rejected before handler');

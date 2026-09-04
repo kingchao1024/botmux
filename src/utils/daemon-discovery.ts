@@ -76,6 +76,9 @@ export interface DaemonDiscoveryOptions {
   processStart?: (pid: number) => string | undefined;
   processExists?: (pid: number) => boolean;
   cleanupStale?: boolean;
+  /** Sandboxed CLIs cannot inspect host PIDs. In opaque mode a fresh modern
+   * descriptor is accepted by heartbeat only and is never deleted. */
+  processVisibility?: 'host' | 'opaque';
 }
 
 export class DaemonDescriptorValidationError extends Error {
@@ -417,7 +420,8 @@ function readDaemonCandidates(options: DaemonDiscoveryOptions): DaemonCandidate[
   const now = options.now ?? Date.now();
   const readStart = options.processStart ?? readSupervisorProcessStartIdentity;
   const exists = options.processExists ?? processExists;
-  const cleanupStale = options.cleanupStale ?? true;
+  const processOpaque = options.processVisibility === 'opaque';
+  const cleanupStale = processOpaque ? false : options.cleanupStale ?? true;
   let names: string[];
   try { names = readdirSync(directory).sort(); } catch { return []; }
   const candidates: DaemonCandidate[] = [];
@@ -447,14 +451,16 @@ function readDaemonCandidates(options: DaemonDiscoveryOptions): DaemonCandidate[
 
     let exactModernProcessAlive = false;
     if (identityNamed && daemon.processStartIdentity && daemon.pid) {
-      const processStatus = exactModernProcessStatus(daemon, readStart, exists);
-      exactModernProcessAlive = processStatus === 'alive';
-      if (processStatus !== 'alive') {
-        if (processStatus === 'unknown') {
-          invalidDescriptor(fileName, 'live process identity is unavailable');
+      if (!processOpaque) {
+        const processStatus = exactModernProcessStatus(daemon, readStart, exists);
+        exactModernProcessAlive = processStatus === 'alive';
+        if (processStatus !== 'alive') {
+          if (processStatus === 'unknown') {
+            invalidDescriptor(fileName, 'live process identity is unavailable');
+          }
+          if (cleanupStale) removeObservedFile(observed, 100);
+          continue;
         }
-        if (cleanupStale) removeObservedFile(observed, 100);
-        continue;
       }
     }
 
@@ -467,7 +473,7 @@ function readDaemonCandidates(options: DaemonDiscoveryOptions): DaemonCandidate[
     // heartbeat may stop while the process is paused or event-loop stalled;
     // hiding it would let activation ignore a still-live predecessor. Legacy
     // descriptors have no such proof and retain heartbeat-only compatibility.
-    if (!exactModernProcessAlive && now - heartbeat > DAEMON_DESCRIPTOR_STALE_MS) {
+    if ((!exactModernProcessAlive || processOpaque) && now - heartbeat > DAEMON_DESCRIPTOR_STALE_MS) {
       if (cleanupStale) removeObservedFile(observed, 100);
       continue;
     }

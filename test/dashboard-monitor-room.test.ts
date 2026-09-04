@@ -63,12 +63,12 @@ describe('monitor room local session set', () => {
 });
 
 describe('session terminal href', () => {
-  const local: SessionTerminalLocation = { protocol: 'http:', origin: 'http://localhost:8801', hostname: 'localhost' };
+  const local: SessionTerminalLocation = { protocol: 'http:', origin: 'http://localhost:7891', hostname: 'localhost' };
   const platform: SessionTerminalLocation = { protocol: 'https:', origin: 'https://m-1.example.test', hostname: 'm-1.example.test' };
 
   it('builds local direct and proxy terminal urls', () => {
     expect(sessionTerminalHref({ sessionId: 'abc', webPort: 3001 }, local)).toBe('http://localhost:3001');
-    expect(sessionTerminalHref({ sessionId: 'abc', webPort: 3001, proxyPort: 8801 }, local)).toBe('http://localhost:8801/s/abc');
+    expect(sessionTerminalHref({ sessionId: 'abc', webPort: 3001, proxyPort: 8801 }, local)).toBe('http://localhost:7891/s/abc');
   });
 
   it('uses same-origin proxy urls on https platform pages', () => {

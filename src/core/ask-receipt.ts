@@ -200,10 +200,34 @@ interface SnapshotBudget {
 export function snapshotAskCallbackData(
   value: unknown,
 ): unknown {
+  return snapshotCallbackData(value, false);
+}
+
+/**
+ * Snapshot a callback after Lark's EventDispatcher has parsed it. The SDK adds
+ * one enumerable `Symbol(event-type)` metadata property to the root object
+ * before invoking registered handlers. That value has already selected the
+ * `card.action.trigger` handler; it is not part of the untrusted callback data
+ * or the signed Ask receipt. Accept exactly that one SDK marker at the root and
+ * keep every other symbol (including nested symbols) fail-closed.
+ */
+export function snapshotLarkCardActionCallbackData(value: unknown): unknown {
+  return snapshotCallbackData(value, true);
+}
+
+function snapshotCallbackData(
+  value: unknown,
+  allowLarkEventTypeAtRoot: boolean,
+): unknown {
   if (value !== null && typeof value === 'object' && askCallbackSnapshots.has(value)) {
     return value;
   }
-  const snapshot = snapshotAskCallbackDataUnbranded(value, 0, { values: 0, stringBytes: 0 });
+  const snapshot = snapshotAskCallbackDataUnbranded(
+    value,
+    0,
+    { values: 0, stringBytes: 0 },
+    allowLarkEventTypeAtRoot,
+  );
   if (!snapshot || typeof snapshot !== 'object') return snapshot;
   askCallbackSnapshots.add(snapshot);
   return snapshot;
@@ -213,6 +237,7 @@ function snapshotAskCallbackDataUnbranded(
   value: unknown,
   depth: number,
   budget: SnapshotBudget,
+  allowLarkEventTypeAtRoot = false,
 ): unknown {
   if (++budget.values > MAX_CALLBACK_SNAPSHOT_VALUES) {
     throw new Error('Ask callback exceeds snapshot bounds');
@@ -233,9 +258,23 @@ function snapshotAskCallbackDataUnbranded(
   const prototype = Object.getPrototypeOf(value);
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = Reflect.ownKeys(descriptors);
-  if (keys.some((key) => typeof key === 'symbol')) {
+  const symbolKeys = keys.filter((key): key is symbol => typeof key === 'symbol');
+  const larkEventType = symbolKeys.length === 1
+    ? Object.getOwnPropertyDescriptor(value, symbolKeys[0])
+    : undefined;
+  const hasOnlyExpectedLarkEventType = depth === 0
+    && allowLarkEventTypeAtRoot
+    && symbolKeys.length === 1
+    && Symbol.keyFor(symbolKeys[0]) === undefined
+    && symbolKeys[0].description === 'event-type'
+    && !!larkEventType
+    && 'value' in larkEventType
+    && larkEventType.enumerable === true
+    && larkEventType.value === 'card.action.trigger';
+  if (symbolKeys.length > 0 && !hasOnlyExpectedLarkEventType) {
     throw new Error('Ask callback must not contain symbol properties');
   }
+  const stringKeys = keys.filter((key): key is string => typeof key === 'string');
 
   if (Array.isArray(value)) {
     if (prototype !== Array.prototype) throw new Error('Ask callback arrays must be plain');
@@ -244,7 +283,7 @@ function snapshotAskCallbackDataUnbranded(
       throw new Error('Ask callback array length is invalid');
     }
     const out: unknown[] = [];
-    for (const key of keys as string[]) {
+    for (const key of stringKeys) {
       if (key === 'length') continue;
       const index = Number(key);
       const descriptor = descriptors[key]!;
@@ -262,7 +301,7 @@ function snapshotAskCallbackDataUnbranded(
   }
   if (prototype !== Object.prototype) throw new Error('Ask callback objects must be plain');
   const out: Record<string, unknown> = {};
-  for (const key of keys as string[]) {
+  for (const key of stringKeys) {
     const descriptor = descriptors[key]!;
     if ('get' in descriptor || descriptor.enumerable !== true) {
       throw new Error('Ask callback objects must contain only enumerable data properties');

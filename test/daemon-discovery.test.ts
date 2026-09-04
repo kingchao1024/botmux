@@ -346,6 +346,28 @@ describe('daemon discovery', () => {
     expect(existsSync(publication.filePath)).toBe(true);
   });
 
+  it('opaque process visibility accepts only fresh modern descriptors and never deletes them', () => {
+    const registryDir = join(dir, 'dashboard-daemons');
+    const fresh = publishDaemonDescriptor(registryDir, modernDescriptor({ lastHeartbeat: 199_999 }));
+    const stale = publishDaemonDescriptor(registryDir, modernDescriptor({
+      bootInstanceId: 'B'.repeat(43),
+      processStartIdentity: 'proc-stale',
+      pid: 124,
+      lastHeartbeat: 1_000,
+    }));
+
+    expect(listOnlineDaemons({
+      registryDir,
+      now: 200_000,
+      processStart: () => undefined,
+      processExists: () => false,
+      cleanupStale: true,
+      processVisibility: 'opaque',
+    })).toEqual([expect.objectContaining({ bootInstanceId: 'A'.repeat(43) })]);
+    expect(existsSync(fresh.filePath)).toBe(true);
+    expect(existsSync(stale.filePath)).toBe(true);
+  });
+
   it.each([
     ['dead', undefined, false],
     ['pid reused', 'different-proc-start', true],

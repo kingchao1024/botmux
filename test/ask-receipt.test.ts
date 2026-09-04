@@ -1,4 +1,5 @@
 import { generateKeyPairSync } from 'node:crypto';
+import * as Lark from '@larksuiteoapi/node-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -6,6 +7,7 @@ import {
   askQuestionDigest,
   askReceiptJti,
   snapshotAskCallbackData,
+  snapshotLarkCardActionCallbackData,
   verifyAskReceipt,
 } from '../src/core/ask-receipt.js';
 import { createAskAnswerProvenanceAuthority, createAskReceiptSigner } from '../src/daemon/ask-receipt-authority.js';
@@ -332,6 +334,64 @@ describe('signed Ask receipt', () => {
 
     expect(snapshotError).toBeInstanceOf(Error);
     expect(claimEvent).not.toHaveBeenCalled();
+  });
+
+  it('accepts only the SDK card-action event marker at the callback root', async () => {
+    const dispatcher = new Lark.EventDispatcher({});
+    let snapshot: any;
+    dispatcher.register({
+      'card.action.trigger': (data: unknown) => {
+        expect(Object.getOwnPropertySymbols(data)).toHaveLength(1);
+        snapshot = snapshotLarkCardActionCallbackData(data);
+      },
+    });
+
+    await dispatcher.invoke({
+      schema: '2.0',
+      header: { event_type: 'card.action.trigger', event_id: 'evt-sdk-card' },
+      event: {
+        operator: { open_id: 'ou-reviewer' },
+        context: { open_message_id: 'om-card' },
+        action: { value: { action: 'close', session_id: 'session-1' } },
+      },
+    }, { needCheck: false });
+
+    expect(snapshot).toMatchObject({
+      event_id: 'evt-sdk-card',
+      operator: { open_id: 'ou-reviewer' },
+      context: { open_message_id: 'om-card' },
+      action: { value: { action: 'close', session_id: 'session-1' } },
+    });
+    expect(Object.getOwnPropertySymbols(snapshot)).toHaveLength(0);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.action.value)).toBe(true);
+  });
+
+  it('keeps non-SDK and nested callback symbols fail-closed', () => {
+    const strict = { action: { value: { action: 'close' } } };
+    Object.defineProperty(strict, Symbol('event-type'), { value: 'card.action.trigger', enumerable: true });
+    expect(() => snapshotAskCallbackData(strict)).toThrow('symbol properties');
+
+    const external = { action: { value: { action: 'close' } } };
+    Object.defineProperty(external, Symbol('external'), { value: 'card.action.trigger', enumerable: true });
+    expect(() => snapshotLarkCardActionCallbackData(external)).toThrow('symbol properties');
+
+    const wrongEvent = { action: { value: { action: 'close' } } };
+    Object.defineProperty(wrongEvent, Symbol('event-type'), { value: 'im.message.receive_v1', enumerable: true });
+    expect(() => snapshotLarkCardActionCallbackData(wrongEvent)).toThrow('symbol properties');
+
+    const hiddenEvent = { action: { value: { action: 'close' } } };
+    Object.defineProperty(hiddenEvent, Symbol('event-type'), { value: 'card.action.trigger' });
+    expect(() => snapshotLarkCardActionCallbackData(hiddenEvent)).toThrow('symbol properties');
+
+    const multiple = { action: { value: { action: 'close' } } };
+    Object.defineProperty(multiple, Symbol('event-type'), { value: 'card.action.trigger', enumerable: true });
+    Object.defineProperty(multiple, Symbol('external'), { value: 'card.action.trigger', enumerable: true });
+    expect(() => snapshotLarkCardActionCallbackData(multiple)).toThrow('symbol properties');
+
+    const nested = { action: { value: { action: 'close' } } };
+    Object.defineProperty(nested.action, Symbol('event-type'), { value: 'card.action.trigger', enumerable: true });
+    expect(() => snapshotLarkCardActionCallbackData(nested)).toThrow('symbol properties');
   });
 
   it('round-trips with a pinned key and exact binding', () => {

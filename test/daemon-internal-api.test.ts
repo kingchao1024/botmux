@@ -98,6 +98,55 @@ describe('dispatch: read endpoints', () => {
     expect(r.body).toEqual({ sessions: [{ sessionId: 's1' }] });
   });
 
+  it('POST session view-link routes to the owner without retrying a capability mint', async () => {
+    const deps = makeDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest(
+      'POST',
+      url('/__daemon/sessions/sess-known/view-link', { scope: 'global' }),
+      '',
+      'cli_caller',
+    );
+    expect(r.status).toBe(200);
+    expect(deps.proxyToDaemon).toHaveBeenCalledWith(
+      'cli_owner',
+      '/api/sessions/sess-known/view-link',
+      { method: 'GET' },
+    );
+  });
+
+  it('POST session view-link rejects cross-bot access outside global scope', async () => {
+    const deps = makeDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest(
+      'POST',
+      url('/__daemon/sessions/sess-known/view-link'),
+      '',
+      'cli_caller',
+    );
+    expect(r).toEqual({ status: 403, body: { ok: false, error: 'session_owner_mismatch' } });
+    expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('POST session view-link rejects an unknown session without proxying', async () => {
+    const deps = makeDeps();
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest(
+      'POST',
+      url('/__daemon/sessions/sess-missing/view-link'),
+      '',
+      'cli_caller',
+    );
+    expect(r).toEqual({ status: 404, body: { ok: false, error: 'unknown_session' } });
+    expect(deps.proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('GET session view-link is rejected because capability minting is not retry-safe', async () => {
+    const api = createDaemonInternalApi(makeDeps());
+    const r = await api.dispatchForTest('GET', url('/__daemon/sessions/sess-known/view-link'));
+    expect(r).toEqual({ status: 405, body: { ok: false, error: 'method_not_allowed' } });
+  });
+
   it('GET /__daemon/settings-snapshot returns deps.resolveDashboardSettings()', async () => {
     const api = createDaemonInternalApi(makeDeps());
     const r = await api.dispatchForTest('GET', url('/__daemon/settings-snapshot'));

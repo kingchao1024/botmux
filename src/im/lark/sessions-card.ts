@@ -23,10 +23,9 @@ import type { SessionRowDto, SessionDetailDto } from '../../dashboard/session-ca
 import { composeEntries, sortByStatus, paginate, composeDetail } from '../../dashboard/session-card-model.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
-import { config } from '../../config.js';
-import { formatUrlHost } from '../../core/dashboard-url.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
+import { logger } from '../../utils/logger.js';
 
 import { terminalMultiUrl } from './card-builder.js';
 import type { CardActionData } from './card-handler.js';
@@ -587,25 +586,6 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
   }
 }
 
-/** Compute the Web Terminal URL for a SessionRow. Mirrors
- *  `src/dashboard/web/sessions.ts:terminalHref`: proxy port wins (with the
- *  `/s/{sessionId}` suffix); otherwise direct worker port. Returns null when
- *  the session has no port at all (e.g. closed / starting).
- *
- *  Closed sessions can carry a stale webPort, so closed rows are always
- *  rejected here even if the raw row still has a port value. */
-export function buildSessionTerminalUrl(row: SessionRow): string | null {
-  if (row.status === 'closed') return null;
-  const host = formatUrlHost(config.web.externalHost);
-  if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
-    return `http://${host}:${row.proxyPort}/s/${encodeURIComponent(row.sessionId)}`;
-  }
-  if (typeof row.webPort === 'number' && row.webPort > 0) {
-    return `http://${host}:${row.webPort}`;
-  }
-  return null;
-}
-
 function formatRelativeForDetail(fromMs: number, nowMs: number): string {
   const diff = nowMs - fromMs;
   if (!Number.isFinite(diff) || diff < 0) return 'just now';
@@ -670,8 +650,8 @@ function errorToast(textKey: string, params: Record<string, string> | undefined,
 }
 
 /**
- * Dispatch a `dash_sessions_*` action callback. Awaits the Route B GET
- * inline and returns the rebuilt card body in the SAME response.
+ * Dispatch a `dash_sessions_*` action callback. Awaits Route B inline and
+ * returns the rebuilt card body in the SAME response.
  */
 export async function handleSessionsCardAction(
   data: CardActionData,
@@ -744,6 +724,9 @@ export async function handleSessionsCardAction(
       return errorToast('card.dashboard.sessions.session_not_found', undefined, locale);
     }
     const detail = composeDetail(row, now());
+    const terminalUrl = detail.actions.openTerminal.enabled
+      ? await safeGetSessionViewLink(client, sessionId, pathSuffix)
+      : null;
     const cardJson = buildSessionsDetailCard(detail, {
       invokerOpenId: operatorOpenId,
       locale,
@@ -752,7 +735,7 @@ export async function handleSessionsCardAction(
       pageSize: navPageSize,
       sourcePage: navPage,
       scope: navScope,
-      terminalUrl: buildSessionTerminalUrl(row),
+      terminalUrl,
       feishuChatLink: row.feishuChatLink ?? null,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -839,7 +822,7 @@ export async function handleSessionsCardAction(
       pageSize: navPageSize,
       sourcePage: navPage,
       scope: navScope,
-      terminalUrl: buildSessionTerminalUrl(synth),
+      terminalUrl: null,
       feishuChatLink: synth.feishuChatLink ?? null,
     });
     const card = JSON.parse(cardJson) as Record<string, unknown>;
@@ -972,6 +955,9 @@ export async function handleSessionsCardAction(
       after = { ...before, status: 'idle', closedAt: undefined };
     }
     const detail = composeDetail(after, now());
+    const terminalUrl = detail.actions.openTerminal.enabled
+      ? await safeGetSessionViewLink(client, sessionId, pathSuffix)
+      : null;
     const cardJson = buildSessionsDetailCard(detail, {
       invokerOpenId: operatorOpenId,
       locale,
@@ -980,7 +966,7 @@ export async function handleSessionsCardAction(
       pageSize: navPageSize,
       sourcePage: navPage,
       scope: navScope,
-      terminalUrl: buildSessionTerminalUrl(after),
+      terminalUrl,
       feishuChatLink: after.feishuChatLink ?? null,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -1064,4 +1050,38 @@ async function safeGetSessionsList(
   }
   const rows = ((r.body as { sessions?: ReadonlyArray<SessionRow> })?.sessions) ?? [];
   return { rows };
+}
+
+/**
+ * Ask Route B for the owning daemon's current read-only capability URL. Session
+ * rows deliberately omit terminal tokens, so constructing a URL from their
+ * ports would create an unauthenticated dead link. A failed or stale mint only
+ * disables the terminal button; the rest of the detail card remains usable.
+ */
+async function safeGetSessionViewLink(
+  client: DaemonClient,
+  sessionId: string,
+  pathSuffix = '',
+): Promise<string | null> {
+  try {
+    const response = await client.request({
+      method: 'POST',
+      path: `/__daemon/sessions/${encodeURIComponent(sessionId)}/view-link${pathSuffix}`,
+      retries: 0,
+      timeoutMs: 1_000,
+    });
+    const body = response.body as { ok?: unknown; url?: unknown } | undefined;
+    if (response.status !== 200 || body?.ok !== true || typeof body.url !== 'string') return null;
+    const url = new URL(body.url);
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:')
+        || !url.searchParams.has('viewToken')
+        || url.searchParams.has('token')) return null;
+    return url.toString();
+  } catch (error) {
+    logger.debug(
+      `[sessions-card] view-link unavailable for ${sessionId.substring(0, 8)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
 }

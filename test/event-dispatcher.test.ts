@@ -7723,6 +7723,36 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(handlers.handleCardAction).toHaveBeenCalledWith(data, MY_APP_ID);
   });
 
+  it('accepts a real Lark SDK v2 card action after the SDK adds its event-type symbol', async () => {
+    const actualLark = await vi.importActual<typeof import('@larksuiteoapi/node-sdk')>(
+      '@larksuiteoapi/node-sdk',
+    );
+    const dispatcher = new actualLark.EventDispatcher({});
+    dispatcher.register({
+      'card.action.trigger': capturedHandlers['card.action.trigger'] as any,
+    });
+    handlers.handleCardAction.mockResolvedValue({
+      toast: { type: 'success', content: 'builtin accepted' },
+    });
+
+    const result = await dispatcher.invoke({
+      schema: '2.0',
+      header: { event_type: 'card.action.trigger', event_id: 'evt-sdk-builtin' },
+      event: {
+        action: { value: { action: 'close', root_id: 'om_root', session_id: 'sess-1' } },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_sdk_card' },
+      },
+    }, { needCheck: false });
+
+    expect(result).toEqual({ toast: { type: 'success', content: 'builtin accepted' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledOnce();
+    const handled = handlers.handleCardAction.mock.calls[0]![0];
+    expect(Object.getOwnPropertySymbols(handled)).toHaveLength(0);
+    expect(Object.isFrozen(handled)).toBe(true);
+    expect(Object.isFrozen(handled.action.value)).toBe(true);
+  });
+
   it('returns a valid empty ACK when a fast card handler has no payload', async () => {
     handlers.handleCardAction.mockResolvedValue(undefined);
 
