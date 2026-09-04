@@ -77,7 +77,7 @@ import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
-import { snapshotLarkCardActionCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
+import { hasExactAskCallbackValueKeys, hasOnlyLarkCardActionKeys, snapshotLarkCardActionCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
 import type { AskCardActionOutcome } from './ask-card.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
@@ -1084,13 +1084,13 @@ function validateAskCallbackShape(data: unknown): boolean {
   if (!nonEmptyString(valueRecord.ask_id) || !nonEmptyString(valueRecord.nonce)) return false;
 
   if (action === 'ask_select') {
-    return exactKeys(actionRecord, ['value'])
-      && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
+    return hasOnlyLarkCardActionKeys(actionRecord, false)
+      && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
       && nonEmptyString(valueRecord.key);
   }
   if (action === 'ask_toggle') {
-    return exactKeys(actionRecord, ['value'])
-      && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
+    return hasOnlyLarkCardActionKeys(actionRecord, false)
+      && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
       && nonEmptyString(valueRecord.key)
       && safeQuestionIndex(valueRecord.question_index);
   }
@@ -1099,12 +1099,27 @@ function validateAskCallbackShape(data: unknown): boolean {
     : ['action', 'ask_id', 'nonce'];
   const formValueOwn = Object.prototype.hasOwnProperty.call(actionRecord, 'form_value');
   const formValue = actionRecord.form_value;
-  return exactKeys(actionRecord, formValueOwn ? ['value', 'form_value'] : ['value'])
-    && exactKeys(valueRecord, expectedValueKeys)
+  return hasOnlyLarkCardActionKeys(actionRecord, formValueOwn)
+    && hasExactAskCallbackValueKeys(valueRecord, expectedValueKeys)
     && (valueRecord.confirm_empty === undefined
       || valueRecord.confirm_empty === true
       || valueRecord.confirm_empty === 'true')
     && (!formValueOwn || isPlainRecord(formValue));
+}
+
+function cardActionShapeForLog(data: unknown): string {
+  if (!isPlainRecord(data)) return `root=${Array.isArray(data) ? 'array' : typeof data}`;
+  const action = isPlainRecord(data.action) ? data.action : undefined;
+  const value = isPlainRecord(action?.value) ? action.value : undefined;
+  const fieldTypes = (record: Record<string, unknown> | undefined): string =>
+    record
+      ? Object.keys(record).sort().map(key => {
+          const field = record[key];
+          const type = field === null ? 'null' : Array.isArray(field) ? 'array' : typeof field;
+          return `${key}:${type}`;
+        }).join(',')
+      : 'not_object';
+  return `action={${fieldTypes(action)}} value={${fieldTypes(value)}}`;
 }
 
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
@@ -1139,7 +1154,7 @@ async function handleCardActionAckSafe(
   const askAction = data?.action?.value?.action;
   const isAskAction = askAction === 'ask_select' || askAction === 'ask_toggle' || askAction === 'ask_submit';
   if (isAskAction && !validateAskCallbackShape(data)) {
-    logger.warn('[ask-receipt] malformed ask callback rejected before handler');
+    logger.warn(`[ask-receipt] malformed ask callback rejected before handler: ${cardActionShapeForLog(data)}`);
     return { toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } };
   }
   let issued: AskAnswerProvenanceIssue = { kind: 'not_ask' };
