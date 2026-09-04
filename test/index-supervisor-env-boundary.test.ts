@@ -40,6 +40,12 @@ vi.mock('../src/core/fleet-runtime.js', () => ({
   resolveFleetMembers: () => [],
   resolveFleetDaemonEnv: () => ({ ...process.env }),
   fleetDaemonNodeArgs: () => [],
+  validateSupervisorLaunchPlan: (plan: unknown) => plan,
+}));
+
+vi.mock('../src/core/fleet-launch-plan.js', () => ({
+  FLEET_LAUNCH_PLAN_ENV: 'BOTMUX_FLEET_LAUNCH_PLAN_V1',
+  decodeFleetLaunchPlan: () => ({ bots: [] }),
 }));
 
 vi.mock('../src/core/fleet-command-queue.js', () => ({
