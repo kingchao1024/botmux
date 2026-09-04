@@ -331,6 +331,21 @@ describe('daemon discovery', () => {
     expect(existsSync(publication.filePath)).toBe(false);
   });
 
+  it('does not delete a descriptor when discovery cleanup is disabled', () => {
+    const registryDir = join(dir, 'dashboard-daemons');
+    const descriptor = modernDescriptor({ lastHeartbeat: 199_999 });
+    const publication = publishDaemonDescriptor(registryDir, descriptor);
+
+    expect(listOnlineDaemons({
+      registryDir,
+      now: 200_000,
+      processStart: () => undefined,
+      processExists: () => false,
+      cleanupStale: false,
+    })).toEqual([]);
+    expect(existsSync(publication.filePath)).toBe(true);
+  });
+
   it.each([
     ['dead', undefined, false],
     ['pid reused', 'different-proc-start', true],
