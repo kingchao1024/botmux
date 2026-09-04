@@ -7291,12 +7291,29 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
       complete,
       revoke: authority.redeemer.revoke,
     });
+    const actualLark = await vi.importActual<typeof import('@larksuiteoapi/node-sdk')>(
+      '@larksuiteoapi/node-sdk',
+    );
+    const dispatcher = new actualLark.EventDispatcher({});
+    dispatcher.register({
+      'card.action.trigger': capturedHandlers['card.action.trigger'] as any,
+    });
     const event = {
-      event_id: 'evt-real-dispatch', operator: { open_id: USER_OPEN_ID },
-      context: { open_message_id: 'om-ask-card' },
-      action: { value: { action: ASK_SELECT_ACTION, ask_id: ask!.askId, nonce: ask!.nonce, key: 'yes' } },
+      schema: '2.0',
+      header: { event_type: 'card.action.trigger', event_id: 'evt-real-dispatch' },
+      event: {
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om-ask-card' },
+        action: {
+          tag: 'button',
+          name: null,
+          option: null,
+          timezone: 'Asia/Shanghai',
+          value: { __bm_cb: 1, action: ASK_SELECT_ACTION, ask_id: ask!.askId, nonce: ask!.nonce, key: 'yes' },
+        },
+      },
     };
-    await capturedHandlers['card.action.trigger'](event);
+    await dispatcher.invoke(event, { needCheck: false });
     const result = await pendingResult;
     expect(result.kind === 'answered' ? result.receipt?.payload : undefined).toMatchObject({
       larkAppId: MY_APP_ID, actor: { identity: USER_OPEN_ID },
@@ -7305,7 +7322,7 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
     expect([...claimed]).toEqual([`${MY_APP_ID}:evt-real-dispatch`]);
     await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
-    const replay = await capturedHandlers['card.action.trigger']({ ...event });
+    const replay = await dispatcher.invoke(event, { needCheck: false });
     expect(replay).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
     expect(issue).toHaveBeenCalledTimes(2);
     expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
@@ -7366,6 +7383,82 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     expect(claimEvent).not.toHaveBeenCalled();
     expect(handlers.handleCardAction).not.toHaveBeenCalled();
     expect(completeEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects undocumented action metadata before durable Ask claim', async () => {
+    const issuer = {
+      issue: vi.fn(async () => ({ kind: 'not_ask' } as const)),
+      wasRedeemed: vi.fn(() => false),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-undocumented-action-metadata',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: {
+        tag: 'button',
+        unexpected: 'hidden',
+        value: { action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes' },
+      },
+    });
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } });
+    expect(issuer.issue).not.toHaveBeenCalled();
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+  });
+
+  it('rejects documented action metadata with an invalid type', async () => {
+    const issuer = {
+      issue: vi.fn(async () => ({ kind: 'not_ask' } as const)),
+      wasRedeemed: vi.fn(() => false),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-invalid-action-metadata-type',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: {
+        tag: { forged: true },
+        value: { action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes' },
+      },
+    });
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } });
+    expect(issuer.issue).not.toHaveBeenCalled();
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid Botmux callback marker version before durable claim', async () => {
+    const issuer = {
+      issue: vi.fn(async () => ({ kind: 'not_ask' } as const)),
+      wasRedeemed: vi.fn(() => false),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-invalid-botmux-callback-marker',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: {
+        tag: 'button',
+        value: {
+          __bm_cb: 2,
+          action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes',
+        },
+      },
+    });
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } });
+    expect(issuer.issue).not.toHaveBeenCalled();
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
   });
 
   it('uses one immutable callback snapshot across deferred claim and handler dispatch', async () => {

@@ -20,6 +20,8 @@ import {
   canonicalAskReceiptBytes,
   canonicalJson,
   exportAskReceiptPublicKey,
+  hasExactAskCallbackValueKeys,
+  hasOnlyLarkCardActionKeys,
   importAskReceiptPublicKey,
   normalizeAskSubmitValue,
   snapshotAskCallbackData,
@@ -282,21 +284,21 @@ export function createAskAnswerProvenanceAuthority(input: {
     formValueRecord: Record<string, unknown> | undefined,
   ): boolean => {
     if (action === 'ask_select') {
-      return exactKeys(actionRecord, ['value'])
-        && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
+      return hasOnlyLarkCardActionKeys(actionRecord, false)
+        && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
         && nonEmptyString(valueRecord.key);
     }
     if (action === 'ask_toggle') {
-      return exactKeys(actionRecord, ['value'])
-        && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
+      return hasOnlyLarkCardActionKeys(actionRecord, false)
+        && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
         && nonEmptyString(valueRecord.key)
         && integer(valueRecord.question_index) !== undefined;
     }
     const expectedValueKeys = Object.prototype.hasOwnProperty.call(valueRecord, 'confirm_empty')
       ? ['action', 'ask_id', 'nonce', 'confirm_empty']
       : ['action', 'ask_id', 'nonce'];
-    return exactKeys(actionRecord, formValueOwn ? ['value', 'form_value'] : ['value'])
-      && exactKeys(valueRecord, expectedValueKeys)
+    return hasOnlyLarkCardActionKeys(actionRecord, formValueOwn)
+      && hasExactAskCallbackValueKeys(valueRecord, expectedValueKeys)
       && validSubmitConfirmEmpty(valueRecord.confirm_empty)
       && (!formValueOwn || formValueRecord !== undefined);
   };

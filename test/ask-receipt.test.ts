@@ -352,7 +352,13 @@ describe('signed Ask receipt', () => {
       event: {
         operator: { open_id: 'ou-reviewer' },
         context: { open_message_id: 'om-card' },
-        action: { value: { action: 'close', session_id: 'session-1' } },
+        action: {
+          tag: 'button',
+          name: null,
+          option: null,
+          timezone: 'Asia/Shanghai',
+          value: { action: 'close', session_id: 'session-1' },
+        },
       },
     }, { needCheck: false });
 
@@ -360,7 +366,13 @@ describe('signed Ask receipt', () => {
       event_id: 'evt-sdk-card',
       operator: { open_id: 'ou-reviewer' },
       context: { open_message_id: 'om-card' },
-      action: { value: { action: 'close', session_id: 'session-1' } },
+      action: {
+        tag: 'button',
+        name: null,
+        option: null,
+        timezone: 'Asia/Shanghai',
+        value: { action: 'close', session_id: 'session-1' },
+      },
     });
     expect(Object.getOwnPropertySymbols(snapshot)).toHaveLength(0);
     expect(Object.isFrozen(snapshot)).toBe(true);

@@ -450,6 +450,40 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
   return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }
 
+const LARK_CARD_ACTION_METADATA_KEYS = ['tag', 'name', 'option', 'timezone'] as const;
+export const BOTMUX_ASK_CALLBACK_MARKER_KEY = '__bm_cb';
+export const BOTMUX_ASK_CALLBACK_MARKER_VERSION = 1;
+
+/** Validate the documented Lark transport metadata around action.value. */
+export function hasOnlyLarkCardActionKeys(
+  action: Record<string, unknown>,
+  includeFormValue: boolean,
+): boolean {
+  const required = includeFormValue ? ['value', 'form_value'] : ['value'];
+  const allowed = new Set([...required, ...LARK_CARD_ACTION_METADATA_KEYS]);
+  if (!required.every(key => Object.prototype.hasOwnProperty.call(action, key))
+      || Object.keys(action).some(key => !allowed.has(key))) {
+    return false;
+  }
+  return LARK_CARD_ACTION_METADATA_KEYS.every(key =>
+    action[key] === undefined || action[key] === null || typeof action[key] === 'string',
+  );
+}
+
+/** Allow the egress ownership marker that Botmux itself stamps onto every
+ * callback button while keeping all other callback value keys exact. */
+export function hasExactAskCallbackValueKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const marker = value[BOTMUX_ASK_CALLBACK_MARKER_KEY];
+  const expectedKeys = marker === undefined
+    ? expected
+    : [...expected, BOTMUX_ASK_CALLBACK_MARKER_KEY];
+  return exactKeys(value, expectedKeys)
+    && (marker === undefined || marker === BOTMUX_ASK_CALLBACK_MARKER_VERSION);
+}
+
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
