@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { FleetLaunchPlan } from '../src/core/fleet-launch-plan.js';
 
 const H5_PREFIX = 'BOTMUX_DASHBOARD_FEISHU_H5_';
 const FUTURE_H5_KEY = `${H5_PREFIX}FUTURE_SPAWN_TEST`;
@@ -21,8 +22,19 @@ vi.mock('node:fs', async (importOriginal) => {
   return { ...actual, openSync: io.openSync };
 });
 
+vi.mock('../src/core/process-start-identity.js', () => ({
+  readSupervisorProcessStartIdentity: () => 'supervisor-birth',
+}));
+
 describe('startFleetViaSupervisor restart environment', () => {
   let home: string;
+  const launchPlan = (): FleetLaunchPlan => ({
+    version: 1,
+    requestedConfigPath: join(home, '.botmux', 'bots.json'),
+    canonicalConfigPath: join(home, '.botmux', 'bots.json'),
+    rosterRevision: 'a'.repeat(64),
+    bots: [],
+  });
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'fleet-spawn-env-'));
@@ -56,7 +68,7 @@ describe('startFleetViaSupervisor restart environment', () => {
   it('passes persisted terminal endpoint settings to the supervisor instead of stale session snapshots', async () => {
     const { startFleetViaSupervisor } = await import('../src/core/fleet-runtime.js');
 
-    expect(startFleetViaSupervisor()).toMatchObject({ action: 'started', supervisorPid: 4321 });
+    expect(startFleetViaSupervisor(launchPlan())).toMatchObject({ action: 'started', supervisorPid: 4321 });
     expect(io.spawn).toHaveBeenCalledOnce();
     const options = io.spawn.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv };
     expect(options.env.WEB_HOST).toBe('10.9.9.9');
@@ -74,7 +86,7 @@ describe('startFleetViaSupervisor restart environment', () => {
     }));
     const { startFleetViaSupervisor } = await import('../src/core/fleet-runtime.js');
 
-    expect(startFleetViaSupervisor({ refreshPersistedEnv: true })).toMatchObject({
+    expect(startFleetViaSupervisor(launchPlan(), { refreshPersistedEnv: true })).toMatchObject({
       action: 'started',
       supervisorPid: 4321,
     });
@@ -86,7 +98,7 @@ describe('startFleetViaSupervisor restart environment', () => {
   it('does not load persisted H5 settings into the supervisor spawn environment', async () => {
     const { startFleetViaSupervisor } = await import('../src/core/fleet-runtime.js');
 
-    expect(startFleetViaSupervisor({ refreshPersistedEnv: true })).toMatchObject({
+    expect(startFleetViaSupervisor(launchPlan(), { refreshPersistedEnv: true })).toMatchObject({
       action: 'started',
       supervisorPid: 4321,
     });
@@ -100,7 +112,7 @@ describe('startFleetViaSupervisor restart environment', () => {
     vi.stubEnv(FUTURE_H5_KEY, 'inherited-future-secret');
     const { startFleetViaSupervisor } = await import('../src/core/fleet-runtime.js');
 
-    expect(startFleetViaSupervisor()).toMatchObject({ action: 'started', supervisorPid: 4321 });
+    expect(startFleetViaSupervisor(launchPlan())).toMatchObject({ action: 'started', supervisorPid: 4321 });
     const options = io.spawn.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv };
     expect(Object.keys(options.env).filter(key => key.startsWith(H5_PREFIX))).toEqual([]);
   });
@@ -110,7 +122,7 @@ describe('startFleetViaSupervisor restart environment', () => {
     delete process.env.BOTMUX_SESSION_ID;
     const { startFleetViaSupervisor } = await import('../src/core/fleet-runtime.js');
 
-    expect(startFleetViaSupervisor({ refreshPersistedEnv: true })).toMatchObject({ action: 'started', supervisorPid: 4321 });
+    expect(startFleetViaSupervisor(launchPlan(), { refreshPersistedEnv: true })).toMatchObject({ action: 'started', supervisorPid: 4321 });
     expect(io.spawn).toHaveBeenCalledOnce();
     const options = io.spawn.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv };
     expect(options.env.WEB_HOST).toBe('0.0.0.0');
@@ -127,7 +139,7 @@ describe('startFleetViaSupervisor restart environment', () => {
     delete process.env.BOTMUX_SESSION_ID;
     const { startFleetViaSupervisor } = await import('../src/core/fleet-runtime.js');
 
-    expect(startFleetViaSupervisor({
+    expect(startFleetViaSupervisor(launchPlan(), {
       refreshPersistedEnv: true,
       readFailureFallback: {
         WEB_HOST: '127.0.0.1',

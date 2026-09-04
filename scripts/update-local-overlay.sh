@@ -49,12 +49,16 @@ bun_cmd=(npx --yes bun@1.4.0)
   test/device-isolation-daemon.test.ts \
   test/device-isolation-roster.test.ts \
   test/event-dispatcher.test.ts \
+  test/fleet-runtime.test.ts \
+  test/fleet-runtime-spawn-env.test.ts \
   test/fleet-supervisor.integration.test.ts \
   test/fs-policy.test.ts \
+  test/index-supervisor-env-boundary.test.ts \
   test/model-catalog.test.ts \
   test/platform-device-isolation.test.ts \
   test/plugin-card-action-gateway.test.ts \
   test/plugin-card-action-gateway.integration.test.ts \
+  test/plugin-service-restart-lifecycle.test.ts \
   test/read-isolation.test.ts \
   test/restart-true-readiness.test.ts \
   test/secure-host-file.test.ts \
