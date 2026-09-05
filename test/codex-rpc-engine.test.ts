@@ -5,11 +5,15 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 // A real subprocess app-server stand-in (HTTP /readyz + JSON-RPC WS on one port).
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-rpc-server.mjs', import.meta.url));
+const STOP_WITHOUT_BARRIER_FIXTURE = fileURLToPath(
+  new URL('./fixtures/codex-rpc-stop-without-barrier.mts', import.meta.url),
+);
 beforeAll(() => { chmodSync(FIXTURE, 0o755); });
 
 type EngineDependencies = NonNullable<ConstructorParameters<typeof CodexRpcEngine>[1]>;
@@ -678,6 +682,42 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     engine.stop();
     await new Promise((r) => setTimeout(r, 300));
     expect(dead).toBe(false);
+  }, 20_000);
+
+  it('demonstrates that immediate worker exit drops stop()\'s unref\'d SIGKILL fallback', async () => {
+    const pidFile = join(
+      tmpdir(),
+      'codex-rpc-stop-without-barrier-' + process.pid + '-' + Date.now() + '.pid',
+    );
+    let appServerPid: number | undefined;
+    try {
+      const worker = spawnNodeTsScript(STOP_WITHOUT_BARRIER_FIXTURE, [pidFile], {
+        stdio: 'ignore',
+      });
+      await new Promise<void>((resolve, reject) => {
+        worker.once('error', reject);
+        worker.once('exit', code => code === 0 ? resolve() : reject(new Error('worker exited ' + code)));
+      });
+      appServerPid = Number.parseInt(readFileSync(pidFile, 'utf8'), 10);
+      expect(Number.isInteger(appServerPid)).toBe(true);
+      expect(isAlive(appServerPid)).toBe(true);
+    } finally {
+      if (appServerPid) {
+        try { process.kill(-appServerPid, 'SIGKILL'); } catch { try { process.kill(appServerPid, 'SIGKILL'); } catch { /* gone */ } }
+      }
+      rmSync(pidFile, { force: true });
+    }
+  }, 20_000);
+
+  it('waits through the bounded SIGKILL fallback when the app-server ignores SIGTERM', async () => {
+    const engine = makeEngine({
+      sessionId: 'stop-barrier',
+      env: { ...process.env, FAKE_IGNORE_SIGTERM: '1' },
+    });
+    await engine.start();
+    const pid = engine.appServerPid!;
+    await engine.stopAndWait();
+    expect(isAlive(pid)).toBe(false);
   }, 20_000);
 
   it('stop releases every still-active native turn with its exact owner', async () => {

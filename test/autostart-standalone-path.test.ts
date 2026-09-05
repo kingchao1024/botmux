@@ -86,6 +86,11 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
     // ExecStop was broken the same way and is just as load-bearing: a bad path
     // there makes `systemctl --user stop botmux` a no-op that reports success.
     expect(unit).toContain(`ExecStop=${BINARY} stop`);
+    // The detached supervisor deliberately preserves non-RPC tmux sessions on a
+    // restart. Keep systemd's stop fallback scoped to its control process, while
+    // the worker reaps Botmux-owned RPC app-server groups itself.
+    expect(unit).toContain('KillMode=process');
+    expect(unit).toContain('TimeoutStopSec=20s');
   });
 
   it('renders no /$bunfs into the launchd plist or the Windows startup script', () => {

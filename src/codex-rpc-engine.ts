@@ -146,6 +146,13 @@ const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
  *  FIRST turn on a cold app-server pays MCP/model-list startup latency. */
 const REQUEST_TIMEOUT_MS = 60_000;
 
+/** A worker that is shutting down must keep running long enough to reap its
+ * managed app-server. The graceful wait gives the server a chance to close its
+ * listener and descendants; the short second window only confirms the SIGKILL
+ * fallback has landed. */
+const APP_SERVER_STOP_GRACE_MS = 2_000;
+const APP_SERVER_STOP_KILL_SETTLE_MS = 250;
+
 /** Floor for a metadata-poll iteration's per-request budget. Below this, the
  *  poll deadline is effectively reached: issuing a thread/read with a
  *  sub-floor client timeout would reliably time out (and REJECT, not return)
@@ -548,12 +555,29 @@ export class CodexRpcEngine {
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
       try { killGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
-      const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, 2000);
+      const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, APP_SERVER_STOP_GRACE_MS);
       t.unref?.();
     } else {
       this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
+  }
+
+  /**
+   * Stop the managed app-server and keep the owning worker alive until its child
+   * has exited, or until the SIGKILL fallback has had a short bounded chance to
+   * take effect. `stop()` remains synchronous for in-worker restart paths; this
+   * barrier is for parent-process shutdown, where exiting immediately would
+   * discard stop()'s unref'd SIGKILL timer and leave a detached app-server behind.
+   */
+  async stopAndWait(): Promise<void> {
+    this.stop();
+    const child = this.child;
+    const pid = child?.pid;
+    if (!child || !pid) return;
+    if (await this.waitForChildExit(child, APP_SERVER_STOP_GRACE_MS)) return;
+    try { killGroup(pid, 'SIGKILL'); } catch { /* already gone */ }
+    await this.waitForChildExit(child, APP_SERVER_STOP_KILL_SETTLE_MS);
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------
@@ -617,6 +641,24 @@ export class CodexRpcEngine {
       const [pidStr, url] = readFileSync(mp, 'utf8').trim().split('\n');
       if (parseInt(pidStr, 10) === this.child?.pid && url === this.wsUrl) rmSync(mp, { force: true });
     } catch { /* no marker / unreadable → leave it (next reap handles it) */ }
+  }
+
+  private waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = (exited: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.removeListener('exit', onExit);
+        resolve(exited);
+      };
+      const onExit = (): void => finish(true);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      child.once('exit', onExit);
+      if (child.exitCode !== null || child.signalCode !== null) finish(true);
+    });
   }
 
   // ---- internals -----------------------------------------------------------

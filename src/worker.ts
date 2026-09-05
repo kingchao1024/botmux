@@ -20201,7 +20201,16 @@ function cleanup(): void {
  * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
  * retain the historical killCli shutdown path.
  */
+let parentExitShutdown: Promise<void> | null = null;
+
 function shutdownWorkerForParentExit(reason: string): void {
+  if (parentExitShutdown) return;
+  parentExitShutdown = shutdownWorkerForParentExitImpl(reason).catch(() => {
+    process.exit(0);
+  });
+}
+
+async function shutdownWorkerForParentExitImpl(reason: string): Promise<void> {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
@@ -20209,6 +20218,11 @@ function shutdownWorkerForParentExit(reason: string): void {
     process.exit(0);
     return;
   }
+  // App-server children are detached so a worker can manage their whole process
+  // group. Do not call process.exit() until the bounded RPC stop barrier has
+  // reaped that group; otherwise stop()'s unref'd SIGKILL timer dies with this
+  // worker and systemd eventually has to clean up the orphan.
+  await codexRpcEngine?.stopAndWait();
   killCli();
   cleanup();
   process.exit(0);

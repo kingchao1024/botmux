@@ -29,6 +29,7 @@ const DUPLICATE_TERMINAL = process.env.FAKE_DUPLICATE_TERMINAL === '1';
 const NO_TURN_TERMINAL = process.env.FAKE_NO_TURN_TERMINAL === '1';
 const TURN_STATUS = process.env.FAKE_TURN_STATUS ?? '';
 const DIE_AFTER = process.env.FAKE_DIE_AFTER_MS ? Number(process.env.FAKE_DIE_AFTER_MS) : 0;
+if (process.env.FAKE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
 const PREVIEW_DELAY_READS = Number(process.env.FAKE_PREVIEW_DELAY_READS ?? '0');
 const UPDATED_DELAY_READS = Number(process.env.FAKE_UPDATED_DELAY_READS ?? '0');
 const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
