@@ -35,7 +35,9 @@ if (process.env.FAKE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
 if (process.env.FAKE_LEADER_EXITS_ON_SIGTERM === '1') process.on('SIGTERM', () => process.exit(0));
 if (process.env.FAKE_GROUP_CHILD_PID_FILE) {
   const child = spawn(process.execPath, ['-e', [
-    '// app-server --listen ' + listenArg + '\n',
+    (process.env.FAKE_GROUP_CHILD_UNVERIFIED === '1'
+      ? '// unrelated process\n'
+      : '// app-server --listen ' + listenArg + '\n'),
     "process.on('SIGTERM', () => {})",
     'setInterval(() => {}, 1_000)',
   ].join(';')], { stdio: 'ignore' });

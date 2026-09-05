@@ -19861,6 +19861,10 @@ process.on('message', async (raw: unknown) => {
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
+      // destroySession() can synchronously trigger the remote viewer's onExit,
+      // which clears the global engine reference. Keep this exact managed engine
+      // so local close still awaits its detached app-server group afterwards.
+      const closeRpcEngine = codexRpcEngine;
       // Local close destroys persistent owned sessions. Remote backends never
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
@@ -19869,6 +19873,16 @@ process.on('message', async (raw: unknown) => {
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
+      }
+      try {
+        // A managed RPC app-server is detached from the tmux viewer. Do not let
+        // this local close exit the worker until its bounded group barrier proves
+        // the app-server is gone; otherwise stop()'s unref timer dies with us.
+        await closeRpcEngine?.stopAndWait();
+      } catch (error) {
+        log(`Local close RPC teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+        return;
       }
       killCli();
       // Bridge marker + turn-journal files outlive a single CLI process (kept

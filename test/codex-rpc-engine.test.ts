@@ -792,6 +792,36 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     }
   }, 20_000);
 
+  it('refuses to signal an unverified current PID and leaves an unrelated process alive', async () => {
+    const signals: NodeJS.Signals[] = [];
+    const engine = makeEngine({}, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        return spawn(command, args, options);
+      },
+      hasExactProcessGroupIdentity: () => false,
+      signalProcessGroup(_pid, signal): void {
+        signals.push(signal);
+      },
+    });
+    const unrelated = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+    unrelated.unref();
+    let managedPid: number | undefined;
+    try {
+      await engine.start();
+      managedPid = engine.appServerPid!;
+      // Model a child pid that was recycled after the managed leader exited.
+      (engine as any).child = unrelated;
+      await expect(engine.stopAndWait()).rejects.toThrow(/exact app-server identity could not be verified/);
+      expect(signals).toEqual([]);
+      expect(isAlive(unrelated.pid!)).toBe(true);
+    } finally {
+      if (managedPid) {
+        try { process.kill(-managedPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      try { process.kill(-unrelated.pid!, 'SIGKILL'); } catch { /* gone */ }
+    }
+  }, 20_000);
+
   it('stop releases every still-active native turn with its exact owner', async () => {
     const terminals: any[] = [];
     const engine = makeEngine({

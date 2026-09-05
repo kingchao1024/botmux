@@ -582,6 +582,103 @@ describe('TRAE native subagent hook worker launches', () => {
     }
   }, 25_000);
 
+  it.skipIf(!tmuxAvailable)('local close awaits managed RPC group reaping before a clean worker exit', async () => {
+    const groupChildPidFile = join(tmpdir(), 'botmux-local-close-rpc-' + process.pid + '-' + Date.now() + '.pid');
+    const harness = makeHarness({
+      cliId: 'codex',
+      backendType: 'tmux',
+      codexRpcInput: true,
+      rpcFixtureEnv: {
+        FAKE_GROUP_CHILD_PID_FILE: groupChildPidFile,
+        FAKE_LEADER_EXITS_ON_SIGTERM: '1',
+      },
+    });
+    const markerPath = join(
+      harness.root,
+      '.botmux',
+      'data',
+      'codex-rpc-app-servers',
+      harness.sessionId + '.pid',
+    );
+    let groupLeaderPid: number | undefined;
+    let groupChildPid: number | undefined;
+    try {
+      await waitFor(
+        harness,
+        () => (
+          existsSync(markerPath)
+          && existsSync(groupChildPidFile)
+          && harness.messages.some(message => message.type === 'ready')
+        ),
+        'local-close RPC marker, group child, and readiness',
+      );
+      groupLeaderPid = Number.parseInt(readFileSync(markerPath, 'utf8'), 10);
+      groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
+      harness.child.send({ type: 'close' } as DaemonToWorker);
+      await waitForChildExit(harness.child, { description: 'local close RPC worker', logs: harness.logs });
+      expect(harness.child.exitCode).toBe(0);
+      expect(processGroupAlive(groupLeaderPid)).toBe(false);
+      expect(processAlive(groupChildPid)).toBe(false);
+    } finally {
+      if (groupLeaderPid && processGroupAlive(groupLeaderPid)) {
+        try { process.kill(-groupLeaderPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      if (groupChildPid && processAlive(groupChildPid)) {
+        try { process.kill(groupChildPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      rmSync(groupChildPidFile, { force: true });
+    }
+  }, 25_000);
+
+  it.skipIf(!tmuxAvailable)('local close refuses an unverified surviving RPC group and exits nonzero', async () => {
+    const groupChildPidFile = join(tmpdir(), 'botmux-local-close-unverified-' + process.pid + '-' + Date.now() + '.pid');
+    const harness = makeHarness({
+      cliId: 'codex',
+      backendType: 'tmux',
+      codexRpcInput: true,
+      rpcFixtureEnv: {
+        FAKE_GROUP_CHILD_PID_FILE: groupChildPidFile,
+        FAKE_GROUP_CHILD_UNVERIFIED: '1',
+        FAKE_LEADER_EXITS_ON_SIGTERM: '1',
+      },
+    });
+    const markerPath = join(
+      harness.root,
+      '.botmux',
+      'data',
+      'codex-rpc-app-servers',
+      harness.sessionId + '.pid',
+    );
+    let groupLeaderPid: number | undefined;
+    let groupChildPid: number | undefined;
+    try {
+      await waitFor(
+        harness,
+        () => (
+          existsSync(markerPath)
+          && existsSync(groupChildPidFile)
+          && harness.messages.some(message => message.type === 'ready')
+        ),
+        'unverified local-close RPC marker, group child, and readiness',
+      );
+      groupLeaderPid = Number.parseInt(readFileSync(markerPath, 'utf8'), 10);
+      groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
+      harness.child.send({ type: 'close' } as DaemonToWorker);
+      await waitForChildExit(harness.child, { description: 'unverified local close worker', logs: harness.logs });
+      expect(harness.child.exitCode).toBe(1);
+      expect(processAlive(groupChildPid)).toBe(true);
+      expect(harness.logs.join('')).toContain('Local close RPC teardown failed: exact app-server identity could not be verified');
+    } finally {
+      if (groupLeaderPid && processGroupAlive(groupLeaderPid)) {
+        try { process.kill(-groupLeaderPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      if (groupChildPid && processAlive(groupChildPid)) {
+        try { process.kill(groupChildPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      rmSync(groupChildPidFile, { force: true });
+    }
+  }, 25_000);
+
   it.skipIf(!tmuxAvailable)('preserves an ordinary tmux session when SIGTERM exits a non-RPC worker', async () => {
     const harness = makeHarness({ cliId: 'codex', backendType: 'tmux' });
     const tmuxName = 'bmx-' + harness.sessionId.slice(0, 8);

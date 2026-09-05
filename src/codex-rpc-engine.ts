@@ -61,7 +61,8 @@ function isProcessGroupAlive(pid: number): boolean {
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */
 function killGroup(pid: number, signal: NodeJS.Signals): void {
-  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+  if (process.platform === 'win32') process.kill(pid, signal);
+  else process.kill(-pid, signal);
 }
 
 export interface CodexRpcEngineOpts {
@@ -111,6 +112,7 @@ export interface CodexRpcEngineDependencies {
   spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
   /** Test seam for the detached app-server process-group boundary. */
   isProcessGroupAlive?(pid: number): boolean;
+  hasExactProcessGroupIdentity?(pid: number, expectedUrl?: string): boolean;
   signalProcessGroup?(pid: number, signal: NodeJS.Signals): void;
 }
 
@@ -563,16 +565,22 @@ export class CodexRpcEngine {
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
+    let signalError: Error | undefined;
     if (pid) {
       // Bounded SIGTERM → SIGKILL: don't leave a stubborn child as an untracked
       // orphan. The marker is removed by the child 'exit' handler (confirmed
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
-      try { this.signalManagedProcessGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
-      if (options.scheduleKill !== false) {
+      try {
+        this.signalManagedProcessGroup(pid, 'SIGTERM');
+      } catch (error) {
+        signalError = error instanceof Error ? error : new Error(String(error));
+      }
+      if (!signalError && options.scheduleKill !== false) {
         const t = setTimeout(() => {
-          if (this.isManagedProcessGroupAlive(pid)) {
-            try { this.signalManagedProcessGroup(pid, 'SIGKILL'); } catch { /* already gone */ }
+          try { this.signalManagedProcessGroup(pid, 'SIGKILL'); }
+          catch (error) {
+            this.log('[codex-rpc] refusing SIGKILL for group ' + pid + ': ' + (error instanceof Error ? error.message : String(error)));
           }
         }, APP_SERVER_STOP_GRACE_MS);
         t.unref?.();
@@ -581,6 +589,7 @@ export class CodexRpcEngine {
       this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
+    if (signalError) throw signalError;
   }
 
   /**
@@ -598,7 +607,7 @@ export class CodexRpcEngine {
       this.removeMarkerIfOwned();
       return;
     }
-    try { this.signalManagedProcessGroup(pid, 'SIGKILL'); } catch { /* already gone */ }
+    this.signalManagedProcessGroup(pid, 'SIGKILL');
     if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
       this.removeMarkerIfOwned();
       return;
@@ -681,7 +690,7 @@ export class CodexRpcEngine {
       if (!this.processGroupHasOurAppServer(pid, markedUrl)) {
         throw new Error(`stale codex app-server process group ${pid} could not be identity-checked`);
       }
-      this.signalManagedProcessGroup(pid, 'SIGKILL');
+      this.signalManagedProcessGroup(pid, 'SIGKILL', markedUrl);
       if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
         rmSync(mp, { force: true });
         this.log(`[codex-rpc] reaped stale app-server group ${pid}`);
@@ -738,7 +747,20 @@ export class CodexRpcEngine {
     return this.dependencies.isProcessGroupAlive?.(pid) ?? isProcessGroupAlive(pid);
   }
 
-  private signalManagedProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  private hasExactManagedProcessGroupIdentity(pid: number, expectedUrl?: string): boolean {
+    return this.dependencies.hasExactProcessGroupIdentity?.(pid, expectedUrl)
+      ?? this.processGroupHasOurAppServer(pid, expectedUrl);
+  }
+
+  private signalManagedProcessGroup(
+    pid: number,
+    signal: NodeJS.Signals,
+    expectedUrl = this.wsUrl,
+  ): void {
+    if (!this.isManagedProcessGroupAlive(pid)) return;
+    if (!this.hasExactManagedProcessGroupIdentity(pid, expectedUrl)) {
+      throw new Error(`exact app-server identity could not be verified for process group ${pid}`);
+    }
     if (this.dependencies.signalProcessGroup) {
       this.dependencies.signalProcessGroup(pid, signal);
       return;
