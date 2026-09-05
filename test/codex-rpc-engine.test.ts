@@ -37,6 +37,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     const engine = makeEngine({
       cwd,
       env: childEnv,
+      bypassHookTrust: true,
       appServerFeatures: ['feature-a', 'feature-b'],
       appServerConfig: ['config-a', 'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[]}]'],
     }, {
@@ -51,6 +52,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
       expect(launches[0]).toEqual({
         command: FIXTURE,
         args: [
+          '--dangerously-bypass-hook-trust',
           'app-server',
           '--enable', 'feature-a',
           '--enable', 'feature-b',
@@ -65,6 +67,23 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
           detached: true,
         },
       });
+    } finally {
+      engine.stop();
+    }
+  }, 20_000);
+
+  it('keeps hook trust interactive unless the caller explicitly bypasses it', async () => {
+    const launches: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
+    const engine = makeEngine({}, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        launches.push({ command, args: [...args], options });
+        return spawn(command, args, options);
+      },
+    });
+    try {
+      await engine.start();
+      expect(launches).toHaveLength(1);
+      expect(launches[0]!.args).not.toContain('--dangerously-bypass-hook-trust');
     } finally {
       engine.stop();
     }

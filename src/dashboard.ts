@@ -955,7 +955,8 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
-   *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
+   *  Codex-family managed TUI and TraeX RPC app-server launches. Default ON
+   *  (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
   codexNotifier: {
     enabled: boolean;

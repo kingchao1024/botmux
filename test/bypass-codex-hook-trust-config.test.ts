@@ -11,9 +11,8 @@ import { config } from '../src/config.js';
  * semantics: absent ⇒ ON, and ONLY an explicit stored `false` disables it. This
  * differs from most toggles (which are default-OFF `=== true`) because a headless
  * fleet must not wedge on codex 0.14x's "Press t to trust" gate out of the box.
- * The worker ANDs this with each bot's `!disableCliBypass` before the adapter emits
- * `--dangerously-bypass-hook-trust` (that AND is covered by the adapter matrix in
- * cli-adapters.test.ts).
+ * The worker ANDs this with each bot's `!disableCliBypass` before a managed TUI
+ * or the TraeX RPC app-server emits `--dangerously-bypass-hook-trust`.
  */
 describe('config.bypassCodexHookTrust (default-ON global toggle)', () => {
   let home: string;

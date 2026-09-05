@@ -74,6 +74,11 @@ export interface CodexRpcEngineOpts {
   appServerFeatures?: string[];
   /** Generic process-scoped app-server config overrides. */
   appServerConfig?: string[];
+  /**
+   * Bypass TraeX's interactive hook-review gate for a botmux-managed app-server.
+   * Only set after the caller applies its automation and restricted-bot policy.
+   */
+  bypassHookTrust?: boolean;
   /** Bridge a native request_user_input server request to the host UI. */
   onRequestUserInput?: (params: unknown) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
@@ -282,9 +287,12 @@ export class CodexRpcEngine {
   async start(): Promise<void> {
     this.reapStaleAppServer();
     this.port = await findFreePort();
+    const globalArgs = this.opts.bypassHookTrust
+      ? ['--dangerously-bypass-hook-trust']
+      : [];
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = (this.opts.appServerConfig ?? []).flatMap(value => ['-c', value]);
-    this.child = this.dependencies.spawnProcess(this.opts.cliBin, ['app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
+    this.child = this.dependencies.spawnProcess(this.opts.cliBin, [...globalArgs, 'app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
