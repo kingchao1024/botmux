@@ -38,6 +38,7 @@ interface DaemonAuthorityInput {
 
 interface StoredAuthentication {
   authenticationId: string;
+  principal?: AuthenticatedTaskControlPrincipal;
 }
 
 function nonBlank(value: unknown): string | undefined {
@@ -85,7 +86,6 @@ function sameSignature(actual: string, expected: Buffer): boolean {
  */
 export class DaemonTaskControlAuthority implements TaskControlAuthority {
   private readonly authentications = new WeakMap<object, StoredAuthentication>();
-  private readonly usedApprovalRefs = new Set<string>();
 
   constructor(private readonly input: DaemonAuthorityInput) {}
 
@@ -100,9 +100,24 @@ export class DaemonTaskControlAuthority implements TaskControlAuthority {
     return token;
   }
 
+  /**
+   * Internal daemon bridge capability.  No user-facing IPC accepts this token
+   * or its principal fields; event adapters receive only the opaque token.
+   */
+  issueBridgePrincipal(principal: AuthenticatedTaskControlPrincipal): TaskControlAuthentication | undefined {
+    const actorId = nonBlank(principal.actorId);
+    if (!actorId || !['controller', 'worker', 'reviewer', 'collector', 'acceptor'].includes(principal.actorRole)) {
+      return undefined;
+    }
+    const token = Object.freeze({ [daemonAuthenticationBrand]: true }) as TaskControlAuthentication;
+    this.authentications.set(token, { authenticationId: `bridge:${actorId}`, principal: { actorId, actorRole: principal.actorRole } });
+    return token;
+  }
+
   authenticate(authentication: unknown): AuthenticatedTaskControlPrincipal | undefined {
     if (!authentication || typeof authentication !== 'object') return undefined;
     const stored = this.authentications.get(authentication);
+    if (stored?.principal) return { ...stored.principal };
     const principal = stored ? this.input.resolvePrincipal(stored.authenticationId) : undefined;
     return principal ? { ...principal } : undefined;
   }
@@ -141,11 +156,9 @@ export class DaemonTaskControlAuthority implements TaskControlAuthority {
       || projectId !== input.projectId
       || phaseId !== input.phaseId
       || acceptorId !== input.acceptorId
-      || JSON.stringify(taskSetSnapshot) !== JSON.stringify(canonicalTaskSet(input.taskSetSnapshot))
-      || this.usedApprovalRefs.has(approvalRef)) return undefined;
+      || JSON.stringify(taskSetSnapshot) !== JSON.stringify(canonicalTaskSet(input.taskSetSnapshot))) return undefined;
     const unsigned = { keyId, approvalRef, projectId, phaseId, taskSetSnapshot, acceptorId, approvedAt, expiresAt };
     if (!sameSignature(raw.signature, signatureFor(key, unsigned))) return undefined;
-    this.usedApprovalRefs.add(approvalRef);
     return { ...unsigned };
   }
 }

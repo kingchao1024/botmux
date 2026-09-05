@@ -5,7 +5,13 @@ import type { TaskControlPlaneLifecycle } from '../src/services/task-control-pla
 describe('TaskControlEventAdapters', () => {
   it('forwards only supplied stable references and never derives state from body or exit status', () => {
     const appended: any[] = [];
-    const lifecycle: TaskControlPlaneLifecycle = { enabled: true, append: event => appended.push(event), close: async () => {} };
+    const lifecycle: TaskControlPlaneLifecycle = {
+      enabled: true,
+      append: event => appended.push(event),
+      appendUnknownObservation: () => {},
+      enqueueUnknownObservation: () => {},
+      close: async () => {},
+    };
     const adapters = new TaskControlEventAdapters(lifecycle);
     const authentication = {} as any;
     adapters.dispatchRequested({

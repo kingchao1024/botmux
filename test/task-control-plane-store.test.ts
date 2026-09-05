@@ -432,6 +432,129 @@ describe('TaskControlPlaneStore durable delivery', () => {
 });
 
 describe('TaskControlPlaneStore freeze validator', () => {
+  it('does not consume approval until every freeze gate passes', async () => {
+    const { store } = await fixture();
+    seedFreezableTask(store);
+    const proof = approval('approval:rejected-first');
+    store.appendEvent(taskEvent('13', 'unknown.required', { payload: { unknownKey: 'still-open' } }));
+    expect(store.freezePhase({
+      eventId: 'evt_freeze_rejected', projectId: 'project-1', phaseId: 'phase-1',
+      authentication: auth('acceptor-1', 'acceptor'), approval: proof, idempotencyKey: 'freeze-rejected-first',
+    })).toMatchObject({ kind: 'rejected' });
+    expect(store.getApprovalConsumption('approval:rejected-first')).toBeUndefined();
+    store.appendEvent(taskEvent('14', 'unknown.declared', { payload: { unknownKey: 'still-open' } }));
+    store.appendEvent(event('15', 'phase.freeze_requested', {
+      sourceRef: 'task-comment:15',
+      payload: { taskGuids: ['task-1'], openIssueCodes: [], requestRef: 'task-comment:15' },
+    }));
+    const frozen = store.freezePhase({
+      eventId: 'evt_freeze_after_reject', projectId: 'project-1', phaseId: 'phase-1',
+      authentication: auth('acceptor-1', 'acceptor'), approval: proof, idempotencyKey: 'freeze-rejected-first',
+    });
+    expect(frozen).toMatchObject({ kind: 'frozen', event: { eventId: 'evt_freeze_after_reject' } });
+    expect(store.getApprovalConsumption('approval:rejected-first')).toMatchObject({
+      frozenEventId: 'evt_freeze_after_reject', freezeIdempotencyKey: 'freeze-rejected-first',
+    });
+    store.close();
+  });
+
+  it('does not consume approval when the frozen event write rolls back', async () => {
+    const { store } = await fixture();
+    seedFreezableTask(store);
+    const db = new DatabaseSync(store.path);
+    try {
+      db.prepare('INSERT INTO control_approval_consumptions(approval_ref,project_id,phase_id,task_set_hash,acceptor_id,freeze_idempotency_key,frozen_event_id,approved_at,consumed_at) VALUES(?,?,?,?,?,?,?,?,?)').run(
+        'approval:other', 'project-1', 'phase-1', 'sha256:other', 'acceptor-1', 'freeze-write-collision',
+        'evt_09', '2026-09-04T00:00:12.000Z', '2026-09-04T00:00:12.000Z',
+      );
+    } finally { db.close(); }
+    expect(() => store.freezePhase({
+      eventId: 'evt_freeze_write_collision', projectId: 'project-1', phaseId: 'phase-1',
+      authentication: auth('acceptor-1', 'acceptor'), approval: approval('approval:rollback-proof'),
+      idempotencyKey: 'freeze-write-collision',
+    })).toThrow();
+    expect(store.getApprovalConsumption('approval:rollback-proof')).toBeUndefined();
+    expect(store.listEvents().some(event => event.eventId === 'evt_freeze_write_collision')).toBe(false);
+    store.close();
+  });
+
+  it('rejects durable approval replay after reopening with a fresh authority', async () => {
+    const { dir, store } = await fixture();
+    seedFreezableTask(store);
+    expect(store.freezePhase({
+      eventId: 'evt_freeze_durable', projectId: 'project-1', phaseId: 'phase-1',
+      authentication: auth('acceptor-1', 'acceptor'), approval: approval('approval:durable-replay'),
+      idempotencyKey: 'freeze-durable',
+    })).toMatchObject({ kind: 'frozen' });
+    store.close();
+    const replayAuthority: TaskControlAuthority = {
+      authenticate(value) { return value === 'acceptor' ? { actorId: 'acceptor-1', actorRole: 'acceptor' } : undefined; },
+      verifyApproval() {
+        return {
+          approvalRef: 'approval:durable-replay', projectId: 'project-1', phaseId: 'phase-1',
+          taskSetSnapshot: ['task-1'], acceptorId: 'acceptor-1',
+          approvedAt: '2026-09-04T00:00:12.500Z', expiresAt: '2099-09-04T01:00:00.000Z',
+        };
+      },
+    };
+    const reopened = await TaskControlPlaneStore.open(dir, replayAuthority);
+    expect(() => reopened.freezePhase({
+      eventId: 'evt_freeze_replay', projectId: 'project-1', phaseId: 'phase-1',
+      authentication: 'acceptor', approval: 'proof', idempotencyKey: 'freeze-durable-replay',
+    })).toThrow('task_control_freeze_approval_already_consumed:approval:durable-replay');
+    reopened.close();
+  });
+
+  it('returns the prior frozen event for client retry with the same idempotency key', async () => {
+    const { store } = await fixture();
+    seedFreezableTask(store);
+    const first = store.freezePhase({
+      eventId: 'evt_freeze_retryable', projectId: 'project-1', phaseId: 'phase-1',
+      authentication: auth('acceptor-1', 'acceptor'), approval: approval('approval:client-retry'),
+      idempotencyKey: 'freeze-client-retry',
+    });
+    expect(first).toMatchObject({ kind: 'frozen', event: { eventId: 'evt_freeze_retryable' } });
+    const retry = store.freezePhase({
+      eventId: 'evt_freeze_lost_response', projectId: 'project-1', phaseId: 'phase-1',
+      authentication: auth('acceptor-1', 'acceptor'), approval: { forged: true },
+      idempotencyKey: 'freeze-client-retry',
+    });
+    expect(retry).toMatchObject({ kind: 'frozen', event: { eventId: 'evt_freeze_retryable' } });
+    expect(store.listEvents().filter(event => event.eventType === 'phase.frozen')).toHaveLength(1);
+    store.close();
+  });
+
+  it('allows exactly one concurrent durable approval consumer', async () => {
+    const { dir, store } = await fixture();
+    seedFreezableTask(store);
+    store.close();
+    const source = `
+      import { TaskControlPlaneStore } from ${JSON.stringify(storeModuleUrl)};
+      const authority = {
+        authenticate(value) { return value === 'acceptor' ? { actorId: 'acceptor-1', actorRole: 'acceptor' } : undefined; },
+        verifyApproval() { return { approvalRef: 'approval:concurrent', projectId: 'project-1', phaseId: 'phase-1', taskSetSnapshot: ['task-1'], acceptorId: 'acceptor-1', approvedAt: '2026-09-04T00:00:12.500Z', expiresAt: '2099-09-04T01:00:00.000Z' }; },
+      };
+      const store = await TaskControlPlaneStore.open(process.env.CONTROL_DIR, authority);
+      try {
+        const result = store.freezePhase({ eventId: 'evt_freeze_' + process.env.WORKER_ID, projectId: 'project-1', phaseId: 'phase-1', authentication: 'acceptor', approval: 'proof', idempotencyKey: 'freeze-' + process.env.WORKER_ID });
+        process.stdout.write(result.kind);
+      } catch (error) {
+        process.stdout.write(String(error.message));
+      } finally { store.close(); }
+    `;
+    const children = ['a', 'b'].map(workerId => spawnTsEvalWithRepoImports(source, {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      env: { ...process.env, CONTROL_DIR: dir, WORKER_ID: workerId },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+    const results = await Promise.all(children.map(collectChild));
+    expect(results.map(result => result.code)).toEqual([0, 0]);
+    expect(results.map(result => result.stdout).sort()).toEqual([
+      'frozen',
+      'task_control_freeze_approval_already_consumed:approval:concurrent',
+    ]);
+  });
+
   it('requires a complete immutable freeze-request snapshot', async () => {
     const { store } = await fixture();
     openPhase(store);
