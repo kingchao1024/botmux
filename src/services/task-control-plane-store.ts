@@ -15,12 +15,13 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const DATABASE_NAME = 'botmux-task-control-plane.sqlite';
 
 export type TaskControlEventType =
   | 'phase.opened'
   | 'mapping.registered'
+  | 'task.dispatch_requested'
   | 'task.acceptance_requested'
   | 'task.accepted'
   | 'task.not_accepted'
@@ -80,8 +81,12 @@ export interface VerifiedTaskControlApproval {
   approvalRef: string;
   projectId: string;
   phaseId: string;
+  /** Exact sorted task-set snapshot the approval was issued for. */
+  taskSetSnapshot: readonly string[];
   acceptorId: string;
   approvedAt: string;
+  /** Approval proofs are short lived and must not be used after this instant. */
+  expiresAt: string;
 }
 
 export interface TaskControlAuthority {
@@ -92,7 +97,9 @@ export interface TaskControlAuthority {
     approval: unknown;
     projectId: string;
     phaseId: string;
+    taskSetSnapshot: readonly string[];
     acceptorId: string;
+    now: string;
   }): VerifiedTaskControlApproval | undefined;
 }
 
@@ -151,6 +158,28 @@ export interface TaskControlEvent {
   payload: Record<string, unknown>;
 }
 
+/** Non-state observation retained when a real daemon signal has no verified task mapping. */
+export interface TaskControlObservation {
+  seq: number;
+  eventId: string;
+  attemptedEventType: TaskControlEventType;
+  sourceRef: string;
+  idempotencyKey: string;
+  occurredAt: string;
+  outcome: 'unknown' | 'conflict';
+  payloadHash: string;
+  payload: Record<string, unknown>;
+}
+
+export interface AppendTaskControlObservationInput {
+  eventId: string;
+  attemptedEventType: TaskControlEventType;
+  sourceRef: string;
+  idempotencyKey: string;
+  occurredAt?: string;
+  payload?: Record<string, unknown>;
+}
+
 export interface TaskIdentityMapping {
   projectId: string;
   phaseId: string;
@@ -185,6 +214,8 @@ export interface ReviewProjection {
   reviewerId: string;
   independent: boolean;
   verdict: ReviewVerdict;
+  conditionIds: string[];
+  resolvedConditionEvidence: Record<string, string>;
   docToken?: string;
   docRevision?: number;
 }
@@ -198,6 +229,7 @@ export interface TaskProjection {
   acceptedActorId?: string;
   terminalBody?: TerminalBodyProjection;
   independentReview?: ReviewProjection;
+  unresolvedReviewConditionIds: string[];
   doneEvent?: { eventId: string; seq: number };
   unknowns: UnknownProjection[];
   unresolvedConflictEventIds: string[];
@@ -220,6 +252,11 @@ export type AppendTaskControlEventResult =
   | { kind: 'appended'; event: TaskControlEvent }
   | { kind: 'duplicate'; event: TaskControlEvent }
   | { kind: 'conflict'; existingEvent: TaskControlEvent; conflictEvent: TaskControlEvent };
+
+export type AppendTaskControlObservationResult =
+  | { kind: 'appended'; observation: TaskControlObservation }
+  | { kind: 'duplicate'; observation: TaskControlObservation }
+  | { kind: 'conflict'; existingObservation: TaskControlObservation; conflictObservation: TaskControlObservation };
 
 export type DeliveryOutboxStatus = 'pending' | 'inflight' | 'delivered' | 'degraded';
 export type DeliveryReceiptState = 'retry_scheduled' | 'claim_recovered' | 'delivered' | 'degraded' | 'fallback_verified';
@@ -276,6 +313,7 @@ export type FreezeIssueCode =
   | 'terminal_body_missing'
   | 'independent_review_missing'
   | 'reviewer_not_independent'
+  | 'review_conditions_unresolved'
   | 'review_terminal_mismatch'
   | 'task_done_missing'
   | 'task_done_precedes_terminal_body'
@@ -467,6 +505,23 @@ const SCHEMA = `
   CREATE UNIQUE INDEX IF NOT EXISTS control_mapping_task_unique
     ON control_events(task_guid) WHERE event_type='mapping.registered';
 
+  CREATE TABLE IF NOT EXISTS control_observations(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    attempted_event_type TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    occurred_at TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('unknown','conflict')),
+    payload_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS control_observations_source_seq ON control_observations(source_ref,seq);
+  CREATE TRIGGER IF NOT EXISTS control_observations_no_update BEFORE UPDATE ON control_observations
+  BEGIN SELECT RAISE(ABORT,'control_observation_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_observations_no_delete BEFORE DELETE ON control_observations
+  BEGIN SELECT RAISE(ABORT,'control_observation_immutable'); END;
+
   CREATE TABLE IF NOT EXISTS control_outbox(
     outbox_id TEXT PRIMARY KEY,
     event_id TEXT NOT NULL REFERENCES control_events(event_id),
@@ -543,6 +598,10 @@ function stableId(prefix: string, ...parts: string[]): string {
   return `${prefix}_${createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32)}`;
 }
 
+function payloadHash(value: unknown): string {
+  return sha256(JSON.stringify(canonicalize(value)));
+}
+
 function eventPayloadHash(input: AuthenticatedAppendTaskControlEventInput): string {
   const semantic = {
     eventType: input.eventType,
@@ -564,7 +623,7 @@ function eventPayloadHash(input: AuthenticatedAppendTaskControlEventInput): stri
     payload: input.payload ?? {},
     deliverTo: [...new Set(input.deliverTo ?? [])].sort(),
   };
-  return sha256(JSON.stringify(canonicalize(semantic)));
+  return payloadHash(semantic);
 }
 
 function isBusy(error: unknown): boolean {
@@ -583,6 +642,30 @@ function sleepShort(attempt: number): void {
 function parseReviewVerdict(value: unknown): ReviewVerdict {
   if (value === 'pass' || value === 'conditional' || value === 'fail' || value === 'unknown') return value;
   throw new Error('task_control_invalid:payload.verdict');
+}
+
+function conditionEvidenceRefs(value: unknown): Record<string, string> {
+  if (value === undefined) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('task_control_invalid:payload.resolvedConditionEvidence');
+  }
+  const result: Record<string, string> = {};
+  for (const [conditionId, evidenceRef] of Object.entries(value as Record<string, unknown>)) {
+    nonEmpty(conditionId, 'payload.resolvedConditionEvidence.conditionId');
+    result[conditionId] = controlledEvidenceRef(evidenceRef, `payload.resolvedConditionEvidence.${conditionId}`);
+  }
+  return result;
+}
+
+function exactTaskSetSnapshot(value: unknown, field: string): string[] {
+  return uniqueStrings(value, field).sort();
+}
+
+function timestampMs(value: unknown, field: string): number {
+  const normalized = nonEmpty(value, field);
+  const parsed = Date.parse(normalized);
+  if (!Number.isFinite(parsed)) throw new Error(`task_control_invalid:${field}`);
+  return parsed;
 }
 
 function parseDeliveryFallback(payload: Record<string, unknown>): DeliveryFallbackEvidence {
@@ -659,10 +742,25 @@ function validateInput(input: AuthenticatedAppendTaskControlEventInput, allowFro
     positiveInteger(payload.docRevision, 'payload.docRevision');
   }
   if (input.eventType === 'task.reviewed') {
+    if (input.actorRole !== 'reviewer') throw new Error('task_control_invalid:reviewer_role');
     positiveInteger(payload.reviewRound, 'payload.reviewRound');
     nonEmpty(payload.reviewCommentId, 'payload.reviewCommentId');
     if (typeof payload.independent !== 'boolean') throw new Error('task_control_invalid:payload.independent');
-    parseReviewVerdict(payload.verdict);
+    const verdict = parseReviewVerdict(payload.verdict);
+    const conditionIds = payload.conditionIds === undefined
+      ? []
+      : exactTaskSetSnapshot(payload.conditionIds, 'payload.conditionIds');
+    if (verdict === 'conditional' && conditionIds.length === 0) {
+      throw new Error('task_control_invalid:payload.conditionIds_required');
+    }
+    if (verdict !== 'conditional' && conditionIds.length > 0) {
+      throw new Error('task_control_invalid:payload.conditionIds_unexpected');
+    }
+    const resolvedConditionEvidence = conditionEvidenceRefs(payload.resolvedConditionEvidence);
+    if (verdict === 'conditional'
+      && Object.keys(resolvedConditionEvidence).some(conditionId => !conditionIds.includes(conditionId))) {
+      throw new Error('task_control_invalid:payload.resolvedConditionEvidence_unknown_condition');
+    }
   }
   if (input.eventType === 'task.delivery_fallback_verified') {
     const fallback = parseDeliveryFallback(payload);
@@ -703,6 +801,20 @@ function rowToEvent(row: EventRow): TaskControlEvent {
     terminal: Number(row.terminal) === 1,
     payloadHash: row.payload_hash,
     payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+  };
+}
+
+function rowToObservation(row: Record<string, unknown>): TaskControlObservation {
+  return {
+    seq: Number(row.seq),
+    eventId: String(row.event_id),
+    attemptedEventType: String(row.attempted_event_type) as TaskControlEventType,
+    sourceRef: String(row.source_ref),
+    idempotencyKey: String(row.idempotency_key),
+    occurredAt: String(row.occurred_at),
+    outcome: String(row.outcome) as TaskControlObservation['outcome'],
+    payloadHash: String(row.payload_hash),
+    payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>,
   };
 }
 
@@ -781,6 +893,7 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
   let terminalBody: TerminalBodyProjection | undefined;
   let independentReview: ReviewProjection | undefined;
   let doneEvent: { eventId: string; seq: number } | undefined;
+  const unresolvedReviewConditions = new Set<string>();
   const transitionViolations: TaskProjection['transitionViolations'] = [];
 
   for (const event of events) {
@@ -800,14 +913,25 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
       case 'task.reviewed': {
         const verdict = parseReviewVerdict(event.payload.verdict);
         if (event.payload.independent === true) {
+          const conditionIds = event.payload.conditionIds === undefined
+            ? []
+            : exactTaskSetSnapshot(event.payload.conditionIds, 'payload.conditionIds');
           independentReview = {
             eventId: event.eventId, seq: event.seq,
             reviewRound: positiveInteger(event.payload.reviewRound, 'payload.reviewRound'),
             reviewCommentId: nonEmpty(event.payload.reviewCommentId, 'payload.reviewCommentId'),
             reviewerId: event.actorId, independent: true, verdict,
+            conditionIds,
+            resolvedConditionEvidence: conditionEvidenceRefs(event.payload.resolvedConditionEvidence),
             ...(optionalString(event.payload.docToken) ? { docToken: optionalString(event.payload.docToken)! } : {}),
             ...(typeof event.payload.docRevision === 'number' ? { docRevision: event.payload.docRevision } : {}),
           };
+          if (verdict === 'conditional') {
+            for (const conditionId of conditionIds) unresolvedReviewConditions.add(conditionId);
+          }
+          for (const conditionId of Object.keys(independentReview.resolvedConditionEvidence)) {
+            unresolvedReviewConditions.delete(conditionId);
+          }
         }
         break;
       }
@@ -839,6 +963,7 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
       ...(acceptedActorId ? { acceptedActorId } : {}),
       ...(terminalBody ? { terminalBody } : {}),
       ...(independentReview ? { independentReview } : {}),
+      unresolvedReviewConditionIds: [...unresolvedReviewConditions].sort(),
       ...(doneEvent ? { doneEvent } : {}),
       unknowns: reduceUnknowns(events),
       unresolvedConflictEventIds: conflicts,
@@ -944,12 +1069,12 @@ export class TaskControlPlaneStore {
       db.exec('PRAGMA synchronous=FULL;');
       const version = Number((db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined)?.user_version ?? 0);
       if (version > SCHEMA_VERSION) throw new Error(`task_control_schema_newer:${version}`);
-      if (version === 0) {
+      if (version < SCHEMA_VERSION) {
         for (let attempt = 1; attempt <= 10; attempt++) {
           try {
             db.exec('BEGIN IMMEDIATE;');
             const lockedVersion = Number((db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined)?.user_version ?? 0);
-            if (lockedVersion === 0) {
+            if (lockedVersion < SCHEMA_VERSION) {
               db.exec(SCHEMA);
               db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
             } else if (lockedVersion > SCHEMA_VERSION) {
@@ -1020,6 +1145,58 @@ export class TaskControlPlaneStore {
       .filter(event => (!filter.projectId || event.projectId === filter.projectId)
         && (!filter.phaseId || event.phaseId === filter.phaseId)
         && (!filter.taskGuid || event.taskGuid === filter.taskGuid));
+  }
+
+  listObservations(): TaskControlObservation[] {
+    return (this.db.prepare('SELECT * FROM control_observations ORDER BY seq').all() as Record<string, unknown>[])
+      .map(rowToObservation);
+  }
+
+  appendUnknownObservation(input: AppendTaskControlObservationInput): AppendTaskControlObservationResult {
+    this.assertWritable();
+    const eventId = nonEmpty(input.eventId, 'observation.eventId');
+    const sourceRef = nonEmpty(input.sourceRef, 'observation.sourceRef');
+    const idempotencyKey = nonEmpty(input.idempotencyKey, 'observation.idempotencyKey');
+    const payload = input.payload ?? {};
+    const semanticHash = payloadHash({
+      attemptedEventType: input.attemptedEventType, sourceRef, payload,
+    });
+    return this.withImmediateWrite(() => {
+      const existingRaw = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=?')
+        .get(idempotencyKey) as Record<string, unknown> | undefined;
+      if (existingRaw) {
+        const existing = rowToObservation(existingRaw);
+        if (existing.payloadHash === semanticHash) return { kind: 'duplicate', observation: existing };
+        const conflictIdempotencyKey = `observation-conflict:${sha256(idempotencyKey).slice(7)}:${semanticHash.slice(7)}`;
+        const priorConflict = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=?')
+          .get(conflictIdempotencyKey) as Record<string, unknown> | undefined;
+        if (priorConflict) return {
+          kind: 'conflict', existingObservation: existing, conflictObservation: rowToObservation(priorConflict),
+        };
+        const conflictEventId = stableId('obs_conflict', idempotencyKey, semanticHash);
+        const occurredAt = input.occurredAt ?? new Date().toISOString();
+        this.db.prepare(`INSERT INTO control_observations(
+          event_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+        ) VALUES(?,?,?,?,?,'conflict',?,?)`).run(
+          conflictEventId, input.attemptedEventType, sourceRef, conflictIdempotencyKey, occurredAt, semanticHash,
+          JSON.stringify({ existingEventId: existing.eventId, incomingEventId: eventId, sourceRef, payload }),
+        );
+        const conflict = this.db.prepare('SELECT * FROM control_observations WHERE event_id=?')
+          .get(conflictEventId) as Record<string, unknown> | undefined;
+        if (!conflict) throw new Error('task_control_observation_insert_failed');
+        return { kind: 'conflict', existingObservation: existing, conflictObservation: rowToObservation(conflict) };
+      }
+      const occurredAt = input.occurredAt ?? new Date().toISOString();
+      this.db.prepare(`INSERT INTO control_observations(
+        event_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+      ) VALUES(?,?,?,?,?,'unknown',?,?)`).run(
+        eventId, input.attemptedEventType, sourceRef, idempotencyKey, occurredAt, semanticHash, JSON.stringify(payload),
+      );
+      const row = this.db.prepare('SELECT * FROM control_observations WHERE event_id=?')
+        .get(eventId) as Record<string, unknown> | undefined;
+      if (!row) throw new Error('task_control_observation_insert_failed');
+      return { kind: 'appended', observation: rowToObservation(row) };
+    });
   }
 
   private eventByIdempotencyKey(key: string): TaskControlEvent | undefined {
@@ -1359,6 +1536,13 @@ export class TaskControlPlaneStore {
       if (!review || (review.verdict !== 'pass' && review.verdict !== 'conditional')) {
         issues.push({ code: 'independent_review_missing', message: 'independent accepting review is missing', taskGuid });
       }
+      if (task.unresolvedReviewConditionIds.length > 0) {
+        issues.push({
+          code: 'review_conditions_unresolved',
+          message: `conditional review has unresolved conditions: ${task.unresolvedReviewConditionIds.join(',')}`,
+          taskGuid, eventId: review?.eventId,
+        });
+      }
       if (task.mapping && review?.independent && review.reviewerId === task.mapping.ownerId) {
         issues.push({ code: 'reviewer_not_independent', message: 'reviewer is the mapped task owner', taskGuid, eventId: review.eventId });
       }
@@ -1474,11 +1658,16 @@ export class TaskControlPlaneStore {
         throw new Error(`task_control_freeze_unauthorized_acceptor:${principal.actorId}`);
       }
       if (principal.actorRole !== 'acceptor') throw new Error(`task_control_freeze_unauthorized_role:${principal.actorRole}`);
+      const taskSetSnapshot = [...phase.expectedTaskGuids].sort();
       const approval = this.authority?.verifyApproval({
-        approval: input.approval, projectId: input.projectId, phaseId: input.phaseId, acceptorId: principal.actorId,
+        approval: input.approval, projectId: input.projectId, phaseId: input.phaseId,
+        taskSetSnapshot, acceptorId: principal.actorId, now: checkedAt,
       });
       if (!approval || approval.projectId !== input.projectId || approval.phaseId !== input.phaseId
-        || approval.acceptorId !== principal.actorId) {
+        || approval.acceptorId !== principal.actorId
+        || JSON.stringify(exactTaskSetSnapshot(approval.taskSetSnapshot, 'verifiedApproval.taskSetSnapshot'))
+          !== JSON.stringify(taskSetSnapshot)
+        || timestampMs(approval.expiresAt, 'verifiedApproval.expiresAt') <= timestampMs(checkedAt, 'checkedAt')) {
         throw new Error('task_control_freeze_approval_unverified');
       }
       const approvalRef = controlledEvidenceRef(approval.approvalRef, 'verifiedApproval.approvalRef');

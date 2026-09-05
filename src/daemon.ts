@@ -87,6 +87,8 @@ import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
+import { DaemonTaskControlAuthority } from './services/task-control-plane-authority.js';
+import { startTaskControlPlaneRuntime, taskControlPlaneFlags, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -490,6 +492,7 @@ let selfV3BootInstanceId: string | undefined;
 /** Generic daemon identity used by internal receiver endpoints. Unlike the
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
+let taskControlPlane: TaskControlPlaneLifecycle | undefined;
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -6172,6 +6175,23 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+  // The dispatch root is a real daemon event, but this route has no verified
+  // project/phase/task mapping. Preserve only a stable UNKNOWN observation;
+  // never promote title, seed text, report body, exit status, or task done into
+  // a lifecycle state. A later trusted mapping bridge may correlate sourceRef.
+  taskControlPlane?.appendUnknownObservation({
+    eventId: `dispatch-observation:${dispatchRoot}`,
+    attemptedEventType: 'task.dispatch_requested',
+    sourceRef: `dispatch:${dispatchRoot}`,
+    idempotencyKey: `dispatch:${dispatchRoot}`,
+    occurredAt: issuedAt,
+    payload: {
+      dispatchRoot,
+      sourceSessionId: ds.session.sessionId,
+      targetChatId,
+      acceptanceRequested,
+    },
+  });
   return jsonRes(res, 201, { ok: true, dispatchRoot });
 });
 
@@ -22077,6 +22097,39 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // validate their 0700 root before any restored worker can receive a sandbox
   // policy; a symlink/corrupt root aborts startup instead of exposing scripts.
   ensureSchedulePreconditionRoot(config.session.dataDir);
+  // P2-6 stays opt-in: default false means this isolated ledger has no effect on
+  // legacy dispatch/report/session paths.  Its authentication adapter is owned
+  // here (not exposed to callers), and bootstrap failure returns a no-op handle.
+  const taskControlFlags = taskControlPlaneFlags();
+  if (!taskControlFlags.ledgerEnabled) {
+    // Do not create keys, databases, timers or files while the feature is off.
+    // A deliberately empty verifier keeps the disabled lifecycle inert.
+    taskControlPlane = await startTaskControlPlaneRuntime({
+      dataDir: config.session.dataDir, flags: taskControlFlags, logger,
+      authority: new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined, approvalKeys: new Map() }),
+    });
+  } else {
+    try {
+      const taskControlAuthority = new DaemonTaskControlAuthority({
+        // Real P2 phase/mapping authorities are not configured in this release.
+        // Refuse every event until a daemon-owned mapping bridge is explicitly
+        // wired; enabling the flag cannot make caller payload authoritative.
+        resolvePrincipal: () => undefined,
+        // Reuse the existing host-only daemon IPC trust material.  P2-6 does not
+        // create a second sidecar secret or any data file beyond its SQLite ledger.
+        approvalKeys: new Map([['daemon-ipc-hmac-v1', loadDaemonIpcSecret()]]),
+      });
+      taskControlPlane = await startTaskControlPlaneRuntime({
+        dataDir: config.session.dataDir, flags: taskControlFlags, authority: taskControlAuthority, logger,
+      });
+    } catch (error) {
+      logger.warn(`[task-control] trust bootstrap failed; continuing with ledger disabled: ${String(error)}`);
+      taskControlPlane = await startTaskControlPlaneRuntime({
+        dataDir: config.session.dataDir, flags: { ...taskControlFlags, ledgerEnabled: false }, logger,
+        authority: new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined, approvalKeys: new Map() }),
+      });
+    }
+  }
   // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
   // disabled still opens the shared feedback DB here for turn-completion
   // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
@@ -24067,6 +24120,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
+    // The task-control ledger is an optional sidecar.  It drains/owns only its
+    // own outbox; failure is contained so existing daemon shutdown semantics do
+    // not depend on this default-off feature.
+    try { await taskControlPlane?.close(remainingBudget()); }
+    catch (error) { logger.warn(`[task-control] shutdown close failed: ${String(error)}`); }
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on

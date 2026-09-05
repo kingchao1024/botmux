@@ -40,7 +40,10 @@ function approval(
   const token = Object.freeze({});
   approvals.set(token, {
     approvalRef, projectId: 'project-1', phaseId: 'phase-1', acceptorId: 'acceptor-1',
-    approvedAt: '2026-09-04T00:00:12.500Z', ...overrides,
+    taskSetSnapshot: ['task-1'],
+    approvedAt: '2026-09-04T00:00:12.500Z',
+    expiresAt: '2099-09-04T01:00:00.000Z',
+    ...overrides,
   });
   return token;
 }
@@ -157,6 +160,27 @@ describe('TaskControlPlaneStore event ledger', () => {
       payload: { taskGuids: ['task-1'], designatedAcceptorId: 'forged' },
     })).toThrow('task_control_authentication_failed');
     expect(store.listEvents()).toEqual([]);
+    store.close();
+  });
+
+  it('persists unmapped daemon signals as immutable UNKNOWN observations without task state', async () => {
+    const { store } = await fixture();
+    const input = {
+      eventId: 'obs-dispatch-1', attemptedEventType: 'task.dispatch_requested' as const,
+      sourceRef: 'dispatch:om_seed', idempotencyKey: 'dispatch:om_seed',
+      payload: { dispatchRoot: 'om_seed', sourceSessionId: 'session-1' },
+    };
+    expect(store.appendUnknownObservation(input)).toMatchObject({ kind: 'appended' });
+    expect(store.appendUnknownObservation(input)).toMatchObject({ kind: 'duplicate' });
+    expect(store.getTaskProjection('task-not-mapped').state).toBe('planned');
+    expect(store.listObservations()).toEqual([expect.objectContaining({
+      eventId: 'obs-dispatch-1', outcome: 'unknown', sourceRef: 'dispatch:om_seed',
+    })]);
+    const conflict = store.appendUnknownObservation({
+      ...input, eventId: 'obs-dispatch-2', payload: { dispatchRoot: 'om_seed', sourceSessionId: 'different-session' },
+    });
+    expect(conflict).toMatchObject({ kind: 'conflict', conflictObservation: { outcome: 'conflict' } });
+    expect(store.listObservations()).toHaveLength(2);
     store.close();
   });
 
@@ -471,6 +495,71 @@ describe('TaskControlPlaneStore freeze validator', () => {
     store.close();
   });
 
+  it('requires a trusted reviewer role and condition evidence before conditional review can freeze', async () => {
+    const { store } = await fixture();
+    seedFreezableTask(store);
+    expect(() => store.appendEvent(taskEvent('conditional-role', 'task.reviewed', {
+      actorId: 'worker-1', actorRole: 'worker',
+      payload: { reviewRound: 2, reviewCommentId: 'review-role', independent: true, verdict: 'conditional', conditionIds: ['condition-1'] },
+    }))).toThrow('task_control_invalid:reviewer_role');
+    store.appendEvent(taskEvent('conditional-review', 'task.reviewed', {
+      actorId: 'reviewer-2', actorRole: 'reviewer',
+      payload: {
+        reviewRound: 2, reviewCommentId: 'review-condition', independent: true, verdict: 'conditional',
+        conditionIds: ['condition-1'], docToken: 'doc-final', docRevision: 7,
+      },
+    }));
+    const validation = store.validatePhaseFreeze('project-1', 'phase-1');
+    expect(validation.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'review_conditions_unresolved', eventId: 'evt_conditional-review' }),
+    ]));
+    store.appendEvent(taskEvent('conditional-resolved', 'task.reviewed', {
+      actorId: 'reviewer-2', actorRole: 'reviewer',
+      payload: {
+        reviewRound: 3, reviewCommentId: 'review-condition-resolved', independent: true, verdict: 'conditional',
+        conditionIds: ['condition-1'],
+        resolvedConditionEvidence: { 'condition-1': 'task-comment:99' },
+        docToken: 'doc-final', docRevision: 7,
+      },
+    }));
+    expect(store.validatePhaseFreeze('project-1', 'phase-1').issues.map(issue => issue.code))
+      .not.toContain('review_conditions_unresolved');
+    store.close();
+  });
+
+  it('keeps a prior conditional review condition open until later reviewer evidence resolves it', async () => {
+    const { store } = await fixture();
+    seedFreezableTask(store);
+    store.appendEvent(taskEvent('condition-open', 'task.reviewed', {
+      actorId: 'reviewer-2', actorRole: 'reviewer',
+      payload: {
+        reviewRound: 2, reviewCommentId: 'condition-open', independent: true, verdict: 'conditional',
+        conditionIds: ['condition-1'], docToken: 'doc-final', docRevision: 7,
+      },
+    }));
+    store.appendEvent(taskEvent('later-pass', 'task.reviewed', {
+      actorId: 'reviewer-2', actorRole: 'reviewer',
+      payload: {
+        reviewRound: 3, reviewCommentId: 'later-pass', independent: true, verdict: 'pass',
+        docToken: 'doc-final', docRevision: 7,
+      },
+    }));
+    expect(store.validatePhaseFreeze('project-1', 'phase-1').issues)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: 'review_conditions_unresolved' })]));
+    store.appendEvent(taskEvent('condition-resolved', 'task.reviewed', {
+      actorId: 'reviewer-2', actorRole: 'reviewer',
+      payload: {
+        reviewRound: 4, reviewCommentId: 'condition-resolved', independent: true, verdict: 'pass',
+        resolvedConditionEvidence: { 'condition-1': 'task-comment:100' },
+        docToken: 'doc-final', docRevision: 7,
+      },
+    }));
+    expect(store.getTaskProjection('task-1').unresolvedReviewConditionIds).toEqual([]);
+    expect(store.validatePhaseFreeze('project-1', 'phase-1').issues.map(issue => issue.code))
+      .not.toContain('review_conditions_unresolved');
+    store.close();
+  });
+
   it('rejects a degraded delivery until a typed fallback event is linked', async () => {
     const { store } = await fixture();
     seedFreezableTask(store, { degradedFallback: 'unverified' });
@@ -507,7 +596,7 @@ describe('TaskControlPlaneStore freeze validator', () => {
     openPhase(store);
     store.appendEvent(taskEvent('03', 'task.accepted', { actorId: 'controller', actorRole: 'controller' }));
     store.appendEvent(taskEvent('04', 'task.reviewed', {
-      actorId: 'worker-1', actorRole: 'worker',
+      actorId: 'worker-1', actorRole: 'reviewer',
       payload: { reviewRound: 1, reviewCommentId: 'self-review', independent: true, verdict: 'pass', docToken: 'doc-final', docRevision: 7 },
     }));
     store.appendEvent(taskEvent('05', 'task.delivered', {
