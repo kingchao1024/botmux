@@ -8,6 +8,29 @@ import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const isProcessGroupAlive = (pid: number) => {
+  try { process.kill(-pid, 0); return true; } catch { return false; }
+};
+
+function waitForWorkerExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolvePromise, rejectPromise) => {
+    const onExit = (): void => finish();
+    const onError = (error: Error): void => finish(error);
+    const timer = setTimeout(() => {
+      finish(new Error('worker pid ' + (child.pid ?? 'unknown') + ' did not exit within ' + timeoutMs + 'ms'));
+    }, timeoutMs);
+    const finish = (error?: Error): void => {
+      clearTimeout(timer);
+      child.removeListener('exit', onExit);
+      child.removeListener('error', onError);
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    };
+    child.once('exit', onExit);
+    child.once('error', onError);
+  });
+}
 
 // A real subprocess app-server stand-in (HTTP /readyz + JSON-RPC WS on one port).
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-rpc-server.mjs', import.meta.url));
@@ -689,35 +712,63 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       tmpdir(),
       'codex-rpc-stop-without-barrier-' + process.pid + '-' + Date.now() + '.pid',
     );
+    const groupChildPidFile = pidFile + '.child';
     let appServerPid: number | undefined;
+    let groupChildPid: number | undefined;
     try {
-      const worker = spawnNodeTsScript(STOP_WITHOUT_BARRIER_FIXTURE, [pidFile], {
+      const worker = spawnNodeTsScript(STOP_WITHOUT_BARRIER_FIXTURE, [pidFile, groupChildPidFile], {
         stdio: 'ignore',
       });
-      await new Promise<void>((resolve, reject) => {
-        worker.once('error', reject);
-        worker.once('exit', code => code === 0 ? resolve() : reject(new Error('worker exited ' + code)));
-      });
+      await waitForWorkerExit(worker, 5_000);
       appServerPid = Number.parseInt(readFileSync(pidFile, 'utf8'), 10);
+      groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
       expect(Number.isInteger(appServerPid)).toBe(true);
-      expect(isAlive(appServerPid)).toBe(true);
+      expect(Number.isInteger(groupChildPid)).toBe(true);
+      expect(isAlive(appServerPid)).toBe(false);
+      expect(isAlive(groupChildPid)).toBe(true);
+      expect(isProcessGroupAlive(appServerPid)).toBe(true);
     } finally {
       if (appServerPid) {
         try { process.kill(-appServerPid, 'SIGKILL'); } catch { try { process.kill(appServerPid, 'SIGKILL'); } catch { /* gone */ } }
       }
       rmSync(pidFile, { force: true });
+      rmSync(groupChildPidFile, { force: true });
     }
   }, 20_000);
 
-  it('waits through the bounded SIGKILL fallback when the app-server ignores SIGTERM', async () => {
+  it('reaps a surviving process-group descendant within the bounded SIGKILL fallback', async () => {
+    const groupChildPidFile = join(tmpdir(), 'codex-rpc-stop-barrier-' + process.pid + '-' + Date.now() + '.child');
+    let pid: number | undefined;
+    let groupChildPid: number | undefined;
     const engine = makeEngine({
       sessionId: 'stop-barrier',
-      env: { ...process.env, FAKE_IGNORE_SIGTERM: '1' },
+      env: {
+        ...process.env,
+        FAKE_GROUP_CHILD_PID_FILE: groupChildPidFile,
+        FAKE_LEADER_EXITS_ON_SIGTERM: '1',
+      },
     });
-    await engine.start();
-    const pid = engine.appServerPid!;
-    await engine.stopAndWait();
-    expect(isAlive(pid)).toBe(false);
+    try {
+      await engine.start();
+      pid = engine.appServerPid!;
+      groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
+      expect(isAlive(groupChildPid)).toBe(true);
+      const startedAt = Date.now();
+      await engine.stopAndWait();
+      // 2s TERM grace + 250ms SIGKILL settle, with bounded scheduler slack.
+      expect(Date.now() - startedAt).toBeLessThanOrEqual(2_750);
+      expect(isProcessGroupAlive(pid)).toBe(false);
+      expect(isAlive(groupChildPid)).toBe(false);
+    } finally {
+      engine.stop();
+      if (pid && isProcessGroupAlive(pid)) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      if (groupChildPid && isAlive(groupChildPid)) {
+        try { process.kill(groupChildPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      rmSync(groupChildPidFile, { force: true });
+    }
   }, 20_000);
 
   it('stop releases every still-active native turn with its exact owner', async () => {

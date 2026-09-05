@@ -48,6 +48,16 @@ function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+function isProcessGroupAlive(pid: number): boolean {
+  if (process.platform === 'win32') return isAlive(pid);
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */
 function killGroup(pid: number, signal: NodeJS.Signals): void {
@@ -152,6 +162,7 @@ const REQUEST_TIMEOUT_MS = 60_000;
  * fallback has landed. */
 const APP_SERVER_STOP_GRACE_MS = 2_000;
 const APP_SERVER_STOP_KILL_SETTLE_MS = 250;
+const APP_SERVER_STOP_POLL_INTERVAL_MS = 25;
 
 /** Floor for a metadata-poll iteration's per-request budget. Below this, the
  *  poll deadline is effectively reached: issuing a thread/read with a
@@ -555,7 +566,11 @@ export class CodexRpcEngine {
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
       try { killGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
-      const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, APP_SERVER_STOP_GRACE_MS);
+      const t = setTimeout(() => {
+        if (isProcessGroupAlive(pid)) {
+          try { killGroup(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+      }, APP_SERVER_STOP_GRACE_MS);
       t.unref?.();
     } else {
       this.removeMarkerIfOwned();
@@ -564,20 +579,19 @@ export class CodexRpcEngine {
   }
 
   /**
-   * Stop the managed app-server and keep the owning worker alive until its child
-   * has exited, or until the SIGKILL fallback has had a short bounded chance to
-   * take effect. `stop()` remains synchronous for in-worker restart paths; this
-   * barrier is for parent-process shutdown, where exiting immediately would
-   * discard stop()'s unref'd SIGKILL timer and leave a detached app-server behind.
+   * Stop the managed app-server and keep the owning worker alive until its whole
+   * detached process group has exited, or until the SIGKILL fallback has had a
+   * short bounded chance to take effect. stop() remains synchronous for in-worker
+   * restart paths; this barrier prevents a native descendant outliving its Node
+   * wrapper during parent-process shutdown.
    */
   async stopAndWait(): Promise<void> {
     this.stop();
-    const child = this.child;
-    const pid = child?.pid;
-    if (!child || !pid) return;
-    if (await this.waitForChildExit(child, APP_SERVER_STOP_GRACE_MS)) return;
+    const pid = this.child?.pid;
+    if (!pid) return;
+    if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_GRACE_MS)) return;
     try { killGroup(pid, 'SIGKILL'); } catch { /* already gone */ }
-    await this.waitForChildExit(child, APP_SERVER_STOP_KILL_SETTLE_MS);
+    await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS);
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------
@@ -643,21 +657,18 @@ export class CodexRpcEngine {
     } catch { /* no marker / unreadable → leave it (next reap handles it) */ }
   }
 
-  private waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  private waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+    if (!isProcessGroupAlive(pid)) return Promise.resolve(true);
     return new Promise(resolve => {
-      let settled = false;
       const finish = (exited: boolean): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        child.removeListener('exit', onExit);
+        clearTimeout(timeout);
+        clearInterval(poll);
         resolve(exited);
       };
-      const onExit = (): void => finish(true);
-      const timer = setTimeout(() => finish(false), timeoutMs);
-      child.once('exit', onExit);
-      if (child.exitCode !== null || child.signalCode !== null) finish(true);
+      const poll = setInterval(() => {
+        if (!isProcessGroupAlive(pid)) finish(true);
+      }, APP_SERVER_STOP_POLL_INTERVAL_MS);
+      const timeout = setTimeout(() => finish(false), timeoutMs);
     });
   }
 

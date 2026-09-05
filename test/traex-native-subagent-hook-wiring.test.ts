@@ -93,6 +93,50 @@ function nonProbeLaunches(harness: WorkerHarness): LaunchRecord[] {
   return readLaunches(harness.capturePath).filter(record => record.argv[0] !== '--version');
 }
 
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function processGroupAlive(pid: number): boolean {
+  try { process.kill(-pid, 0); return true; } catch { return false; }
+}
+
+function tmuxSessionAlive(name: string): boolean {
+  try {
+    execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitForChildExit(
+  child: ChildProcess,
+  logs: string[],
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolvePromise, rejectPromise) => {
+    const onExit = (): void => finish();
+    const onError = (error: Error): void => finish(error);
+    const timer = setTimeout(() => {
+      finish(new Error(
+        'worker pid ' + (child.pid ?? 'unknown') + ' did not exit within ' + timeoutMs + 'ms\n'
+        + logs.join(''),
+      ));
+    }, timeoutMs);
+    const finish = (error?: Error): void => {
+      clearTimeout(timer);
+      child.removeListener('exit', onExit);
+      child.removeListener('error', onError);
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    };
+    child.once('exit', onExit);
+    child.once('error', onError);
+  });
+}
+
 async function stopChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
@@ -111,8 +155,10 @@ function makeHarness(options: {
   resume?: boolean;
   cliSessionId?: string;
   codexRpcInput?: boolean;
+  existingAppServerEndpoint?: string;
   disableCliBypass?: boolean;
   bypassCodexHookTrust?: boolean;
+  rpcFixtureEnv?: Record<string, string>;
 }): WorkerHarness {
   const root = mkdtempSync(join(tmpdir(), 'botmux-traex-launch-'));
   tempDirs.add(root);
@@ -210,10 +256,12 @@ if (commandArgv[0] === 'app-server') {
     env: {
       LAUNCH_CAPTURE_PATH: capturePath,
       RPC_FIXTURE_PATH: resolve('test/fixtures/fake-codex-rpc-server.mjs'),
+      ...options.rpcFixtureEnv,
     },
     resume: options.resume,
     cliSessionId: options.cliSessionId,
     codexRpcInput: options.codexRpcInput,
+    existingAppServerEndpoint: options.existingAppServerEndpoint,
     disableCliBypass: options.disableCliBypass,
     ...(options.codexRpcInput
       ? {
@@ -440,4 +488,95 @@ describe('TRAE native subagent hook worker launches', () => {
     expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
     expectHookFilesUnchanged(harness);
   }, 25_000);
+
+  it.skipIf(!tmuxAvailable)('reaps the Botmux-owned RPC group before SIGTERM exits the worker, while preserving its tmux viewer', async () => {
+    const groupChildPidFile = join(tmpdir(), 'botmux-worker-rpc-group-' + process.pid + '-' + Date.now() + '.pid');
+    const harness = makeHarness({
+      cliId: 'codex',
+      backendType: 'tmux',
+      codexRpcInput: true,
+      rpcFixtureEnv: {
+        FAKE_GROUP_CHILD_PID_FILE: groupChildPidFile,
+        FAKE_LEADER_EXITS_ON_SIGTERM: '1',
+      },
+    });
+    const markerPath = join(
+      harness.root,
+      '.botmux',
+      'data',
+      'codex-rpc-app-servers',
+      harness.sessionId + '.pid',
+    );
+    const tmuxName = 'bmx-' + harness.sessionId.slice(0, 8);
+    let groupLeaderPid: number | undefined;
+    let groupChildPid: number | undefined;
+    try {
+      await waitFor(
+        harness,
+        () => (
+          existsSync(markerPath)
+          && existsSync(groupChildPidFile)
+          && harness.messages.some(message => message.type === 'ready')
+        ),
+        'RPC marker, group child, and worker readiness',
+      );
+      groupLeaderPid = Number.parseInt(readFileSync(markerPath, 'utf8'), 10);
+      groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
+      expect(processAlive(groupChildPid)).toBe(true);
+      expect(processGroupAlive(groupLeaderPid)).toBe(true);
+
+      const startedAt = Date.now();
+      harness.child.kill('SIGTERM');
+      await waitForChildExit(harness.child, harness.logs);
+      expect(Date.now() - startedAt).toBeLessThanOrEqual(3_000);
+      expect(processGroupAlive(groupLeaderPid)).toBe(false);
+      expect(processAlive(groupChildPid)).toBe(false);
+      expect(tmuxSessionAlive(tmuxName)).toBe(true);
+    } finally {
+      if (groupLeaderPid && processGroupAlive(groupLeaderPid)) {
+        try { process.kill(-groupLeaderPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      if (groupChildPid && processAlive(groupChildPid)) {
+        try { process.kill(groupChildPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      rmSync(groupChildPidFile, { force: true });
+    }
+  }, 25_000);
+
+  it.skipIf(!tmuxAvailable)('preserves an ordinary tmux session when SIGTERM exits a non-RPC worker', async () => {
+    const harness = makeHarness({ cliId: 'codex', backendType: 'tmux' });
+    const tmuxName = 'bmx-' + harness.sessionId.slice(0, 8);
+    await waitFor(
+      harness,
+      () => harness.messages.some(message => message.type === 'ready'),
+      'non-RPC tmux worker readiness',
+    );
+
+    harness.child.kill('SIGTERM');
+    await waitForChildExit(harness.child, harness.logs);
+    expect(tmuxSessionAlive(tmuxName)).toBe(true);
+  }, 20_000);
+
+  it.skipIf(!tmuxAvailable)('preserves an external app-server viewer without starting or stopping a Botmux RPC group', async () => {
+    const harness = makeHarness({
+      cliId: 'codex',
+      backendType: 'tmux',
+      cliSessionId: 'external-thread',
+      existingAppServerEndpoint: 'ws://127.0.0.1:65535',
+    });
+    const tmuxName = 'bmx-' + harness.sessionId.slice(0, 8);
+    await waitFor(
+      harness,
+      () => (
+        harness.messages.some(message => message.type === 'ready')
+        && readLaunches(harness.capturePath).some(record => record.argv[0] === '--remote')
+      ),
+      'external app-server viewer readiness',
+    );
+    expect(readLaunches(harness.capturePath).some(isAppServerLaunch)).toBe(false);
+
+    harness.child.kill('SIGTERM');
+    await waitForChildExit(harness.child, harness.logs);
+    expect(tmuxSessionAlive(tmuxName)).toBe(true);
+  }, 20_000);
 });
