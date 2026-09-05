@@ -35,6 +35,15 @@ export class TaskControlEventAdapters {
     });
   }
 
+  enqueue(eventType: TaskControlEventType, observation: TaskControlEventObservation): void {
+    this.lifecycle.enqueueEvent({
+      eventType, eventId: observation.eventId, idempotencyKey: observation.idempotencyKey,
+      projectId: observation.projectId, phaseId: observation.phaseId, taskGuid: observation.taskGuid,
+      topicRootId: observation.topicRootId, sourceRef: observation.sourceRef,
+      evidenceRef: observation.evidenceRef, authentication: observation.authentication, payload: observation.payload,
+    });
+  }
+
   phaseOpened(observation: TaskControlEventObservation): void { this.append('phase.opened', observation); }
   mappingRegistered(observation: TaskControlEventObservation): void { this.append('mapping.registered', observation); }
   dispatchRequested(observation: TaskControlEventObservation): void { this.append('task.dispatch_requested', observation); }

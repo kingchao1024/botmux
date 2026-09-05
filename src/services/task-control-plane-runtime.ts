@@ -4,6 +4,8 @@ import {
   type AppendTaskControlEventInput,
   type AppendTaskControlObservationInput,
   type DeliveryOutboxRow,
+  type PhaseFreezeValidation,
+  type TaskControlEvent,
 } from './task-control-plane-store.js';
 import { DaemonTaskControlAuthority, type TaskControlAuthentication } from './task-control-plane-authority.js';
 
@@ -26,8 +28,22 @@ export interface TaskControlPlaneDeliveryResult {
 export interface TaskControlPlaneLifecycle {
   readonly enabled: boolean;
   append(input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication?: TaskControlAuthentication }): void;
+  enqueueEvent(input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication: TaskControlAuthentication }): void;
   appendUnknownObservation(input: AppendTaskControlObservationInput): void;
+  enqueueUnknownObservation(input: AppendTaskControlObservationInput): void;
+  getStore(): TaskControlPlaneStore | undefined;
+  freeze(input: {
+    eventId: string; projectId: string; phaseId: string; authentication: TaskControlAuthentication; approval: unknown;
+    idempotencyKey: string; occurredAt?: string; evidenceRef?: string;
+  }): { kind: 'frozen'; validation: PhaseFreezeValidation; event: TaskControlEvent } | { kind: 'rejected'; validation: PhaseFreezeValidation };
   close(timeoutMs?: number): Promise<void>;
+}
+
+export class TaskControlPlaneFlagError extends Error {
+  constructor(public readonly code: string) {
+    super(`task_control_flag_invalid:${code}`);
+    this.name = 'TaskControlPlaneFlagError';
+  }
 }
 
 export function taskControlPlaneDatabasePath(dataDir: string): string {
@@ -44,6 +60,8 @@ export interface TaskControlPlaneRuntimeOptions {
   intervalMs?: number;
   staleClaimMs?: number;
   maxAttempts?: number;
+  /** Shadow only drives reference-only active collection; it never freezes. */
+  collect?: () => Promise<void>;
 }
 
 const DEFAULT_FLAGS: TaskControlPlaneFlags = Object.freeze({
@@ -63,6 +81,14 @@ export function taskControlPlaneFlags(env: NodeJS.ProcessEnv = process.env): Tas
   };
 }
 
+function validateFlags(flags: TaskControlPlaneFlags, hasDelivery: boolean, hasCollector: boolean): void {
+  if (flags.shadowEnabled && !flags.ledgerEnabled) throw new TaskControlPlaneFlagError('shadow_requires_ledger');
+  if (flags.shadowEnabled && !hasCollector) throw new TaskControlPlaneFlagError('shadow_collector_required');
+  if (flags.freezeEnforcement && !flags.ledgerEnabled) throw new TaskControlPlaneFlagError('freeze_enforcement_requires_ledger');
+  if (flags.pumpEnabled && !flags.ledgerEnabled) throw new TaskControlPlaneFlagError('pump_requires_ledger');
+  if (flags.pumpEnabled && !hasDelivery) throw new TaskControlPlaneFlagError('pump_delivery_required');
+}
+
 function retryDelay(attempt: number): number {
   return Math.min(1_000 * 2 ** Math.max(0, attempt - 1), 60_000);
 }
@@ -70,7 +96,11 @@ function retryDelay(attempt: number): number {
 class DisabledTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
   readonly enabled = false;
   append(): void { /* Default off: legacy daemon paths remain wholly unchanged. */ }
+  enqueueEvent(): void { /* Default off: legacy daemon paths remain wholly unchanged. */ }
   appendUnknownObservation(): void { /* Default off: legacy daemon paths remain wholly unchanged. */ }
+  enqueueUnknownObservation(): void { /* Default off: legacy daemon paths remain wholly unchanged. */ }
+  getStore(): undefined { return undefined; }
+  freeze(): never { throw new TaskControlPlaneFlagError('freeze_enforcement_disabled'); }
   async close(): Promise<void> { /* no resources */ }
 }
 
@@ -79,20 +109,33 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
   private timer: NodeJS.Timeout | undefined;
   private running: Promise<void> | undefined;
   private stopped = false;
+  private closed = false;
+  private closeAfterInflight: Promise<void> | undefined;
+  private readonly pendingSidecarWrites: Array<
+    | { kind: 'observation'; input: AppendTaskControlObservationInput }
+    | { kind: 'event'; input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication: TaskControlAuthentication } }
+  > = [];
+  private sidecarScheduled = false;
+  private droppedSidecarWrites = 0;
 
   constructor(
     private readonly store: TaskControlPlaneStore,
     private readonly options: Required<Pick<TaskControlPlaneRuntimeOptions, 'logger' | 'now' | 'staleClaimMs' | 'maxAttempts'>>
-      & Pick<TaskControlPlaneRuntimeOptions, 'deliver' | 'intervalMs'>,
+      & Pick<TaskControlPlaneRuntimeOptions, 'deliver' | 'collect' | 'intervalMs'> & { freezeEnabled: boolean },
   ) {}
 
   start(): void {
-    if (!this.options.deliver || this.timer) return;
-    const tick = (): void => { void this.pump().catch(error => this.options.logger.warn(`[task-control] outbox pump failed: ${String(error)}`)); };
+    if (this.timer || (!this.options.deliver && !this.options.collect)) return;
+    const tick = (): void => {
+      if (this.options.deliver) void this.pump().catch(error => this.options.logger.warn(`[task-control] outbox pump failed: ${String(error)}`));
+      if (this.options.collect && !this.stopped) void this.options.collect().catch(error => this.options.logger.warn(`[task-control] shadow collector failed: ${String(error)}`));
+    };
     tick();
     this.timer = setInterval(tick, this.options.intervalMs ?? 5_000);
     this.timer.unref?.();
   }
+
+  getStore(): TaskControlPlaneStore { return this.store; }
 
   append(input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication?: TaskControlAuthentication }): void {
     if (!input.authentication) {
@@ -103,9 +146,77 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
     catch (error) { this.options.logger.warn(`[task-control] ledger append failed (legacy path continued): ${String(error)}`); }
   }
 
+  enqueueEvent(input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication: TaskControlAuthentication }): void {
+    this.enqueueSidecarWrite({ kind: 'event', input });
+  }
+
   appendUnknownObservation(input: AppendTaskControlObservationInput): void {
     try { this.store.appendUnknownObservation(input); }
     catch (error) { this.options.logger.warn(`[task-control] observation append failed (legacy path continued): ${String(error)}`); }
+  }
+
+  private tryAppendUnknownObservation(input: AppendTaskControlObservationInput): boolean {
+    try { return this.store.tryAppendUnknownObservation(input) !== undefined; }
+    catch (error) {
+      this.options.logger.warn(`[task-control] observation append failed (legacy path continued): ${String(error)}`);
+      return false;
+    }
+  }
+
+  private tryAppendEvent(input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication: TaskControlAuthentication }): boolean {
+    try { return this.store.tryAppendEvent(input) !== undefined; }
+    catch (error) {
+      this.options.logger.warn(`[task-control] ledger append failed (legacy path continued): ${String(error)}`);
+      return false;
+    }
+  }
+
+  enqueueUnknownObservation(input: AppendTaskControlObservationInput): void {
+    this.enqueueSidecarWrite({ kind: 'observation', input });
+  }
+
+  private enqueueSidecarWrite(write: typeof this.pendingSidecarWrites[number]): void {
+    if (this.stopped || this.closed) {
+      this.droppedSidecarWrites++;
+      this.options.logger.warn('[task-control] sidecar write dropped after shutdown');
+      return;
+    }
+    if (this.pendingSidecarWrites.length >= 128) {
+      this.droppedSidecarWrites++;
+      this.options.logger.warn('[task-control] sidecar queue full; write dropped');
+      return;
+    }
+    this.pendingSidecarWrites.push(write);
+    this.pumpSidecarWrites();
+  }
+
+
+  freeze(input: {
+    eventId: string; projectId: string; phaseId: string; authentication: TaskControlAuthentication; approval: unknown;
+    idempotencyKey: string; occurredAt?: string; evidenceRef?: string;
+  }): { kind: 'frozen'; validation: PhaseFreezeValidation; event: TaskControlEvent } | { kind: 'rejected'; validation: PhaseFreezeValidation } {
+    if (!this.options.freezeEnabled) throw new TaskControlPlaneFlagError('freeze_enforcement_disabled');
+    if (this.stopped || this.closed) throw new Error('task_control_runtime_closed');
+    return this.store.freezePhase(input);
+  }
+
+  private pumpSidecarWrites(): void {
+    if (this.sidecarScheduled) return;
+    this.sidecarScheduled = true;
+    setImmediate(() => {
+      this.sidecarScheduled = false;
+      const next = this.pendingSidecarWrites.shift();
+      if (next && !this.stopped && !this.closed) {
+        const written = next.kind === 'event' ? this.tryAppendEvent(next.input) : this.tryAppendUnknownObservation(next.input);
+        if (!written) {
+          this.droppedSidecarWrites++;
+          this.options.logger.warn(`[task-control] ${next.kind} write busy; sidecar write dropped`);
+        }
+      }
+      if (this.pendingSidecarWrites.length > 0 && !this.stopped && !this.closed) {
+        this.pumpSidecarWrites();
+      }
+    });
   }
 
   private async pump(): Promise<void> {
@@ -119,6 +230,7 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
       try { rows = this.store.claimOutbox({ now, limit: 10, claimToken: token }); }
       catch (error) { this.options.logger.warn(`[task-control] outbox claim failed: ${String(error)}`); return; }
       for (const row of rows) {
+        if (this.stopped) break;
         try {
           const result = await this.options.deliver!(row);
           if (result.kind === 'delivered') {
@@ -144,14 +256,42 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
     await this.running;
   }
 
+  private closeStore(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.store.close();
+  }
+
+  private deferCloseUntilInflightSettles(inflight: Promise<void>): void {
+    if (this.closeAfterInflight) return;
+    this.closeAfterInflight = inflight.then(
+      () => { this.closeStore(); },
+      () => { this.closeStore(); },
+    );
+  }
+
   async close(timeoutMs = 2_000): Promise<void> {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
-    const running = this.running;
-    if (running && timeoutMs > 0) {
-      await Promise.race([running, new Promise<void>(resolve => setTimeout(resolve, timeoutMs))]);
+    if (this.pendingSidecarWrites.length > 0) {
+      this.droppedSidecarWrites += this.pendingSidecarWrites.length;
+      this.pendingSidecarWrites.length = 0;
     }
-    this.store.close();
+    if (this.droppedSidecarWrites > 0) {
+      this.options.logger.warn(`[task-control] ${this.droppedSidecarWrites} queued sidecar writes dropped during shutdown`);
+    }
+    const inflight = this.running;
+    if (!inflight) { this.closeStore(); return; }
+    const settled = await Promise.race([
+      inflight.then(() => true, () => true),
+      new Promise<false>(resolve => setTimeout(() => resolve(false), Math.max(0, timeoutMs))),
+    ]);
+    if (settled) { this.closeStore(); return; }
+    // Keep the database open: the in-flight delivery owns its claim and must
+    // settle (or leave it for crash/restart recovery) without touching a closed
+    // handle. The process may exit before this continuation; then stale-claim
+    // recovery is the only subsequent writer.
+    this.deferCloseUntilInflightSettles(inflight);
   }
 }
 
@@ -161,6 +301,7 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
  */
 export async function startTaskControlPlaneRuntime(options: TaskControlPlaneRuntimeOptions): Promise<TaskControlPlaneLifecycle> {
   const flags = { ...DEFAULT_FLAGS, ...options.flags };
+  validateFlags(flags, !!options.deliver, !!options.collect);
   if (!flags.ledgerEnabled) return new DisabledTaskControlPlaneLifecycle();
   try {
     const store = await TaskControlPlaneStore.open(options.dataDir, options.authority);
@@ -170,6 +311,8 @@ export async function startTaskControlPlaneRuntime(options: TaskControlPlaneRunt
       staleClaimMs: options.staleClaimMs ?? 60_000,
       maxAttempts: options.maxAttempts ?? 5,
       deliver: flags.pumpEnabled ? options.deliver : undefined,
+      collect: flags.shadowEnabled ? options.collect : undefined,
+      freezeEnabled: flags.freezeEnforcement,
       intervalMs: options.intervalMs,
     });
     lifecycle.start();

@@ -8,14 +8,14 @@ describe('TaskControlActiveCollector', () => {
     const lifecycle: TaskControlPlaneLifecycle = {
       enabled: true, append: input => { appended.push({ kind: 'event', input }); },
       appendUnknownObservation: input => { appended.push({ kind: 'observation', input }); }, close: async () => {},
+      enqueueUnknownObservation: input => { appended.push({ kind: 'queued-observation', input }); },
     };
     const calls: any[] = [];
     const collector = new TaskControlActiveCollector(lifecycle, {
       list: async input => {
         calls.push(input);
         return { records: [{
-          kind: 'doc_revision', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root',
-          sourceRef: 'doc:doc-token@7', eventId: 'collector-doc-7', idempotencyKey: 'doc:doc-token@7',
+          kind: 'doc_revision', sourceRef: 'doc:doc-token@7', eventId: 'collector-doc-7', idempotencyKey: 'doc:doc-token@7',
         }], nextCursor: 'next-cursor' };
       },
     });
@@ -24,7 +24,7 @@ describe('TaskControlActiveCollector', () => {
     expect(appended).toEqual([expect.objectContaining({
       kind: 'observation', input: expect.objectContaining({
         attemptedEventType: 'unknown.declared', eventId: 'collector-doc-7', sourceRef: 'doc:doc-token@7',
-        payload: expect.objectContaining({ collectionKind: 'doc_revision' }),
+        payload: { collectionKind: 'doc_revision', referenceOnly: true },
       }),
     })]);
   });

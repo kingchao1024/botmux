@@ -37,7 +37,7 @@ describe('DaemonTaskControlAuthority', () => {
     expect(authority.authenticate(authentication)).toBeUndefined();
   });
 
-  it('binds signed approval to domain, normalized task snapshot, acceptor, lifetime and one-time use', () => {
+  it('binds signed approval to domain, normalized task snapshot, acceptor and lifetime without consuming it', () => {
     const authority = verifier();
     const proof = approval();
     const base = {
@@ -45,7 +45,7 @@ describe('DaemonTaskControlAuthority', () => {
       taskSetSnapshot: ['task-1', 'task-2'], acceptorId: 'acceptor-1', now: '2026-09-05T00:30:00.000Z',
     };
     expect(authority.verifyApproval(base)).toMatchObject({ approvalRef: 'approval:one', taskSetSnapshot: ['task-1', 'task-2'] });
-    expect(authority.verifyApproval(base)).toBeUndefined();
+    expect(authority.verifyApproval(base)).toMatchObject({ approvalRef: 'approval:one' });
   });
 
   it('fails closed for forged, wrong-domain, expired, future and mismatched proofs', () => {

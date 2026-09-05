@@ -699,6 +699,16 @@ export interface WorkerPoolCallbacks {
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
   ) => void | Promise<void>;
+  /** Exact worker-generation input commit. Optional sidecars must never alter acceptance. */
+  onTurnInputCommitted?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number },
+  ) => void | Promise<void>;
+  /** First exact working edge for a worker turn. */
+  onTurnExecutionStarted?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number },
+  ) => void | Promise<void>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
@@ -11586,6 +11596,8 @@ function setupWorkerHandlers(
         } else {
           logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
+        void Promise.resolve(cb.onTurnInputCommitted?.(ds, { turnId: msg.turnId, workerGeneration }))
+          .catch(error => logger.warn(`[${t}] task-control input-commit sidecar failed: ${String(error)}`));
         break;
       }
       case 'session_ready_ack': {
@@ -12340,6 +12352,10 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
+          if (ds.lastScreenStatus === 'working' && msg.turnId) {
+            void Promise.resolve(cb.onTurnExecutionStarted?.(ds, { turnId: msg.turnId, workerGeneration }))
+              .catch(error => logger.warn(`[${t}] task-control execution sidecar failed: ${String(error)}`));
+          }
           // fresh:true —— 这是「状态边沿触发的 refresh 读」，transcript 此刻刚追加完
           // 本轮输出。绕过 resolver 对懒创建 rollout 的 30s miss 负缓存，否则首轮
           // (spawn 时 rollout 还没落盘)徽标要等 30s 后某次边沿才出现。

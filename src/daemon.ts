@@ -87,7 +87,11 @@ import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
+import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
+import { DaemonTaskControlIntegration } from './services/task-control-plane-daemon-integration.js';
 import { DaemonTaskControlAuthority } from './services/task-control-plane-authority.js';
+import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
+import { DaemonTaskControlIntegration } from './services/task-control-plane-daemon-integration.js';
 import { startTaskControlPlaneRuntime, taskControlPlaneFlags, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
@@ -299,6 +303,13 @@ import {
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
+
+const TASK_CONTROL_MAPPING_REGISTER_ROUTE = '/api/task-control/mappings';
+const TASK_CONTROL_MAPPING_REGISTER_MAX_BYTES = 16 * 1024;
+const TASK_CONTROL_FREEZE_ROUTE = '/api/task-control/freeze';
+const TASK_CONTROL_FREEZE_MAX_BYTES = 16 * 1024;
+const TASK_CONTROL_APPROVAL_REGISTER_ROUTE = '/api/task-control/approvals';
+const TASK_CONTROL_APPROVAL_REGISTER_MAX_BYTES = 16 * 1024;
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -493,6 +504,8 @@ let selfV3BootInstanceId: string | undefined;
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
 let taskControlPlane: TaskControlPlaneLifecycle | undefined;
+let taskControlIntegration: DaemonTaskControlIntegration | undefined;
+let taskControlIntegration: DaemonTaskControlIntegration | undefined;
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -6072,6 +6085,109 @@ workflowDaemonMutationRoute('grant', async (reply, params, body, identity) => {
 
 // ─── report session relay：隔离 CLI 的 dispatch 完成回注 ──────────────────
 //
+// Controller-owned P2 bindings. This endpoint is deliberately host-HMAC only:
+// a sandboxed worker may report a dispatch, but cannot assign its own project,
+// phase, owner, reviewer or acceptor. Every field is an opaque identifier; no
+// title/body/status is accepted as a substitute for a typed registration.
+ipcRoute('POST', TASK_CONTROL_MAPPING_REGISTER_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req) || !taskControlIntegration) {
+    return jsonRes(res, 403, { ok: false, error: 'task_control_mapping_unavailable' });
+  }
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req, TASK_CONTROL_MAPPING_REGISTER_MAX_BYTES); }
+  catch (error) {
+    return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, { ok: false, error: 'bad_json' });
+  }
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+  const text = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  const dispatchRoot = text(body?.dispatchRoot);
+  let controllerId: string | undefined;
+  if (dispatchRoot) {
+    try {
+      const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8')) as Record<string, unknown>;
+      const entry = registry[dispatchRoot];
+      const orchAppId = entry && typeof entry === 'object' && !Array.isArray(entry)
+        ? text((entry as Record<string, unknown>).orchAppId)
+        : undefined;
+      if (orchAppId && orchAppId === selfDaemonLarkAppId) controllerId = `daemon:${orchAppId}`;
+    } catch { /* absent/malformed registry is an unproven mapping */ }
+  }
+  const docToken = text(body?.docToken);
+  const mapping: Omit<import('./services/task-control-plane-daemon-bridge.js').DaemonTaskControlMapping, 'controllerId'> = {
+    projectId: text(body?.projectId) ?? '', phaseId: text(body?.phaseId) ?? '',
+    phaseTaskGuids: Array.isArray(body?.phaseTaskGuids)
+      ? body.phaseTaskGuids.filter((item): item is string => typeof item === 'string')
+      : [],
+    taskGuid: text(body?.taskGuid) ?? '', topicRootId: text(body?.topicRootId) ?? '',
+    ownerId: text(body?.ownerId) ?? '', reviewerId: text(body?.reviewerId) ?? '',
+    acceptorId: text(body?.acceptorId) ?? '', registrationRef: text(body?.registrationRef) ?? '',
+    ...(docToken ? { docToken } : {}),
+  };
+  if (!dispatchRoot || !controllerId || !taskControlIntegration.registerMapping(dispatchRoot, mapping, controllerId)) {
+    return jsonRes(res, 400, { ok: false, error: 'task_control_mapping_invalid_or_conflict' });
+  }
+  return jsonRes(res, 201, { ok: true, dispatchRoot });
+});
+
+ipcRoute('POST', TASK_CONTROL_APPROVAL_REGISTER_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req) || !taskControlIntegration || !taskControlPlane?.getStore()) {
+    return jsonRes(res, 403, { ok: false, error: 'task_control_approval_unavailable' });
+  }
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req, TASK_CONTROL_APPROVAL_REGISTER_MAX_BYTES); }
+  catch (error) { return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, { ok: false, error: 'bad_json' }); }
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+  const approvalRef = typeof body?.approvalRef === 'string' ? body.approvalRef.trim() : '';
+  const proof = body?.proof && typeof body.proof === 'object' && !Array.isArray(body.proof)
+    ? body.proof as Record<string, unknown>
+    : undefined;
+  if (!approvalRef || !proof) return jsonRes(res, 400, { ok: false, error: 'task_control_approval_invalid' });
+  try {
+    const created = taskControlPlane.getStore()!.registerApprovalProof({ approvalRef, proof });
+    return jsonRes(res, created ? 201 : 200, { ok: true, approvalRef, created });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Freeze is an explicit controller command, never a side-effect of task status
+// or report output. The lifecycle also checks the disabled flag so even a valid
+// host request cannot turn a default-off daemon into an enforcing daemon.
+ipcRoute('POST', TASK_CONTROL_FREEZE_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req) || !taskControlIntegration || !taskControlPlane) {
+    return jsonRes(res, 403, { ok: false, error: 'task_control_freeze_unavailable' });
+  }
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req, TASK_CONTROL_FREEZE_MAX_BYTES); }
+  catch (error) {
+    return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, { ok: false, error: 'bad_json' });
+  }
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+  const text = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  const dispatchRoot = text(body?.dispatchRoot);
+  const approvalRef = text(body?.approvalRef);
+  const eventId = text(body?.eventId);
+  const idempotencyKey = text(body?.idempotencyKey);
+  if (!dispatchRoot || !approvalRef || !eventId || !idempotencyKey) {
+    return jsonRes(res, 400, { ok: false, error: 'task_control_freeze_invalid' });
+  }
+  const mapping = taskControlIntegration.mapping(dispatchRoot);
+  const authentication = taskControlIntegration.issueAuthentication(dispatchRoot, 'acceptor');
+  const approval = taskControlIntegration.approval(approvalRef);
+  if (!mapping || !authentication || !approval) {
+    return jsonRes(res, 403, { ok: false, error: 'task_control_freeze_unproven' });
+  }
+  try {
+    const result = taskControlPlane.freeze({
+      eventId, projectId: mapping.projectId, phaseId: mapping.phaseId, authentication, approval, idempotencyKey,
+      evidenceRef: `approval:${approvalRef.replace(/^approval:/, '')}`,
+    });
+    return jsonRes(res, result.kind === 'frozen' ? 201 : 409, { ok: result.kind === 'frozen', result });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 // Linux credential-only bwrap / macOS read isolation 都
 // 不允许 CLI 读取 `.dashboard-secret`。这里验证 source session 当前轮换的
 // capability，并把 dispatch root 与 daemon 自己的 live session 绑定；目标
@@ -6179,19 +6295,10 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   // project/phase/task mapping. Preserve only a stable UNKNOWN observation;
   // never promote title, seed text, report body, exit status, or task done into
   // a lifecycle state. A later trusted mapping bridge may correlate sourceRef.
-  taskControlPlane?.appendUnknownObservation({
-    eventId: `dispatch-observation:${dispatchRoot}`,
-    attemptedEventType: 'task.dispatch_requested',
-    sourceRef: `dispatch:${dispatchRoot}`,
-    idempotencyKey: `dispatch:${dispatchRoot}`,
-    occurredAt: issuedAt,
-    payload: {
-      dispatchRoot,
-      sourceSessionId: ds.session.sessionId,
-      targetChatId,
-      acceptanceRequested,
-    },
-  });
+  // Dispatch availability is primary. The control-plane sidecar never enters
+  // SQLite on this IPC response path; a bounded asynchronous queue preserves
+  // the observation best-effort and drops it loudly on sidecar pressure.
+  taskControlIntegration?.dispatchRequested(dispatchRoot, ds.session.sessionId, issuedAt);
   return jsonRes(res, 201, { ok: true, dispatchRoot });
 });
 
@@ -6252,6 +6359,10 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
 
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
   if (!targetDaemon) {
+    taskControlIntegration?.reportFallbackUnknown(
+      `report:${decision.source.sessionId}:${decision.target.larkAppId}:offline`,
+      'orchestrator_daemon_offline',
+    );
     return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
   }
   const trigger = buildOrchestratorReportTrigger(decision, {
@@ -6272,6 +6383,10 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       reportTarget: decision.target,
     });
   } catch (error) {
+    taskControlIntegration?.reportFallbackUnknown(
+      `report:${decision.source.sessionId}:${decision.target.larkAppId}:unreachable`,
+      'orchestrator_daemon_unreachable',
+    );
     return jsonRes(res, 502, {
       ok: false,
       error: 'orchestrator_daemon_unreachable',
@@ -22101,6 +22216,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // legacy dispatch/report/session paths.  Its authentication adapter is owned
   // here (not exposed to callers), and bootstrap failure returns a no-op handle.
   const taskControlFlags = taskControlPlaneFlags();
+  taskControlIntegration = undefined;
   if (!taskControlFlags.ledgerEnabled) {
     // Do not create keys, databases, timers or files while the feature is off.
     // A deliberately empty verifier keeps the disabled lifecycle inert.
@@ -22110,18 +22226,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
   } else {
     try {
-      const taskControlAuthority = new DaemonTaskControlAuthority({
-        // Real P2 phase/mapping authorities are not configured in this release.
-        // Refuse every event until a daemon-owned mapping bridge is explicitly
-        // wired; enabling the flag cannot make caller payload authoritative.
-        resolvePrincipal: () => undefined,
-        // Reuse the existing host-only daemon IPC trust material.  P2-6 does not
-        // create a second sidecar secret or any data file beyond its SQLite ledger.
+      const taskControlBridge = new DaemonTaskControlBridge({
+        // P2 approval evidence is registered only by a daemon-owned provider.
+        // This release has no registered P2 gates yet, so unknown approvals fail
+        // closed while the bridge remains restart-safe for registered proofs.
+        approvals: {
+          get: approvalRef => {
+            const stored = taskControlPlane?.getStore()?.getApprovalProof(approvalRef);
+            return stored?.proof as import('./services/task-control-plane-authority.js').TaskControlApprovalObservation | undefined;
+          },
+        },
         approvalKeys: new Map([['daemon-ipc-hmac-v1', loadDaemonIpcSecret()]]),
       });
+      let integration: DaemonTaskControlIntegration | undefined;
       taskControlPlane = await startTaskControlPlaneRuntime({
-        dataDir: config.session.dataDir, flags: taskControlFlags, authority: taskControlAuthority, logger,
+        dataDir: config.session.dataDir, flags: taskControlFlags, authority: taskControlBridge.authority, logger,
+        // The integration itself owns no remote writes. Shadow polls only stable
+        // task/comment/topic/doc references; the outbox can only verify a typed
+        // destination or degrade for subsequent active reconciliation.
+        deliver: row => integration?.deliver(row) ?? Promise.resolve({ kind: 'degraded', error: 'integration_unavailable' }),
+        collect: () => integration?.collectAll() ?? Promise.resolve(),
       });
+      const taskControlStore = taskControlPlane.getStore();
+      if (!taskControlStore) throw new Error('task_control_store_unavailable');
+      integration = new DaemonTaskControlIntegration({
+        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore,
+        bridge: taskControlBridge, logger,
+      });
+      taskControlIntegration = integration;
     } catch (error) {
       logger.warn(`[task-control] trust bootstrap failed; continuing with ledger disabled: ${String(error)}`);
       taskControlPlane = await startTaskControlPlaneRuntime({
@@ -22616,8 +22748,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         status: context.status,
       }).then(() => undefined);
     },
+    onTurnInputCommitted(ds, context) {
+      taskControlIntegration?.workerAccepted(
+        ds.session.rootMessageId ?? '',
+        `input-commit:${ds.session.sessionId}:${context.workerGeneration}:${context.turnId}`,
+      );
+    },
+    onTurnExecutionStarted(ds, context) {
+      taskControlIntegration?.workerExecutionStarted(
+        ds.session.rootMessageId ?? '',
+        `execution:${ds.session.sessionId}:${context.workerGeneration}:${context.turnId}`,
+      );
+    },
     onQueuedActivationSubmitted,
     async onTurnTerminal(ds, terminal, context) {
+      taskControlIntegration?.terminalWithoutRevision(
+        ds.session.rootMessageId ?? '',
+        `terminal:${ds.session.sessionId}:${context.workerGeneration}:${terminal.turnId}`,
+        { sessionId: ds.session.sessionId, workerGeneration: context.workerGeneration, reason: 'terminal_doc_revision_unavailable' },
+      );
       // VC reconcile first: it is in-memory and latency-sensitive, and must not
       // sit behind a synchronous SQLite write. (Master did only this enqueue.)
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);

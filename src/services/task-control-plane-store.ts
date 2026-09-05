@@ -15,7 +15,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 const DATABASE_NAME = 'botmux-task-control-plane.sqlite';
 
 export type TaskControlEventType =
@@ -377,6 +377,62 @@ export interface PhaseFreezeSnapshot {
   issues: FreezeIssue[];
 }
 
+export interface ApprovalConsumption {
+  approvalRef: string;
+  projectId: string;
+  phaseId: string;
+  taskSetHash: string;
+  acceptorId: string;
+  freezeIdempotencyKey: string;
+  frozenEventId: string;
+  approvedAt: string;
+  consumedAt: string;
+}
+
+/** Durable, host-authenticated control identity. This is a reference record, not a task body. */
+export interface TrustedTaskControlMappingRecord {
+  dispatchRoot: string;
+  projectId: string;
+  phaseId: string;
+  phaseTaskGuids: readonly string[];
+  taskGuid: string;
+  topicRootId: string;
+  ownerId: string;
+  reviewerId: string;
+  acceptorId: string;
+  registrationRef: string;
+  controllerId: string;
+  docToken?: string;
+  createdAt: string;
+}
+
+export interface DurableTaskControlApprovalProof {
+  approvalRef: string;
+  proof: Record<string, unknown>;
+  registeredAt: string;
+}
+
+export interface RegisterTrustedTaskControlMappingInput {
+  dispatchRoot: string;
+  projectId: string;
+  phaseId: string;
+  phaseTaskGuids: readonly string[];
+  taskGuid: string;
+  topicRootId: string;
+  ownerId: string;
+  reviewerId: string;
+  acceptorId: string;
+  registrationRef: string;
+  controllerId: string;
+  docToken?: string;
+  authentication: unknown;
+  occurredAt?: string;
+}
+
+export type RegisterTrustedTaskControlMappingResult =
+  | { kind: 'registered'; mapping: TrustedTaskControlMappingRecord }
+  | { kind: 'duplicate'; mapping: TrustedTaskControlMappingRecord };
+
 interface EventRow {
   seq: number | bigint;
   event_id: string;
@@ -522,6 +578,52 @@ const SCHEMA = `
   CREATE TRIGGER IF NOT EXISTS control_observations_no_delete BEFORE DELETE ON control_observations
   BEGIN SELECT RAISE(ABORT,'control_observation_immutable'); END;
 
+  CREATE TABLE IF NOT EXISTS control_approval_consumptions(
+    approval_ref TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    phase_id TEXT NOT NULL,
+    task_set_hash TEXT NOT NULL,
+    acceptor_id TEXT NOT NULL,
+    freeze_idempotency_key TEXT NOT NULL UNIQUE,
+    frozen_event_id TEXT NOT NULL UNIQUE REFERENCES control_events(event_id),
+    approved_at TEXT NOT NULL,
+    consumed_at TEXT NOT NULL
+  );
+  CREATE TRIGGER IF NOT EXISTS control_approval_consumptions_no_update BEFORE UPDATE ON control_approval_consumptions
+  BEGIN SELECT RAISE(ABORT,'control_approval_consumption_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_approval_consumptions_no_delete BEFORE DELETE ON control_approval_consumptions
+  BEGIN SELECT RAISE(ABORT,'control_approval_consumption_immutable'); END;
+
+  CREATE TABLE IF NOT EXISTS control_trusted_mappings(
+    dispatch_root TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    phase_id TEXT NOT NULL,
+    phase_task_guids_json TEXT NOT NULL,
+    task_guid TEXT NOT NULL,
+    topic_root_id TEXT NOT NULL UNIQUE,
+    owner_id TEXT NOT NULL,
+    reviewer_id TEXT NOT NULL,
+    acceptor_id TEXT NOT NULL,
+    registration_ref TEXT NOT NULL UNIQUE,
+    controller_id TEXT NOT NULL,
+    doc_token TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE TRIGGER IF NOT EXISTS control_trusted_mappings_no_update BEFORE UPDATE ON control_trusted_mappings
+  BEGIN SELECT RAISE(ABORT,'control_mapping_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_trusted_mappings_no_delete BEFORE DELETE ON control_trusted_mappings
+  BEGIN SELECT RAISE(ABORT,'control_mapping_immutable'); END;
+
+  CREATE TABLE IF NOT EXISTS control_approval_proofs(
+    approval_ref TEXT PRIMARY KEY,
+    proof_json TEXT NOT NULL,
+    registered_at TEXT NOT NULL
+  );
+  CREATE TRIGGER IF NOT EXISTS control_approval_proofs_no_update BEFORE UPDATE ON control_approval_proofs
+  BEGIN SELECT RAISE(ABORT,'control_approval_proof_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_approval_proofs_no_delete BEFORE DELETE ON control_approval_proofs
+  BEGIN SELECT RAISE(ABORT,'control_approval_proof_immutable'); END;
+
   CREATE TABLE IF NOT EXISTS control_outbox(
     outbox_id TEXT PRIMARY KEY,
     event_id TEXT NOT NULL REFERENCES control_events(event_id),
@@ -659,6 +761,10 @@ function conditionEvidenceRefs(value: unknown): Record<string, string> {
 
 function exactTaskSetSnapshot(value: unknown, field: string): string[] {
   return uniqueStrings(value, field).sort();
+}
+
+function taskSetHash(value: readonly string[]): string {
+  return sha256(JSON.stringify(exactTaskSetSnapshot(value, 'taskSetSnapshot')));
 }
 
 function timestampMs(value: unknown, field: string): number {
@@ -815,6 +921,20 @@ function rowToObservation(row: Record<string, unknown>): TaskControlObservation 
     outcome: String(row.outcome) as TaskControlObservation['outcome'],
     payloadHash: String(row.payload_hash),
     payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>,
+  };
+}
+
+function approvalConsumptionFromRow(row: Record<string, unknown>): ApprovalConsumption {
+  return {
+    approvalRef: String(row.approval_ref),
+    projectId: String(row.project_id),
+    phaseId: String(row.phase_id),
+    taskSetHash: String(row.task_set_hash),
+    acceptorId: String(row.acceptor_id),
+    freezeIdempotencyKey: String(row.freeze_idempotency_key),
+    frozenEventId: String(row.frozen_event_id),
+    approvedAt: String(row.approved_at),
+    consumedAt: String(row.consumed_at),
   };
 }
 
@@ -1152,8 +1272,151 @@ export class TaskControlPlaneStore {
       .map(rowToObservation);
   }
 
+  listTrustedMappings(): TrustedTaskControlMappingRecord[] {
+    return (this.db.prepare('SELECT * FROM control_trusted_mappings ORDER BY created_at,dispatch_root').all() as Record<string, unknown>[])
+      .map(row => ({
+        dispatchRoot: String(row.dispatch_root), projectId: String(row.project_id), phaseId: String(row.phase_id),
+        phaseTaskGuids: exactTaskSetSnapshot(JSON.parse(String(row.phase_task_guids_json)), 'phaseTaskGuids'),
+        taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id), ownerId: String(row.owner_id),
+        reviewerId: String(row.reviewer_id), acceptorId: String(row.acceptor_id), registrationRef: String(row.registration_ref),
+        controllerId: String(row.controller_id), ...(row.doc_token ? { docToken: String(row.doc_token) } : {}),
+        createdAt: String(row.created_at),
+      }));
+  }
+
+  getApprovalProof(approvalRef: string): DurableTaskControlApprovalProof | undefined {
+    const row = this.db.prepare('SELECT * FROM control_approval_proofs WHERE approval_ref=?')
+      .get(approvalRef) as Record<string, unknown> | undefined;
+    return row ? {
+      approvalRef: String(row.approval_ref), proof: JSON.parse(String(row.proof_json)) as Record<string, unknown>,
+      registeredAt: String(row.registered_at),
+    } : undefined;
+  }
+
+  registerApprovalProof(input: { approvalRef: string; proof: Record<string, unknown>; registeredAt?: string }): boolean {
+    this.assertWritable();
+    const approvalRef = controlledEvidenceRef(input.approvalRef, 'approvalRef');
+    const proofJson = JSON.stringify(canonicalize(input.proof));
+    const registeredAt = input.registeredAt ?? new Date().toISOString();
+    return this.withImmediateWrite(() => {
+      const existing = this.getApprovalProof(approvalRef);
+      if (existing) {
+        if (JSON.stringify(canonicalize(existing.proof)) === proofJson) return false;
+        throw new Error(`task_control_approval_proof_conflict:${approvalRef}`);
+      }
+      this.db.prepare('INSERT INTO control_approval_proofs(approval_ref,proof_json,registered_at) VALUES(?,?,?)')
+        .run(approvalRef, proofJson, registeredAt);
+      return true;
+    });
+  }
+
+  registerTrustedMapping(input: RegisterTrustedTaskControlMappingInput): RegisterTrustedTaskControlMappingResult {
+    this.assertWritable();
+    const dispatchRoot = nonEmpty(input.dispatchRoot, 'dispatchRoot');
+    const projectId = nonEmpty(input.projectId, 'projectId');
+    const phaseId = nonEmpty(input.phaseId, 'phaseId');
+    const phaseTaskGuids = exactTaskSetSnapshot(input.phaseTaskGuids, 'phaseTaskGuids');
+    const taskGuid = nonEmpty(input.taskGuid, 'taskGuid');
+    const topicRootId = nonEmpty(input.topicRootId, 'topicRootId');
+    const ownerId = nonEmpty(input.ownerId, 'ownerId');
+    const reviewerId = nonEmpty(input.reviewerId, 'reviewerId');
+    const acceptorId = nonEmpty(input.acceptorId, 'acceptorId');
+    const registrationRef = controlledEvidenceRef(input.registrationRef, 'registrationRef');
+    const controllerId = nonEmpty(input.controllerId, 'controllerId');
+    const docToken = input.docToken === undefined ? undefined : nonEmpty(input.docToken, 'docToken');
+    if (!phaseTaskGuids.includes(taskGuid) || topicRootId !== dispatchRoot
+      || ownerId === reviewerId || ownerId === acceptorId || reviewerId === acceptorId) {
+      throw new Error('task_control_mapping_invalid');
+    }
+    const principal = this.authenticate(input.authentication);
+    if (principal.actorRole !== 'controller' || principal.actorId !== controllerId) {
+      throw new Error('task_control_mapping_unauthorized_controller');
+    }
+    const mapping: TrustedTaskControlMappingRecord = {
+      dispatchRoot, projectId, phaseId, phaseTaskGuids, taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
+      registrationRef, controllerId, ...(docToken ? { docToken } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
+    };
+    return this.withImmediateWrite(() => {
+      const existing = this.db.prepare('SELECT * FROM control_trusted_mappings WHERE dispatch_root=?')
+        .get(dispatchRoot) as Record<string, unknown> | undefined;
+      if (existing) {
+        const existingMapping = this.listTrustedMappings().find(item => item.dispatchRoot === dispatchRoot)!;
+        if (JSON.stringify(existingMapping) !== JSON.stringify(mapping)) {
+          throw new Error(`task_control_mapping_conflict:${dispatchRoot}`);
+        }
+        return { kind: 'duplicate', mapping: existingMapping };
+      }
+      const phaseRef = `phase:${registrationRef}`;
+      const phaseResult = this.appendEventLocked({
+        eventId: stableId('evt_phase', phaseRef), eventType: 'phase.opened', projectId, phaseId,
+        actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: phaseRef,
+        occurredAt: mapping.createdAt, sourceRef: phaseRef,
+        payload: { taskGuids: phaseTaskGuids, designatedAcceptorId: acceptorId },
+      });
+      if (phaseResult.kind === 'conflict') throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
+      const mappingRef = `mapping:${registrationRef}`;
+      const mappingResult = this.appendEventLocked({
+        eventId: stableId('evt_mapping', mappingRef), eventType: 'mapping.registered', projectId, phaseId, taskGuid, topicRootId,
+        actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: mappingRef,
+        occurredAt: mapping.createdAt, sourceRef: mappingRef,
+        payload: { ownerId, reviewerId, controllerId, ...(docToken ? { docToken } : {}) },
+      });
+      if (mappingResult.kind === 'conflict') throw new Error(`task_control_mapping_event_conflict:${dispatchRoot}`);
+      this.db.prepare(`INSERT INTO control_trusted_mappings(
+        dispatch_root,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,doc_token,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        dispatchRoot, projectId, phaseId, JSON.stringify(phaseTaskGuids), taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
+        registrationRef, controllerId, docToken ?? null, mapping.createdAt,
+      );
+      return { kind: 'registered', mapping };
+    });
+  }
+
+  getApprovalConsumption(approvalRef: string): ApprovalConsumption | undefined {
+    const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE approval_ref=?')
+      .get(approvalRef) as Record<string, unknown> | undefined;
+    return row ? approvalConsumptionFromRow(row) : undefined;
+  }
+
+  private approvalConsumptionForFreezeIdempotency(key: string): ApprovalConsumption | undefined {
+    const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE freeze_idempotency_key=?')
+      .get(key) as Record<string, unknown> | undefined;
+    return row ? approvalConsumptionFromRow(row) : undefined;
+  }
+
   appendUnknownObservation(input: AppendTaskControlObservationInput): AppendTaskControlObservationResult {
     this.assertWritable();
+    return this.withImmediateWrite(() => this.appendUnknownObservationLocked(input));
+  }
+
+  /**
+   * Bounded sidecar path for latency-sensitive daemon hooks.  It never waits
+   * behind the regular five-second SQLite busy timeout; callers may drop the
+   * observation while preserving the primary dispatch/report availability.
+   */
+  tryAppendUnknownObservation(input: AppendTaskControlObservationInput): AppendTaskControlObservationResult | undefined {
+    this.assertWritable();
+    this.db.exec('PRAGMA busy_timeout=0;');
+    try {
+      try { this.db.exec('BEGIN IMMEDIATE;'); }
+      catch (error) {
+        if (isBusy(error)) return undefined;
+        throw error;
+      }
+      try {
+        const result = this.appendUnknownObservationLocked(input);
+        this.db.exec('COMMIT;');
+        return result;
+      } catch (error) {
+        try { this.db.exec('ROLLBACK;'); } catch { /* no active transaction */ }
+        throw error;
+      }
+    } finally {
+      this.db.exec('PRAGMA busy_timeout=5000;');
+    }
+  }
+
+  private appendUnknownObservationLocked(input: AppendTaskControlObservationInput): AppendTaskControlObservationResult {
     const eventId = nonEmpty(input.eventId, 'observation.eventId');
     const sourceRef = nonEmpty(input.sourceRef, 'observation.sourceRef');
     const idempotencyKey = nonEmpty(input.idempotencyKey, 'observation.idempotencyKey');
@@ -1161,9 +1424,8 @@ export class TaskControlPlaneStore {
     const semanticHash = payloadHash({
       attemptedEventType: input.attemptedEventType, sourceRef, payload,
     });
-    return this.withImmediateWrite(() => {
-      const existingRaw = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=?')
-        .get(idempotencyKey) as Record<string, unknown> | undefined;
+    const existingRaw = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=?')
+      .get(idempotencyKey) as Record<string, unknown> | undefined;
       if (existingRaw) {
         const existing = rowToObservation(existingRaw);
         if (existing.payloadHash === semanticHash) return { kind: 'duplicate', observation: existing };
@@ -1195,8 +1457,7 @@ export class TaskControlPlaneStore {
       const row = this.db.prepare('SELECT * FROM control_observations WHERE event_id=?')
         .get(eventId) as Record<string, unknown> | undefined;
       if (!row) throw new Error('task_control_observation_insert_failed');
-      return { kind: 'appended', observation: rowToObservation(row) };
-    });
+    return { kind: 'appended', observation: rowToObservation(row) };
   }
 
   private eventByIdempotencyKey(key: string): TaskControlEvent | undefined {
@@ -1239,6 +1500,35 @@ export class TaskControlPlaneStore {
     };
     validateInput(authenticated, false);
     return this.withImmediateWrite(() => this.appendEventLocked(authenticated));
+  }
+
+  /** Zero-wait append for daemon hot paths. Returns undefined on SQLite contention. */
+  tryAppendEvent(input: AppendTaskControlEventInput): AppendTaskControlEventResult | undefined {
+    this.assertWritable();
+    const { authentication: _authentication, ...eventInput } = input;
+    const authenticated: AuthenticatedAppendTaskControlEventInput = {
+      ...eventInput,
+      ...this.authenticate(input.authentication),
+    };
+    validateInput(authenticated, false);
+    this.db.exec('PRAGMA busy_timeout=0;');
+    try {
+      try { this.db.exec('BEGIN IMMEDIATE;'); }
+      catch (error) {
+        if (isBusy(error)) return undefined;
+        throw error;
+      }
+      try {
+        const result = this.appendEventLocked(authenticated);
+        this.db.exec('COMMIT;');
+        return result;
+      } catch (error) {
+        try { this.db.exec('ROLLBACK;'); } catch { /* no active transaction */ }
+        throw error;
+      }
+    } finally {
+      this.db.exec('PRAGMA busy_timeout=5000;');
+    }
   }
 
   private appendEventLocked(input: AuthenticatedAppendTaskControlEventInput, allowFrozen = false): AppendTaskControlEventResult {
@@ -1649,10 +1939,28 @@ export class TaskControlPlaneStore {
   }): { kind: 'frozen'; validation: PhaseFreezeValidation; event: TaskControlEvent }
     | { kind: 'rejected'; validation: PhaseFreezeValidation } {
     return this.withImmediateWrite(() => {
-      const principal = this.authenticate(input.authentication);
       const prior = this.eventByIdempotencyKey(input.idempotencyKey);
       const checkedAt = prior?.eventType === 'phase.frozen' ? prior.occurredAt : input.occurredAt ?? new Date().toISOString();
       const events = this.listEvents({ projectId: input.projectId, phaseId: input.phaseId });
+      if (prior) {
+        if (prior.eventType !== 'phase.frozen'
+          || prior.projectId !== input.projectId
+          || prior.phaseId !== input.phaseId) {
+          throw new Error(`task_control_freeze_idempotency_conflict:${prior.eventId}`);
+        }
+        const consumption = this.approvalConsumptionForFreezeIdempotency(input.idempotencyKey);
+        if (!consumption || consumption.frozenEventId !== prior.eventId
+          || consumption.projectId !== input.projectId
+          || consumption.phaseId !== input.phaseId) {
+          throw new Error(`task_control_freeze_consumption_inconsistent:${prior.eventId}`);
+        }
+        return {
+          kind: 'frozen',
+          validation: this.validatePhaseFreezeFromEvents(input.projectId, input.phaseId, checkedAt, events),
+          event: prior,
+        };
+      }
+      const principal = this.authenticate(input.authentication);
       const phase = reducePhase(events.filter(event => !event.taskGuid));
       if (!phase.designatedAcceptorId || phase.designatedAcceptorId !== principal.actorId) {
         throw new Error(`task_control_freeze_unauthorized_acceptor:${principal.actorId}`);
@@ -1673,6 +1981,9 @@ export class TaskControlPlaneStore {
       const approvalRef = controlledEvidenceRef(approval.approvalRef, 'verifiedApproval.approvalRef');
       const validation = this.validatePhaseFreezeFromEvents(input.projectId, input.phaseId, checkedAt, events);
       if (!validation.ok) return { kind: 'rejected', validation };
+      if (this.getApprovalConsumption(approvalRef)) {
+        throw new Error(`task_control_freeze_approval_already_consumed:${approvalRef}`);
+      }
       const approvedAt = nonEmpty(approval.approvedAt, 'verifiedApproval.approvedAt');
       const snapshot = this.buildFreezeSnapshot(validation, events, checkedAt, principal.actorId, approvalRef, approvedAt);
       const result = this.appendEventLocked({
@@ -1684,6 +1995,12 @@ export class TaskControlPlaneStore {
       if (result.kind === 'conflict') {
         throw new Error(`task_control_freeze_idempotency_conflict:${result.conflictEvent.eventId}`);
       }
+      this.db.prepare(`INSERT INTO control_approval_consumptions(
+        approval_ref,project_id,phase_id,task_set_hash,acceptor_id,freeze_idempotency_key,frozen_event_id,approved_at,consumed_at
+      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+        approvalRef, input.projectId, input.phaseId, taskSetHash(taskSetSnapshot), principal.actorId,
+        input.idempotencyKey, result.event.eventId, approvedAt, checkedAt,
+      );
       return { kind: 'frozen', validation, event: result.event };
     });
   }

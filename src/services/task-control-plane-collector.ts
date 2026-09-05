@@ -4,14 +4,11 @@ export type TaskControlCollectionKind = 'task' | 'task_comment' | 'topic' | 'doc
 
 export interface TaskControlCollectedRecord {
   kind: TaskControlCollectionKind;
-  projectId: string;
-  phaseId: string;
-  taskGuid: string;
-  topicRootId: string;
+  /** A stable remote-object reference, never remote content or a parsed verdict. */
   sourceRef: string;
   eventId: string;
   idempotencyKey: string;
-  payload?: Record<string, unknown>;
+  occurredAt?: string;
 }
 
 export interface TaskControlCollectionSource {
@@ -19,9 +16,13 @@ export interface TaskControlCollectionSource {
 }
 
 /**
- * Read-only active collector seam.  Production code supplies authenticated task,
+ * Read-only active collector seam. Production code supplies authenticated task,
  * comment, topic and document-revision readers; this module never writes a
  * remote Lark object and never infers review/freeze from text or task status.
+ *
+ * The ledger gets only a bounded source reference. In particular, it must not
+ * become a second store for task descriptions, comments, topic bodies or doc
+ * contents just because Shadow is enabled.
  */
 export class TaskControlActiveCollector {
   private readonly cursors = new Map<TaskControlCollectionKind, string | undefined>();
@@ -38,14 +39,10 @@ export class TaskControlActiveCollector {
       this.lifecycle.appendUnknownObservation({
         eventId: record.eventId, attemptedEventType: 'unknown.declared',
         sourceRef: record.sourceRef, idempotencyKey: record.idempotencyKey,
+        occurredAt: record.occurredAt,
         payload: {
           collectionKind: record.kind,
-          projectId: record.projectId,
-          phaseId: record.phaseId,
-          taskGuid: record.taskGuid,
-          topicRootId: record.topicRootId,
-          sourceRef: record.sourceRef,
-          ...(record.payload ?? {}),
+          referenceOnly: true,
         },
       });
       accepted++;
