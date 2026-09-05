@@ -74,11 +74,14 @@ function observableLockLabel(
   return allowed.has(value) ? value : 'invalid';
 }
 
-function logBotsJsonLockTimeout(
-  error: FileLockTimeoutError,
+function logOwnedBotsJsonLockTimeout(
+  error: unknown,
+  targetPath: string,
   options: BotsJsonLockOptions,
   startedAt: number,
 ): void {
+  if (!(error instanceof FileLockTimeoutError) || error.lockPath !== targetPath + '.lock') return;
+
   logger.warn('[bots-lock] timeout', {
     lock: 'bots.json.lock',
     caller: observableLockLabel(options.caller, LOCK_CALLERS),
@@ -110,7 +113,7 @@ export function withBotsJsonLockSync<T>(
       return result;
     }, options);
   } catch (error) {
-    if (error instanceof FileLockTimeoutError) logBotsJsonLockTimeout(error, options, startedAt);
+    logOwnedBotsJsonLockTimeout(error, target.targetPath, options, startedAt);
     throw error;
   }
 }
@@ -129,7 +132,7 @@ export function withBotsJsonLock<T>(
     if (target.requestedWasSymlink) assertTargetStable();
     return result;
   }, options).catch(error => {
-    if (error instanceof FileLockTimeoutError) logBotsJsonLockTimeout(error, options, startedAt);
+    logOwnedBotsJsonLockTimeout(error, target.targetPath, options, startedAt);
     throw error;
   });
 }
@@ -157,7 +160,7 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
       }
     });
   } catch (error) {
-    if (error instanceof FileLockTimeoutError) logBotsJsonLockTimeout(error, options, startedAt);
+    logOwnedBotsJsonLockTimeout(error, target.targetPath, options, startedAt);
     throw error;
   }
 }
