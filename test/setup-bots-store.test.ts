@@ -21,7 +21,11 @@ import {
   type BotsJsonLockCaller,
   type BotsJsonLockOperation,
 } from '../src/setup/bots-store.js';
-import { FileLockTimeoutError } from '../src/utils/file-lock.js';
+import {
+  FileLockTimeoutError,
+  withFileLock,
+  withFileLockSync,
+} from '../src/utils/file-lock.js';
 import {
   readBotsJsonOrEmpty,
   withBotsJsonLock,
@@ -207,6 +211,74 @@ describe('bots.json lock observability', () => {
 
     try {
       expect(() => withBotsJsonLockSync(botsPath, () => { throw expected; })).toThrow(expected);
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('does not mislabel an async nested lock timeout as bots.json contention', async () => {
+    const nestedTarget = join(tmpDir, 'nested.json');
+    const nestedLockPath = nestedTarget + '.lock';
+    writeFileSync(nestedLockPath, String(process.pid), 'utf8');
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    let nestedLock = false;
+    let nestedError: unknown;
+    let thrown: unknown;
+
+    try {
+      await withBotsJsonLock(botsPath, async () => {
+        nestedLock = true;
+        try {
+          return await withFileLock(nestedTarget, async () => 'unreachable', { maxWaitMs: 0 });
+        } catch (error) {
+          nestedError = error;
+          throw error;
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    try {
+      expect(nestedLock).toBe(true);
+      expect(thrown).toBeInstanceOf(FileLockTimeoutError);
+      expect(thrown).toBe(nestedError);
+      expect((thrown as FileLockTimeoutError).lockPath).toBe(nestedLockPath);
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('does not mislabel a sync nested lock timeout as bots.json contention', () => {
+    const nestedTarget = join(tmpDir, 'nested.json');
+    const nestedLockPath = nestedTarget + '.lock';
+    writeFileSync(nestedLockPath, String(process.pid), 'utf8');
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    let nestedLock = false;
+    let nestedError: unknown;
+    let thrown: unknown;
+
+    try {
+      withBotsJsonLockSync(botsPath, () => {
+        nestedLock = true;
+        try {
+          return withFileLockSync(nestedTarget, () => 'unreachable', { maxWaitMs: 0 });
+        } catch (error) {
+          nestedError = error;
+          throw error;
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    try {
+      expect(nestedLock).toBe(true);
+      expect(thrown).toBeInstanceOf(FileLockTimeoutError);
+      expect(thrown).toBe(nestedError);
+      expect((thrown as FileLockTimeoutError).lockPath).toBe(nestedLockPath);
       expect(stderrWrite).not.toHaveBeenCalled();
     } finally {
       stderrWrite.mockRestore();
