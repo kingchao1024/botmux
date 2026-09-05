@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/setup-bots-store.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   existsSync,
   mkdtempSync,
@@ -12,10 +12,16 @@ import {
   statSync,
   symlinkSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  type BotsJsonLockCaller,
+  type BotsJsonLockOperation,
+} from '../src/setup/bots-store.js';
+import { FileLockTimeoutError } from '../src/utils/file-lock.js';
 import {
   readBotsJsonOrEmpty,
   withBotsJsonLock,
@@ -36,6 +42,15 @@ afterEach(() => {
 });
 
 describe('writeBotsJsonAtomic', () => {
+  it('creates a missing registry with the same atomic-write result', () => {
+    expect(existsSync(botsPath)).toBe(false);
+
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_first' }]);
+
+    expect(JSON.parse(readFileSync(botsPath, 'utf8'))).toEqual([{ larkAppId: 'cli_first' }]);
+    expect(existsSync(botsPath + '.tmp')).toBe(false);
+  });
+
   it('writes valid JSON with trailing newline', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_1', larkAppSecret: 's1' }]);
     expect(existsSync(botsPath)).toBe(true);
@@ -133,5 +148,68 @@ describe('readBotsJsonOrEmpty', () => {
   it('returns parsed array when file is valid', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'a' }, { larkAppId: 'b' }]);
     expect(readBotsJsonOrEmpty(botsPath).map((b: any) => b.larkAppId)).toEqual(['a', 'b']);
+  });
+});
+
+describe('bots.json lock observability', () => {
+  it('does not log on successful acquisition', () => {
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      expect(withBotsJsonLockSync(botsPath, () => 'acquired')).toBe('acquired');
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('logs timeout fields while redacting an unsafe caller label', () => {
+    const lockPath = botsPath + '.lock';
+    writeFileSync(lockPath, String(process.pid), 'utf8');
+    const old = new Date(Date.now() - 1_000);
+    utimesSync(lockPath, old, old);
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    let thrown: unknown;
+    try {
+      withBotsJsonLockSync(botsPath, () => 'unreachable', {
+        maxWaitMs: 0,
+        caller: 'token-do-not-log' as BotsJsonLockCaller,
+        operation: 'config-write' as BotsJsonLockOperation,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    try {
+      expect(thrown).toBeInstanceOf(FileLockTimeoutError);
+      expect(thrown).toMatchObject({
+        code: 'FILE_LOCK_TIMEOUT',
+        holderPid: process.pid,
+      });
+      const logged = stderrWrite.mock.calls.map(([chunk]) => String(chunk)).join('');
+      expect(logged).toContain('[bots-lock] timeout');
+      expect(logged).toContain('\"lock\":\"bots.json.lock\"');
+      expect(logged).toContain('\"caller\":\"invalid\"');
+      expect(logged).toContain('\"operation\":\"invalid\"');
+      expect(logged).toContain(`\"holderPid\":${process.pid}`);
+      expect(logged).toMatch(/\"waitedMs\":\d+/);
+      expect(logged).toMatch(/\"lockAgeMs\":\d+/);
+      expect(logged).not.toContain('token-do-not-log');
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('rethrows non-timeout failures without logging', () => {
+    const expected = new Error('callback failed');
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      expect(() => withBotsJsonLockSync(botsPath, () => { throw expected; })).toThrow(expected);
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
   });
 });

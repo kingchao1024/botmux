@@ -60,7 +60,7 @@ export async function migrateSandboxConfigOnDisk(path: string): Promise<{ migrat
       await writeRawConfigAtomic(targetPath, raw);
       logger.info(`[sandbox-migration] migrated legacy sandbox fields for ${migrated.length} bot(s): ${migrated.join(', ')} (backup: ${bak})`);
       return { migrated };
-    });
+    }, { caller: 'sandbox-migration', operation: 'legacy-config-migration' });
   } catch (err) {
     logger.warn(`[sandbox-migration] skipped (${err instanceof Error ? err.message : String(err)})`);
     return { migrated: [] };
