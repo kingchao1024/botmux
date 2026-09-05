@@ -236,7 +236,15 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
         // so an interactive update dialog would freeze the resume. TraeX shares
         // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+        // The viewer is a second TraeX process with its own hook-review gate.
+        // Keep this exact three-way gate aligned with the app-server: only
+        // Botmux-managed TraeX RPC, an enabled global toggle, and a non-restricted
+        // bot may bypass hook trust. This process-global flag must precede the
+        // --remote subcommand instead of being added after resume.
+        return [
+          ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
+          '--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId,
+        ];
       }
       const baseArgs = [
         ...(!disableCliBypass ? [

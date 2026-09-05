@@ -20205,8 +20205,9 @@ let parentExitShutdown: Promise<void> | null = null;
 
 function shutdownWorkerForParentExit(reason: string): void {
   if (parentExitShutdown) return;
-  parentExitShutdown = shutdownWorkerForParentExitImpl(reason).catch(() => {
-    process.exit(0);
+  parentExitShutdown = shutdownWorkerForParentExitImpl(reason).catch((error) => {
+    log(`Parent-exit RPC teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
   });
 }
 

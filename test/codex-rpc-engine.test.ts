@@ -6,31 +6,12 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { waitForChildExit } from './helpers/child-process.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const isProcessGroupAlive = (pid: number) => {
   try { process.kill(-pid, 0); return true; } catch { return false; }
 };
-
-function waitForWorkerExit(child: ChildProcess, timeoutMs: number): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise((resolvePromise, rejectPromise) => {
-    const onExit = (): void => finish();
-    const onError = (error: Error): void => finish(error);
-    const timer = setTimeout(() => {
-      finish(new Error('worker pid ' + (child.pid ?? 'unknown') + ' did not exit within ' + timeoutMs + 'ms'));
-    }, timeoutMs);
-    const finish = (error?: Error): void => {
-      clearTimeout(timer);
-      child.removeListener('exit', onExit);
-      child.removeListener('error', onError);
-      if (error) rejectPromise(error);
-      else resolvePromise();
-    };
-    child.once('exit', onExit);
-    child.once('error', onError);
-  });
-}
 
 // A real subprocess app-server stand-in (HTTP /readyz + JSON-RPC WS on one port).
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-rpc-server.mjs', import.meta.url));
@@ -719,7 +700,7 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       const worker = spawnNodeTsScript(STOP_WITHOUT_BARRIER_FIXTURE, [pidFile, groupChildPidFile], {
         stdio: 'ignore',
       });
-      await waitForWorkerExit(worker, 5_000);
+      await waitForChildExit(worker, { description: 'old stop fixture worker' });
       appServerPid = Number.parseInt(readFileSync(pidFile, 'utf8'), 10);
       groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
       expect(Number.isInteger(appServerPid)).toBe(true);
@@ -768,6 +749,46 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
         try { process.kill(groupChildPid, 'SIGKILL'); } catch { /* gone */ }
       }
       rmSync(groupChildPidFile, { force: true });
+    }
+  }, 20_000);
+
+  it('reports an unreaped process group and retains its marker for a later recovery', async () => {
+    const sid = 'stop-group-still-alive-' + process.pid + '-' + Date.now();
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    let groupAlive = true;
+    const signals: NodeJS.Signals[] = [];
+    let recovery: CodexRpcEngine | undefined;
+    const engine = makeEngine({ sessionId: sid }, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        return spawn(command, args, options);
+      },
+      isProcessGroupAlive: () => groupAlive,
+      signalProcessGroup(_pid, signal): void {
+        signals.push(signal);
+      },
+    });
+    try {
+      await engine.start();
+      const stalePid = engine.appServerPid!;
+      await expect(engine.stopAndWait()).rejects.toThrow(
+        /process group .* still alive after SIGTERM 2000ms and SIGKILL settle 250ms/,
+      );
+      expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(existsSync(marker)).toBe(true);
+      const retainedMarker = readFileSync(marker, 'utf8');
+
+      groupAlive = false;
+      recovery = makeEngine({ sessionId: sid });
+      await recovery.start();
+      expect(isAlive(stalePid)).toBe(false);
+      expect(readFileSync(marker, 'utf8')).not.toBe(retainedMarker);
+      expect(existsSync(marker)).toBe(true);
+      recovery.stop();
+    } finally {
+      groupAlive = false;
+      engine.stop();
+      recovery?.stop();
+      rmSync(marker, { force: true });
     }
   }, 20_000);
 

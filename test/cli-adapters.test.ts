@@ -480,17 +480,27 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
-  it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
+  it('traex RPC viewer bypasses hook review before --remote only when the three-way gate allows it', () => {
     const traex = createTraexAdapter('/bin/traex');
-    const args = traex.buildArgs({
-      sessionId: 'sess-rpc', resume: true,
-      remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
-      bypassHookTrust: true,
-    });
-    expect(args).toEqual([
-      '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
-      '-c', 'check_for_update_on_startup=false', 'thread-xyz',
-    ]);
+    for (const { toggle, restricted, flag } of [
+      { toggle: true, restricted: false, flag: true },
+      { toggle: false, restricted: false, flag: false },
+      { toggle: true, restricted: true, flag: false },
+      { toggle: false, restricted: true, flag: false },
+    ]) {
+      const args = traex.buildArgs({
+        sessionId: 'sess-rpc', resume: true,
+        remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
+        bypassHookTrust: toggle, disableCliBypass: restricted,
+      });
+      expect(args.includes('--dangerously-bypass-hook-trust')).toBe(flag);
+      expect(args.indexOf('--remote')).toBe(flag ? 1 : 0);
+      expect(args).toEqual([
+        ...(flag ? ['--dangerously-bypass-hook-trust'] : []),
+        '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
+        '-c', 'check_for_update_on_startup=false', 'thread-xyz',
+      ]);
+    }
   });
 
   it('does not inject a stale turn id into Codex shell environment policy', () => {

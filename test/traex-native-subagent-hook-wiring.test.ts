@@ -1,4 +1,4 @@
-import { execFileSync, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -10,10 +10,12 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { createServer } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { isBunRuntime, spawnTsScript } from './helpers/ts-runner.js';
+import { waitForChildExit } from './helpers/child-process.js';
 
 type LaunchRecord = {
   argv: string[];
@@ -72,6 +74,10 @@ function isAppServerLaunch(record: LaunchRecord): boolean {
   return record.argv.includes('app-server');
 }
 
+function isRemoteViewerLaunch(record: LaunchRecord): boolean {
+  return record.argv.includes('--remote');
+}
+
 async function waitFor(
   harness: WorkerHarness,
   predicate: () => boolean,
@@ -110,21 +116,44 @@ function tmuxSessionAlive(name: string): boolean {
   }
 }
 
-function waitForChildExit(
-  child: ChildProcess,
-  logs: string[],
-  timeoutMs = 5_000,
-): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+async function findFreePort(): Promise<number> {
   return new Promise((resolvePromise, rejectPromise) => {
+    const server = createServer();
+    server.once('error', rejectPromise);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = address && typeof address === 'object' ? address.port : 0;
+      server.close(error => error || !port
+        ? rejectPromise(error ?? new Error('no free port'))
+        : resolvePromise(port));
+    });
+  });
+}
+
+function waitForFile(path: string, timeoutMs: number, description: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolvePromise, rejectPromise) => {
+    const poll = setInterval(() => {
+      if (existsSync(path)) finish();
+      else if (Date.now() >= deadline) finish(new Error('timed out waiting for ' + description));
+    }, 25);
+    const finish = (error?: Error): void => {
+      clearInterval(poll);
+      if (error) rejectPromise(error);
+      else resolvePromise();
+    };
+  });
+}
+
+async function stopProcess(child: ChildProcess, description: string): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill('SIGTERM');
+  await new Promise<void>((resolvePromise, rejectPromise) => {
     const onExit = (): void => finish();
     const onError = (error: Error): void => finish(error);
     const timer = setTimeout(() => {
-      finish(new Error(
-        'worker pid ' + (child.pid ?? 'unknown') + ' did not exit within ' + timeoutMs + 'ms\n'
-        + logs.join(''),
-      ));
-    }, timeoutMs);
+      finish(new Error(description + ' pid ' + (child.pid ?? 'unknown') + ' did not exit within 5000ms'));
+    }, 5_000);
     const finish = (error?: Error): void => {
       clearTimeout(timer);
       child.removeListener('exit', onExit);
@@ -152,7 +181,9 @@ async function stopChild(child: ChildProcess): Promise<void> {
 function makeHarness(options: {
   cliId: 'traex' | 'codex';
   backendType: 'pty' | 'tmux';
+  root?: string;
   resume?: boolean;
+  sessionId?: string;
   cliSessionId?: string;
   codexRpcInput?: boolean;
   existingAppServerEndpoint?: string;
@@ -160,8 +191,8 @@ function makeHarness(options: {
   bypassCodexHookTrust?: boolean;
   rpcFixtureEnv?: Record<string, string>;
 }): WorkerHarness {
-  const root = mkdtempSync(join(tmpdir(), 'botmux-traex-launch-'));
-  tempDirs.add(root);
+  const root = options.root ?? mkdtempSync(join(tmpdir(), 'botmux-traex-launch-'));
+  if (!options.root) tempDirs.add(root);
   const dataDir = join(root, 'data');
   const workingDir = join(root, 'project');
   mkdirSync(dataDir, { recursive: true });
@@ -184,7 +215,7 @@ function makeHarness(options: {
   const capturePath = join(root, 'launches.jsonl');
   const fakeCli = join(root, 'fake-cli.mjs');
   writeFileSync(fakeCli, `#!/usr/bin/env node
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 const argv = process.argv.slice(2);
 const commandArgv = argv[0] === '--dangerously-bypass-hook-trust' ? argv.slice(1) : argv;
@@ -203,6 +234,13 @@ if (commandArgv[0] === '--version') {
 if (commandArgv[0] === 'app-server') {
   await import(pathToFileURL(process.env.RPC_FIXTURE_PATH).href);
 } else {
+  if (commandArgv[0] === '--remote' && process.env.EXTERNAL_CONNECTION_FILE) {
+    const socket = new WebSocket(commandArgv[1]);
+    socket.addEventListener('open', () => writeFileSync(process.env.EXTERNAL_CONNECTION_FILE, 'connected'));
+  }
+  if (commandArgv[0] === '--remote' && process.env.EXTERNAL_VIEWER_FILE) {
+    appendFileSync(process.env.EXTERNAL_VIEWER_FILE, 'viewer\\n');
+  }
   process.stdout.write('\\n› \\n');
   process.stdin.resume();
   setInterval(() => {}, 1000);
@@ -210,7 +248,8 @@ if (commandArgv[0] === 'app-server') {
 `);
   chmodSync(fakeCli, 0o755);
 
-  const sessionId = `h${(++sequence).toString(36)}${process.pid.toString(36)}${Date.now().toString(36)}`;
+  const sessionId = options.sessionId
+    ?? `h${(++sequence).toString(36)}${process.pid.toString(36)}${Date.now().toString(36)}`;
   const logs: string[] = [];
   const messages: WorkerToDaemon[] = [];
   const workerEnv = {
@@ -366,14 +405,14 @@ describe('TRAE native subagent hook worker launches', () => {
     expectHookFilesUnchanged(harness);
   }, 25_000);
 
-  it.skipIf(!tmuxAvailable)('puts the hook on the Trae RPC app-server but not its remote viewer', async () => {
+  it.skipIf(!tmuxAvailable)('puts the hook-trust bypass on both managed Trae RPC processes before --remote', async () => {
     const harness = makeHarness({ cliId: 'traex', backendType: 'tmux', codexRpcInput: true });
     await waitFor(
       harness,
       () => {
         const launches = readLaunches(harness.capturePath);
         return launches.some(isAppServerLaunch)
-          && launches.some(record => record.argv[0] === '--remote')
+          && launches.some(isRemoteViewerLaunch)
           && harness.messages.some(message => message.type === 'ready');
       },
       'Trae app-server and remote viewer launches',
@@ -381,15 +420,15 @@ describe('TRAE native subagent hook worker launches', () => {
     );
     const launches = readLaunches(harness.capturePath);
     const appServer = launches.find(isAppServerLaunch);
-    const viewer = launches.find(record => record.argv[0] === '--remote');
+    const viewer = launches.find(isRemoteViewerLaunch);
     expect(appServer).toBeDefined();
     expect(viewer).toBeDefined();
     expectSingleNativeHook(appServer!);
     expect(appServer!.argv[0]).toBe('--dangerously-bypass-hook-trust');
     expect(appServer!.argv[1]).toBe('app-server');
     expect(appServer!.argv).toContain('default_mode_request_user_input');
-    expect(hookOverrides(viewer!.argv)).toEqual([]);
     expect(viewer!.argv).toEqual([
+      '--dangerously-bypass-hook-trust',
       '--remote', expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', 'thread-fake-1',
     ]);
@@ -411,7 +450,7 @@ describe('TRAE native subagent hook worker launches', () => {
       () => {
         const launches = readLaunches(harness.capturePath);
         return launches.some(isAppServerLaunch)
-          && launches.some(record => record.argv[0] === '--remote')
+          && launches.some(isRemoteViewerLaunch)
           && harness.messages.some(message => message.type === 'ready');
       },
       'Trae app-server and remote viewer launches',
@@ -419,7 +458,7 @@ describe('TRAE native subagent hook worker launches', () => {
     );
     const launches = readLaunches(harness.capturePath);
     const appServer = launches.find(isAppServerLaunch);
-    const viewer = launches.find(record => record.argv[0] === '--remote');
+    const viewer = launches.find(isRemoteViewerLaunch);
     expect(appServer).toBeDefined();
     expect(viewer).toBeDefined();
     expect(appServer!.argv[0]).toBe('app-server');
@@ -471,7 +510,7 @@ describe('TRAE native subagent hook worker launches', () => {
       () => {
         const launches = readLaunches(harness.capturePath);
         return launches.some(record => record.argv[0] === 'app-server')
-          && launches.some(record => record.argv[0] === '--remote')
+          && launches.some(isRemoteViewerLaunch)
           && harness.messages.some(message => message.type === 'ready');
       },
       'Codex app-server and remote viewer launches',
@@ -479,7 +518,7 @@ describe('TRAE native subagent hook worker launches', () => {
     );
     const launches = readLaunches(harness.capturePath);
     const appServer = launches.find(record => record.argv[0] === 'app-server');
-    const viewer = launches.find(record => record.argv[0] === '--remote');
+    const viewer = launches.find(isRemoteViewerLaunch);
     expect(appServer).toBeDefined();
     expect(viewer).toBeDefined();
     expect(hookOverrides(appServer!.argv)).toEqual([]);
@@ -527,7 +566,7 @@ describe('TRAE native subagent hook worker launches', () => {
 
       const startedAt = Date.now();
       harness.child.kill('SIGTERM');
-      await waitForChildExit(harness.child, harness.logs);
+      await waitForChildExit(harness.child, { description: 'RPC worker', logs: harness.logs });
       expect(Date.now() - startedAt).toBeLessThanOrEqual(3_000);
       expect(processGroupAlive(groupLeaderPid)).toBe(false);
       expect(processAlive(groupChildPid)).toBe(false);
@@ -553,7 +592,7 @@ describe('TRAE native subagent hook worker launches', () => {
     );
 
     harness.child.kill('SIGTERM');
-    await waitForChildExit(harness.child, harness.logs);
+    await waitForChildExit(harness.child, { description: 'non-RPC worker', logs: harness.logs });
     expect(tmuxSessionAlive(tmuxName)).toBe(true);
   }, 20_000);
 
@@ -569,14 +608,115 @@ describe('TRAE native subagent hook worker launches', () => {
       harness,
       () => (
         harness.messages.some(message => message.type === 'ready')
-        && readLaunches(harness.capturePath).some(record => record.argv[0] === '--remote')
+        && readLaunches(harness.capturePath).some(isRemoteViewerLaunch)
       ),
       'external app-server viewer readiness',
     );
     expect(readLaunches(harness.capturePath).some(isAppServerLaunch)).toBe(false);
 
     harness.child.kill('SIGTERM');
-    await waitForChildExit(harness.child, harness.logs);
+    await waitForChildExit(harness.child, { description: 'external viewer worker', logs: harness.logs });
     expect(tmuxSessionAlive(tmuxName)).toBe(true);
   }, 20_000);
+
+  it.skipIf(!tmuxAvailable)('re-forks and reattaches a persistent tmux session after worker restart', async () => {
+    const first = makeHarness({ cliId: 'codex', backendType: 'tmux' });
+    const tmuxName = 'bmx-' + first.sessionId.slice(0, 8);
+    try {
+      await waitFor(first, () => first.messages.some(message => message.type === 'ready'), 'first worker readiness');
+      expect(tmuxSessionAlive(tmuxName)).toBe(true);
+      const firstLaunchCount = nonProbeLaunches(first).length;
+
+      first.child.kill('SIGTERM');
+      await waitForChildExit(first.child, { description: 'first re-fork worker', logs: first.logs });
+      expect(tmuxSessionAlive(tmuxName)).toBe(true);
+
+      const second = makeHarness({
+        cliId: 'codex',
+        backendType: 'tmux',
+        root: first.root,
+        sessionId: first.sessionId,
+        resume: true,
+      });
+      await waitFor(second, () => second.messages.some(message => message.type === 'ready'), 're-forked worker readiness');
+      expect(tmuxSessionAlive(tmuxName)).toBe(true);
+      // The second worker attaches the pre-existing bmx-* session rather than
+      // spawning a replacement CLI into it.
+      expect(nonProbeLaunches(second)).toHaveLength(firstLaunchCount);
+      expect(firstLaunchCount).toBe(1);
+      second.child.kill('SIGTERM');
+      await waitForChildExit(second.child, { description: 'second re-fork worker', logs: second.logs });
+    } finally {
+      // afterEach owns the persistent tmux session and the first root cleanup.
+    }
+  }, 25_000);
+
+  it.skipIf(!tmuxAvailable)('keeps a real external app-server alive across worker restart and viewer reattach', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-external-app-server-'));
+    tempDirs.add(root);
+    const port = await findFreePort();
+    const pidFile = join(root, 'external.pid');
+    const readyFile = join(root, 'external.ready');
+    const connectionFile = join(root, 'external.connected');
+    const viewerFile = join(root, 'external.viewers');
+    const external = spawn(process.execPath, [
+      resolve('test/fixtures/fake-codex-rpc-server.mjs'),
+      'app-server',
+      '--listen', 'ws://127.0.0.1:' + port,
+    ], {
+      env: {
+        ...process.env,
+        FAKE_EXTERNAL_PID_FILE: pidFile,
+        FAKE_EXTERNAL_READY_FILE: readyFile,
+        FAKE_EXTERNAL_CONNECTION_FILE: connectionFile,
+      },
+      stdio: 'ignore',
+    });
+    let externalPid: number | undefined;
+    try {
+      await waitForFile(pidFile, 5_000, 'external app-server pid file');
+      await waitForFile(readyFile, 5_000, 'external app-server listener');
+      externalPid = Number.parseInt(readFileSync(pidFile, 'utf8'), 10);
+      expect(processAlive(externalPid)).toBe(true);
+
+      const first = makeHarness({
+        cliId: 'codex', backendType: 'tmux', root, sessionId: 'x' + process.pid + '-' + Date.now() + '-external',
+        cliSessionId: 'external-thread', existingAppServerEndpoint: 'ws://127.0.0.1:' + port,
+        rpcFixtureEnv: {
+          EXTERNAL_CONNECTION_FILE: connectionFile,
+          EXTERNAL_VIEWER_FILE: viewerFile,
+        },
+      });
+      const tmuxName = 'bmx-' + first.sessionId.slice(0, 8);
+      await waitFor(first, () => first.messages.some(message => message.type === 'ready'), 'external first worker readiness');
+      expect(readLaunches(first.capturePath).some(isAppServerLaunch)).toBe(false);
+      await waitForFile(connectionFile, 5_000, 'first external viewer WebSocket connection');
+      expect(readFileSync(viewerFile, 'utf8').trim().split('\n')).toHaveLength(1);
+      const firstLaunchCount = nonProbeLaunches(first).length;
+      expect(processAlive(externalPid)).toBe(true);
+
+      first.child.kill('SIGTERM');
+      await waitForChildExit(first.child, { description: 'first external viewer worker', logs: first.logs });
+      expect(processAlive(externalPid)).toBe(true);
+      expect(tmuxSessionAlive(tmuxName)).toBe(true);
+
+      const second = makeHarness({
+        cliId: 'codex', backendType: 'tmux', root, sessionId: first.sessionId, resume: true,
+        cliSessionId: 'external-thread', existingAppServerEndpoint: 'ws://127.0.0.1:' + port,
+      });
+      await waitFor(second, () => second.messages.some(message => message.type === 'ready'), 'external re-forked worker readiness');
+      expect(readLaunches(second.capturePath).some(isAppServerLaunch)).toBe(false);
+      expect(nonProbeLaunches(second)).toHaveLength(firstLaunchCount);
+      expect(readFileSync(viewerFile, 'utf8').trim().split('\n')).toHaveLength(1);
+      expect(processAlive(externalPid)).toBe(true);
+      second.child.kill('SIGTERM');
+      await waitForChildExit(second.child, { description: 'second external viewer worker', logs: second.logs });
+    } finally {
+      await stopProcess(external, 'external app-server');
+      rmSync(pidFile, { force: true });
+      rmSync(readyFile, { force: true });
+      rmSync(connectionFile, { force: true });
+      rmSync(viewerFile, { force: true });
+    }
+  }, 30_000);
 });
