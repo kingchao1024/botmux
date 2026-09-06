@@ -16,6 +16,8 @@ export interface TaskControlEventObservation extends TaskControlEventIdentity {
   authentication: TaskControlAuthentication;
   payload?: Record<string, unknown>;
   evidenceRef?: string;
+  terminal?: boolean;
+  deliverTo?: readonly string[];
 }
 
 /**
@@ -32,6 +34,7 @@ export class TaskControlEventAdapters {
       projectId: observation.projectId, phaseId: observation.phaseId, taskGuid: observation.taskGuid,
       topicRootId: observation.topicRootId, sourceRef: observation.sourceRef,
       evidenceRef: observation.evidenceRef, authentication: observation.authentication, payload: observation.payload,
+      terminal: observation.terminal, deliverTo: observation.deliverTo,
     });
   }
 
@@ -41,6 +44,7 @@ export class TaskControlEventAdapters {
       projectId: observation.projectId, phaseId: observation.phaseId, taskGuid: observation.taskGuid,
       topicRootId: observation.topicRootId, sourceRef: observation.sourceRef,
       evidenceRef: observation.evidenceRef, authentication: observation.authentication, payload: observation.payload,
+      terminal: observation.terminal, deliverTo: observation.deliverTo,
     });
   }
 

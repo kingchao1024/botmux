@@ -23,10 +23,14 @@ export interface TaskControlPlaneLogger {
 export interface TaskControlPlaneDeliveryResult {
   kind: 'delivered' | 'retry' | 'degraded';
   error?: string;
+  /** Exact provider receipt for this event/destination; required for delivered. */
+  receiptRef?: string;
 }
 
 export interface TaskControlPlaneLifecycle {
   readonly enabled: boolean;
+  /** Start timers/pump only after daemon-owned adapters are fully constructed. */
+  activate(): void;
   append(input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication?: TaskControlAuthentication }): void;
   enqueueEvent(input: Omit<AppendTaskControlEventInput, 'authentication'> & { authentication: TaskControlAuthentication }): void;
   appendUnknownObservation(input: AppendTaskControlObservationInput): void;
@@ -52,6 +56,8 @@ export function taskControlPlaneDatabasePath(dataDir: string): string {
 
 export interface TaskControlPlaneRuntimeOptions {
   dataDir: string;
+  /** Owning bot identity; shared dataDir pumps never claim another bot's rows. */
+  larkAppId?: string;
   flags?: Partial<TaskControlPlaneFlags>;
   authority: DaemonTaskControlAuthority;
   logger: TaskControlPlaneLogger;
@@ -62,6 +68,8 @@ export interface TaskControlPlaneRuntimeOptions {
   maxAttempts?: number;
   /** Shadow only drives reference-only active collection; it never freezes. */
   collect?: () => Promise<void>;
+  /** Defer activation for daemon bootstrap so recovery cannot beat adapter readiness. */
+  deferStart?: boolean;
 }
 
 const DEFAULT_FLAGS: TaskControlPlaneFlags = Object.freeze({
@@ -87,6 +95,9 @@ function validateFlags(flags: TaskControlPlaneFlags, hasDelivery: boolean, hasCo
   if (flags.freezeEnforcement && !flags.ledgerEnabled) throw new TaskControlPlaneFlagError('freeze_enforcement_requires_ledger');
   if (flags.pumpEnabled && !flags.ledgerEnabled) throw new TaskControlPlaneFlagError('pump_requires_ledger');
   if (flags.pumpEnabled && !hasDelivery) throw new TaskControlPlaneFlagError('pump_delivery_required');
+  if (flags.shadowEnabled && flags.pumpEnabled) throw new TaskControlPlaneFlagError('shadow_pump_mutually_exclusive');
+  if (flags.shadowEnabled && flags.freezeEnforcement) throw new TaskControlPlaneFlagError('shadow_freeze_mutually_exclusive');
+  if (flags.pumpEnabled && flags.freezeEnforcement) throw new TaskControlPlaneFlagError('pump_freeze_mutually_exclusive');
 }
 
 function retryDelay(attempt: number): number {
@@ -95,6 +106,7 @@ function retryDelay(attempt: number): number {
 
 class DisabledTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
   readonly enabled = false;
+  activate(): void { /* disabled */ }
   append(): void { /* Default off: legacy daemon paths remain wholly unchanged. */ }
   enqueueEvent(): void { /* Default off: legacy daemon paths remain wholly unchanged. */ }
   appendUnknownObservation(): void { /* Default off: legacy daemon paths remain wholly unchanged. */ }
@@ -108,6 +120,7 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
   readonly enabled = true;
   private timer: NodeJS.Timeout | undefined;
   private running: Promise<void> | undefined;
+  private collecting = false;
   private stopped = false;
   private closed = false;
   private closeAfterInflight: Promise<void> | undefined;
@@ -128,12 +141,19 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
     if (this.timer || (!this.options.deliver && !this.options.collect)) return;
     const tick = (): void => {
       if (this.options.deliver) void this.pump().catch(error => this.options.logger.warn(`[task-control] outbox pump failed: ${String(error)}`));
-      if (this.options.collect && !this.stopped) void this.options.collect().catch(error => this.options.logger.warn(`[task-control] shadow collector failed: ${String(error)}`));
+      if (this.options.collect && !this.stopped && !this.collecting) {
+        this.collecting = true;
+        void this.options.collect()
+          .catch(error => this.options.logger.warn(`[task-control] shadow collector failed: ${String(error)}`))
+          .finally(() => { this.collecting = false; });
+      }
     };
     tick();
     this.timer = setInterval(tick, this.options.intervalMs ?? 5_000);
     this.timer.unref?.();
   }
+
+  activate(): void { this.start(); }
 
   getStore(): TaskControlPlaneStore { return this.store; }
 
@@ -234,7 +254,16 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
         try {
           const result = await this.options.deliver!(row);
           if (result.kind === 'delivered') {
-            this.store.settleOutboxDelivered(row.outboxId, token, new Date(this.options.now()).toISOString());
+            if (!result.receiptRef) {
+              this.store.rescheduleOutbox(row.outboxId, token, {
+                error: 'delivery_receipt_missing', nextAttemptAt: this.options.now() + retryDelay(row.attempts),
+              });
+            } else {
+              this.store.settleOutboxDelivered(row.outboxId, token, {
+                receiptRef: TaskControlPlaneStore.providerReceiptRef(row.eventId, row.destinationId, result.receiptRef),
+                deliveredAt: new Date(this.options.now()).toISOString(),
+              });
+            }
           } else if (result.kind === 'degraded' || row.attempts >= this.options.maxAttempts) {
             this.store.settleOutboxDegraded(row.outboxId, token, { error: result.error ?? 'delivery_retry_exhausted' });
           } else {
@@ -304,7 +333,7 @@ export async function startTaskControlPlaneRuntime(options: TaskControlPlaneRunt
   validateFlags(flags, !!options.deliver, !!options.collect);
   if (!flags.ledgerEnabled) return new DisabledTaskControlPlaneLifecycle();
   try {
-    const store = await TaskControlPlaneStore.open(options.dataDir, options.authority);
+    const store = await TaskControlPlaneStore.open(options.dataDir, options.authority, options.larkAppId);
     const lifecycle = new ActiveTaskControlPlaneLifecycle(store, {
       logger: options.logger,
       now: options.now ?? Date.now,
@@ -315,7 +344,7 @@ export async function startTaskControlPlaneRuntime(options: TaskControlPlaneRunt
       freezeEnabled: flags.freezeEnforcement,
       intervalMs: options.intervalMs,
     });
-    lifecycle.start();
+    if (!options.deferStart) lifecycle.activate();
     return lifecycle;
   } catch (error) {
     options.logger.warn(`[task-control] bootstrap failed; continuing with ledger disabled: ${String(error)}`);

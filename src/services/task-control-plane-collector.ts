@@ -36,7 +36,10 @@ export class TaskControlActiveCollector {
     const response = await this.source.list({ kind, cursor: this.cursors.get(kind) });
     let accepted = 0;
     for (const record of response.records) {
-      this.lifecycle.appendUnknownObservation({
+      // Shadow collection is a sidecar: slow/locked SQLite must never stall
+      // daemon event processing. The lifecycle's bounded single-consumer queue
+      // preserves order and drops with evidence under pressure.
+      this.lifecycle.enqueueUnknownObservation({
         eventId: record.eventId, attemptedEventType: 'unknown.declared',
         sourceRef: record.sourceRef, idempotencyKey: record.idempotencyKey,
         occurredAt: record.occurredAt,

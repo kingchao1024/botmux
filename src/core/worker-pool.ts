@@ -709,6 +709,12 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { turnId: string; workerGeneration: number },
   ) => void | Promise<void>;
+  /** A canonical final-output provider receipt, emitted only after the actual
+   * Lark reply/comment send succeeds for the current worker generation. */
+  onTurnDeliveryReceipt?: (
+    ds: DaemonSession,
+    context: { sessionId: string; turnId: string; workerGeneration: number; destinationId: string; receiptRef: string; docToken?: string },
+  ) => void | Promise<void>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
@@ -14609,11 +14615,29 @@ function deliverFinalOutput(
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
+  inheritedReceiptOwner?: {
+    sessionId: string; workerGeneration: number; worker: ChildProcess | null; dispatchRootMessageId?: string;
+  },
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
     return;
   }
+  // A provider reply may resolve after a replacement worker has taken over this
+  // DaemonSession.  The sidecar receipt is a generation-scoped authorization
+  // fact, so capture the exact owner before any provider await and never derive
+  // it later from mutable `ds` fields.
+  const receiptOwner = inheritedReceiptOwner ?? {
+    sessionId: ds.session.sessionId,
+    workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+    worker: ds.worker,
+    dispatchRootMessageId: ds.session.rootMessageId,
+  };
+  const ownsReceiptOwner = (): boolean => isStillOwned()
+    && ds.session.sessionId === receiptOwner.sessionId
+    && ds.worker === receiptOwner.worker
+    && (ds.workerGeneration ?? ds.session.workerGeneration ?? 0) === receiptOwner.workerGeneration
+    && (ds.session.workerGeneration ?? receiptOwner.workerGeneration) === receiptOwner.workerGeneration;
   let cardUsage = frozenUsage;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
@@ -14691,10 +14715,28 @@ function deliverFinalOutput(
         // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
         const chunks = chunkCommentText(msg.content);
+        let providerReceipt: { destinationId: string; receiptRef: string } | undefined;
         for (let i = 0; i < chunks.length; i++) {
-          if (!isStillOwned()) { onComplete?.(false); return; }
-          await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
-          if (!isStillOwned()) { onComplete?.(false); return; }
+          if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+          const result = await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
+          // Older adapters/mocks returned void after a successful provider send.
+          // Receipt enrichment is optional; delivery cleanup/dedupe remains the
+          // pre-existing success path when no structured receipt is available.
+          if (i === 0 && result) {
+            const commentId = result.commentId ?? docTurn.commentId;
+            const receiptId = result.replyId ?? commentId;
+            if (commentId && receiptId) providerReceipt = { destinationId: `task-comment:${commentId}`, receiptRef: `task-comment:${receiptId}` };
+          }
+          if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+        }
+        if (providerReceipt) {
+          // The provider accepted the comment, but a newer worker now owns the
+          // session. Never let the old receipt settle the new generation.
+          if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+          void Promise.resolve(cb.onTurnDeliveryReceipt?.(ds, {
+            sessionId: receiptOwner.sessionId, turnId: msg.turnId, workerGeneration: receiptOwner.workerGeneration,
+            ...providerReceipt, docToken: docTurn.fileToken,
+          })).catch(error => logger.warn(`[${t}] task-control doc delivery receipt sidecar failed: ${String(error)}`));
         }
         // The user-visible reply is committed. Consume the route and dedupe
         // marker BEFORE best-effort reaction cleanup: a missing/expired
@@ -15074,6 +15116,17 @@ function deliverFinalOutput(
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
           : deliveryReplyOptions,
       );
+      // `scopedReply` can cross an arbitrary provider await. The visible reply
+      // is already accepted, but a receipt from the old owner must not be
+      // projected into a replacement worker generation.
+      if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+      void Promise.resolve(cb.onTurnDeliveryReceipt?.(ds, {
+        sessionId: receiptOwner.sessionId, turnId: msg.turnId, workerGeneration: receiptOwner.workerGeneration,
+        // The dispatch/topic root is the controlled delivery destination; the
+        // newly returned final-output message id is an independent provider
+        // receipt. Never use a readable topic root as its own receipt.
+        destinationId: `topic-message:${receiptOwner.dispatchRootMessageId ?? messageId}`, receiptRef: `topic-message:${messageId}`,
+      })).catch(error => logger.warn(`[${t}] task-control final delivery receipt sidecar failed: ${String(error)}`));
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       if (msg.turnId.startsWith('mlrp_turn_')) {
@@ -15123,7 +15176,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, receiptOwner);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

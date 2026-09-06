@@ -787,6 +787,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // root server-side, then lets the trusted daemon relay to the orchestrator.
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
+  // ReviewerVerdict is the sole task-control worker aperture. Its handler
+  // re-derives the reviewer daemon/session/generation/capability and never
+  // accepts a caller-provided app, verifier, source hash or trust root.
+  if (method === 'POST' && pathname === '/api/task-control/reviewer-verdicts/submit') return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.

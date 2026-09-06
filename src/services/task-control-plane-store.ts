@@ -7,15 +7,20 @@
  * append-only receipt log so an unavailable report relay is observable instead
  * of being mistaken for successful delivery.
  *
- * This module intentionally has no daemon wiring yet. It can be validated and
- * reviewed without changing live Botmux behavior.
+ * The daemon/runtime wire this ledger only behind default-off task-control
+ * flags. Production ReviewerVerdict trust-root signing, Lark source resolution,
+ * and restricted ingress are intentionally not wired here; absent proof remains
+ * UNKNOWN rather than being inferred from daemon/report state.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import {
+  reviewerCapabilityHash, reviewerVerdictPayloadHash, type DesignatedReviewerMapping, type ReviewerConditionEvidence, type ReviewerVerdictAttestation, type ReviewerVerdictV1,
+} from './task-control-plane-reviewer-verdict.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 9;
 const DATABASE_NAME = 'botmux-task-control-plane.sqlite';
 
 export type TaskControlEventType =
@@ -215,9 +220,10 @@ export interface ReviewProjection {
   independent: boolean;
   verdict: ReviewVerdict;
   conditionIds: string[];
-  resolvedConditionEvidence: Record<string, string>;
+  resolvedConditionEvidence: Record<string, ReviewerConditionEvidence>;
   docToken?: string;
   docRevision?: number;
+  reviewerVerdictId?: string;
 }
 
 export interface TaskProjection {
@@ -229,6 +235,8 @@ export interface TaskProjection {
   acceptedActorId?: string;
   terminalBody?: TerminalBodyProjection;
   independentReview?: ReviewProjection;
+  /** Present when a historical review event no longer has a current trusted verdict head. */
+  reviewerVerdictIssue?: string;
   unresolvedReviewConditionIds: string[];
   doneEvent?: { eventId: string; seq: number };
   unknowns: UnknownProjection[];
@@ -292,6 +300,7 @@ export interface DeliveryReceipt {
   destinationId: string;
   attempt: number;
   state: DeliveryReceiptState;
+  receiptRef?: string;
   error?: string;
   fallbackEventId?: string;
   createdAt: string;
@@ -313,6 +322,7 @@ export type FreezeIssueCode =
   | 'terminal_body_missing'
   | 'independent_review_missing'
   | 'reviewer_not_independent'
+  | 'reviewer_verdict_unverified'
   | 'review_conditions_unresolved'
   | 'review_terminal_mismatch'
   | 'task_done_missing'
@@ -402,14 +412,17 @@ export interface TrustedTaskControlMappingRecord {
   acceptorId: string;
   registrationRef: string;
   controllerId: string;
+  approvalGate: {
+    approvalRef: string;
+    runId: string;
+    nodeId: string;
+    instanceId: string;
+    waitId: string;
+    operatorId: string;
+    approverPolicy: readonly string[];
+  };
   docToken?: string;
   createdAt: string;
-}
-
-export interface DurableTaskControlApprovalProof {
-  approvalRef: string;
-  proof: Record<string, unknown>;
-  registeredAt: string;
 }
 
 export interface RegisterTrustedTaskControlMappingInput {
@@ -424,9 +437,16 @@ export interface RegisterTrustedTaskControlMappingInput {
   acceptorId: string;
   registrationRef: string;
   controllerId: string;
+  approvalGate: TrustedTaskControlMappingRecord['approvalGate'];
   docToken?: string;
   authentication: unknown;
   occurredAt?: string;
+}
+
+export interface ReviewerVerdictHead {
+  status: 'active' | 'superseded' | 'revoked' | 'unknown';
+  verdict?: ReviewerVerdictV1;
+  reason?: string;
 }
 
 export type RegisterTrustedTaskControlMappingResult =
@@ -436,6 +456,7 @@ export type RegisterTrustedTaskControlMappingResult =
 interface EventRow {
   seq: number | bigint;
   event_id: string;
+  lark_app_id: string;
   event_type: string;
   schema_version: number | bigint;
   project_id: string;
@@ -491,18 +512,24 @@ const TASK_TRANSITIONS: Partial<Record<TaskControlEventType, TaskTransitionRule>
   'task.accepted': { from: ['planned', 'blocked'], to: 'accepted' },
   'task.not_accepted': { from: ['planned', 'blocked'], to: 'blocked' },
   'task.acceptance_timed_out': { from: ['planned', 'blocked'], to: 'blocked' },
-  'task.execution_started': { from: ['accepted', 'blocked'], to: 'executing' },
+  // A rework execution must be evidenced after the reviewer result but before
+  // task.rework_started can consume that result. Keep reviewing while recording
+  // this fresh worker execution; the explicit rework event is the only state
+  // transition into rework and is never inferred from FAIL/CONDITIONAL.
+  'task.execution_started': {
+    from: ['accepted', 'blocked', 'reviewing'],
+    to: (_payload, current) => current === 'reviewing' ? 'reviewing' : 'executing',
+  },
   'task.first_submitted': { from: ['executing', 'rework'], to: 'submitted' },
   'task.reviewed': {
     from: ['submitted'],
     to: payload => {
       const verdict = parseReviewVerdict(payload.verdict);
-      if (verdict === 'fail') return 'rework';
       if (verdict === 'unknown') return 'blocked';
       return 'reviewing';
     },
   },
-  'task.rework_started': { from: ['reviewing', 'rework'], to: 'rework' },
+  'task.rework_started': { from: ['reviewing'], to: 'rework' },
   'task.delivered': { from: ['reviewing'], to: 'delivered' },
   'task.done_marked': { from: ['delivered'], to: 'task_done_pending_freeze' },
   'task.blocked': { from: ALL_OPEN_TASK_STATES, to: 'blocked' },
@@ -529,7 +556,8 @@ const PHASE_TRANSITIONS: Partial<Record<TaskControlEventType, PhaseTransitionRul
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS control_events(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id TEXT NOT NULL UNIQUE,
+    lark_app_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     schema_version INTEGER NOT NULL CHECK(schema_version=1),
     project_id TEXT NOT NULL,
@@ -544,7 +572,7 @@ const SCHEMA = `
     source_ref TEXT,
     payload_ref TEXT,
     evidence_ref TEXT,
-    idempotency_key TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
     causation_id TEXT,
     correlation_id TEXT,
     attempt INTEGER NOT NULL DEFAULT 1 CHECK(attempt >= 1),
@@ -552,42 +580,52 @@ const SCHEMA = `
     ack_deadline TEXT,
     terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0,1)),
     payload_hash TEXT NOT NULL,
-    payload_json TEXT NOT NULL
+    payload_json TEXT NOT NULL,
+    UNIQUE(lark_app_id,event_id),
+    UNIQUE(lark_app_id,idempotency_key)
   );
-  CREATE INDEX IF NOT EXISTS control_events_phase_seq ON control_events(project_id,phase_id,seq);
-  CREATE INDEX IF NOT EXISTS control_events_task_seq ON control_events(task_guid,seq);
+  CREATE INDEX IF NOT EXISTS control_events_phase_seq ON control_events(lark_app_id,project_id,phase_id,seq);
+  CREATE INDEX IF NOT EXISTS control_events_task_seq ON control_events(lark_app_id,task_guid,seq);
   CREATE UNIQUE INDEX IF NOT EXISTS control_mapping_topic_unique
-    ON control_events(topic_root_id) WHERE event_type='mapping.registered';
+    ON control_events(lark_app_id,topic_root_id) WHERE event_type='mapping.registered';
   CREATE UNIQUE INDEX IF NOT EXISTS control_mapping_task_unique
-    ON control_events(task_guid) WHERE event_type='mapping.registered';
+    ON control_events(lark_app_id,task_guid) WHERE event_type='mapping.registered';
 
   CREATE TABLE IF NOT EXISTS control_observations(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id TEXT NOT NULL UNIQUE,
+    lark_app_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
     attempted_event_type TEXT NOT NULL,
     source_ref TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
     occurred_at TEXT NOT NULL,
     outcome TEXT NOT NULL CHECK(outcome IN ('unknown','conflict')),
     payload_hash TEXT NOT NULL,
-    payload_json TEXT NOT NULL
+    payload_json TEXT NOT NULL,
+    UNIQUE(lark_app_id,event_id),
+    UNIQUE(lark_app_id,idempotency_key)
   );
-  CREATE INDEX IF NOT EXISTS control_observations_source_seq ON control_observations(source_ref,seq);
+  CREATE INDEX IF NOT EXISTS control_observations_source_seq ON control_observations(lark_app_id,source_ref,seq);
   CREATE TRIGGER IF NOT EXISTS control_observations_no_update BEFORE UPDATE ON control_observations
   BEGIN SELECT RAISE(ABORT,'control_observation_immutable'); END;
   CREATE TRIGGER IF NOT EXISTS control_observations_no_delete BEFORE DELETE ON control_observations
   BEGIN SELECT RAISE(ABORT,'control_observation_immutable'); END;
 
   CREATE TABLE IF NOT EXISTS control_approval_consumptions(
-    approval_ref TEXT PRIMARY KEY,
+    lark_app_id TEXT NOT NULL,
+    approval_ref TEXT NOT NULL,
     project_id TEXT NOT NULL,
     phase_id TEXT NOT NULL,
     task_set_hash TEXT NOT NULL,
     acceptor_id TEXT NOT NULL,
-    freeze_idempotency_key TEXT NOT NULL UNIQUE,
-    frozen_event_id TEXT NOT NULL UNIQUE REFERENCES control_events(event_id),
+    freeze_idempotency_key TEXT NOT NULL,
+    frozen_event_id TEXT NOT NULL,
     approved_at TEXT NOT NULL,
-    consumed_at TEXT NOT NULL
+    consumed_at TEXT NOT NULL,
+    PRIMARY KEY(lark_app_id,approval_ref),
+    UNIQUE(lark_app_id,freeze_idempotency_key),
+    UNIQUE(lark_app_id,frozen_event_id),
+    FOREIGN KEY(lark_app_id,frozen_event_id) REFERENCES control_events(lark_app_id,event_id)
   );
   CREATE TRIGGER IF NOT EXISTS control_approval_consumptions_no_update BEFORE UPDATE ON control_approval_consumptions
   BEGIN SELECT RAISE(ABORT,'control_approval_consumption_immutable'); END;
@@ -595,38 +633,35 @@ const SCHEMA = `
   BEGIN SELECT RAISE(ABORT,'control_approval_consumption_immutable'); END;
 
   CREATE TABLE IF NOT EXISTS control_trusted_mappings(
-    dispatch_root TEXT PRIMARY KEY,
+    lark_app_id TEXT NOT NULL,
+    dispatch_root TEXT NOT NULL,
     project_id TEXT NOT NULL,
     phase_id TEXT NOT NULL,
     phase_task_guids_json TEXT NOT NULL,
     task_guid TEXT NOT NULL,
-    topic_root_id TEXT NOT NULL UNIQUE,
+    topic_root_id TEXT NOT NULL,
     owner_id TEXT NOT NULL,
     reviewer_id TEXT NOT NULL,
     acceptor_id TEXT NOT NULL,
-    registration_ref TEXT NOT NULL UNIQUE,
+    registration_ref TEXT NOT NULL,
     controller_id TEXT NOT NULL,
+    approval_gate_json TEXT NOT NULL,
     doc_token TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(lark_app_id,dispatch_root),
+    UNIQUE(lark_app_id,task_guid),
+    UNIQUE(lark_app_id,topic_root_id),
+    UNIQUE(lark_app_id,registration_ref)
   );
   CREATE TRIGGER IF NOT EXISTS control_trusted_mappings_no_update BEFORE UPDATE ON control_trusted_mappings
   BEGIN SELECT RAISE(ABORT,'control_mapping_immutable'); END;
   CREATE TRIGGER IF NOT EXISTS control_trusted_mappings_no_delete BEFORE DELETE ON control_trusted_mappings
   BEGIN SELECT RAISE(ABORT,'control_mapping_immutable'); END;
 
-  CREATE TABLE IF NOT EXISTS control_approval_proofs(
-    approval_ref TEXT PRIMARY KEY,
-    proof_json TEXT NOT NULL,
-    registered_at TEXT NOT NULL
-  );
-  CREATE TRIGGER IF NOT EXISTS control_approval_proofs_no_update BEFORE UPDATE ON control_approval_proofs
-  BEGIN SELECT RAISE(ABORT,'control_approval_proof_immutable'); END;
-  CREATE TRIGGER IF NOT EXISTS control_approval_proofs_no_delete BEFORE DELETE ON control_approval_proofs
-  BEGIN SELECT RAISE(ABORT,'control_approval_proof_immutable'); END;
-
   CREATE TABLE IF NOT EXISTS control_outbox(
-    outbox_id TEXT PRIMARY KEY,
-    event_id TEXT NOT NULL REFERENCES control_events(event_id),
+    lark_app_id TEXT NOT NULL,
+    outbox_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
     destination_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('pending','inflight','delivered','degraded')),
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -634,25 +669,60 @@ const SCHEMA = `
     claim_token TEXT,
     claimed_at INTEGER,
     last_error TEXT,
-    fallback_event_id TEXT REFERENCES control_events(event_id),
+    fallback_event_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE(event_id,destination_id)
+    PRIMARY KEY(lark_app_id,outbox_id),
+    UNIQUE(lark_app_id,event_id,destination_id),
+    FOREIGN KEY(lark_app_id,event_id) REFERENCES control_events(lark_app_id,event_id),
+    FOREIGN KEY(lark_app_id,fallback_event_id) REFERENCES control_events(lark_app_id,event_id)
   );
-  CREATE INDEX IF NOT EXISTS control_outbox_due ON control_outbox(status,next_attempt_at,outbox_id);
+  CREATE INDEX IF NOT EXISTS control_outbox_due ON control_outbox(lark_app_id,status,next_attempt_at,outbox_id);
 
   CREATE TABLE IF NOT EXISTS control_delivery_receipts(
-    receipt_id TEXT PRIMARY KEY,
-    outbox_id TEXT NOT NULL REFERENCES control_outbox(outbox_id),
-    event_id TEXT NOT NULL REFERENCES control_events(event_id),
+    lark_app_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    outbox_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
     destination_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('retry_scheduled','claim_recovered','delivered','degraded','fallback_verified')),
+    receipt_ref TEXT,
     error TEXT,
-    fallback_event_id TEXT REFERENCES control_events(event_id),
-    created_at TEXT NOT NULL
+    fallback_event_id TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(lark_app_id,receipt_id),
+    FOREIGN KEY(lark_app_id,outbox_id) REFERENCES control_outbox(lark_app_id,outbox_id),
+    FOREIGN KEY(lark_app_id,event_id) REFERENCES control_events(lark_app_id,event_id),
+    FOREIGN KEY(lark_app_id,fallback_event_id) REFERENCES control_events(lark_app_id,event_id)
   );
-  CREATE INDEX IF NOT EXISTS control_receipts_event ON control_delivery_receipts(event_id,created_at,receipt_id);
+  CREATE INDEX IF NOT EXISTS control_receipts_event ON control_delivery_receipts(lark_app_id,event_id,created_at,receipt_id);
+
+  CREATE TABLE IF NOT EXISTS control_designated_reviewers(
+    designated_reviewer_ref TEXT NOT NULL,
+    lark_app_id TEXT NOT NULL,
+    project_id TEXT NOT NULL, phase_id TEXT NOT NULL, task_guid TEXT NOT NULL, topic_root_id TEXT NOT NULL, task_set_json TEXT NOT NULL, review_round INTEGER NOT NULL,
+    reviewer_id TEXT NOT NULL, reviewer_bot_app_id TEXT NOT NULL, controller_id TEXT NOT NULL, controller_bot_app_id TEXT NOT NULL,
+    effective_at TEXT NOT NULL, expires_at TEXT NOT NULL, issued_at TEXT NOT NULL, key_id TEXT NOT NULL, signature TEXT NOT NULL,
+    supersedes_ref TEXT,
+    PRIMARY KEY(lark_app_id,designated_reviewer_ref)
+  );
+  CREATE TRIGGER IF NOT EXISTS control_designated_reviewers_no_update BEFORE UPDATE ON control_designated_reviewers
+  BEGIN SELECT RAISE(ABORT,'control_designated_reviewer_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_designated_reviewers_no_delete BEFORE DELETE ON control_designated_reviewers
+  BEGIN SELECT RAISE(ABORT,'control_designated_reviewer_immutable'); END;
+
+  CREATE TABLE IF NOT EXISTS control_reviewer_verdicts(
+    verdict_id TEXT NOT NULL,
+    lark_app_id TEXT NOT NULL, project_id TEXT NOT NULL, phase_id TEXT NOT NULL, task_guid TEXT NOT NULL, task_set_json TEXT NOT NULL, review_round INTEGER NOT NULL,
+    canonical_hash TEXT NOT NULL, canonical_json TEXT NOT NULL, issued_at TEXT NOT NULL,
+    PRIMARY KEY(lark_app_id,verdict_id)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS control_reviewer_verdict_payload_unique ON control_reviewer_verdicts(lark_app_id,verdict_id,canonical_hash);
+  CREATE TRIGGER IF NOT EXISTS control_reviewer_verdicts_no_update BEFORE UPDATE ON control_reviewer_verdicts
+  BEGIN SELECT RAISE(ABORT,'control_reviewer_verdict_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_reviewer_verdicts_no_delete BEFORE DELETE ON control_reviewer_verdicts
+  BEGIN SELECT RAISE(ABORT,'control_reviewer_verdict_immutable'); END;
 
   CREATE TRIGGER IF NOT EXISTS control_events_no_update BEFORE UPDATE ON control_events
   BEGIN SELECT RAISE(ABORT,'control_event_immutable'); END;
@@ -746,15 +816,22 @@ function parseReviewVerdict(value: unknown): ReviewVerdict {
   throw new Error('task_control_invalid:payload.verdict');
 }
 
-function conditionEvidenceRefs(value: unknown): Record<string, string> {
+function conditionEvidenceRefs(value: unknown): Record<string, ReviewerConditionEvidence> {
   if (value === undefined) return {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('task_control_invalid:payload.resolvedConditionEvidence');
   }
-  const result: Record<string, string> = {};
-  for (const [conditionId, evidenceRef] of Object.entries(value as Record<string, unknown>)) {
+  const result: Record<string, ReviewerConditionEvidence> = {};
+  for (const [conditionId, evidence] of Object.entries(value as Record<string, unknown>)) {
     nonEmpty(conditionId, 'payload.resolvedConditionEvidence.conditionId');
-    result[conditionId] = controlledEvidenceRef(evidenceRef, `payload.resolvedConditionEvidence.${conditionId}`);
+    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
+      throw new Error(`task_control_invalid:payload.resolvedConditionEvidence.${conditionId}`);
+    }
+    const item = evidence as Record<string, unknown>;
+    result[conditionId] = {
+      evidenceRef: controlledEvidenceRef(item.evidenceRef, `payload.resolvedConditionEvidence.${conditionId}.evidenceRef`),
+      observedAt: new Date(timestampMs(item.observedAt, `payload.resolvedConditionEvidence.${conditionId}.observedAt`)).toISOString(),
+    };
   }
   return result;
 }
@@ -793,12 +870,315 @@ function parseDeliveryFallback(payload: Record<string, unknown>): DeliveryFallba
   return { deliveryEventId, destinationId, method, receiptRef };
 }
 
+function receiptRefBindsEventAndDestination(receiptRef: string, eventId: string, destinationId: string): boolean {
+  // A generic readable message/comment id proves neither which terminal event
+  // caused it nor which outbox destination it acknowledges. Terminal receipts
+  // must carry a stable provider-issued binding envelope, preserving all three
+  // dimensions without exposing payload/body text. Legacy stored evidence stays
+  // readable but cannot settle a new row through this path.
+  const match = /^provider-receipt:([a-f0-9]{32}):([a-f0-9]{32}):([a-f0-9]{32})$/.exec(receiptRef);
+  if (!match) return false;
+  return match[1] === sha256(eventId).slice(7, 39)
+    && match[2] === sha256(destinationId).slice(7, 39)
+    && match[3] !== '';
+}
+
+function receiptRefForEventDestination(eventId: string, destinationId: string, providerReceiptId: string): string {
+  return `provider-receipt:${sha256(eventId).slice(7, 39)}:${sha256(destinationId).slice(7, 39)}:${sha256(nonEmpty(providerReceiptId, 'providerReceiptId')).slice(7, 39)}`;
+}
+
 function controlledEvidenceRef(value: unknown, field: string): string {
   const ref = nonEmpty(value, field);
   if (!/^(task-comment:[0-9]+|topic-message:om_[A-Za-z0-9]+|approval:[A-Za-z0-9][A-Za-z0-9._:-]*)$/.test(ref)) {
     throw new Error(`task_control_invalid:${field}`);
   }
   return ref;
+}
+
+function parseApprovalGate(value: unknown): TrustedTaskControlMappingRecord['approvalGate'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('task_control_invalid:approvalGate');
+  const gate = value as Record<string, unknown>;
+  return {
+    approvalRef: controlledEvidenceRef(gate.approvalRef, 'approvalGate.approvalRef'),
+    runId: nonEmpty(gate.runId, 'approvalGate.runId'),
+    nodeId: nonEmpty(gate.nodeId, 'approvalGate.nodeId'),
+    instanceId: nonEmpty(gate.instanceId, 'approvalGate.instanceId'),
+    waitId: nonEmpty(gate.waitId, 'approvalGate.waitId'),
+    operatorId: nonEmpty(gate.operatorId, 'approvalGate.operatorId'),
+    approverPolicy: exactTaskSetSnapshot(gate.approverPolicy, 'approvalGate.approverPolicy'),
+  };
+}
+
+function tableColumns(db: DatabaseSyncLike, table: string): Set<string> {
+  return new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>)
+    .map(row => typeof row.name === 'string' ? row.name : ''));
+}
+
+function hasCompositePrimaryKey(db: DatabaseSyncLike, table: string, expected: readonly string[]): boolean {
+  const keys = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown; pk?: unknown }>)
+    .map(row => ({ name: typeof row.name === 'string' ? row.name : '', pk: Number(row.pk) }))
+    .filter(row => row.pk > 0)
+    .sort((left, right) => left.pk - right.pk)
+    .map(row => row.name);
+  return JSON.stringify(keys) === JSON.stringify(expected);
+}
+
+function hasUniqueKey(db: DatabaseSyncLike, table: string, expected: readonly string[]): boolean {
+  return (db.prepare(`PRAGMA index_list(${table})`).all() as Array<{ name?: unknown; unique?: unknown }>)
+    .some(index => index.unique === 1 && typeof index.name === 'string'
+      && JSON.stringify((db.prepare(`PRAGMA index_info(${index.name})`).all() as Array<{ name?: unknown }>)
+        .map(row => row.name)) === JSON.stringify(expected));
+}
+
+function hasCompositeForeignKey(
+  db: DatabaseSyncLike, table: string, targetTable: string, from: readonly string[], to: readonly string[],
+): boolean {
+  const rows = db.prepare(`PRAGMA foreign_key_list(${table})`).all() as Array<{ id?: unknown; seq?: unknown; table?: unknown; from?: unknown; to?: unknown }> ;
+  const groups = new Map<number, Array<{ seq: number; table: string; from: string; to: string }>>();
+  for (const row of rows) {
+    const id = Number(row.id);
+    const entry = { seq: Number(row.seq), table: String(row.table), from: String(row.from), to: String(row.to) };
+    groups.set(id, [...(groups.get(id) ?? []), entry]);
+  }
+  return [...groups.values()].some(group => {
+    const ordered = [...group].sort((left, right) => left.seq - right.seq);
+    return ordered.length === from.length
+      && ordered.every((row, index) => row.table === targetTable && row.from === from[index] && row.to === to[index]);
+  });
+}
+
+function migrateReviewerTablesToAppCompositeKeys(db: DatabaseSyncLike): void {
+  const designationReady = hasCompositePrimaryKey(db, 'control_designated_reviewers', ['lark_app_id', 'designated_reviewer_ref']);
+  const verdictReady = hasCompositePrimaryKey(db, 'control_reviewer_verdicts', ['lark_app_id', 'verdict_id']);
+  if (designationReady && verdictReady) return;
+  if (!designationReady && tableColumns(db, 'control_designated_reviewers').size === 0) throw new Error('task_control_schema_reviewer_designation_missing');
+  if (!verdictReady && tableColumns(db, 'control_reviewer_verdicts').size === 0) throw new Error('task_control_schema_reviewer_verdict_missing');
+  db.exec(`
+    DROP TRIGGER IF EXISTS control_designated_reviewers_no_update;
+    DROP TRIGGER IF EXISTS control_designated_reviewers_no_delete;
+    DROP TRIGGER IF EXISTS control_reviewer_verdicts_no_update;
+    DROP TRIGGER IF EXISTS control_reviewer_verdicts_no_delete;
+    DROP INDEX IF EXISTS control_reviewer_verdict_payload_unique;
+    ALTER TABLE control_designated_reviewers RENAME TO control_designated_reviewers_v7;
+    ALTER TABLE control_reviewer_verdicts RENAME TO control_reviewer_verdicts_v7;
+    CREATE TABLE control_designated_reviewers(
+      designated_reviewer_ref TEXT NOT NULL,lark_app_id TEXT NOT NULL,project_id TEXT NOT NULL,phase_id TEXT NOT NULL,task_guid TEXT NOT NULL,topic_root_id TEXT NOT NULL,task_set_json TEXT NOT NULL,review_round INTEGER NOT NULL,
+      reviewer_id TEXT NOT NULL,reviewer_bot_app_id TEXT NOT NULL,controller_id TEXT NOT NULL,controller_bot_app_id TEXT NOT NULL,effective_at TEXT NOT NULL,expires_at TEXT NOT NULL,issued_at TEXT NOT NULL,key_id TEXT NOT NULL,signature TEXT NOT NULL,supersedes_ref TEXT,
+      PRIMARY KEY(lark_app_id,designated_reviewer_ref)
+    );
+    CREATE TABLE control_reviewer_verdicts(
+      verdict_id TEXT NOT NULL,lark_app_id TEXT NOT NULL,project_id TEXT NOT NULL,phase_id TEXT NOT NULL,task_guid TEXT NOT NULL,task_set_json TEXT NOT NULL,review_round INTEGER NOT NULL,canonical_hash TEXT NOT NULL,canonical_json TEXT NOT NULL,issued_at TEXT NOT NULL,
+      PRIMARY KEY(lark_app_id,verdict_id)
+    );
+    INSERT INTO control_designated_reviewers(
+      designated_reviewer_ref,lark_app_id,project_id,phase_id,task_guid,topic_root_id,task_set_json,review_round,reviewer_id,reviewer_bot_app_id,controller_id,controller_bot_app_id,effective_at,expires_at,issued_at,key_id,signature,supersedes_ref
+    ) SELECT designated_reviewer_ref,lark_app_id,project_id,phase_id,task_guid,topic_root_id,task_set_json,review_round,reviewer_id,reviewer_bot_app_id,controller_id,controller_bot_app_id,effective_at,expires_at,issued_at,key_id,signature,supersedes_ref FROM control_designated_reviewers_v7;
+    INSERT INTO control_reviewer_verdicts(
+      verdict_id,lark_app_id,project_id,phase_id,task_guid,task_set_json,review_round,canonical_hash,canonical_json,issued_at
+    ) SELECT verdict_id,lark_app_id,project_id,phase_id,task_guid,task_set_json,review_round,canonical_hash,canonical_json,issued_at FROM control_reviewer_verdicts_v7;
+    DROP TABLE control_designated_reviewers_v7;
+    DROP TABLE control_reviewer_verdicts_v7;
+    CREATE UNIQUE INDEX control_reviewer_verdict_payload_unique ON control_reviewer_verdicts(lark_app_id,verdict_id,canonical_hash);
+    CREATE TRIGGER control_designated_reviewers_no_update BEFORE UPDATE ON control_designated_reviewers BEGIN SELECT RAISE(ABORT,'control_designated_reviewer_immutable'); END;
+    CREATE TRIGGER control_designated_reviewers_no_delete BEFORE DELETE ON control_designated_reviewers BEGIN SELECT RAISE(ABORT,'control_designated_reviewer_immutable'); END;
+    CREATE TRIGGER control_reviewer_verdicts_no_update BEFORE UPDATE ON control_reviewer_verdicts BEGIN SELECT RAISE(ABORT,'control_reviewer_verdict_immutable'); END;
+    CREATE TRIGGER control_reviewer_verdicts_no_delete BEFORE DELETE ON control_reviewer_verdicts BEGIN SELECT RAISE(ABORT,'control_reviewer_verdict_immutable'); END;
+  `);
+}
+
+/**
+ * v9 scopes every durable logical identifier by lark_app_id. Earlier versions
+ * filtered reads by app but retained global SQLite UNIQUE/PRIMARY KEY clauses,
+ * so one controller could reserve an idempotency key, event id, outbox id or
+ * receipt name for every other controller. Rebuild the related graph together
+ * so foreign references stay inside the same app domain.
+ *
+ * This runs inside the caller's BEGIN IMMEDIATE transaction. Inserts preserve
+ * every physical seq and payload verbatim; any duplicate or foreign-key defect
+ * aborts the transaction rather than deleting or silently rewriting evidence.
+ */
+function migrateLogicalIdsToAppScope(db: DatabaseSyncLike): void {
+  const ready = hasUniqueKey(db, 'control_events', ['lark_app_id', 'event_id'])
+    && hasUniqueKey(db, 'control_events', ['lark_app_id', 'idempotency_key'])
+    && hasUniqueKey(db, 'control_observations', ['lark_app_id', 'event_id'])
+    && hasUniqueKey(db, 'control_observations', ['lark_app_id', 'idempotency_key'])
+    && hasCompositePrimaryKey(db, 'control_approval_consumptions', ['lark_app_id', 'approval_ref'])
+    && hasUniqueKey(db, 'control_approval_consumptions', ['lark_app_id', 'freeze_idempotency_key'])
+    && hasUniqueKey(db, 'control_approval_consumptions', ['lark_app_id', 'frozen_event_id'])
+    && hasCompositeForeignKey(db, 'control_approval_consumptions', 'control_events', ['lark_app_id', 'frozen_event_id'], ['lark_app_id', 'event_id'])
+    && hasCompositePrimaryKey(db, 'control_trusted_mappings', ['lark_app_id', 'dispatch_root'])
+    && hasUniqueKey(db, 'control_trusted_mappings', ['lark_app_id', 'task_guid'])
+    && hasUniqueKey(db, 'control_trusted_mappings', ['lark_app_id', 'topic_root_id'])
+    && hasUniqueKey(db, 'control_trusted_mappings', ['lark_app_id', 'registration_ref'])
+    && hasCompositePrimaryKey(db, 'control_outbox', ['lark_app_id', 'outbox_id'])
+    && hasUniqueKey(db, 'control_outbox', ['lark_app_id', 'event_id', 'destination_id'])
+    && hasCompositeForeignKey(db, 'control_outbox', 'control_events', ['lark_app_id', 'event_id'], ['lark_app_id', 'event_id'])
+    && hasCompositeForeignKey(db, 'control_outbox', 'control_events', ['lark_app_id', 'fallback_event_id'], ['lark_app_id', 'event_id'])
+    && hasCompositePrimaryKey(db, 'control_delivery_receipts', ['lark_app_id', 'receipt_id'])
+    && hasCompositeForeignKey(db, 'control_delivery_receipts', 'control_outbox', ['lark_app_id', 'outbox_id'], ['lark_app_id', 'outbox_id'])
+    && hasCompositeForeignKey(db, 'control_delivery_receipts', 'control_events', ['lark_app_id', 'event_id'], ['lark_app_id', 'event_id'])
+    && hasCompositeForeignKey(db, 'control_delivery_receipts', 'control_events', ['lark_app_id', 'fallback_event_id'], ['lark_app_id', 'event_id']);
+  if (ready) return;
+  const required = [
+    'control_events', 'control_observations', 'control_approval_consumptions',
+    'control_trusted_mappings', 'control_outbox', 'control_delivery_receipts',
+  ];
+  if (required.some(table => tableColumns(db, table).size === 0)) {
+    throw new Error('task_control_schema_app_scope_tables_missing');
+  }
+  // Existing v8 databases can carry the former single-column foreign keys.
+  // Rebuilding the connected graph swaps parents and children in one existing
+  // BEGIN IMMEDIATE transaction, so defer enforcement until the replacement
+  // graph is complete and then explicitly check it below.
+  db.exec('PRAGMA defer_foreign_keys=ON;');
+  db.exec(`
+    DROP TRIGGER IF EXISTS control_events_no_update;
+    DROP TRIGGER IF EXISTS control_events_no_delete;
+    DROP TRIGGER IF EXISTS control_observations_no_update;
+    DROP TRIGGER IF EXISTS control_observations_no_delete;
+    DROP TRIGGER IF EXISTS control_approval_consumptions_no_update;
+    DROP TRIGGER IF EXISTS control_approval_consumptions_no_delete;
+    DROP TRIGGER IF EXISTS control_trusted_mappings_no_update;
+    DROP TRIGGER IF EXISTS control_trusted_mappings_no_delete;
+    DROP TRIGGER IF EXISTS control_receipts_no_update;
+    DROP TRIGGER IF EXISTS control_receipts_no_delete;
+
+    ALTER TABLE control_events RENAME TO control_events_v8;
+    ALTER TABLE control_observations RENAME TO control_observations_v8;
+    ALTER TABLE control_approval_consumptions RENAME TO control_approval_consumptions_v8;
+    ALTER TABLE control_trusted_mappings RENAME TO control_trusted_mappings_v8;
+    ALTER TABLE control_outbox RENAME TO control_outbox_v8;
+    ALTER TABLE control_delivery_receipts RENAME TO control_delivery_receipts_v8;
+
+    CREATE TABLE control_events(
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      lark_app_id TEXT NOT NULL,event_id TEXT NOT NULL,event_type TEXT NOT NULL,schema_version INTEGER NOT NULL CHECK(schema_version=1),
+      project_id TEXT NOT NULL,phase_id TEXT NOT NULL,task_guid TEXT,topic_root_id TEXT,actor_id TEXT NOT NULL,actor_role TEXT NOT NULL,occurred_at TEXT NOT NULL,
+      state_before TEXT NOT NULL,state_after TEXT NOT NULL,source_ref TEXT,payload_ref TEXT,evidence_ref TEXT,idempotency_key TEXT NOT NULL,
+      causation_id TEXT,correlation_id TEXT,attempt INTEGER NOT NULL DEFAULT 1 CHECK(attempt >= 1),error_class TEXT,ack_deadline TEXT,terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0,1)),
+      payload_hash TEXT NOT NULL,payload_json TEXT NOT NULL,
+      UNIQUE(lark_app_id,event_id),UNIQUE(lark_app_id,idempotency_key)
+    );
+    CREATE TABLE control_observations(
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      lark_app_id TEXT NOT NULL,event_id TEXT NOT NULL,attempted_event_type TEXT NOT NULL,source_ref TEXT NOT NULL,idempotency_key TEXT NOT NULL,occurred_at TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK(outcome IN ('unknown','conflict')),payload_hash TEXT NOT NULL,payload_json TEXT NOT NULL,
+      UNIQUE(lark_app_id,event_id),UNIQUE(lark_app_id,idempotency_key)
+    );
+    CREATE TABLE control_approval_consumptions(
+      lark_app_id TEXT NOT NULL,approval_ref TEXT NOT NULL,project_id TEXT NOT NULL,phase_id TEXT NOT NULL,task_set_hash TEXT NOT NULL,acceptor_id TEXT NOT NULL,
+      freeze_idempotency_key TEXT NOT NULL,frozen_event_id TEXT NOT NULL,approved_at TEXT NOT NULL,consumed_at TEXT NOT NULL,
+      PRIMARY KEY(lark_app_id,approval_ref),UNIQUE(lark_app_id,freeze_idempotency_key),UNIQUE(lark_app_id,frozen_event_id),
+      FOREIGN KEY(lark_app_id,frozen_event_id) REFERENCES control_events(lark_app_id,event_id)
+    );
+    CREATE TABLE control_trusted_mappings(
+      lark_app_id TEXT NOT NULL,dispatch_root TEXT NOT NULL,project_id TEXT NOT NULL,phase_id TEXT NOT NULL,phase_task_guids_json TEXT NOT NULL,task_guid TEXT NOT NULL,topic_root_id TEXT NOT NULL,
+      owner_id TEXT NOT NULL,reviewer_id TEXT NOT NULL,acceptor_id TEXT NOT NULL,registration_ref TEXT NOT NULL,controller_id TEXT NOT NULL,approval_gate_json TEXT NOT NULL,doc_token TEXT,created_at TEXT NOT NULL,
+      PRIMARY KEY(lark_app_id,dispatch_root),UNIQUE(lark_app_id,task_guid),UNIQUE(lark_app_id,topic_root_id),UNIQUE(lark_app_id,registration_ref)
+    );
+    CREATE TABLE control_outbox(
+      lark_app_id TEXT NOT NULL,outbox_id TEXT NOT NULL,event_id TEXT NOT NULL,destination_id TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','inflight','delivered','degraded')),
+      attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL,claim_token TEXT,claimed_at INTEGER,last_error TEXT,fallback_event_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+      PRIMARY KEY(lark_app_id,outbox_id),UNIQUE(lark_app_id,event_id,destination_id),
+      FOREIGN KEY(lark_app_id,event_id) REFERENCES control_events(lark_app_id,event_id),
+      FOREIGN KEY(lark_app_id,fallback_event_id) REFERENCES control_events(lark_app_id,event_id)
+    );
+    CREATE TABLE control_delivery_receipts(
+      lark_app_id TEXT NOT NULL,receipt_id TEXT NOT NULL,outbox_id TEXT NOT NULL,event_id TEXT NOT NULL,destination_id TEXT NOT NULL,attempt INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('retry_scheduled','claim_recovered','delivered','degraded','fallback_verified')),receipt_ref TEXT,error TEXT,fallback_event_id TEXT,created_at TEXT NOT NULL,
+      PRIMARY KEY(lark_app_id,receipt_id),
+      FOREIGN KEY(lark_app_id,outbox_id) REFERENCES control_outbox(lark_app_id,outbox_id),
+      FOREIGN KEY(lark_app_id,event_id) REFERENCES control_events(lark_app_id,event_id),
+      FOREIGN KEY(lark_app_id,fallback_event_id) REFERENCES control_events(lark_app_id,event_id)
+    );
+
+    INSERT INTO control_events(
+      seq,lark_app_id,event_id,event_type,schema_version,project_id,phase_id,task_guid,topic_root_id,actor_id,actor_role,occurred_at,state_before,state_after,source_ref,payload_ref,evidence_ref,idempotency_key,causation_id,correlation_id,attempt,error_class,ack_deadline,terminal,payload_hash,payload_json
+    ) SELECT
+      seq,lark_app_id,event_id,event_type,schema_version,project_id,phase_id,task_guid,topic_root_id,actor_id,actor_role,occurred_at,state_before,state_after,source_ref,payload_ref,evidence_ref,idempotency_key,causation_id,correlation_id,attempt,error_class,ack_deadline,terminal,payload_hash,payload_json
+    FROM control_events_v8;
+    INSERT INTO control_observations(
+      seq,lark_app_id,event_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+    ) SELECT
+      seq,lark_app_id,event_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+    FROM control_observations_v8;
+    INSERT INTO control_trusted_mappings(
+      lark_app_id,dispatch_root,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,approval_gate_json,doc_token,created_at
+    ) SELECT
+      lark_app_id,dispatch_root,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,approval_gate_json,doc_token,created_at
+    FROM control_trusted_mappings_v8;
+    INSERT INTO control_approval_consumptions(
+      lark_app_id,approval_ref,project_id,phase_id,task_set_hash,acceptor_id,freeze_idempotency_key,frozen_event_id,approved_at,consumed_at
+    ) SELECT
+      lark_app_id,approval_ref,project_id,phase_id,task_set_hash,acceptor_id,freeze_idempotency_key,frozen_event_id,approved_at,consumed_at
+    FROM control_approval_consumptions_v8;
+    INSERT INTO control_outbox(
+      lark_app_id,outbox_id,event_id,destination_id,status,attempts,next_attempt_at,claim_token,claimed_at,last_error,fallback_event_id,created_at,updated_at
+    ) SELECT
+      lark_app_id,outbox_id,event_id,destination_id,status,attempts,next_attempt_at,claim_token,claimed_at,last_error,fallback_event_id,created_at,updated_at
+    FROM control_outbox_v8;
+    INSERT INTO control_delivery_receipts(
+      lark_app_id,receipt_id,outbox_id,event_id,destination_id,attempt,state,receipt_ref,error,fallback_event_id,created_at
+    ) SELECT
+      lark_app_id,receipt_id,outbox_id,event_id,destination_id,attempt,state,receipt_ref,error,fallback_event_id,created_at
+    FROM control_delivery_receipts_v8;
+
+    DROP TABLE control_delivery_receipts_v8;
+    DROP TABLE control_outbox_v8;
+    DROP TABLE control_approval_consumptions_v8;
+    DROP TABLE control_trusted_mappings_v8;
+    DROP TABLE control_observations_v8;
+    DROP TABLE control_events_v8;
+  `);
+  if ((db.prepare('PRAGMA foreign_key_check').all() as unknown[]).length > 0) {
+    throw new Error('task_control_schema_app_scope_foreign_key_invalid');
+  }
+  db.exec(SCHEMA);
+}
+
+/** Upgrade v4 in place. Every new owner/provenance column defaults empty so
+ * legacy evidence remains readable but is never claimed by a v5 bot. */
+function migrateSchema(db: DatabaseSyncLike, fromVersion: number): void {
+  const add = (table: string, column: string, definition: string): void => {
+    if (!tableColumns(db, table).has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  };
+  if (fromVersion < 5) {
+    // v4 rows are preserved under an unclaimable legacy owner. They are visible
+    // to a forensic raw SQLite read but cannot be picked up by a v5 daemon.
+    add('control_events', 'lark_app_id', "lark_app_id TEXT NOT NULL DEFAULT 'legacy:v4'");
+    add('control_observations', 'lark_app_id', "lark_app_id TEXT NOT NULL DEFAULT 'legacy:v4'");
+    add('control_approval_consumptions', 'lark_app_id', "lark_app_id TEXT NOT NULL DEFAULT 'legacy:v4'");
+    add('control_trusted_mappings', 'lark_app_id', "lark_app_id TEXT NOT NULL DEFAULT 'legacy:v4'");
+    // v4 mappings are preserved but have no durable gate provenance, so they
+    // cannot be restored as trusted v5 bindings. No rows are deleted or rewritten.
+    add('control_trusted_mappings', 'approval_gate_json', "approval_gate_json TEXT NOT NULL DEFAULT ''");
+    add('control_outbox', 'lark_app_id', "lark_app_id TEXT NOT NULL DEFAULT 'legacy:v4'");
+    add('control_delivery_receipts', 'lark_app_id', "lark_app_id TEXT NOT NULL DEFAULT 'legacy:v4'");
+    add('control_delivery_receipts', 'receipt_ref', 'receipt_ref TEXT');
+  }
+  // Existing v4 receipts can share a historic provider reference. New writes
+  // are protected in insertReceiptLocked after their exact triple is checked.
+  if (fromVersion < 6) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS control_designated_reviewers(
+        designated_reviewer_ref TEXT NOT NULL,lark_app_id TEXT NOT NULL,project_id TEXT NOT NULL,phase_id TEXT NOT NULL,task_guid TEXT NOT NULL,topic_root_id TEXT NOT NULL DEFAULT '',task_set_json TEXT NOT NULL,review_round INTEGER NOT NULL,
+        reviewer_id TEXT NOT NULL,reviewer_bot_app_id TEXT NOT NULL,controller_id TEXT NOT NULL,controller_bot_app_id TEXT NOT NULL,effective_at TEXT NOT NULL,expires_at TEXT NOT NULL,issued_at TEXT NOT NULL,key_id TEXT NOT NULL,signature TEXT NOT NULL,supersedes_ref TEXT,PRIMARY KEY(lark_app_id,designated_reviewer_ref)
+      );
+      CREATE TABLE IF NOT EXISTS control_reviewer_verdicts(
+        verdict_id TEXT NOT NULL,lark_app_id TEXT NOT NULL,project_id TEXT NOT NULL,phase_id TEXT NOT NULL,task_guid TEXT NOT NULL,task_set_json TEXT NOT NULL,review_round INTEGER NOT NULL,canonical_hash TEXT NOT NULL,canonical_json TEXT NOT NULL,issued_at TEXT NOT NULL,PRIMARY KEY(lark_app_id,verdict_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS control_reviewer_verdict_payload_unique ON control_reviewer_verdicts(lark_app_id,verdict_id,canonical_hash);
+    `);
+  }
+  if (fromVersion < 7) {
+    // Old ReviewerVerdict rows lack a canonical topic binding and are retained
+    // only as forensic evidence. The empty default cannot validate a v7 verdict.
+    add('control_designated_reviewers', 'topic_root_id', "topic_root_id TEXT NOT NULL DEFAULT ''");
+  }
+  // v4/v5 create the reviewer tables above in their final composite-key
+  // shape. Only the original v6/v7 layouts need the v8 table rebuild.
+  if (fromVersion >= 6 && fromVersion < 8) migrateReviewerTablesToAppCompositeKeys(db);
+  if (fromVersion < 9) migrateLogicalIdsToAppScope(db);
 }
 
 function taskEvent(type: TaskControlEventType): boolean {
@@ -867,6 +1247,12 @@ function validateInput(input: AuthenticatedAppendTaskControlEventInput, allowFro
       && Object.keys(resolvedConditionEvidence).some(conditionId => !conditionIds.includes(conditionId))) {
       throw new Error('task_control_invalid:payload.resolvedConditionEvidence_unknown_condition');
     }
+    nonEmpty(payload.reviewerVerdictId, 'payload.reviewerVerdictId');
+  }
+  if (input.eventType === 'task.rework_started') {
+    if (input.actorRole !== 'worker') throw new Error('task_control_invalid:rework_worker_role');
+    nonEmpty(payload.sourceReviewerVerdictId, 'payload.sourceReviewerVerdictId');
+    nonEmpty(payload.newExecutionEventId, 'payload.newExecutionEventId');
   }
   if (input.eventType === 'task.delivery_fallback_verified') {
     const fallback = parseDeliveryFallback(payload);
@@ -963,6 +1349,7 @@ function receiptFromRow(row: Record<string, unknown>): DeliveryReceipt {
     destinationId: String(row.destination_id),
     attempt: Number(row.attempt),
     state: String(row.state) as DeliveryReceiptState,
+    ...(row.receipt_ref ? { receiptRef: String(row.receipt_ref) } : {}),
     ...(row.error ? { error: String(row.error) } : {}),
     ...(row.fallback_event_id ? { fallbackEventId: String(row.fallback_event_id) } : {}),
     createdAt: String(row.created_at),
@@ -1043,6 +1430,7 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
             reviewerId: event.actorId, independent: true, verdict,
             conditionIds,
             resolvedConditionEvidence: conditionEvidenceRefs(event.payload.resolvedConditionEvidence),
+            ...(optionalString(event.payload.reviewerVerdictId) ? { reviewerVerdictId: optionalString(event.payload.reviewerVerdictId)! } : {}),
             ...(optionalString(event.payload.docToken) ? { docToken: optionalString(event.payload.docToken)! } : {}),
             ...(typeof event.payload.docRevision === 'number' ? { docRevision: event.payload.docRevision } : {}),
           };
@@ -1161,11 +1549,23 @@ export class TaskControlPlaneStore {
     path: string,
     private readonly readOnly: boolean,
     private readonly authority?: TaskControlAuthority,
+    private readonly larkAppId: string = 'test:unscoped',
   ) {
     this.path = path;
   }
+  private reviewerVerifier?: {
+    verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean;
+    verifyVerdict(value: ReviewerVerdictV1): boolean;
+  };
 
-  static async open(dataDir: string, authority: TaskControlAuthority): Promise<TaskControlPlaneStore> {
+  setReviewerVerdictVerifier(verifier: {
+    verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean;
+    verifyVerdict(value: ReviewerVerdictV1): boolean;
+  } | undefined): void {
+    this.reviewerVerifier = verifier;
+  }
+
+  static async open(dataDir: string, authority: TaskControlAuthority, larkAppId = 'test:unscoped'): Promise<TaskControlPlaneStore> {
     if (!authority || typeof authority.authenticate !== 'function' || typeof authority.verifyApproval !== 'function') {
       throw new Error('task_control_authority_required');
     }
@@ -1195,7 +1595,17 @@ export class TaskControlPlaneStore {
             db.exec('BEGIN IMMEDIATE;');
             const lockedVersion = Number((db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined)?.user_version ?? 0);
             if (lockedVersion < SCHEMA_VERSION) {
-              db.exec(SCHEMA);
+              // v4 lacks lark_app_id, so creating v9's app-scoped indexes
+              // first fails before the compatibility columns exist. Later
+              // versions already carry the column but may lack tables added by
+              // a newer schema, so retain the established schema-first path.
+              if (lockedVersion > 0 && lockedVersion < 5) {
+                migrateSchema(db, lockedVersion);
+                db.exec(SCHEMA);
+              } else {
+                db.exec(SCHEMA);
+                migrateSchema(db, lockedVersion);
+              }
               db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
             } else if (lockedVersion > SCHEMA_VERSION) {
               throw new Error(`task_control_schema_newer:${lockedVersion}`);
@@ -1209,22 +1619,27 @@ export class TaskControlPlaneStore {
           }
         }
       }
-      return new TaskControlPlaneStore(db, path, false, authority);
+      return new TaskControlPlaneStore(db, path, false, authority, nonEmpty(larkAppId, 'larkAppId'));
     } catch (error) { db.close(); throw error; }
   }
 
-  static async openReadOnly(dataDir: string): Promise<TaskControlPlaneStore> {
+  static async openReadOnly(dataDir: string, larkAppId = 'test:unscoped'): Promise<TaskControlPlaneStore> {
     const path = join(dataDir, DATABASE_NAME);
     const db = await openDatabaseSync(path, { readOnly: true });
     try {
       db.exec('PRAGMA busy_timeout=5000;');
       const version = Number((db.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined)?.user_version ?? 0);
       if (version !== SCHEMA_VERSION) throw new Error(`task_control_schema_unsupported:${version}`);
-      return new TaskControlPlaneStore(db, path, true);
+      return new TaskControlPlaneStore(db, path, true, undefined, nonEmpty(larkAppId, 'larkAppId'));
     } catch (error) { db.close(); throw error; }
   }
 
   close(): void { this.db.close(); }
+
+  /** Encodes one opaque provider receipt for exactly one control event/outbox destination. */
+  static providerReceiptRef(eventId: string, destinationId: string, providerReceiptId: string): string {
+    return receiptRefForEventDestination(eventId, destinationId, providerReceiptId);
+  }
 
   private assertWritable(): void {
     if (this.readOnly) throw new Error('task_control_read_only');
@@ -1260,7 +1675,7 @@ export class TaskControlPlaneStore {
   }
 
   listEvents(filter: { projectId?: string; phaseId?: string; taskGuid?: string } = {}): TaskControlEvent[] {
-    return (this.db.prepare('SELECT * FROM control_events ORDER BY seq').all() as unknown as EventRow[])
+    return (this.db.prepare('SELECT * FROM control_events WHERE lark_app_id=? ORDER BY seq').all(this.larkAppId) as unknown as EventRow[])
       .map(rowToEvent)
       .filter(event => (!filter.projectId || event.projectId === filter.projectId)
         && (!filter.phaseId || event.phaseId === filter.phaseId)
@@ -1268,46 +1683,374 @@ export class TaskControlPlaneStore {
   }
 
   listObservations(): TaskControlObservation[] {
-    return (this.db.prepare('SELECT * FROM control_observations ORDER BY seq').all() as Record<string, unknown>[])
+    return (this.db.prepare('SELECT * FROM control_observations WHERE lark_app_id=? ORDER BY seq').all(this.larkAppId) as Record<string, unknown>[])
       .map(rowToObservation);
   }
 
   listTrustedMappings(): TrustedTaskControlMappingRecord[] {
-    return (this.db.prepare('SELECT * FROM control_trusted_mappings ORDER BY created_at,dispatch_root').all() as Record<string, unknown>[])
+    return (this.db.prepare('SELECT * FROM control_trusted_mappings WHERE lark_app_id=? ORDER BY created_at,dispatch_root').all(this.larkAppId) as Record<string, unknown>[])
       .map(row => ({
-        dispatchRoot: String(row.dispatch_root), projectId: String(row.project_id), phaseId: String(row.phase_id),
+        larkAppId: String(row.lark_app_id), dispatchRoot: String(row.dispatch_root), projectId: String(row.project_id), phaseId: String(row.phase_id),
         phaseTaskGuids: exactTaskSetSnapshot(JSON.parse(String(row.phase_task_guids_json)), 'phaseTaskGuids'),
         taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id), ownerId: String(row.owner_id),
         reviewerId: String(row.reviewer_id), acceptorId: String(row.acceptor_id), registrationRef: String(row.registration_ref),
-        controllerId: String(row.controller_id), ...(row.doc_token ? { docToken: String(row.doc_token) } : {}),
+        controllerId: String(row.controller_id), approvalGate: parseApprovalGate(JSON.parse(String(row.approval_gate_json))),
+        ...(row.doc_token ? { docToken: String(row.doc_token) } : {}),
         createdAt: String(row.created_at),
       }));
   }
 
-  getApprovalProof(approvalRef: string): DurableTaskControlApprovalProof | undefined {
-    const row = this.db.prepare('SELECT * FROM control_approval_proofs WHERE approval_ref=?')
-      .get(approvalRef) as Record<string, unknown> | undefined;
-    return row ? {
-      approvalRef: String(row.approval_ref), proof: JSON.parse(String(row.proof_json)) as Record<string, unknown>,
-      registeredAt: String(row.registered_at),
-    } : undefined;
+  appendDesignatedReviewer(mapping: DesignatedReviewerMapping, authentication: unknown, verify: (value: DesignatedReviewerMapping) => boolean): void {
+    this.assertWritable();
+    const principal = this.authenticate(authentication);
+    if (principal.actorRole !== 'controller' || principal.actorId !== mapping.controllerId
+      || mapping.controllerBotAppId !== this.larkAppId || !verify(mapping)) {
+      throw new Error('task_control_designated_reviewer_unauthorized');
+    }
+    const snapshot = exactTaskSetSnapshot(mapping.taskSetSnapshot, 'designatedReviewer.taskSetSnapshot');
+    if (!snapshot.includes(mapping.taskGuid) || mapping.reviewRound < 1
+      || timestampMs(mapping.expiresAt, 'designatedReviewer.expiresAt') <= timestampMs(mapping.effectiveAt, 'designatedReviewer.effectiveAt')) {
+      throw new Error('task_control_designated_reviewer_invalid');
+    }
+    this.withImmediateWrite(() => {
+      const existing = this.db.prepare('SELECT * FROM control_designated_reviewers WHERE lark_app_id=? AND designated_reviewer_ref=?')
+        .get(this.larkAppId, mapping.designatedReviewerRef) as Record<string, unknown> | undefined;
+      if (existing) {
+        if (String(existing.signature) === mapping.signature && String(existing.key_id) === (mapping.keyId ?? '')) return;
+        throw new Error(`task_control_designated_reviewer_conflict:${mapping.designatedReviewerRef}`);
+      }
+      if (mapping.supersedesDesignatedReviewerRef) {
+        const prior = this.db.prepare('SELECT * FROM control_designated_reviewers WHERE designated_reviewer_ref=? AND lark_app_id=?')
+          .get(mapping.supersedesDesignatedReviewerRef, this.larkAppId) as Record<string, unknown> | undefined;
+        if (!prior
+          || String(prior.project_id) !== mapping.projectId
+          || String(prior.phase_id) !== mapping.phaseId
+          || String(prior.task_guid) !== mapping.taskGuid
+          || String(prior.topic_root_id) !== mapping.topicRootId
+          || Number(prior.review_round) !== mapping.reviewRound
+          || JSON.stringify(exactTaskSetSnapshot(JSON.parse(String(prior.task_set_json)), 'prior.taskSetSnapshot')) !== JSON.stringify(snapshot)) {
+          throw new Error('task_control_designated_reviewer_supersedes_invalid');
+        }
+      }
+      this.db.prepare(`INSERT INTO control_designated_reviewers(
+        designated_reviewer_ref,lark_app_id,project_id,phase_id,task_guid,topic_root_id,task_set_json,review_round,reviewer_id,reviewer_bot_app_id,controller_id,controller_bot_app_id,effective_at,expires_at,issued_at,key_id,signature,supersedes_ref
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        mapping.designatedReviewerRef, this.larkAppId, mapping.projectId, mapping.phaseId, mapping.taskGuid, mapping.topicRootId, JSON.stringify(snapshot), mapping.reviewRound,
+        mapping.reviewerId, mapping.reviewerBotAppId, mapping.controllerId, mapping.controllerBotAppId, mapping.effectiveAt, mapping.expiresAt, mapping.issuedAt, mapping.keyId ?? '', mapping.signature, mapping.supersedesDesignatedReviewerRef ?? null,
+      );
+    });
   }
 
-  registerApprovalProof(input: { approvalRef: string; proof: Record<string, unknown>; registeredAt?: string }): boolean {
+  appendReviewerVerdict(input: {
+    verdict: ReviewerVerdictV1;
+    attestation: ReviewerVerdictAttestation;
+    authentication: unknown;
+    verifyVerdict: (value: ReviewerVerdictV1) => boolean;
+    now?: string;
+  }): ReviewerVerdictHead {
     this.assertWritable();
-    const approvalRef = controlledEvidenceRef(input.approvalRef, 'approvalRef');
-    const proofJson = JSON.stringify(canonicalize(input.proof));
-    const registeredAt = input.registeredAt ?? new Date().toISOString();
+    const verdict = input.verdict;
+    const now = input.now ?? new Date().toISOString();
+    const snapshot = exactTaskSetSnapshot(verdict.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot');
+    let principal: AuthenticatedTaskControlPrincipal;
+    try { principal = this.authenticate(input.authentication); }
+    catch { return { status: 'unknown', reason: 'reviewer_verdict_authentication_unproven' }; }
+    if (principal.actorRole !== 'reviewer' || principal.actorId !== verdict.reviewerId
+      || !input.verifyVerdict(verdict) || verdict.reviewerId !== input.attestation.reviewerId
+      || verdict.reviewerBotAppId !== input.attestation.reviewerBotAppId
+      || verdict.sessionId !== input.attestation.sessionId
+      || verdict.workerGeneration !== input.attestation.workerGeneration
+      || verdict.capabilityHash !== (input.attestation.capabilityHash
+        ?? (input.attestation.capability ? reviewerCapabilityHash(input.attestation.capability) : ''))
+      || timestampMs(verdict.expiresAt, 'reviewerVerdict.expiresAt') <= timestampMs(now, 'reviewerVerdict.now')
+      || snapshot.length === 0 || !snapshot.includes(verdict.taskGuid)
+      || verdict.reviewRound < 1
+      || (!verdict.sourceCommentId && !verdict.sourceMessageId)
+      || (!!verdict.revokesVerdictId && !!verdict.supersedesVerdictId)) {
+      return { status: 'unknown', reason: 'reviewer_verdict_unverified' };
+    }
     return this.withImmediateWrite(() => {
-      const existing = this.getApprovalProof(approvalRef);
+      const designated = this.recomputeDesignatedReviewerHead(verdict.projectId, verdict.phaseId, verdict.taskGuid, verdict.topicRootId, snapshot, verdict.reviewRound, now);
+      if (!designated || designated.designatedReviewerRef !== verdict.designatedReviewerRef
+        || designated.reviewerId !== verdict.reviewerId
+        || designated.reviewerBotAppId !== verdict.reviewerBotAppId) return { status: 'unknown', reason: 'designated_reviewer_mapping_unproven' };
+      const hash = reviewerVerdictPayloadHash(verdict);
+      const existing = this.db.prepare('SELECT * FROM control_reviewer_verdicts WHERE lark_app_id=? AND verdict_id=?')
+        .get(this.larkAppId, verdict.verdictId) as Record<string, unknown> | undefined;
       if (existing) {
-        if (JSON.stringify(canonicalize(existing.proof)) === proofJson) return false;
-        throw new Error(`task_control_approval_proof_conflict:${approvalRef}`);
+        if (String(existing.canonical_hash) !== hash) {
+          const prior = JSON.parse(String(existing.canonical_json)) as ReviewerVerdictV1;
+          this.appendReviewerVerdictConflictObservationLocked({
+            verdictId: verdict.verdictId, existingCanonicalHash: String(existing.canonical_hash), incomingCanonicalHash: hash,
+            existingSourceRef: this.reviewerVerdictSourceRef(prior), incomingSourceRef: this.reviewerVerdictSourceRef(verdict),
+          });
+          return { status: 'unknown', reason: 'reviewer_verdict_id_conflict' };
+        }
+        return this.recomputeReviewerVerdictHead(verdict.projectId, verdict.phaseId, verdict.taskGuid, verdict.topicRootId, snapshot, verdict.reviewRound, now);
       }
-      this.db.prepare('INSERT INTO control_approval_proofs(approval_ref,proof_json,registered_at) VALUES(?,?,?)')
-        .run(approvalRef, proofJson, registeredAt);
-      return true;
+      if (verdict.kind === 'verdict' && !verdict.verdict) return { status: 'unknown', reason: 'reviewer_verdict_missing_verdict' };
+      if (verdict.kind === 'revocation' && (!verdict.revokesVerdictId || verdict.verdict !== undefined || verdict.supersedesVerdictId)) {
+        return { status: 'unknown', reason: 'reviewer_verdict_invalid_revocation' };
+      }
+      this.db.prepare(`INSERT INTO control_reviewer_verdicts(
+        verdict_id,lark_app_id,project_id,phase_id,task_guid,task_set_json,review_round,canonical_hash,canonical_json,issued_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        verdict.verdictId, this.larkAppId, verdict.projectId, verdict.phaseId, verdict.taskGuid, JSON.stringify(snapshot), verdict.reviewRound, hash, JSON.stringify(verdict), verdict.issuedAt,
+      );
+      return this.recomputeReviewerVerdictHead(verdict.projectId, verdict.phaseId, verdict.taskGuid, verdict.topicRootId, snapshot, verdict.reviewRound, now);
     });
+  }
+
+  getReviewerVerdictHead(projectId: string, phaseId: string, taskGuid: string, topicRootId: string, taskSetSnapshot: readonly string[], reviewRound: number, now = new Date().toISOString()): ReviewerVerdictHead {
+    return this.recomputeReviewerVerdictHead(projectId, phaseId, taskGuid, topicRootId, exactTaskSetSnapshot(taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot'), reviewRound, now);
+  }
+
+  /**
+   * Route-only lookup for the current verified designation. It intentionally
+   * recomputes the historical chain every time, so expiry, supersession, forks
+   * and a missing verifier all stay fail-closed before an ingress selects a
+   * reviewer-app verifier.
+   */
+  getCurrentDesignatedReviewer(input: {
+    projectId: string; phaseId: string; taskGuid: string; topicRootId: string; taskSetSnapshot: readonly string[]; reviewRound: number; now?: string;
+  }): DesignatedReviewerMapping | undefined {
+    try {
+      return this.recomputeDesignatedReviewerHead(
+        input.projectId, input.phaseId, input.taskGuid, input.topicRootId,
+        exactTaskSetSnapshot(input.taskSetSnapshot, 'designatedReviewer.taskSetSnapshot'),
+        input.reviewRound, input.now ?? new Date().toISOString(),
+      );
+    } catch { return undefined; }
+  }
+
+  private reviewerVerdictHeadById(verdictId: string, now: string): ReviewerVerdictHead {
+    const raw = this.db.prepare('SELECT canonical_json FROM control_reviewer_verdicts WHERE verdict_id=? AND lark_app_id=?')
+      .get(verdictId, this.larkAppId) as Record<string, unknown> | undefined;
+    if (!raw) return { status: 'unknown', reason: 'reviewer_verdict_missing' };
+    try {
+      const verdict = JSON.parse(String(raw.canonical_json)) as ReviewerVerdictV1;
+      const head = this.recomputeReviewerVerdictHead(
+        verdict.projectId, verdict.phaseId, verdict.taskGuid, verdict.topicRootId,
+        exactTaskSetSnapshot(verdict.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot'), verdict.reviewRound, now,
+      );
+      return head.status === 'active' && head.verdict?.verdictId === verdictId
+        ? head
+        : { status: 'unknown', reason: `reviewer_verdict_not_active:${head.status}` };
+    } catch { return { status: 'unknown', reason: 'reviewer_verdict_malformed' }; }
+  }
+
+  private recomputeDesignatedReviewerHead(projectId: string, phaseId: string, taskGuid: string, topicRootId: string, taskSetSnapshot: readonly string[], reviewRound: number, now: string): DesignatedReviewerMapping | undefined {
+    const rows = this.db.prepare(`SELECT * FROM control_designated_reviewers
+      WHERE lark_app_id=? AND project_id=? AND phase_id=? AND task_guid=? AND topic_root_id=? AND review_round=?`)
+      .all(this.larkAppId, projectId, phaseId, taskGuid, topicRootId, reviewRound) as Record<string, unknown>[];
+    if (!this.reviewerVerifier) return undefined;
+    const mappings = rows.map(row => ({
+      schemaVersion: 'DesignatedReviewer.v1' as const, designatedReviewerRef: String(row.designated_reviewer_ref),
+      projectId: String(row.project_id), phaseId: String(row.phase_id), taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id ?? ''),
+      taskSetSnapshot: exactTaskSetSnapshot(JSON.parse(String(row.task_set_json)), 'mapping.taskSetSnapshot'), reviewRound: Number(row.review_round),
+      reviewerId: String(row.reviewer_id), reviewerBotAppId: String(row.reviewer_bot_app_id), controllerId: String(row.controller_id), controllerBotAppId: String(row.controller_bot_app_id),
+      effectiveAt: String(row.effective_at), expiresAt: String(row.expires_at), issuedAt: String(row.issued_at),
+      keyId: String(row.key_id), signature: String(row.signature),
+      ...(row.supersedes_ref ? { supersedesDesignatedReviewerRef: String(row.supersedes_ref) } : {}),
+    })).filter(mapping => JSON.stringify(mapping.taskSetSnapshot) === JSON.stringify(taskSetSnapshot)
+      && this.reviewerVerifier!.verifyDesignatedReviewer(mapping));
+    if (mappings.length === 0) return undefined;
+    const byRef = new Map(mappings.map(mapping => [mapping.designatedReviewerRef, mapping]));
+    const superseded = new Set<string>();
+    for (const mapping of mappings) {
+      if (!mapping.supersedesDesignatedReviewerRef) continue;
+      if (!byRef.has(mapping.supersedesDesignatedReviewerRef)) return undefined;
+      superseded.add(mapping.supersedesDesignatedReviewerRef);
+    }
+    const heads = mappings.filter(mapping => !superseded.has(mapping.designatedReviewerRef));
+    if (heads.length !== 1) return undefined;
+    const head = heads[0]!;
+    // Supersession is historical: a new head permanently retires the old one.
+    // Apply its temporal validity only after the chain is resolved so an expired
+    // successor cannot make its superseded predecessor appear current again.
+    return timestampMs(head.effectiveAt, 'designatedReviewer.effectiveAt') <= timestampMs(now, 'designatedReviewer.now')
+      && timestampMs(head.expiresAt, 'designatedReviewer.expiresAt') > timestampMs(now, 'designatedReviewer.now')
+      ? head
+      : undefined;
+  }
+
+  private recomputeReviewerVerdictHead(projectId: string, phaseId: string, taskGuid: string, topicRootId: string, taskSetSnapshot: readonly string[], reviewRound: number, now: string): ReviewerVerdictHead {
+    const rows = this.db.prepare(`SELECT canonical_json FROM control_reviewer_verdicts
+      WHERE lark_app_id=? AND project_id=? AND phase_id=? AND task_guid=? AND review_round=? ORDER BY issued_at,verdict_id`)
+      .all(this.larkAppId, projectId, phaseId, taskGuid, reviewRound) as Record<string, unknown>[];
+    if (!this.reviewerVerifier) return { status: 'unknown', reason: 'reviewer_verdict_verifier_missing' };
+    const records = rows.map(row => JSON.parse(String(row.canonical_json)) as ReviewerVerdictV1)
+      .filter(record => record.topicRootId === topicRootId
+        && JSON.stringify(exactTaskSetSnapshot(record.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot')) === JSON.stringify(taskSetSnapshot)
+        && this.reviewerVerifier!.verifyVerdict(record));
+    if (records.length === 0) return { status: 'unknown', reason: 'reviewer_verdict_missing' };
+    const byId = new Map(records.map(record => [record.verdictId, record]));
+    const children = new Map<string, ReviewerVerdictV1[]>();
+    for (const record of records) {
+      const target = record.revokesVerdictId ?? record.supersedesVerdictId;
+      if (!target) continue;
+      if (!byId.has(target) || target === record.verdictId) return { status: 'unknown', reason: 'reviewer_verdict_target_missing_or_cycle' };
+      const list = children.get(target) ?? []; list.push(record); children.set(target, list);
+    }
+    for (const [id, list] of children) if (list.length > 1) return { status: 'unknown', reason: `reviewer_verdict_fork:${id}` };
+    for (const record of records) {
+      const seen = new Set<string>();
+      let cursor: ReviewerVerdictV1 | undefined = record;
+      while (cursor) {
+        if (seen.has(cursor.verdictId)) return { status: 'unknown', reason: 'reviewer_verdict_cycle' };
+        seen.add(cursor.verdictId);
+        const target: string | undefined = cursor.revokesVerdictId ?? cursor.supersedesVerdictId;
+        cursor = target ? byId.get(target) : undefined;
+      }
+    }
+    const superseded = new Set(records.filter(record => !!record.supersedesVerdictId).map(record => record.supersedesVerdictId!));
+    const revoked = new Set(records.filter(record => !!record.revokesVerdictId).map(record => record.revokesVerdictId!));
+    const heads = records.filter(record => !children.has(record.verdictId));
+    if (heads.length !== 1) return { status: 'unknown', reason: 'reviewer_verdict_head_ambiguous' };
+    const head = heads[0]!;
+    if (timestampMs(head.expiresAt, 'reviewerVerdict.expiresAt') <= timestampMs(now, 'reviewerVerdict.now')) return { status: 'unknown', reason: 'reviewer_verdict_expired' };
+    if (head.kind === 'revocation' || revoked.has(head.verdictId)) return { status: 'revoked', verdict: head };
+    if (superseded.has(head.verdictId)) return { status: 'superseded', verdict: head };
+    return { status: 'active', verdict: head };
+  }
+
+  private verifiedReviewerVerdictForReview(task: TaskProjection, review: ReviewProjection, now: string): boolean {
+    if (!review.reviewerVerdictId || !task.mapping) return false;
+    const head = this.reviewerVerdictHeadById(review.reviewerVerdictId, now);
+    const verdict = head.status === 'active' ? head.verdict : undefined;
+    const designated = verdict
+      ? this.recomputeDesignatedReviewerHead(
+        verdict.projectId, verdict.phaseId, verdict.taskGuid, verdict.topicRootId,
+        exactTaskSetSnapshot(verdict.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot'), verdict.reviewRound, now,
+      )
+      : undefined;
+    return !!verdict
+      && head.verdict?.verdictId === review.reviewerVerdictId
+      && designated?.designatedReviewerRef === verdict.designatedReviewerRef
+      && designated.reviewerId === verdict.reviewerId
+      && designated.reviewerBotAppId === verdict.reviewerBotAppId
+      && verdict.projectId === task.mapping.projectId
+      && verdict.phaseId === task.mapping.phaseId
+      && verdict.taskGuid === task.taskGuid
+      && verdict.topicRootId === task.mapping.topicRootId
+      && verdict.reviewerId === review.reviewerId
+      && verdict.reviewRound === review.reviewRound
+      && verdict.verdict === review.verdict
+      && verdict.docToken === review.docToken
+      && verdict.docRevision === review.docRevision
+      && JSON.stringify([...verdict.conditionIds].sort()) === JSON.stringify([...review.conditionIds].sort())
+      && JSON.stringify(verdict.resolvedConditionEvidence) === JSON.stringify(review.resolvedConditionEvidence);
+  }
+
+  private reviewerVerdictSourceRef(verdict: ReviewerVerdictV1): string {
+    return verdict.sourceCommentId
+      ? `task-comment:${verdict.sourceCommentId}`
+      : `topic-message:${verdict.sourceMessageId}`;
+  }
+
+  private hasReviewerVerdictConflict(verdictId: string): boolean {
+    const rows = this.db.prepare(`SELECT payload_json FROM control_observations
+      WHERE lark_app_id=? AND attempted_event_type='task.reviewed' AND outcome='conflict'`)
+      .all(this.larkAppId) as Array<{ payload_json?: unknown }> ;
+    return rows.some(row => {
+      try {
+        const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+        return payload.conflictKind === 'reviewer_verdict_id_canonical_hash' && payload.verdictId === verdictId;
+      } catch { return true; }
+    });
+  }
+
+  /**
+   * A duplicate verdict id with a different canonical payload is not a normal
+   * UNKNOWN boundary: it is immutable contradictory evidence. Keep the
+   * original and incoming references/hashes together, and replay the same
+   * collision idempotently without ever changing the first verdict row.
+   */
+  private appendReviewerVerdictConflictObservationLocked(input: {
+    verdictId: string; existingCanonicalHash: string; incomingCanonicalHash: string; existingSourceRef: string; incomingSourceRef: string;
+  }): void {
+    const sourceRef = input.incomingSourceRef;
+    const idempotencyKey = `reviewer-verdict-conflict:${this.larkAppId}:${input.verdictId}:${input.incomingCanonicalHash}`;
+    const existing = this.db.prepare('SELECT event_id FROM control_observations WHERE idempotency_key=? AND lark_app_id=?')
+      .get(idempotencyKey, this.larkAppId) as { event_id?: unknown } | undefined;
+    if (existing) return;
+    const payload = {
+      conflictKind: 'reviewer_verdict_id_canonical_hash', verdictId: input.verdictId,
+      existingCanonicalHash: input.existingCanonicalHash, incomingCanonicalHash: input.incomingCanonicalHash,
+      existingSourceRef: input.existingSourceRef, incomingSourceRef: input.incomingSourceRef,
+    };
+    const eventId = stableId('obs_reviewer_verdict_conflict', this.larkAppId, input.verdictId, input.incomingCanonicalHash);
+    this.db.prepare(`INSERT INTO control_observations(
+      event_id,lark_app_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+    ) VALUES(?,?,?,?,?,?,'conflict',?,?)`).run(
+      eventId, this.larkAppId, 'task.reviewed', sourceRef, idempotencyKey, new Date().toISOString(),
+      payloadHash({ attemptedEventType: 'task.reviewed', sourceRef, payload }), JSON.stringify(payload),
+    );
+  }
+
+  private refreshReviewerVerdictProjection(task: TaskProjection, checkedAt: string): TaskProjection {
+    const review = task.independentReview;
+    if (!review) return task;
+    if (review.reviewerVerdictId && this.hasReviewerVerdictConflict(review.reviewerVerdictId)) {
+      return { ...task, independentReview: undefined, reviewerVerdictIssue: 'reviewer verdict canonical-hash conflict is unresolved' };
+    }
+    if (!this.verifiedReviewerVerdictForReview(task, review, checkedAt)) {
+      return { ...task, independentReview: undefined, reviewerVerdictIssue: 'independent review lacks an active exact ReviewerVerdict' };
+    }
+    return task;
+  }
+
+  private assertReviewedVerdictCurrentLocked(input: AuthenticatedAppendTaskControlEventInput): void {
+    const taskGuid = input.taskGuid!;
+    const mapping = this.mappingForTask(taskGuid);
+    if (!mapping || mapping.projectId !== input.projectId || mapping.phaseId !== input.phaseId || mapping.topicRootId !== input.topicRootId) {
+      throw new Error('task_control_reviewer_verdict_mapping_unproven');
+    }
+    const payload = input.payload ?? {};
+    const review: ReviewProjection = {
+      eventId: input.eventId, seq: 0, reviewRound: positiveInteger(payload.reviewRound, 'payload.reviewRound'),
+      reviewCommentId: nonEmpty(payload.reviewCommentId, 'payload.reviewCommentId'), reviewerId: input.actorId,
+      independent: payload.independent === true, verdict: parseReviewVerdict(payload.verdict),
+      conditionIds: payload.conditionIds === undefined ? [] : exactTaskSetSnapshot(payload.conditionIds, 'payload.conditionIds'),
+      resolvedConditionEvidence: conditionEvidenceRefs(payload.resolvedConditionEvidence),
+      reviewerVerdictId: nonEmpty(payload.reviewerVerdictId, 'payload.reviewerVerdictId'),
+      ...(optionalString(payload.docToken) ? { docToken: optionalString(payload.docToken)! } : {}),
+      ...(typeof payload.docRevision === 'number' ? { docRevision: payload.docRevision } : {}),
+    };
+    const task: TaskProjection = {
+      taskGuid, mapping, state: 'submitted', explicitlyAccepted: true, unresolvedReviewConditionIds: [],
+      unknowns: [], unresolvedConflictEventIds: [], transitionViolations: [], independentReview: review,
+    };
+    if (!review.independent || !this.verifiedReviewerVerdictForReview(task, review, input.occurredAt ?? new Date().toISOString())) {
+      throw new Error('task_control_reviewer_verdict_unverified');
+    }
+  }
+
+  private assertReworkSourceCurrentLocked(input: AuthenticatedAppendTaskControlEventInput): void {
+    const taskGuid = input.taskGuid!;
+    const mapping = this.mappingForTask(taskGuid);
+    if (!mapping || mapping.projectId !== input.projectId || mapping.phaseId !== input.phaseId || mapping.topicRootId !== input.topicRootId) {
+      throw new Error('task_control_rework_mapping_unproven');
+    }
+    const now = input.occurredAt ?? new Date().toISOString();
+    const sourceVerdictId = nonEmpty(input.payload?.sourceReviewerVerdictId, 'payload.sourceReviewerVerdictId');
+    const projection = this.getTaskProjection(taskGuid, now);
+    const review = projection.independentReview;
+    const execution = this.eventById(nonEmpty(input.payload?.newExecutionEventId, 'payload.newExecutionEventId'));
+    const head = this.reviewerVerdictHeadById(sourceVerdictId, now);
+    if (!review || review.reviewerVerdictId !== sourceVerdictId
+      || !this.verifiedReviewerVerdictForReview(projection, review, now)
+      || head.status !== 'active' || !head.verdict
+      || (head.verdict.verdict !== 'fail' && head.verdict.verdict !== 'conditional')
+      || !execution || execution.eventType !== 'task.execution_started'
+      || execution.taskGuid !== taskGuid || execution.seq <= review.seq) {
+      throw new Error('task_control_rework_source_unproven');
+    }
+  }
+
+  private trustedMappingExists(taskGuid: string): boolean {
+    return !!this.db.prepare('SELECT dispatch_root FROM control_trusted_mappings WHERE lark_app_id=? AND task_guid=?')
+      .get(this.larkAppId, taskGuid);
   }
 
   registerTrustedMapping(input: RegisterTrustedTaskControlMappingInput): RegisterTrustedTaskControlMappingResult {
@@ -1323,6 +2066,7 @@ export class TaskControlPlaneStore {
     const acceptorId = nonEmpty(input.acceptorId, 'acceptorId');
     const registrationRef = controlledEvidenceRef(input.registrationRef, 'registrationRef');
     const controllerId = nonEmpty(input.controllerId, 'controllerId');
+    const approvalGate = parseApprovalGate(input.approvalGate);
     const docToken = input.docToken === undefined ? undefined : nonEmpty(input.docToken, 'docToken');
     if (!phaseTaskGuids.includes(taskGuid) || topicRootId !== dispatchRoot
       || ownerId === reviewerId || ownerId === acceptorId || reviewerId === acceptorId) {
@@ -1334,11 +2078,11 @@ export class TaskControlPlaneStore {
     }
     const mapping: TrustedTaskControlMappingRecord = {
       dispatchRoot, projectId, phaseId, phaseTaskGuids, taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-      registrationRef, controllerId, ...(docToken ? { docToken } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
+      registrationRef, controllerId, approvalGate, ...(docToken ? { docToken } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
     };
     return this.withImmediateWrite(() => {
-      const existing = this.db.prepare('SELECT * FROM control_trusted_mappings WHERE dispatch_root=?')
-        .get(dispatchRoot) as Record<string, unknown> | undefined;
+      const existing = this.db.prepare('SELECT * FROM control_trusted_mappings WHERE dispatch_root=? AND lark_app_id=?')
+        .get(dispatchRoot, this.larkAppId) as Record<string, unknown> | undefined;
       if (existing) {
         const existingMapping = this.listTrustedMappings().find(item => item.dispatchRoot === dispatchRoot)!;
         if (JSON.stringify(existingMapping) !== JSON.stringify(mapping)) {
@@ -1363,24 +2107,24 @@ export class TaskControlPlaneStore {
       });
       if (mappingResult.kind === 'conflict') throw new Error(`task_control_mapping_event_conflict:${dispatchRoot}`);
       this.db.prepare(`INSERT INTO control_trusted_mappings(
-        dispatch_root,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,doc_token,created_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-        dispatchRoot, projectId, phaseId, JSON.stringify(phaseTaskGuids), taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-        registrationRef, controllerId, docToken ?? null, mapping.createdAt,
+        dispatch_root,lark_app_id,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,approval_gate_json,doc_token,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        dispatchRoot, this.larkAppId, projectId, phaseId, JSON.stringify(phaseTaskGuids), taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
+        registrationRef, controllerId, JSON.stringify(approvalGate), docToken ?? null, mapping.createdAt,
       );
       return { kind: 'registered', mapping };
     });
   }
 
   getApprovalConsumption(approvalRef: string): ApprovalConsumption | undefined {
-    const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE approval_ref=?')
-      .get(approvalRef) as Record<string, unknown> | undefined;
+    const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE approval_ref=? AND lark_app_id=?')
+      .get(approvalRef, this.larkAppId) as Record<string, unknown> | undefined;
     return row ? approvalConsumptionFromRow(row) : undefined;
   }
 
   private approvalConsumptionForFreezeIdempotency(key: string): ApprovalConsumption | undefined {
-    const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE freeze_idempotency_key=?')
-      .get(key) as Record<string, unknown> | undefined;
+    const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE freeze_idempotency_key=? AND lark_app_id=?')
+      .get(key, this.larkAppId) as Record<string, unknown> | undefined;
     return row ? approvalConsumptionFromRow(row) : undefined;
   }
 
@@ -1424,49 +2168,49 @@ export class TaskControlPlaneStore {
     const semanticHash = payloadHash({
       attemptedEventType: input.attemptedEventType, sourceRef, payload,
     });
-    const existingRaw = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=?')
-      .get(idempotencyKey) as Record<string, unknown> | undefined;
+    const existingRaw = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=? AND lark_app_id=?')
+      .get(idempotencyKey, this.larkAppId) as Record<string, unknown> | undefined;
       if (existingRaw) {
         const existing = rowToObservation(existingRaw);
         if (existing.payloadHash === semanticHash) return { kind: 'duplicate', observation: existing };
         const conflictIdempotencyKey = `observation-conflict:${sha256(idempotencyKey).slice(7)}:${semanticHash.slice(7)}`;
-        const priorConflict = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=?')
-          .get(conflictIdempotencyKey) as Record<string, unknown> | undefined;
+        const priorConflict = this.db.prepare('SELECT * FROM control_observations WHERE idempotency_key=? AND lark_app_id=?')
+          .get(conflictIdempotencyKey, this.larkAppId) as Record<string, unknown> | undefined;
         if (priorConflict) return {
           kind: 'conflict', existingObservation: existing, conflictObservation: rowToObservation(priorConflict),
         };
         const conflictEventId = stableId('obs_conflict', idempotencyKey, semanticHash);
         const occurredAt = input.occurredAt ?? new Date().toISOString();
         this.db.prepare(`INSERT INTO control_observations(
-          event_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
-        ) VALUES(?,?,?,?,?,'conflict',?,?)`).run(
-          conflictEventId, input.attemptedEventType, sourceRef, conflictIdempotencyKey, occurredAt, semanticHash,
+          event_id,lark_app_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+        ) VALUES(?,?,?,?,?,?,'conflict',?,?)`).run(
+          conflictEventId, this.larkAppId, input.attemptedEventType, sourceRef, conflictIdempotencyKey, occurredAt, semanticHash,
           JSON.stringify({ existingEventId: existing.eventId, incomingEventId: eventId, sourceRef, payload }),
         );
-        const conflict = this.db.prepare('SELECT * FROM control_observations WHERE event_id=?')
-          .get(conflictEventId) as Record<string, unknown> | undefined;
+        const conflict = this.db.prepare('SELECT * FROM control_observations WHERE event_id=? AND lark_app_id=?')
+          .get(conflictEventId, this.larkAppId) as Record<string, unknown> | undefined;
         if (!conflict) throw new Error('task_control_observation_insert_failed');
         return { kind: 'conflict', existingObservation: existing, conflictObservation: rowToObservation(conflict) };
       }
       const occurredAt = input.occurredAt ?? new Date().toISOString();
       this.db.prepare(`INSERT INTO control_observations(
-        event_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
-      ) VALUES(?,?,?,?,?,'unknown',?,?)`).run(
-        eventId, input.attemptedEventType, sourceRef, idempotencyKey, occurredAt, semanticHash, JSON.stringify(payload),
+        event_id,lark_app_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+      ) VALUES(?,?,?,?,?,?,'unknown',?,?)`).run(
+        eventId, this.larkAppId, input.attemptedEventType, sourceRef, idempotencyKey, occurredAt, semanticHash, JSON.stringify(payload),
       );
-      const row = this.db.prepare('SELECT * FROM control_observations WHERE event_id=?')
-        .get(eventId) as Record<string, unknown> | undefined;
+      const row = this.db.prepare('SELECT * FROM control_observations WHERE event_id=? AND lark_app_id=?')
+        .get(eventId, this.larkAppId) as Record<string, unknown> | undefined;
       if (!row) throw new Error('task_control_observation_insert_failed');
     return { kind: 'appended', observation: rowToObservation(row) };
   }
 
   private eventByIdempotencyKey(key: string): TaskControlEvent | undefined {
-    const row = this.db.prepare('SELECT * FROM control_events WHERE idempotency_key=?').get(key) as unknown as EventRow | undefined;
+    const row = this.db.prepare('SELECT * FROM control_events WHERE idempotency_key=? AND lark_app_id=?').get(key, this.larkAppId) as unknown as EventRow | undefined;
     return row ? rowToEvent(row) : undefined;
   }
 
   private eventById(eventId: string): TaskControlEvent | undefined {
-    const row = this.db.prepare('SELECT * FROM control_events WHERE event_id=?').get(eventId) as unknown as EventRow | undefined;
+    const row = this.db.prepare('SELECT * FROM control_events WHERE event_id=? AND lark_app_id=?').get(eventId, this.larkAppId) as unknown as EventRow | undefined;
     return row ? rowToEvent(row) : undefined;
   }
 
@@ -1479,8 +2223,8 @@ export class TaskControlPlaneStore {
     if (input.eventType === 'mapping.registered') {
       const prior = this.mappingForTask(input.taskGuid);
       if (prior) throw new Error(`task_control_mapping_already_registered:${input.taskGuid}`);
-      const topicOwner = this.db.prepare(`SELECT task_guid FROM control_events WHERE event_type='mapping.registered' AND topic_root_id=?`)
-        .get(input.topicRootId!) as { task_guid?: string } | undefined;
+      const topicOwner = this.db.prepare(`SELECT task_guid FROM control_events WHERE event_type='mapping.registered' AND topic_root_id=? AND lark_app_id=?`)
+        .get(input.topicRootId!, this.larkAppId) as { task_guid?: string } | undefined;
       if (topicOwner && topicOwner.task_guid !== input.taskGuid) throw new Error(`task_control_topic_mapping_conflict:${input.topicRootId}`);
       return;
     }
@@ -1533,6 +2277,8 @@ export class TaskControlPlaneStore {
 
   private appendEventLocked(input: AuthenticatedAppendTaskControlEventInput, allowFrozen = false): AppendTaskControlEventResult {
     validateInput(input, allowFrozen);
+    if (input.eventType === 'task.reviewed') this.assertReviewedVerdictCurrentLocked(input);
+    if (input.eventType === 'task.rework_started') this.assertReworkSourceCurrentLocked(input);
     const payloadHash = eventPayloadHash(input);
     const existing = this.eventByIdempotencyKey(input.idempotencyKey);
     if (existing) {
@@ -1581,11 +2327,11 @@ export class TaskControlPlaneStore {
       : phaseStateAfter(input.eventType, beforePhase.lifecycleState);
     const occurredAt = input.occurredAt ?? new Date().toISOString();
     const result = this.db.prepare(`INSERT INTO control_events(
-      event_id,event_type,schema_version,project_id,phase_id,task_guid,topic_root_id,actor_id,actor_role,occurred_at,
+      event_id,lark_app_id,event_type,schema_version,project_id,phase_id,task_guid,topic_root_id,actor_id,actor_role,occurred_at,
       state_before,state_after,source_ref,payload_ref,evidence_ref,idempotency_key,causation_id,correlation_id,attempt,
       error_class,ack_deadline,terminal,payload_hash,payload_json
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      input.eventId, input.eventType, 1, input.projectId, input.phaseId, input.taskGuid ?? null, input.topicRootId ?? null,
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      input.eventId, this.larkAppId, input.eventType, 1, input.projectId, input.phaseId, input.taskGuid ?? null, input.topicRootId ?? null,
       input.actorId, input.actorRole, occurredAt, stateBefore, stateAfter, input.sourceRef ?? null, input.payloadRef ?? null,
       input.evidenceRef ?? null, input.idempotencyKey, input.causationId ?? null, input.correlationId ?? null, input.attempt ?? 1,
       input.errorClass ?? null, input.ackDeadline ?? null, input.terminal ? 1 : 0, payloadHash, JSON.stringify(payload),
@@ -1600,37 +2346,37 @@ export class TaskControlPlaneStore {
         throw new Error(`task_control_fallback_delivery_mismatch:${fallback.deliveryEventId}`);
       }
       const row = this.db.prepare(`SELECT * FROM control_outbox
-        WHERE event_id=? AND destination_id=?`).get(
-        fallback.deliveryEventId, fallback.destinationId,
+        WHERE event_id=? AND destination_id=? AND lark_app_id=?`).get(
+        fallback.deliveryEventId, fallback.destinationId, this.larkAppId,
       ) as Record<string, unknown> | undefined;
       if (!row) throw new Error(`task_control_fallback_outbox_missing:${fallback.deliveryEventId}:${fallback.destinationId}`);
       const outbox = outboxFromRow(row);
       if (outbox.status !== 'degraded') throw new Error(`task_control_fallback_not_degraded:${outbox.outboxId}`);
       if (outbox.fallbackEventId) throw new Error(`task_control_fallback_already_verified:${outbox.outboxId}`);
       const linked = this.db.prepare(`UPDATE control_outbox SET fallback_event_id=?,updated_at=?
-        WHERE outbox_id=? AND status='degraded' AND fallback_event_id IS NULL`).run(
-        event.eventId, occurredAt, outbox.outboxId,
+        WHERE outbox_id=? AND lark_app_id=? AND status='degraded' AND fallback_event_id IS NULL`).run(
+        event.eventId, occurredAt, outbox.outboxId, this.larkAppId,
       );
       if (Number(linked.changes) !== 1) throw new Error(`task_control_fallback_link_failed:${outbox.outboxId}`);
       this.insertReceiptLocked(outbox, {
-        state: 'fallback_verified', fallbackEventId: event.eventId, createdAt: occurredAt,
+        state: 'fallback_verified', receiptRef: fallback.receiptRef, fallbackEventId: event.eventId, createdAt: occurredAt,
       });
     }
     const destinations = [...new Set(input.deliverTo ?? [])].sort();
     for (const destinationId of destinations) {
       const outboxId = stableId('out', event.eventId, destinationId);
       this.db.prepare(`INSERT INTO control_outbox(
-        outbox_id,event_id,destination_id,status,attempts,next_attempt_at,created_at,updated_at
-      ) VALUES(?,?,?,'pending',0,?,?,?)`).run(
-        outboxId, event.eventId, destinationId, Date.parse(occurredAt) || Date.now(), occurredAt, occurredAt,
+        outbox_id,lark_app_id,event_id,destination_id,status,attempts,next_attempt_at,created_at,updated_at
+      ) VALUES(?,?,?,?,'pending',0,?,?,?)`).run(
+        outboxId, this.larkAppId, event.eventId, destinationId, Date.parse(occurredAt) || Date.now(), occurredAt, occurredAt,
       );
     }
     return event;
   }
 
-  getTaskProjection(taskGuid: string): TaskProjection {
+  getTaskProjection(taskGuid: string, checkedAt = new Date().toISOString()): TaskProjection {
     const projection = reduceTask(this.listEvents({ taskGuid })).projection;
-    return { ...projection, taskGuid };
+    return this.refreshReviewerVerdictProjection({ ...projection, taskGuid }, checkedAt);
   }
 
   getPhaseProjection(projectId: string, phaseId: string): PhaseProjection {
@@ -1650,7 +2396,8 @@ export class TaskControlPlaneStore {
 
   listOutbox(filter: { eventId?: string; phaseId?: string } = {}): DeliveryOutboxRow[] {
     const rows = this.db.prepare(`SELECT o.* FROM control_outbox o
-      JOIN control_events e ON e.event_id=o.event_id ORDER BY o.created_at,o.outbox_id`).all() as Record<string, unknown>[];
+      JOIN control_events e ON e.event_id=o.event_id AND e.lark_app_id=o.lark_app_id
+      WHERE o.lark_app_id=? ORDER BY o.created_at,o.outbox_id`).all(this.larkAppId) as Record<string, unknown>[];
     return rows.map(outboxFromRow).filter(row => !filter.eventId || row.eventId === filter.eventId)
       .filter(row => {
         if (!filter.phaseId) return true;
@@ -1659,7 +2406,7 @@ export class TaskControlPlaneStore {
   }
 
   listReceipts(eventId?: string): DeliveryReceipt[] {
-    return (this.db.prepare('SELECT * FROM control_delivery_receipts ORDER BY created_at,receipt_id').all() as Record<string, unknown>[])
+    return (this.db.prepare('SELECT * FROM control_delivery_receipts WHERE lark_app_id=? ORDER BY created_at,receipt_id').all(this.larkAppId) as Record<string, unknown>[])
       .map(receiptFromRow).filter(receipt => !eventId || receipt.eventId === eventId);
   }
 
@@ -1667,20 +2414,76 @@ export class TaskControlPlaneStore {
     nonEmpty(input.claimToken, 'claimToken');
     return this.withImmediateWrite(() => {
       const ids = (this.db.prepare(`SELECT outbox_id FROM control_outbox
-        WHERE status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,outbox_id LIMIT ?`)
-        .all(input.now, Math.max(1, Math.min(input.limit, 100))) as Array<{ outbox_id: string }>)
+        WHERE lark_app_id=? AND status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,outbox_id LIMIT ?`)
+        .all(this.larkAppId, input.now, Math.max(1, Math.min(input.limit, 100))) as Array<{ outbox_id: string }>)
         .map(row => row.outbox_id);
       for (const outboxId of ids) {
         this.db.prepare(`UPDATE control_outbox SET status='inflight',attempts=attempts+1,claim_token=?,claimed_at=?,updated_at=?
-          WHERE outbox_id=? AND status='pending'`).run(input.claimToken, input.now, new Date(input.now).toISOString(), outboxId);
+          WHERE outbox_id=? AND lark_app_id=? AND status='pending'`).run(input.claimToken, input.now, new Date(input.now).toISOString(), outboxId, this.larkAppId);
       }
       const wanted = new Set(ids);
       return this.listOutbox().filter(row => wanted.has(row.outboxId) && row.claimToken === input.claimToken);
     });
   }
 
-  settleOutboxDelivered(outboxId: string, claimToken: string, deliveredAt = new Date().toISOString()): boolean {
-    return this.settleOutbox(outboxId, claimToken, { state: 'delivered', createdAt: deliveredAt });
+  /** Atomically claim exactly one known event/destination row without touching unrelated pending outbox work. */
+  claimOutboxForEventDestination(input: {
+    eventId: string; destinationId: string; now: number; claimToken: string;
+  }): DeliveryOutboxRow | undefined {
+    const eventId = nonEmpty(input.eventId, 'eventId');
+    const destinationId = nonEmpty(input.destinationId, 'destinationId');
+    const claimToken = nonEmpty(input.claimToken, 'claimToken');
+    if (!Number.isFinite(input.now)) throw new Error('task_control_invalid:outbox_claim_now');
+    return this.withImmediateWrite(() => {
+      const raw = this.db.prepare(`SELECT * FROM control_outbox
+        WHERE lark_app_id=? AND event_id=? AND destination_id=? AND status='pending'`)
+        .get(this.larkAppId, eventId, destinationId) as Record<string, unknown> | undefined;
+      if (!raw) return undefined;
+      const outbox = outboxFromRow(raw);
+      const changed = this.db.prepare(`UPDATE control_outbox
+        SET status='inflight',attempts=attempts+1,claim_token=?,claimed_at=?,updated_at=?
+        WHERE outbox_id=? AND lark_app_id=? AND status='pending'`).run(
+        claimToken, input.now, new Date(input.now).toISOString(), outbox.outboxId, this.larkAppId,
+      );
+      if (Number(changed.changes) !== 1) return undefined;
+      const claimed = this.db.prepare(`SELECT * FROM control_outbox
+        WHERE outbox_id=? AND lark_app_id=? AND status='inflight' AND claim_token=?`)
+        .get(outbox.outboxId, this.larkAppId, claimToken) as Record<string, unknown> | undefined;
+      return claimed ? outboxFromRow(claimed) : undefined;
+    });
+  }
+
+  settleOutboxDelivered(
+    outboxId: string,
+    claimToken: string,
+    input: { receiptRef: string; deliveredAt?: string },
+  ): boolean {
+    const receiptRef = nonEmpty(input.receiptRef, 'receiptRef');
+    return this.settleOutbox(outboxId, claimToken, {
+      state: 'delivered', receiptRef,
+      createdAt: input.deliveredAt ?? new Date().toISOString(),
+    });
+  }
+
+  /** A daemon-owned provider receipt may settle its exact terminal row without a pump claim. */
+  settleOutboxDeliveredByReceipt(input: { eventId: string; destinationId: string; receiptRef: string; deliveredAt?: string }): boolean {
+    const eventId = nonEmpty(input.eventId, 'eventId');
+    const destinationId = nonEmpty(input.destinationId, 'destinationId');
+    const receiptRef = nonEmpty(input.receiptRef, 'receiptRef');
+    const deliveredAt = input.deliveredAt ?? new Date().toISOString();
+    return this.withImmediateWrite(() => {
+      const raw = this.db.prepare(`SELECT * FROM control_outbox
+        WHERE event_id=? AND destination_id=? AND lark_app_id=? AND status IN ('pending','inflight')`)
+        .get(eventId, destinationId, this.larkAppId) as Record<string, unknown> | undefined;
+      if (!raw) return false;
+      const outbox = outboxFromRow(raw);
+      if (!receiptRefBindsEventAndDestination(receiptRef, eventId, destinationId)) return false;
+      const changed = this.db.prepare(`UPDATE control_outbox SET status='delivered',claim_token=NULL,claimed_at=NULL,updated_at=?
+        WHERE outbox_id=? AND lark_app_id=? AND status IN ('pending','inflight')`).run(deliveredAt, outbox.outboxId, this.larkAppId);
+      if (Number(changed.changes) !== 1) return false;
+      this.insertReceiptLocked(outbox, { state: 'delivered', receiptRef, createdAt: deliveredAt });
+      return true;
+    });
   }
 
   settleOutboxDegraded(outboxId: string, claimToken: string, input: { error: string; createdAt?: string }): boolean {
@@ -1705,11 +2508,11 @@ export class TaskControlPlaneStore {
     return this.withImmediateWrite(() => {
       const recoveredAt = new Date(now).toISOString();
       const rows = this.db.prepare(`SELECT * FROM control_outbox
-        WHERE status='inflight' AND claimed_at<=? ORDER BY outbox_id`).all(now - staleAfterMs) as Record<string, unknown>[];
+        WHERE lark_app_id=? AND status='inflight' AND claimed_at<=? ORDER BY outbox_id`).all(this.larkAppId, now - staleAfterMs) as Record<string, unknown>[];
       for (const raw of rows) {
         const row = outboxFromRow(raw);
         this.db.prepare(`UPDATE control_outbox SET status='pending',claim_token=NULL,claimed_at=NULL,updated_at=?
-          WHERE outbox_id=? AND status='inflight'`).run(recoveredAt, row.outboxId);
+          WHERE outbox_id=? AND lark_app_id=? AND status='inflight'`).run(recoveredAt, row.outboxId, this.larkAppId);
         this.insertReceiptLocked(row, {
           state: 'claim_recovered', error: 'delivery_claim_expired', createdAt: recoveredAt,
         });
@@ -1719,19 +2522,21 @@ export class TaskControlPlaneStore {
   }
 
   private settleOutbox(outboxId: string, claimToken: string, input: {
-    state: DeliveryAttemptReceiptState; error?: string; nextAttemptAt?: number; createdAt: string;
+    state: DeliveryAttemptReceiptState; error?: string; receiptRef?: string; nextAttemptAt?: number; createdAt: string;
   }): boolean {
     nonEmpty(outboxId, 'outboxId');
     nonEmpty(claimToken, 'claimToken');
     return this.withImmediateWrite(() => {
-      const row = this.db.prepare(`SELECT * FROM control_outbox WHERE outbox_id=? AND status='inflight' AND claim_token=?`)
-        .get(outboxId, claimToken) as Record<string, unknown> | undefined;
+      const row = this.db.prepare(`SELECT * FROM control_outbox WHERE outbox_id=? AND lark_app_id=? AND status='inflight' AND claim_token=?`)
+        .get(outboxId, this.larkAppId, claimToken) as Record<string, unknown> | undefined;
       if (!row) return false;
       const outbox = outboxFromRow(row);
+      if (input.state === 'delivered' && (!input.receiptRef
+        || !receiptRefBindsEventAndDestination(input.receiptRef, outbox.eventId, outbox.destinationId))) return false;
       const status: DeliveryOutboxStatus = input.state === 'retry_scheduled' ? 'pending' : input.state;
       this.db.prepare(`UPDATE control_outbox SET status=?,next_attempt_at=?,claim_token=NULL,claimed_at=NULL,last_error=?,fallback_event_id=NULL,updated_at=?
-        WHERE outbox_id=? AND status='inflight' AND claim_token=?`).run(
-        status, input.nextAttemptAt ?? outbox.nextAttemptAt, input.error ?? null, input.createdAt, outboxId, claimToken,
+        WHERE outbox_id=? AND lark_app_id=? AND status='inflight' AND claim_token=?`).run(
+        status, input.nextAttemptAt ?? outbox.nextAttemptAt, input.error ?? null, input.createdAt, outboxId, this.larkAppId, claimToken,
       );
       this.insertReceiptLocked(outbox, input);
       return true;
@@ -1739,13 +2544,28 @@ export class TaskControlPlaneStore {
   }
 
   private insertReceiptLocked(outbox: DeliveryOutboxRow, input: {
-    state: DeliveryReceiptState; error?: string; fallbackEventId?: string; createdAt: string;
+    state: DeliveryReceiptState; error?: string; receiptRef?: string; fallbackEventId?: string; createdAt: string;
   }): void {
+    if (input.receiptRef) {
+      if (input.state === 'delivered' && !receiptRefBindsEventAndDestination(input.receiptRef, outbox.eventId, outbox.destinationId)) {
+        throw new Error(`task_control_receipt_binding_unproven:${outbox.eventId}:${outbox.destinationId}`);
+      }
+      const existing = this.db.prepare(`SELECT receipt_id FROM control_delivery_receipts
+        WHERE lark_app_id=? AND event_id=? AND destination_id=? AND receipt_ref=?`)
+        .get(this.larkAppId, outbox.eventId, outbox.destinationId, input.receiptRef) as Record<string, unknown> | undefined;
+      if (existing) throw new Error(`task_control_receipt_replayed:${outbox.eventId}:${outbox.destinationId}`);
+      if (input.state === 'delivered') {
+        const crossBound = this.db.prepare(`SELECT receipt_id FROM control_delivery_receipts
+          WHERE lark_app_id=? AND receipt_ref=? AND (event_id<>? OR destination_id<>?)`)
+          .get(this.larkAppId, input.receiptRef, outbox.eventId, outbox.destinationId) as Record<string, unknown> | undefined;
+        if (crossBound) throw new Error(`task_control_receipt_cross_binding:${outbox.eventId}:${outbox.destinationId}`);
+      }
+    }
     this.db.prepare(`INSERT INTO control_delivery_receipts(
-      receipt_id,outbox_id,event_id,destination_id,attempt,state,error,fallback_event_id,created_at
-    ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
-      `rcpt_${randomUUID().replaceAll('-', '')}`, outbox.outboxId, outbox.eventId, outbox.destinationId, outbox.attempts,
-      input.state, input.error ?? null, input.fallbackEventId ?? null, input.createdAt,
+      receipt_id,lark_app_id,outbox_id,event_id,destination_id,attempt,state,receipt_ref,error,fallback_event_id,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+      `rcpt_${randomUUID().replaceAll('-', '')}`, this.larkAppId, outbox.outboxId, outbox.eventId, outbox.destinationId, outbox.attempts,
+      input.state, input.receiptRef ?? null, input.error ?? null, input.fallbackEventId ?? null, input.createdAt,
     );
   }
 
@@ -1753,7 +2573,7 @@ export class TaskControlPlaneStore {
     const receipts = this.listReceipts(outbox.eventId)
       .filter(receipt => receipt.outboxId === outbox.outboxId);
     if (outbox.status === 'delivered') {
-      return [...receipts].reverse().find(receipt => receipt.state === 'delivered');
+      return [...receipts].reverse().find(receipt => receipt.state === 'delivered' && !!receipt.receiptRef);
     }
     if (outbox.status !== 'degraded' || !outbox.fallbackEventId) return undefined;
     const fallbackEvent = this.eventById(outbox.fallbackEventId);
@@ -1761,7 +2581,7 @@ export class TaskControlPlaneStore {
     const fallback = parseDeliveryFallback(fallbackEvent.payload);
     if (fallback.deliveryEventId !== outbox.eventId || fallback.destinationId !== outbox.destinationId) return undefined;
     return [...receipts].reverse().find(receipt => receipt.state === 'fallback_verified'
-      && receipt.fallbackEventId === outbox.fallbackEventId);
+      && receipt.fallbackEventId === outbox.fallbackEventId && receipt.receiptRef === fallback.receiptRef);
   }
 
   validatePhaseFreeze(projectId: string, phaseId: string, checkedAt = new Date().toISOString()): PhaseFreezeValidation {
@@ -1806,7 +2626,7 @@ export class TaskControlPlaneStore {
     }
     for (const taskGuid of expectedTaskGuids) {
       const taskEvents = events.filter(event => event.taskGuid === taskGuid);
-      const task = reduceTask(taskEvents).projection;
+      const task = this.getTaskProjection(taskGuid, checkedAt);
       if (!task.mapping) {
         issues.push({ code: 'task_mapping_missing', message: 'canonical task/topic mapping is missing', taskGuid });
         continue;
@@ -1835,6 +2655,9 @@ export class TaskControlPlaneStore {
       }
       if (task.mapping && review?.independent && review.reviewerId === task.mapping.ownerId) {
         issues.push({ code: 'reviewer_not_independent', message: 'reviewer is the mapped task owner', taskGuid, eventId: review.eventId });
+      }
+      if (task.reviewerVerdictIssue) {
+        issues.push({ code: 'reviewer_verdict_unverified', message: task.reviewerVerdictIssue, taskGuid, eventId: review?.eventId });
       }
       if (task.terminalBody && review && (review.docToken !== task.terminalBody.docToken || review.docRevision !== task.terminalBody.docRevision)) {
         issues.push({ code: 'review_terminal_mismatch', message: 'review does not identify the terminal document revision', taskGuid, eventId: review.eventId });
@@ -1979,11 +2802,11 @@ export class TaskControlPlaneStore {
         throw new Error('task_control_freeze_approval_unverified');
       }
       const approvalRef = controlledEvidenceRef(approval.approvalRef, 'verifiedApproval.approvalRef');
-      const validation = this.validatePhaseFreezeFromEvents(input.projectId, input.phaseId, checkedAt, events);
-      if (!validation.ok) return { kind: 'rejected', validation };
       if (this.getApprovalConsumption(approvalRef)) {
         throw new Error(`task_control_freeze_approval_already_consumed:${approvalRef}`);
       }
+      const validation = this.validatePhaseFreezeFromEvents(input.projectId, input.phaseId, checkedAt, events);
+      if (!validation.ok) return { kind: 'rejected', validation };
       const approvedAt = nonEmpty(approval.approvedAt, 'verifiedApproval.approvedAt');
       const snapshot = this.buildFreezeSnapshot(validation, events, checkedAt, principal.actorId, approvalRef, approvedAt);
       const result = this.appendEventLocked({
@@ -1996,9 +2819,9 @@ export class TaskControlPlaneStore {
         throw new Error(`task_control_freeze_idempotency_conflict:${result.conflictEvent.eventId}`);
       }
       this.db.prepare(`INSERT INTO control_approval_consumptions(
-        approval_ref,project_id,phase_id,task_set_hash,acceptor_id,freeze_idempotency_key,frozen_event_id,approved_at,consumed_at
-      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
-        approvalRef, input.projectId, input.phaseId, taskSetHash(taskSetSnapshot), principal.actorId,
+        approval_ref,lark_app_id,project_id,phase_id,task_set_hash,acceptor_id,freeze_idempotency_key,frozen_event_id,approved_at,consumed_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        approvalRef, this.larkAppId, input.projectId, input.phaseId, taskSetHash(taskSetSnapshot), principal.actorId,
         input.idempotencyKey, result.event.eventId, approvedAt, checkedAt,
       );
       return { kind: 'frozen', validation, event: result.event };

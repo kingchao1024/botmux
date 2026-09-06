@@ -22,7 +22,7 @@ describe('TaskControlActiveCollector', () => {
     expect(await collector.collect('doc_revision')).toBe(1);
     expect(calls).toEqual([{ kind: 'doc_revision', cursor: undefined }]);
     expect(appended).toEqual([expect.objectContaining({
-      kind: 'observation', input: expect.objectContaining({
+      kind: 'queued-observation', input: expect.objectContaining({
         attemptedEventType: 'unknown.declared', eventId: 'collector-doc-7', sourceRef: 'doc:doc-token@7',
         payload: { collectionKind: 'doc_revision', referenceOnly: true },
       }),
