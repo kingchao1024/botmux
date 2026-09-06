@@ -208,14 +208,14 @@ describe('DaemonTaskControlIntegration', () => {
       integration.workerExecutionStarted('om_root', 'execute');
       integration.firstSubmitted('om_root', 'submit', { docToken: 'doc-final', docRevision: 1, evidenceRef: 'topic-message:om_submit' });
       await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('submitted'));
-      const issue = (verdictId: string, sourceMessageId: string, supersedesVerdictId?: string) => provider.issueVerdict({
+      const issue = (verdictId: string, sourceMessageId: string, supersedesVerdictId?: string, verdict: 'pass' | 'conditional' = 'pass', conditionIds: string[] = []) => provider.issueVerdict({
         verdictId, projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1,
         designatedReviewerRef: designation.designatedReviewerRef, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app',
         sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap', sourceMessageId, sourceVersionHash: `sha256:${sourceMessageId.slice(-1).repeat(64)}`,
-        kind: 'verdict', verdict: 'pass', conditionIds: [], resolvedConditionEvidence: {}, docToken: 'doc-final', docRevision: 1,
+        kind: 'verdict', verdict, conditionIds, resolvedConditionEvidence: {}, docToken: 'doc-final', docRevision: 1,
         ...(supersedesVerdictId ? { supersedesVerdictId } : {}), expiresAt: '2099-09-05T01:00:00.000Z',
       });
-      const first = issue('verdict-v1', 'om_review_a');
+      const first = issue('verdict-v1', 'om_review_a', undefined, 'conditional', ['c1']);
       expect(integration.submitReviewerVerdict({
         dispatchRoot: 'om_root', verdict: first, authentication: reviewer,
         attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap' },
@@ -229,6 +229,7 @@ describe('DaemonTaskControlIntegration', () => {
       })).toMatchObject({ status: 'active', verdict: { verdictId: correction.verdictId } });
       await waitFor(() => expect(store.listEvents({ taskGuid: 'task-1' }).some(event => event.eventType === 'task.review_corrected')).toBe(true));
       expect(store.getTaskProjection('task-1').transitionViolations).toEqual([]);
+      expect(store.getTaskProjection('task-1').unresolvedReviewConditionIds).toEqual([]);
       integration.delivered('om_root', 'deliver', { docToken: 'doc-final', docRevision: 1, destinationId: 'topic-message:om_delivery', receiptRef: 'topic-message:om_receipt', evidenceRef: 'topic-message:om_delivery' });
       integration.doneMarked('om_root', 'done', 'task-comment:done');
       await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('task_done_pending_freeze'));
@@ -578,6 +579,38 @@ describe('DaemonTaskControlIntegration', () => {
       integration.workerExecutionStarted('om_root', 'execution-after-correction');
       await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('rework'));
       expect(store.listEvents({ taskGuid: 'task-1' }).find(event => event.eventType === 'task.rework_started')).toMatchObject({ payload: { sourceReviewerVerdictId: corrected.verdictId } });
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('reopens an auto-delivered PASS correction safely when superseded by FAIL', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-delivered-correction-'));
+    try {
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const store = lifecycle.getStore()!;
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} }, controlledWriteback: true });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const provider = reviewerProvider(); store.setReviewerVerdictVerifier(provider);
+      const controller = bridge.issueAuthentication('om_root', 'controller')!;
+      const reviewer = bridge.issueAuthentication('om_root', 'reviewer')!;
+      const designation = provider.issueDesignatedReviewer({ projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', controllerId: 'controller-1', controllerBotAppId: 'app-1', effectiveAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T01:00:00.000Z' });
+      integration.registerDesignatedReviewer({ mapping: designation, authentication: controller, verify: value => provider.verifyDesignatedReviewer(value) });
+      integration.workerAccepted('om_root', 'accept'); integration.workerExecutionStarted('om_root', 'execute');
+      integration.firstSubmitted('om_root', 'submit', { docToken: 'doc-final', docRevision: 1, evidenceRef: 'topic-message:om_submit' });
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('submitted'));
+      const issue = (verdictId: string, verdict: 'pass' | 'fail', supersedesVerdictId?: string) => provider.issueVerdict({ verdictId, projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, designatedReviewerRef: designation.designatedReviewerRef, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap', sourceMessageId: `om_${verdictId}`, sourceVersionHash: `sha256:${verdictId.slice(-1).repeat(64)}`, kind: 'verdict', verdict, conditionIds: [], resolvedConditionEvidence: {}, docToken: 'doc-final', docRevision: 1, ...(supersedesVerdictId ? { supersedesVerdictId } : {}), expiresAt: '2099-09-05T01:00:00.000Z' });
+      const first = issue('auto-v1', 'pass');
+      expect(integration.submitReviewerVerdict({ dispatchRoot: 'om_root', verdict: first, authentication: reviewer, attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap' }, verifyVerdict: value => provider.verifyVerdict(value) })).toMatchObject({ status: 'active' });
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('delivered'));
+      integration.doneMarked('om_root', 'done', 'task-comment:done');
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('task_done_pending_freeze'));
+      const correction = issue('auto-v2', 'fail', first.verdictId);
+      expect(integration.submitReviewerVerdict({ dispatchRoot: 'om_root', verdict: correction, authentication: reviewer, attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap' }, verifyVerdict: value => provider.verifyVerdict(value) })).toMatchObject({ status: 'active', verdict: { verdictId: correction.verdictId } });
+      expect(store.getTaskProjection('task-1').state).toBe('reviewing');
+      expect(store.getTaskProjection('task-1').transitionViolations).toEqual([]);
+      integration.workerExecutionStarted('om_root', 'execution-after-delivery-correction');
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('rework'));
       await lifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });

@@ -280,7 +280,8 @@ export class DaemonTaskControlIntegration {
       this.reviewerVerdictUnknown(input.dispatchRoot, verdict.verdictId, reviewed.reason, `reviewer-verdict:${verdict.verdictId}`);
       return { status: 'unknown', reason: reviewed.reason };
     }
-    if (this.input.controlledWriteback && verdict.verdict === 'pass' && verdict.conditionIds.length === 0) {
+    if (this.input.controlledWriteback && verdict.verdict === 'pass' && verdict.conditionIds.length === 0
+      && this.input.store.getTaskProjection(mapping.taskGuid).state === 'reviewing') {
       this.deliverAfterReview(input.dispatchRoot, verdict, `reviewer-verdict:${verdict.verdictId}`);
     }
     return head;

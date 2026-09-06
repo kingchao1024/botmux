@@ -538,9 +538,13 @@ const TASK_TRANSITIONS: Partial<Record<TaskControlEventType, TaskTransitionRule>
       return 'reviewing';
     },
   },
-  // A signed superseding verdict replaces review evidence but never repeats the
-  // submitted→reviewing lifecycle transition.
-  'task.review_corrected': { from: ['reviewing'], to: 'reviewing' },
+  // A signed superseding verdict replaces review evidence. PASS preserves a
+  // delivered/done terminal projection; FAIL/CONDITIONAL reopen reviewing and
+  // require fresh execution before rework.
+  'task.review_corrected': {
+    from: ['reviewing', 'delivered', 'task_done_pending_freeze'],
+    to: (payload, current) => parseReviewVerdict(payload.verdict) === 'pass' ? current : 'reviewing',
+  },
   'task.rework_started': { from: ['reviewing'], to: 'rework' },
   'task.delivered': { from: ['reviewing'], to: 'delivered' },
   'task.done_marked': { from: ['delivered'], to: 'task_done_pending_freeze' },
@@ -1443,6 +1447,7 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
       case 'task.review_corrected': {
         const verdict = parseReviewVerdict(event.payload.verdict);
         if (event.payload.independent === true) {
+          if (event.eventType === 'task.review_corrected') unresolvedReviewConditions.clear();
           const conditionIds = event.payload.conditionIds === undefined
             ? []
             : exactTaskSetSnapshot(event.payload.conditionIds, 'payload.conditionIds');
@@ -2793,10 +2798,12 @@ export class TaskControlPlaneStore {
       if (task.doneEvent && task.terminalBody && task.doneEvent.seq < task.terminalBody.seq) {
         issues.push({ code: 'task_done_precedes_terminal_body', message: 'task done predates terminal body', taskGuid, eventId: task.doneEvent.eventId });
       }
-      if (task.doneEvent && review && task.doneEvent.seq < review.seq) {
+      const reviewEvent = review ? taskEvents.find(event => event.eventId === review.eventId) : undefined;
+      const isCorrection = reviewEvent?.eventType === 'task.review_corrected';
+      if (task.doneEvent && review && task.doneEvent.seq < review.seq && !isCorrection) {
         issues.push({ code: 'task_done_precedes_review', message: 'task done predates independent review', taskGuid, eventId: task.doneEvent.eventId });
       }
-      if (review && task.terminalBody && review.seq > task.terminalBody.seq) {
+      if (review && task.terminalBody && review.seq > task.terminalBody.seq && !isCorrection) {
         issues.push({ code: 'review_terminal_mismatch', message: 'independent review was recorded after terminal delivery', taskGuid, eventId: review.eventId });
       }
       if (task.state !== 'task_done_pending_freeze') {
