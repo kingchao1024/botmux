@@ -5,8 +5,11 @@ import { join } from 'node:path';
 import { DaemonTaskControlAuthority } from '../src/services/task-control-plane-authority.js';
 import { DaemonTaskControlBridge } from '../src/services/task-control-plane-daemon-bridge.js';
 import { DaemonTaskControlIntegration } from '../src/services/task-control-plane-daemon-integration.js';
+import { TaskControlPlaneStore } from '../src/services/task-control-plane-store.js';
 import { startTaskControlPlaneRuntime } from '../src/services/task-control-plane-runtime.js';
 import { DaemonReviewerVerdictProvider } from '../src/services/task-control-plane-reviewer-verdict.js';
+import { TaskControlMappingTrust } from '../src/services/task-control-plane-mapping-trust.js';
+
 
 function gate() {
   return {
@@ -60,6 +63,92 @@ describe('DaemonTaskControlIntegration', () => {
       new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle: restoredLifecycle, store: restoredLifecycle.getStore()!, bridge: restoredBridge, logger: { warn: () => {} } });
       expect(restoredBridge.mapping('om_root')).toMatchObject({ projectId: 'project-1', taskGuid: 'task-1' });
       await restoredLifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('persists the generated mapping proof and restores the signed production mapping after restart', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-proof-restart-'));
+    try {
+      const trust = new TaskControlMappingTrust({ hostSecret: 'test-host-secret', larkAppId: 'app-1' });
+      const verifier = { minimumTaskCount: 1, verifyMapping: (proof: any, facts: Record<string, unknown>) => trust.verifyMapping(proof, facts) };
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1', productionMapping: verifier });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store: lifecycle.getStore()!, bridge, logger: { warn: () => {} }, mappingTrust: trust });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      expect(lifecycle.getStore()!.listTrustedMappings()[0]?.mappingProof).toMatchObject({ keyId: trust.mappingKeyId });
+      await lifecycle.close();
+      const restoredBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1', productionMapping: verifier });
+      const restored = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: restoredBridge.authority, logger: { warn: () => {} } });
+      new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle: restored, store: restored.getStore()!, bridge: restoredBridge, logger: { warn: () => {} }, mappingTrust: trust });
+      expect(restoredBridge.mapping('om_root')).toMatchObject({ taskGuid: 'task-1', mappingProof: { keyId: trust.mappingKeyId } });
+      await restored.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('reconciles a post-write/pre-settle task comment across restart without a duplicate create', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-comment-crash-'));
+    try {
+      const trust = new TaskControlMappingTrust({ hostSecret: 'comment-host-secret', larkAppId: 'app-1' });
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const store = lifecycle.getStore()!;
+      const comments: Array<{ id: string; content: string }> = [];
+      let creates = 0;
+      const deliveryClient = {
+        listTaskComments: async () => ({ code: 0, data: { items: comments, has_more: false } }),
+        createTaskComment: async ({ content }: { taskGuid: string; content: string }) => { creates++; comments.push({ id: '2001', content }); return { code: 0, commentId: '2001' }; },
+        replyTopic: async () => 'om_unused',
+      };
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const worker = bridge.issueAuthentication('om_root', 'worker')!;
+      store.appendEvent({ eventId: 'delivered', eventType: 'task.delivered', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', authentication: worker, idempotencyKey: 'delivered', terminal: true, deliverTo: ['task-comment:task-1'], payload: { docToken: 'doc-final', docRevision: 1 } });
+      const first = store.claimOutbox({ now: Date.now(), limit: 1, claimToken: 'first' })[0]!;
+      // First write reaches the provider but the process crashes before settlement.
+      expect(await integration.deliver(first)).toEqual({ kind: 'delivered', receiptRef: 'task-comment:2001' });
+      expect(creates).toBe(1);
+      await lifecycle.close();
+      const restartedBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const restarted = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: restartedBridge.authority, logger: { warn: () => {} } });
+      const restartedStore = restarted.getStore()!;
+      const restartedIntegration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle: restarted, store: restartedStore, bridge: restartedBridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
+      restartedStore.resetExpiredOutboxClaims(Date.now() + 61_000, 60_000);
+      const retry = restartedStore.claimOutbox({ now: Date.now() + 61_000, limit: 1, claimToken: 'retry' })[0]!;
+      expect(await restartedIntegration.deliver(retry)).toEqual({ kind: 'delivered', receiptRef: 'task-comment:2001' });
+      expect(creates).toBe(1);
+      await restarted.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('atomically degrades a permanently rejected task comment into one topic fallback receipt', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-comment-fallback-'));
+    try {
+      const trust = new TaskControlMappingTrust({ hostSecret: 'fallback-host-secret', larkAppId: 'app-1' });
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const store = lifecycle.getStore()!;
+      let topicReplies = 0;
+      const deliveryClient = {
+        listTaskComments: async () => ({ code: 0, data: { items: [], has_more: false } }),
+        createTaskComment: async () => ({ code: 1470403 }),
+        replyTopic: async () => { topicReplies++; return 'om_abc123'; },
+      };
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const worker = bridge.issueAuthentication('om_root', 'worker')!;
+      store.appendEvent({ eventId: 'delivered', eventType: 'task.delivered', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', authentication: worker, idempotencyKey: 'delivered', terminal: true, deliverTo: ['task-comment:task-1'], payload: { docToken: 'doc-final', docRevision: 1 } });
+      const primary = store.claimOutbox({ now: Date.now(), limit: 1, claimToken: 'primary' })[0]!;
+      const rejected = await integration.deliver(primary);
+      expect(rejected).toMatchObject({ kind: 'degraded', fallbackDestinationId: 'topic-message:om_root' });
+      store.degradeOutboxWithFallback({ eventId: primary.eventId, sourceDestinationId: primary.destinationId, fallbackDestinationId: rejected.fallbackDestinationId!, claimToken: 'primary', error: rejected.error!, now: Date.now() });
+      expect(store.listOutbox()).toEqual(expect.arrayContaining([expect.objectContaining({ destinationId: 'task-comment:task-1', status: 'degraded' }), expect.objectContaining({ destinationId: 'topic-message:om_root', status: 'pending' })]));
+      const fallback = store.claimOutbox({ now: Date.now(), limit: 1, claimToken: 'fallback' })[0]!;
+      const fallbackResult = await integration.deliver(fallback);
+      expect(fallbackResult).toEqual({ kind: 'delivered', receiptRef: 'topic-message:om_abc123' });
+      store.settleOutboxDelivered(fallback.outboxId, 'fallback', { receiptRef: TaskControlPlaneStore.providerReceiptRef(fallback.eventId, fallback.destinationId, fallbackResult.receiptRef!) });
+      expect(topicReplies).toBe(1);
+      expect(store.listEvents().some(event => event.eventType === 'task.delivery_fallback_verified')).toBe(true);
+      await lifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
@@ -173,6 +262,36 @@ describe('DaemonTaskControlIntegration', () => {
       ])));
       const terminal = lifecycle.getStore()!.listEvents({ taskGuid: 'task-1' }).filter(event => event.eventType === 'task.delivered').at(-1)!;
       expect(lifecycle.getStore()!.listOutbox({ eventId: terminal.eventId })[0]).toMatchObject({ status: 'delivered', destinationId: 'topic-message:om_delivery' });
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('starts rework only from the active conditional verdict and a later daemon-owned execution fact', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-rework-producer-'));
+    try {
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const store = lifecycle.getStore()!;
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} } });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const provider = reviewerProvider();
+      store.setReviewerVerdictVerifier(provider);
+      const controller = bridge.issueAuthentication('om_root', 'controller')!;
+      const designation = provider.issueDesignatedReviewer({ projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', controllerId: 'controller-1', controllerBotAppId: 'app-1', effectiveAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T01:00:00.000Z' });
+      integration.registerDesignatedReviewer({ mapping: designation, authentication: controller, verify: value => provider.verifyDesignatedReviewer(value) });
+      integration.workerAccepted('om_root', 'accept'); integration.workerExecutionStarted('om_root', 'execution-before-review');
+      integration.firstSubmitted('om_root', 'submit', { docToken: 'doc-final', docRevision: 1, evidenceRef: 'task-comment:101' });
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('submitted'));
+      const verdict = provider.issueVerdict({ projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, designatedReviewerRef: designation.designatedReviewerRef, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review', sourceMessageId: 'om_review', sourceVersionHash: `sha256:${'a'.repeat(64)}`, kind: 'verdict', verdict: 'conditional', conditionIds: ['c1'], resolvedConditionEvidence: {}, docToken: 'doc-final', docRevision: 1, expiresAt: '2099-09-05T01:00:00.000Z' });
+      const reviewer = bridge.issueAuthentication('om_root', 'reviewer')!;
+      const submittedVerdict = integration.submitReviewerVerdict({ dispatchRoot: 'om_root', verdict, authentication: reviewer, attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review' }, verifyVerdict: value => provider.verifyVerdict(value), now: '2026-09-05T00:30:00.000Z' });
+      expect(submittedVerdict).toEqual(expect.objectContaining({ status: 'active' }));
+      integration.workerExecutionStarted('om_root', 'execution-after-review');
+      await waitFor(() => expect(store.listEvents({ taskGuid: 'task-1' }).some(event => event.sourceRef === 'execution-after-review')).toBe(true));
+      const execution = store.listEvents({ taskGuid: 'task-1' }).find(event => event.sourceRef === 'execution-after-review')!;
+      expect(integration.beginRework({ dispatchRoot: 'om_root', sourceRef: 'rework:one', sourceReviewerVerdictId: verdict.verdictId, newExecutionEventId: execution.eventId, evidenceRef: 'task-comment:102' })).toEqual({ ok: true });
+      expect(integration.beginRework({ dispatchRoot: 'om_root', sourceRef: 'rework:bad', sourceReviewerVerdictId: verdict.verdictId, newExecutionEventId: 'missing', evidenceRef: 'task-comment:103' })).toMatchObject({ ok: false });
+      expect(store.getTaskProjection('task-1').state).toBe('rework');
       await lifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });

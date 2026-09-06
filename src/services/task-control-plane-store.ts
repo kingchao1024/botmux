@@ -20,7 +20,7 @@ import {
   reviewerCapabilityHash, reviewerVerdictPayloadHash, type DesignatedReviewerMapping, type ReviewerConditionEvidence, type ReviewerVerdictAttestation, type ReviewerVerdictV1,
 } from './task-control-plane-reviewer-verdict.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const DATABASE_NAME = 'botmux-task-control-plane.sqlite';
 
 export type TaskControlEventType =
@@ -422,6 +422,7 @@ export interface TrustedTaskControlMappingRecord {
     approverPolicy: readonly string[];
   };
   docToken?: string;
+  mappingProof?: import('./task-control-plane-mapping-trust.js').TaskControlMappingProof;
   createdAt: string;
 }
 
@@ -439,6 +440,7 @@ export interface RegisterTrustedTaskControlMappingInput {
   controllerId: string;
   approvalGate: TrustedTaskControlMappingRecord['approvalGate'];
   docToken?: string;
+  mappingProof?: import('./task-control-plane-mapping-trust.js').TaskControlMappingProof;
   authentication: unknown;
   occurredAt?: string;
 }
@@ -647,6 +649,7 @@ const SCHEMA = `
     controller_id TEXT NOT NULL,
     approval_gate_json TEXT NOT NULL,
     doc_token TEXT,
+    mapping_proof_json TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY(lark_app_id,dispatch_root),
     UNIQUE(lark_app_id,task_guid),
@@ -1179,6 +1182,7 @@ function migrateSchema(db: DatabaseSyncLike, fromVersion: number): void {
   // shape. Only the original v6/v7 layouts need the v8 table rebuild.
   if (fromVersion >= 6 && fromVersion < 8) migrateReviewerTablesToAppCompositeKeys(db);
   if (fromVersion < 9) migrateLogicalIdsToAppScope(db);
+  if (fromVersion < 10) add('control_trusted_mappings', 'mapping_proof_json', 'mapping_proof_json TEXT');
 }
 
 function taskEvent(type: TaskControlEventType): boolean {
@@ -1529,6 +1533,9 @@ function taskStateAfter(type: TaskControlEventType, payload: Record<string, unkn
 }
 
 function phaseStateAfter(type: TaskControlEventType, current: TaskControlPhaseState): TaskControlPhaseState {
+  // Late conflict evidence is append-only audit material. It must not reopen
+  // or overwrite a terminal frozen projection.
+  if (current === 'frozen' && type === 'event.conflict_detected') return 'frozen';
   return PHASE_TRANSITIONS[type]?.to ?? current;
 }
 
@@ -1696,6 +1703,7 @@ export class TaskControlPlaneStore {
         reviewerId: String(row.reviewer_id), acceptorId: String(row.acceptor_id), registrationRef: String(row.registration_ref),
         controllerId: String(row.controller_id), approvalGate: parseApprovalGate(JSON.parse(String(row.approval_gate_json))),
         ...(row.doc_token ? { docToken: String(row.doc_token) } : {}),
+        ...(row.mapping_proof_json ? { mappingProof: JSON.parse(String(row.mapping_proof_json)) } : {}),
         createdAt: String(row.created_at),
       }));
   }
@@ -2068,6 +2076,7 @@ export class TaskControlPlaneStore {
     const controllerId = nonEmpty(input.controllerId, 'controllerId');
     const approvalGate = parseApprovalGate(input.approvalGate);
     const docToken = input.docToken === undefined ? undefined : nonEmpty(input.docToken, 'docToken');
+    const mappingProof = input.mappingProof;
     if (!phaseTaskGuids.includes(taskGuid) || topicRootId !== dispatchRoot
       || ownerId === reviewerId || ownerId === acceptorId || reviewerId === acceptorId) {
       throw new Error('task_control_mapping_invalid');
@@ -2078,7 +2087,7 @@ export class TaskControlPlaneStore {
     }
     const mapping: TrustedTaskControlMappingRecord = {
       dispatchRoot, projectId, phaseId, phaseTaskGuids, taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-      registrationRef, controllerId, approvalGate, ...(docToken ? { docToken } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
+      registrationRef, controllerId, approvalGate, ...(docToken ? { docToken } : {}), ...(mappingProof ? { mappingProof } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
     };
     return this.withImmediateWrite(() => {
       const existing = this.db.prepare('SELECT * FROM control_trusted_mappings WHERE dispatch_root=? AND lark_app_id=?')
@@ -2090,7 +2099,10 @@ export class TaskControlPlaneStore {
         }
         return { kind: 'duplicate', mapping: existingMapping };
       }
-      const phaseRef = `phase:${registrationRef}`;
+      // One phase opening is shared by every signed task mapping in its exact
+      // frozen task set. Using a per-task registration ref here turned a real
+      // two-task phase into a second invalid phase.opened transition.
+      const phaseRef = `phase:${projectId}:${phaseId}:${taskSetHash(phaseTaskGuids)}:${acceptorId}`;
       const phaseResult = this.appendEventLocked({
         eventId: stableId('evt_phase', phaseRef), eventType: 'phase.opened', projectId, phaseId,
         actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: phaseRef,
@@ -2107,10 +2119,10 @@ export class TaskControlPlaneStore {
       });
       if (mappingResult.kind === 'conflict') throw new Error(`task_control_mapping_event_conflict:${dispatchRoot}`);
       this.db.prepare(`INSERT INTO control_trusted_mappings(
-        dispatch_root,lark_app_id,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,approval_gate_json,doc_token,created_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        dispatch_root,lark_app_id,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,approval_gate_json,doc_token,mapping_proof_json,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         dispatchRoot, this.larkAppId, projectId, phaseId, JSON.stringify(phaseTaskGuids), taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-        registrationRef, controllerId, JSON.stringify(approvalGate), docToken ?? null, mapping.createdAt,
+        registrationRef, controllerId, JSON.stringify(approvalGate), docToken ?? null, mappingProof ? JSON.stringify(mappingProof) : null, mapping.createdAt,
       );
       return { kind: 'registered', mapping };
     });
@@ -2285,7 +2297,9 @@ export class TaskControlPlaneStore {
       if (existing.payloadHash === payloadHash) return { kind: 'duplicate', event: existing };
       const existingPhase = reducePhase(this.listEvents({ projectId: existing.projectId, phaseId: existing.phaseId })
         .filter(event => !event.taskGuid));
-      if (existingPhase.lifecycleState === 'frozen') throw new Error(`task_control_phase_already_frozen:${existing.phaseId}`);
+      if (existingPhase.lifecycleState === 'frozen') {
+        return this.appendFrozenConflictLocked(input, payloadHash, existing, 'idempotency_payload_conflict_after_frozen');
+      }
       const conflictKeyHash = sha256(input.idempotencyKey).slice(7);
       const conflictEventId = stableId('evt_conflict', input.idempotencyKey, payloadHash);
       const conflictIdempotencyKey = `conflict:${conflictKeyHash}:${payloadHash.slice(7)}`;
@@ -2310,9 +2324,38 @@ export class TaskControlPlaneStore {
     }
     const phase = reducePhase(this.listEvents({ projectId: input.projectId, phaseId: input.phaseId })
       .filter(event => !event.taskGuid));
-    if (phase.lifecycleState === 'frozen') throw new Error(`task_control_phase_already_frozen:${input.phaseId}`);
+    if (phase.lifecycleState === 'frozen') {
+      return this.appendFrozenConflictLocked(input, payloadHash, undefined, 'late_after_frozen');
+    }
     this.validateMapping(input);
     return { kind: 'appended', event: this.insertEventLocked(input, payloadHash) };
+  }
+
+  /** Frozen is terminal: append late/contradictory evidence without reopening or overwriting it. */
+  private appendFrozenConflictLocked(
+    input: AuthenticatedAppendTaskControlEventInput, incomingPayloadHash: string, existing: TaskControlEvent | undefined, errorClass: string,
+  ): AppendTaskControlEventResult {
+    const frozen = this.listEvents({ projectId: input.projectId, phaseId: input.phaseId })
+      .filter(event => event.eventType === 'phase.frozen').at(-1);
+    if (!frozen) throw new Error(`task_control_phase_already_frozen:${input.phaseId}`);
+    const conflictKey = `frozen-conflict:${sha256(input.idempotencyKey).slice(7)}:${incomingPayloadHash.slice(7)}`;
+    const prior = this.eventByIdempotencyKey(conflictKey);
+    if (prior) return { kind: 'conflict', existingEvent: existing ?? frozen, conflictEvent: prior };
+    const conflictInput: AuthenticatedAppendTaskControlEventInput = {
+      eventId: stableId('evt_frozen_conflict', input.projectId, input.phaseId, input.idempotencyKey, incomingPayloadHash),
+      eventType: 'event.conflict_detected', projectId: input.projectId, phaseId: input.phaseId,
+      actorId: input.actorId, actorRole: input.actorRole, occurredAt: input.occurredAt,
+      sourceRef: input.sourceRef, evidenceRef: input.evidenceRef, idempotencyKey: conflictKey,
+      causationId: existing?.eventId ?? frozen.eventId, correlationId: input.correlationId, errorClass,
+      payload: {
+        frozenEventId: frozen.eventId, incomingEventId: input.eventId, incomingEventType: input.eventType,
+        incomingTaskGuid: input.taskGuid ?? null, incomingTopicRootId: input.topicRootId ?? null,
+        incomingIdempotencyKeyHash: sha256(input.idempotencyKey), incomingPayloadHash,
+        ...(existing ? { existingEventId: existing.eventId, existingPayloadHash: existing.payloadHash } : {}),
+      },
+    };
+    const conflictEvent = this.insertEventLocked(conflictInput, eventPayloadHash(conflictInput));
+    return { kind: 'conflict', existingEvent: existing ?? frozen, conflictEvent };
   }
 
   private insertEventLocked(input: AuthenticatedAppendTaskControlEventInput, payloadHash: string): TaskControlEvent {
@@ -2450,6 +2493,55 @@ export class TaskControlPlaneStore {
         WHERE outbox_id=? AND lark_app_id=? AND status='inflight' AND claim_token=?`)
         .get(outbox.outboxId, this.larkAppId, claimToken) as Record<string, unknown> | undefined;
       return claimed ? outboxFromRow(claimed) : undefined;
+    });
+  }
+
+  /**
+   * Atomically degrade an in-flight primary and queue its only fallback. This
+   * closes the crash window where both destinations could later be reclaimed.
+   */
+  degradeOutboxWithFallback(input: {
+    eventId: string; sourceDestinationId: string; fallbackDestinationId: string; claimToken: string; error: string; now?: number;
+  }): DeliveryOutboxRow {
+    const eventId = nonEmpty(input.eventId, 'eventId');
+    const sourceDestinationId = nonEmpty(input.sourceDestinationId, 'sourceDestinationId');
+    const fallbackDestinationId = nonEmpty(input.fallbackDestinationId, 'fallbackDestinationId');
+    const claimToken = nonEmpty(input.claimToken, 'claimToken');
+    const error = nonEmpty(input.error, 'error');
+    if (!fallbackDestinationId.startsWith('topic-message:')) throw new Error('task_control_fallback_destination_invalid');
+    const now = input.now ?? Date.now();
+    return this.withImmediateWrite(() => {
+      const source = this.db.prepare(`SELECT * FROM control_outbox
+        WHERE lark_app_id=? AND event_id=? AND destination_id=? AND status='inflight' AND claim_token=?`)
+        .get(this.larkAppId, eventId, sourceDestinationId, claimToken) as Record<string, unknown> | undefined;
+      if (!source) throw new Error('task_control_fallback_source_not_inflight');
+      const event = this.eventById(eventId);
+      if (!event || event.eventType !== 'task.delivered') throw new Error('task_control_fallback_event_invalid');
+      const existing = this.db.prepare(`SELECT * FROM control_outbox
+        WHERE lark_app_id=? AND event_id=? AND destination_id=?`)
+        .get(this.larkAppId, eventId, fallbackDestinationId) as Record<string, unknown> | undefined;
+      const occurredAt = new Date(now).toISOString();
+      let fallback = existing ? outboxFromRow(existing) : undefined;
+      if (!fallback) {
+        const outboxId = stableId('out', eventId, fallbackDestinationId);
+        this.db.prepare(`INSERT INTO control_outbox(
+          outbox_id,lark_app_id,event_id,destination_id,status,attempts,next_attempt_at,created_at,updated_at
+        ) VALUES(?,?,?,?,'pending',0,?,?,?)`).run(
+          outboxId, this.larkAppId, eventId, fallbackDestinationId, now, occurredAt, occurredAt,
+        );
+        const row = this.db.prepare('SELECT * FROM control_outbox WHERE lark_app_id=? AND outbox_id=?')
+          .get(this.larkAppId, outboxId) as Record<string, unknown> | undefined;
+        if (!row) throw new Error('task_control_fallback_outbox_insert_failed');
+        fallback = outboxFromRow(row);
+      }
+      const sourceOutbox = outboxFromRow(source);
+      const changed = this.db.prepare(`UPDATE control_outbox SET status='degraded',claim_token=NULL,claimed_at=NULL,last_error=?,updated_at=?
+        WHERE lark_app_id=? AND outbox_id=? AND status='inflight' AND claim_token=?`).run(
+        error, occurredAt, this.larkAppId, sourceOutbox.outboxId, claimToken,
+      );
+      if (Number(changed.changes) !== 1) throw new Error('task_control_fallback_primary_degrade_failed');
+      this.insertReceiptLocked(sourceOutbox, { state: 'degraded', error, createdAt: occurredAt });
+      return fallback;
     });
   }
 

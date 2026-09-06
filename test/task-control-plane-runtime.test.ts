@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { scopedTaskControlPlaneConfig, taskControlPlaneDatabasePath, taskControlPlaneFlags } from '../src/services/task-control-plane-runtime.js';
+import { productionTaskControlPlaneConfig, scopedTaskControlPlaneConfig, taskControlPlaneDatabasePath, taskControlPlaneFlags } from '../src/services/task-control-plane-runtime.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 function collectChild(child: ReturnType<typeof spawnTsEvalWithRepoImports>): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -70,6 +70,18 @@ describe('task control plane runtime', () => {
     expect(scopedTaskControlPlaneConfig(appId, {
       TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: appId, TASK_CONTROL_PLANE_TARGET_TASK_GUID: taskGuid,
     })).toEqual({ flags: off });
+  });
+
+  it('requires explicit production mode and validates only explicit key allow/revoke JSON', () => {
+    const appId = 'cli_aac926f0eb795bc1';
+    const base = { TASK_CONTROL_PLANE_PRODUCTION: 'true', TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true', TASK_CONTROL_PLANE_PUMP_ENABLED: 'true' };
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: base })).toMatchObject({ flags: { ledgerEnabled: true, pumpEnabled: true } });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_ALLOWED_KEY_IDS: 'not-json' } }))
+      .toMatchObject({ disabledReason: 'production_key_set_invalid' });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_PRODUCTION: 'false' } }))
+      .toMatchObject({ disabledReason: 'production_mode_required' });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true' } }))
+      .toMatchObject({ disabledReason: 'production_ledger_required' });
   });
 
   it('does not create SQLite for a non-target app even when the scoped Shadow flags are enabled', async () => {

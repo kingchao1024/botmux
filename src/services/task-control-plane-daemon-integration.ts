@@ -1,5 +1,5 @@
 import { getBotClient } from '../bot-registry.js';
-import { getMessageDetail, larkGet } from '../im/lark/client.js';
+import { getMessageDetail, larkGet, replyMessage } from '../im/lark/client.js';
 import { TaskControlActiveCollector, type TaskControlCollectionKind, type TaskControlCollectionSource } from './task-control-plane-collector.js';
 import {
   DaemonTaskControlBridge,
@@ -15,12 +15,19 @@ import type {
   ReviewerVerdictAttestation,
   ReviewerVerdictV1,
 } from './task-control-plane-reviewer-verdict.js';
+import { TaskControlMappingTrust, taskControlMappingFacts } from './task-control-plane-mapping-trust.js';
 
 const MAX_REFERENCE_POLL = 100;
 
 type ReviewerVerdictVerifier = {
   verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean;
   verifyVerdict(value: ReviewerVerdictV1): boolean;
+};
+
+type TaskControlDeliveryClient = {
+  listTaskComments(input: { taskGuid: string; pageToken?: string }): Promise<any>;
+  createTaskComment(input: { taskGuid: string; content: string }): Promise<{ code?: number; commentId?: string }>;
+  replyTopic(input: { topicRootId: string; content: string; uuid: string }): Promise<string>;
 };
 
 function nonBlank(value: unknown): string | undefined {
@@ -44,6 +51,7 @@ type CollectedReference = {
   sourceRef: string;
   eventId: string;
   idempotencyKey: string;
+  done?: boolean;
 };
 
 function assertLarkReadSucceeded(response: any, resource: string): void {
@@ -59,13 +67,7 @@ async function collectTaskReferences(larkAppId: string, taskGuid: string): Promi
     kind: 'task', sourceRef, eventId: DaemonTaskControlBridge.observationId('task', sourceRef),
     idempotencyKey: `tcp-collect:task:${sourceRef}`,
   }];
-  if (response.data?.task?.status === 'done') {
-    const doneRef = reference('task-done-unverified', updatedAt ? `${taskGuid}@${updatedAt}` : taskGuid);
-    records.push({
-      kind: 'task', sourceRef: doneRef, eventId: DaemonTaskControlBridge.observationId('task', doneRef),
-      idempotencyKey: `tcp-collect:task:${doneRef}`,
-    });
-  }
+  if (response.data?.task?.status === 'done') records[0]!.done = true;
   return records;
 }
 
@@ -102,6 +104,12 @@ export class DaemonTaskControlIntegration {
       logger: { warn(message: string): void };
       /** Production injection: a receipt must still name the live worker generation. */
       isLiveReceiptOwner?: (input: { sessionId: string; workerGeneration: number }) => boolean;
+      /** Set only by the production daemon after host-only trust bootstrap. */
+      mappingTrust?: TaskControlMappingTrust;
+      /** Enable only when Pump is live; tests and Shadow keep receipt projection inert. */
+      controlledWriteback?: boolean;
+      /** Narrow test seam; production defaults to the existing Lark client. */
+      deliveryClient?: TaskControlDeliveryClient;
     },
   ) {
     this.adapters = new TaskControlEventAdapters(input.lifecycle);
@@ -122,9 +130,28 @@ export class DaemonTaskControlIntegration {
     mapping: DaemonTaskControlMappingRegistration,
     controllerId: string,
   ): boolean {
-    const controllerMapping: DaemonTaskControlMapping = {
+    const prior = this.input.bridge.mapping(dispatchRoot);
+    if (prior) {
+      return prior.controllerId === controllerId
+        && prior.projectId === mapping.projectId && prior.phaseId === mapping.phaseId && prior.taskGuid === mapping.taskGuid
+        && prior.topicRootId === mapping.topicRootId && prior.ownerId === mapping.ownerId && prior.reviewerId === mapping.reviewerId
+        && prior.acceptorId === mapping.acceptorId && prior.registrationRef === mapping.registrationRef
+        && prior.docToken === mapping.docToken && sameTaskSet(prior.phaseTaskGuids, mapping.phaseTaskGuids);
+    }
+    let controllerMapping: DaemonTaskControlMapping = {
       ...mapping, controllerId, approvalGate: DaemonTaskControlBridge.bindApprovalGate(mapping.approvalGate),
     };
+    if (this.input.mappingTrust) {
+      controllerMapping = {
+        ...controllerMapping,
+        mappingProof: this.input.mappingTrust.issueMapping(taskControlMappingFacts({
+          dispatchRoot, projectId: controllerMapping.projectId, phaseId: controllerMapping.phaseId, phaseTaskGuids: controllerMapping.phaseTaskGuids,
+          taskGuid: controllerMapping.taskGuid, topicRootId: controllerMapping.topicRootId, ownerId: controllerMapping.ownerId,
+          reviewerId: controllerMapping.reviewerId, acceptorId: controllerMapping.acceptorId, registrationRef: controllerMapping.registrationRef,
+          controllerId, approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken,
+        })),
+      };
+    }
     if (!this.input.bridge.registerMapping(dispatchRoot, controllerMapping, controllerId)) return false;
     try {
       const authentication = this.input.bridge.issueAuthentication(dispatchRoot, 'controller');
@@ -133,7 +160,8 @@ export class DaemonTaskControlIntegration {
         dispatchRoot, projectId: controllerMapping.projectId, phaseId: controllerMapping.phaseId, phaseTaskGuids: controllerMapping.phaseTaskGuids,
         taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId,
         acceptorId: mapping.acceptorId, registrationRef: mapping.registrationRef, controllerId,
-        approvalGate: controllerMapping.approvalGate, docToken: mapping.docToken, authentication,
+        approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken, authentication,
+        ...(controllerMapping.mappingProof ? { mappingProof: controllerMapping.mappingProof } : {}),
       });
       return registered.kind === 'registered' || registered.kind === 'duplicate';
     } catch (error) {
@@ -372,21 +400,46 @@ export class DaemonTaskControlIntegration {
     });
   }
 
+  /**
+   * Daemon-owned rework producer. It consumes the currently verified FAIL or
+   * CONDITIONAL head and a fresh worker execution fact; no worker text or
+   * report body can infer this transition.
+   */
+  beginRework(input: {
+    dispatchRoot: string; sourceRef: string; sourceReviewerVerdictId: string; newExecutionEventId: string; evidenceRef: string;
+  }): { ok: true } | { ok: false; reason: string } {
+    const event = this.bridgeEvent('task.rework_started', input.dispatchRoot, 'worker', input.sourceRef, {
+      sourceReviewerVerdictId: input.sourceReviewerVerdictId, newExecutionEventId: input.newExecutionEventId,
+    }, input.evidenceRef);
+    if (!event) return { ok: false, reason: 'rework_mapping_unproven' };
+    try {
+      const result = this.input.store.appendEvent({ ...event, eventType: 'task.rework_started' });
+      return result.kind === 'appended' || result.kind === 'duplicate'
+        ? { ok: true }
+        : { ok: false, reason: 'rework_idempotency_conflict' };
+    } catch { return { ok: false, reason: 'rework_source_unproven' }; }
+  }
+
   delivered(dispatchRoot: string, sourceRef: string, input: {
     docToken: string; docRevision: number; destinationId: string; receiptRef: string; evidenceRef: string;
   }): void {
+    const controlledDestination = this.input.controlledWriteback
+      ? `task-comment:${this.input.bridge.mapping(dispatchRoot)?.taskGuid ?? ''}`
+      : input.destinationId;
     const event = this.bridgeEvent('task.delivered', dispatchRoot, 'worker', sourceRef, {
       docToken: input.docToken, docRevision: input.docRevision,
-    }, input.evidenceRef, [input.destinationId], true);
+    }, input.evidenceRef, [controlledDestination], true);
     if (!event) return;
+    if (this.input.controlledWriteback && !this.input.bridge.mapping(dispatchRoot)?.taskGuid) return;
     // Terminal provider confirmation is a durable side effect boundary. Append
     // its exact event/outbox synchronously, then bind the provider receipt to
     // that same event and destination. A write failure leaves the old path
     // untouched and cannot manufacture a receipt.
-    this.input.lifecycle.append({ ...event, eventType: 'task.delivered', terminal: true, deliverTo: [input.destinationId] });
+    this.input.lifecycle.append({ ...event, eventType: 'task.delivered', terminal: true, deliverTo: [controlledDestination] });
     // The synchronous lifecycle append is intentionally fail-soft and returns
     // void. Only settle after its own event/outbox row is observable; otherwise
     // leave the terminal fact unverified rather than inventing a receipt.
+    if (this.input.controlledWriteback) return;
     const claimToken = `terminal:${event.eventId}`;
     const claimed = this.input.store.claimOutboxForEventDestination({
       eventId: event.eventId, destinationId: input.destinationId, now: Date.now(), claimToken,
@@ -551,15 +604,111 @@ export class DaemonTaskControlIntegration {
 
   /** Controlled delivery: a stable task/topic reference is the destination. */
   async deliver(row: DeliveryOutboxRow): Promise<TaskControlPlaneDeliveryResult> {
-    // Reading an existing Lark object only proves that object exists. It never
-    // proves that THIS terminal event was delivered to its exact destination,
-    // so the pump retains a retry/degraded claim until a typed receipt arrives.
-    if (row.destinationId.startsWith('task-comment:')
-      || row.destinationId.startsWith('topic-message:')
-      || row.destinationId.startsWith('active-collection:')) {
-      return { kind: 'retry', error: 'delivery_receipt_required_for_terminal_event' };
+    const event = this.input.store.listEvents().find(candidate => candidate.eventId === row.eventId);
+    if (!event || event.eventType !== 'task.delivered' || !event.taskGuid || !event.topicRootId) {
+      return { kind: 'degraded', error: 'delivery_event_unproven' };
     }
-    return { kind: 'degraded', error: 'delivery_destination_unrecognized' };
+    const marker = this.input.mappingTrust?.issueDeliveryReceiptMarker({
+      eventId: event.eventId, destinationId: row.destinationId, issuedAt: event.occurredAt,
+    });
+    const content = JSON.stringify({
+      task_control_event_id: event.eventId, project_id: event.projectId, phase_id: event.phaseId, task_guid: event.taskGuid,
+      doc_token: event.payload.docToken, doc_revision: event.payload.docRevision,
+      ...(marker ? { task_control_delivery_receipt: marker } : {}),
+    });
+    const uuid = `tcp-${row.outboxId}`.slice(0, 50);
+    const deliveryClient = this.input.deliveryClient ?? {
+      listTaskComments: ({ taskGuid, pageToken }: { taskGuid: string; pageToken?: string }) => larkGet(getBotClient(this.input.larkAppId), '/open-apis/task/v2/comments', {
+        resource_type: 'task', resource_id: taskGuid, page_size: 100, direction: 'desc', ...(pageToken ? { page_token: pageToken } : {}),
+      }),
+      createTaskComment: async ({ taskGuid, content }: { taskGuid: string; content: string }) => {
+        const response = await getBotClient(this.input.larkAppId).task.v2.comment.create({ data: { resource_type: 'task', resource_id: taskGuid, content } });
+        return { code: response?.code, commentId: nonBlank(response?.data?.comment?.id) };
+      },
+      replyTopic: ({ topicRootId, content, uuid: replyUuid }: { topicRootId: string; content: string; uuid: string }) =>
+        replyMessage(this.input.larkAppId, topicRootId, content, 'text', true, replyUuid),
+    };
+    try {
+      if (row.destinationId === `task-comment:${event.taskGuid}`) {
+        const alreadyWritten = await this.findTaskCommentReceipt({
+          taskGuid: event.taskGuid, eventId: event.eventId, destinationId: row.destinationId, marker,
+        });
+        if (alreadyWritten) return { kind: 'delivered', receiptRef: `task-comment:${alreadyWritten}` };
+        const response = await deliveryClient.createTaskComment({ taskGuid: event.taskGuid, content });
+        const receiptRef = response.commentId;
+        if (response.code !== 0 || !receiptRef) {
+          // Provider business rejections are permanent; transient failures use
+          // retry and do not enqueue topic fallback yet.
+          const code = Number(response.code);
+          const permanent = code === 1470403 || code === 99991672;
+          return {
+            kind: permanent ? 'degraded' : 'retry', error: `task_comment_write_rejected:${String(response.code ?? 'missing')}`,
+            ...(permanent ? { fallbackDestinationId: `topic-message:${event.topicRootId}` } : {}),
+          };
+        }
+        // This binds the provider-returned id to the signed marker. A process
+        // crash between write and local settlement is reconciled by the same
+        // exact marker scan before a reclaimed row is re-sent.
+        const reread = await this.findTaskCommentReceipt({
+          taskGuid: event.taskGuid, eventId: event.eventId, destinationId: row.destinationId, marker,
+        });
+        if (reread !== receiptRef) return { kind: 'retry', error: 'task_comment_receipt_reread_unproven' };
+        return { kind: 'delivered', receiptRef: `task-comment:${receiptRef}` };
+      }
+      if (row.destinationId === `topic-message:${event.topicRootId}`) {
+        const receiptRef = await deliveryClient.replyTopic({ topicRootId: event.topicRootId, content, uuid });
+        this.recordTopicFallback(event, row, receiptRef, `topic-message:${receiptRef}`);
+        return { kind: 'delivered', receiptRef: `topic-message:${receiptRef}` };
+      }
+      return { kind: 'degraded', error: 'delivery_destination_unrecognized' };
+    } catch (error) {
+      return { kind: 'retry', error: `delivery_write_failed:${String(error)}` };
+    }
+  }
+
+  private async findTaskCommentReceipt(input: {
+    taskGuid: string; eventId: string; destinationId: string; marker: unknown;
+  }): Promise<string | undefined> {
+    if (!this.input.mappingTrust || !this.input.mappingTrust.verifyDeliveryReceiptMarker(input.marker, input)) return undefined;
+    let pageToken: string | undefined;
+    for (let page = 0; page < 50; page++) {
+      const deliveryClient = this.input.deliveryClient;
+      const response = deliveryClient
+        ? await deliveryClient.listTaskComments({ taskGuid: input.taskGuid, ...(pageToken ? { pageToken } : {}) })
+        : await larkGet(getBotClient(this.input.larkAppId), '/open-apis/task/v2/comments', {
+          resource_type: 'task', resource_id: input.taskGuid, page_size: 100, direction: 'desc', ...(pageToken ? { page_token: pageToken } : {}),
+        });
+      if (response?.code !== 0 || !Array.isArray(response?.data?.items)) return undefined;
+      for (const item of response.data.items) {
+        const commentId = nonBlank(item?.id);
+        if (!commentId || typeof item?.content !== 'string') continue;
+        let body: unknown;
+        try { body = JSON.parse(item.content); } catch { continue; }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) continue;
+        const record = body as Record<string, unknown>;
+        if (record.task_control_event_id !== input.eventId || record.task_guid !== input.taskGuid
+          || !this.input.mappingTrust.verifyDeliveryReceiptMarker(record.task_control_delivery_receipt, input)) continue;
+        return commentId;
+      }
+      if (!response.data.has_more || typeof response.data.page_token !== 'string' || !response.data.page_token) return undefined;
+      pageToken = response.data.page_token;
+    }
+    return undefined;
+  }
+
+  private recordTopicFallback(event: ReturnType<TaskControlPlaneStore['listEvents']>[number], row: DeliveryOutboxRow, receiptRef: string, evidenceRef: string): void {
+    const primaryDestinationId = `task-comment:${event.taskGuid}`;
+    const authentication = this.input.bridge.issueAuthentication(event.topicRootId ?? '', 'collector');
+    if (!authentication || !event.taskGuid || !event.topicRootId) throw new Error('topic_fallback_authentication_unproven');
+    const result = this.input.store.appendEvent({
+      eventId: `tcp-fallback:${event.eventId}:${primaryDestinationId}:${receiptRef}`,
+      eventType: 'task.delivery_fallback_verified', projectId: event.projectId, phaseId: event.phaseId, taskGuid: event.taskGuid, topicRootId: event.topicRootId,
+      authentication, sourceRef: evidenceRef,
+      idempotencyKey: taskControlEventIdempotencyKey('task.delivery_fallback_verified', `${event.eventId}:${primaryDestinationId}:${receiptRef}`),
+      payload: { deliveryEventId: event.eventId, destinationId: primaryDestinationId, method: 'topic_message', receiptRef: evidenceRef },
+    });
+    if (result.kind === 'conflict') throw new Error('topic_fallback_receipt_conflict');
+    void row;
   }
 
   /**
@@ -623,7 +772,9 @@ export class DaemonTaskControlIntegration {
         } else if (kind === 'task_comment') {
           records.push(...await collectLatestTaskCommentReference(this.input.larkAppId, mapping.taskGuid));
         } else if (kind === 'task') {
-          records.push(...await collectTaskReferences(this.input.larkAppId, mapping.taskGuid));
+          const taskRecords = await collectTaskReferences(this.input.larkAppId, mapping.taskGuid);
+          records.push(...taskRecords);
+          for (const record of taskRecords) if (record.done) this.doneObserved(dispatchRoot, record.sourceRef);
         }
       } catch (error) {
         this.input.logger.warn(`[task-control] ${kind} reference unavailable for ${dispatchRoot}: ${String(error)}`);
@@ -635,6 +786,19 @@ export class DaemonTaskControlIntegration {
       }
     }
     return records;
+  }
+
+  private doneObserved(dispatchRoot: string, sourceRef: string): void {
+    const event = this.input.bridge.event({
+      dispatchRoot, principal: 'collector', eventId: `tcp-task.done_marked:${sourceRef}`,
+      idempotencyKey: taskControlEventIdempotencyKey('task.done_marked', sourceRef), sourceRef, payload: { source: 'task_api_reread' },
+    });
+    if (!event) return;
+    try { this.input.store.appendEvent({ ...event, eventType: 'task.done_marked' }); }
+    catch { this.input.lifecycle.enqueueUnknownObservation({
+      eventId: `tcp-unknown-task.done_marked:${sourceRef}`, attemptedEventType: 'task.done_marked', sourceRef,
+      idempotencyKey: `tcp-unknown-task.done_marked:${sourceRef}`, payload: { reason: 'task_done_reread_unproven', referenceOnly: true },
+    }); }
   }
 }
 

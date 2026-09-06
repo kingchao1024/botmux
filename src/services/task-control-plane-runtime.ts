@@ -8,6 +8,7 @@ import {
   type TaskControlEvent,
 } from './task-control-plane-store.js';
 import { DaemonTaskControlAuthority, type TaskControlAuthentication } from './task-control-plane-authority.js';
+import { parseKeyIdSet } from './task-control-plane-mapping-trust.js';
 
 export interface TaskControlPlaneFlags {
   ledgerEnabled: boolean;
@@ -23,6 +24,13 @@ export interface ScopedTaskControlPlaneConfig {
   disabledReason?: string;
 }
 
+export interface ProductionTaskControlPlaneConfig {
+  flags: TaskControlPlaneFlags;
+  allowedKeyIds?: readonly string[];
+  revokedKeyIds?: readonly string[];
+  disabledReason?: string;
+}
+
 export interface TaskControlPlaneLogger {
   warn(message: string): void;
 }
@@ -32,6 +40,8 @@ export interface TaskControlPlaneDeliveryResult {
   error?: string;
   /** Exact provider receipt for this event/destination; required for delivered. */
   receiptRef?: string;
+  /** Durable controlled fallback queued before the primary row is degraded. */
+  fallbackDestinationId?: string;
 }
 
 export interface TaskControlPlaneLifecycle {
@@ -141,6 +151,30 @@ export function scopedTaskControlPlaneConfig(
     return { flags: disabled(), disabledReason: 'scoped_shadow_read_only_required' };
   }
   return { flags, shadowTaskGuid: targetTaskGuid };
+}
+
+/**
+ * Production is opt-in. Mapping facts arrive only through the authenticated
+ * controller route and are then signed/persisted by the daemon; no comma-list
+ * environment value becomes a control-plane fact.
+ */
+export function productionTaskControlPlaneConfig(input: {
+  larkAppId: string;
+  env?: NodeJS.ProcessEnv;
+}): ProductionTaskControlPlaneConfig {
+  const env = input.env ?? process.env;
+  const flags = taskControlPlaneFlags(env);
+  const disabled = (disabledReason: string): ProductionTaskControlPlaneConfig => ({ flags: { ...DEFAULT_FLAGS }, disabledReason });
+  const flagNames = ['TASK_CONTROL_PLANE_LEDGER_ENABLED', 'TASK_CONTROL_PLANE_SHADOW_ENABLED', 'TASK_CONTROL_PLANE_PUMP_ENABLED', 'TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT'];
+  if (flagNames.some(name => env[name] !== undefined && !/^(true|false)$/i.test(env[name]!.trim()))) return disabled('flag_value_invalid');
+  if (!Object.values(flags).some(Boolean)) return { flags: { ...DEFAULT_FLAGS } };
+  if (env.TASK_CONTROL_PLANE_PRODUCTION !== 'true') return disabled('production_mode_required');
+  if (!flags.ledgerEnabled || flags.shadowEnabled) return disabled('production_ledger_required');
+  const allowedKeyIds = parseKeyIdSet(env.TASK_CONTROL_PLANE_ALLOWED_KEY_IDS);
+  const revokedKeyIds = parseKeyIdSet(env.TASK_CONTROL_PLANE_REVOKED_KEY_IDS);
+  if ((env.TASK_CONTROL_PLANE_ALLOWED_KEY_IDS !== undefined && !allowedKeyIds)
+    || (env.TASK_CONTROL_PLANE_REVOKED_KEY_IDS !== undefined && !revokedKeyIds)) return disabled('production_key_set_invalid');
+  return { flags, allowedKeyIds, revokedKeyIds };
 }
 
 function validateFlags(flags: TaskControlPlaneFlags, hasDelivery: boolean, hasCollector: boolean): void {
@@ -319,6 +353,13 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
               });
             }
           } else if (result.kind === 'degraded' || row.attempts >= this.options.maxAttempts) {
+            if (result.fallbackDestinationId) {
+              this.store.degradeOutboxWithFallback({
+                eventId: row.eventId, sourceDestinationId: row.destinationId, fallbackDestinationId: result.fallbackDestinationId,
+                claimToken: token, error: result.error ?? 'delivery_retry_exhausted', now: this.options.now(),
+              });
+              continue;
+            }
             this.store.settleOutboxDegraded(row.outboxId, token, { error: result.error ?? 'delivery_retry_exhausted' });
           } else {
             this.store.rescheduleOutbox(row.outboxId, token, {
@@ -394,7 +435,9 @@ export async function startTaskControlPlaneRuntime(options: TaskControlPlaneRunt
       staleClaimMs: options.staleClaimMs ?? 60_000,
       maxAttempts: options.maxAttempts ?? 5,
       deliver: flags.pumpEnabled ? options.deliver : undefined,
-      collect: flags.shadowEnabled ? options.collect : undefined,
+      // Production reuses the same bounded read-only collector; a supplied
+      // collector never writes an external object by itself.
+      collect: options.collect,
       freezeEnabled: flags.freezeEnforcement,
       intervalMs: options.intervalMs,
     });
