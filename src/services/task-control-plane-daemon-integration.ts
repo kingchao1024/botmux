@@ -262,6 +262,7 @@ export class DaemonTaskControlIntegration {
     const head = this.input.store.appendReviewerVerdict({
       verdict: input.verdict, attestation: input.attestation, authentication: input.authentication, verifyVerdict: input.verifyVerdict, now: input.now,
     });
+    if (head.status === 'revoked' && input.verdict.kind === 'revocation') return head;
     if (head.status !== 'active' || !head.verdict || head.verdict.kind !== 'verdict' || !head.verdict.verdict) {
       this.reviewerVerdictUnknown(input.dispatchRoot, input.verdict.verdictId, head.reason ?? 'reviewer_verdict_unverified');
       return head;

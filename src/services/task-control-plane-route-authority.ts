@@ -352,7 +352,7 @@ function forwardedVerdict(body: Record<string, unknown>): {
   if (!dispatchRoot || !rawVerdict || !rawAttestation || !hasOnlyKeys(rawVerdict, [
     'schemaVersion', 'provider', 'verdictId', 'projectId', 'phaseId', 'taskGuid', 'topicRootId', 'taskSetSnapshot', 'reviewRound',
     'designatedReviewerRef', 'reviewerId', 'reviewerBotAppId', 'sessionId', 'workerGeneration', 'capabilityHash', 'sourceMessageId',
-    'sourceVersionHash', 'kind', 'verdict', 'conditionIds', 'resolvedConditionEvidence', 'docToken', 'docRevision', 'issuedAt', 'expiresAt', 'keyId', 'signature',
+    'sourceVersionHash', 'kind', 'verdict', 'conditionIds', 'resolvedConditionEvidence', 'docToken', 'docRevision', 'issuedAt', 'expiresAt', 'keyId', 'signature', 'revokesVerdictId', 'supersedesVerdictId',
   ]) || !hasOnlyKeys(rawAttestation, ['reviewerId', 'reviewerBotAppId', 'sessionId', 'workerGeneration', 'capabilityHash'])) return undefined;
   const taskSetSnapshot = stringArray(rawVerdict.taskSetSnapshot);
   const conditionIds = stringArray(rawVerdict.conditionIds);
@@ -364,14 +364,17 @@ function forwardedVerdict(body: Record<string, unknown>): {
     sessionId: text(rawVerdict.sessionId), workerGeneration: rawVerdict.workerGeneration, capabilityHash: text(rawVerdict.capabilityHash),
     sourceMessageId: text(rawVerdict.sourceMessageId), sourceVersionHash: text(rawVerdict.sourceVersionHash), kind: rawVerdict.kind, verdict: rawVerdict.verdict,
     conditionIds, resolvedConditionEvidence, docToken: text(rawVerdict.docToken), docRevision: rawVerdict.docRevision, issuedAt: text(rawVerdict.issuedAt),
-    expiresAt: text(rawVerdict.expiresAt), keyId: text(rawVerdict.keyId), signature: text(rawVerdict.signature),
+    expiresAt: text(rawVerdict.expiresAt), keyId: text(rawVerdict.keyId), signature: text(rawVerdict.signature), revokesVerdictId: text(rawVerdict.revokesVerdictId), supersedesVerdictId: text(rawVerdict.supersedesVerdictId),
   };
   const reviewerId = text(rawAttestation.reviewerId);
   const reviewerBotAppId = text(rawAttestation.reviewerBotAppId);
   const sessionId = text(rawAttestation.sessionId);
   const capabilityHash = text(rawAttestation.capabilityHash);
-  if (verdict.schemaVersion !== 'ReviewerVerdict.v1' || verdict.provider !== 'ReviewerVerdict.v1' || verdict.kind !== 'verdict'
-    || (verdict.verdict !== 'pass' && verdict.verdict !== 'fail' && verdict.verdict !== 'conditional')
+  const ordinary = verdict.kind === 'verdict' && (verdict.verdict === 'pass' || verdict.verdict === 'fail' || verdict.verdict === 'conditional')
+    && !verdict.revokesVerdictId && !verdict.supersedesVerdictId;
+  const revocation = verdict.kind === 'revocation' && verdict.verdict === undefined && !!verdict.revokesVerdictId && !verdict.supersedesVerdictId
+    && conditionIds?.length === 0 && Object.keys(resolvedConditionEvidence ?? {}).length === 0;
+  if (verdict.schemaVersion !== 'ReviewerVerdict.v1' || verdict.provider !== 'ReviewerVerdict.v1' || (!ordinary && !revocation)
     || !verdict.verdictId || !verdict.projectId || !verdict.phaseId || !verdict.taskGuid || !verdict.topicRootId || !taskSetSnapshot
     || !Number.isSafeInteger(verdict.reviewRound) || !verdict.designatedReviewerRef || !verdict.reviewerId || !safeAppId(verdict.reviewerBotAppId)
     || !verdict.sessionId || !Number.isSafeInteger(verdict.workerGeneration) || !verdict.capabilityHash || !verdict.sourceMessageId
@@ -593,11 +596,22 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_origin_changed' });
         return;
       }
+      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
+      integration.setReviewerVerdictVerifier(verifier);
+      const prior = integration.currentDesignatedReviewer(dispatchRoot, reviewRound);
+      if (supersedesDesignatedReviewerRef && prior?.designatedReviewerRef !== supersedesDesignatedReviewerRef) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_supersedes_unproven' });
+        return;
+      }
+      if (!supersedesDesignatedReviewerRef && prior) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_replacement_ref_required' });
+        return;
+      }
       const signer = deriveDaemonDesignatedReviewerProvider({ hostSecret, controllerBotAppId: selfAppId });
       let designatedReviewerRef: string;
       let designation: DesignatedReviewerMapping;
       try {
-        designatedReviewerRef = reviewerDesignationRef(dispatchRoot, reviewerBotAppId, reviewRound);
+        designatedReviewerRef = reviewerDesignationRef(dispatchRoot, reviewerBotAppId, reviewRound, prior ? sourceMessageId : 1);
         designation = signer.issueDesignatedReviewer({
           designatedReviewerRef, projectId: mapping.projectId, phaseId: mapping.phaseId, taskGuid: mapping.taskGuid,
           topicRootId: mapping.topicRootId, taskSetSnapshot, reviewRound, reviewerId, reviewerBotAppId,
@@ -608,7 +622,6 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 400, { ok: false, error: 'task_control_designated_reviewer_invalid' });
         return;
       }
-      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       if (!integration.registerVerifiedDesignatedReviewer({ mapping: designation, verifier })) {
         jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_unproven' });
         return;
@@ -666,6 +679,8 @@ export function createTaskControlRouteHandlers(input: {
       const sourceMessageId = text(body?.sourceMessageId);
       const verdictId = text(body?.verdictId);
       const verdictKind = body?.verdict;
+      const revokesVerdictId = text(body?.revokesVerdictId);
+      const supersedesVerdictId = text(body?.supersedesVerdictId);
       const docToken = text(body?.docToken);
       const docRevision = positiveSafeInteger(body?.docRevision) ? body.docRevision : undefined;
       const reviewRound = positiveSafeInteger(body?.reviewRound) ? body.reviewRound : undefined;
@@ -673,12 +688,15 @@ export function createTaskControlRouteHandlers(input: {
       const resolvedConditionEvidence = conditionEvidence(body?.resolvedConditionEvidence);
       if (!body || !hasOnlyKeys(body, [
         'originCapability', 'originTurnId',
-        'sourceMessageId', 'verdictId', 'verdict', 'docToken', 'docRevision', 'reviewRound', 'conditionIds', 'resolvedConditionEvidence',
+        'sourceMessageId', 'verdictId', 'verdict', 'revokesVerdictId', 'supersedesVerdictId', 'docToken', 'docRevision', 'reviewRound', 'conditionIds', 'resolvedConditionEvidence',
       ]) || !sourceMessageId || !verdictId || !docToken
-        || (verdictKind !== 'pass' && verdictKind !== 'fail' && verdictKind !== 'conditional')
+        || !(['pass', 'fail', 'conditional', 'revocation'].includes(String(verdictKind)))
+        || (verdictKind === 'revocation' && (!revokesVerdictId || supersedesVerdictId))
+        || (verdictKind !== 'revocation' && (!!revokesVerdictId || !!supersedesVerdictId))
         || docRevision === undefined || reviewRound === undefined
         || !conditionIds || !resolvedConditionEvidence
-        || (verdictKind === 'conditional') !== (conditionIds.length > 0)) {
+        || (verdictKind === 'conditional') !== (conditionIds.length > 0)
+        || (verdictKind === 'revocation' && (conditionIds.length !== 0 || Object.keys(resolvedConditionEvidence).length !== 0))) {
         jsonRes(res, 400, { ok: false, error: 'task_control_reviewer_ingress_invalid' });
         return;
       }
@@ -725,7 +743,7 @@ export function createTaskControlRouteHandlers(input: {
       if (!designation
         || designation.reviewerBotAppId !== selfAppId
         || designation.reviewerId !== source.senderId
-        || designation.designatedReviewerRef !== reviewerDesignationRef(dispatchRoot, selfAppId, reviewRound)
+        || !designation.designatedReviewerRef.startsWith('dr_')
         || designation.topicRootId !== dispatchRoot) {
         jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_designation_unproven' });
         return;
@@ -768,7 +786,7 @@ export function createTaskControlRouteHandlers(input: {
           verdictId, projectId: designation.projectId, phaseId: designation.phaseId, taskGuid: designation.taskGuid, topicRootId: designation.topicRootId,
           taskSetSnapshot: designation.taskSetSnapshot, reviewRound, designatedReviewerRef: designation.designatedReviewerRef, reviewerId: source.senderId, reviewerBotAppId: selfAppId,
           sessionId: reviewer.sessionId, workerGeneration: reviewer.workerGeneration, capability: reviewer.capability,
-          sourceMessageId: source.sourceMessageId, sourceVersionHash: source.sourceVersionHash, kind: 'verdict', verdict: verdictKind,
+          sourceMessageId: source.sourceMessageId, sourceVersionHash: source.sourceVersionHash, kind: verdictKind === 'revocation' ? 'revocation' : 'verdict', ...(verdictKind === 'revocation' ? { revokesVerdictId } : { verdict: verdictKind as 'pass' | 'fail' | 'conditional' }),
           conditionIds, resolvedConditionEvidence, docToken: resolved.docToken, docRevision, issuedAt: source.createdAt,
           expiresAt: expiresAt!,
         });
@@ -825,7 +843,7 @@ export function createTaskControlRouteHandlers(input: {
       integration.setReviewerVerdictVerifier(verifier);
       const designation = integration.currentDesignatedReviewer(dispatchRoot, reviewRound);
       if (!designation || designation.reviewerBotAppId !== reviewerBotAppId
-        || designation.designatedReviewerRef !== reviewerDesignationRef(dispatchRoot, reviewerBotAppId, reviewRound)) {
+        || !designation.designatedReviewerRef.startsWith('dr_')) {
         jsonRes(res, 409, { ok: false, error: 'task_control_designation_resolve_unproven' });
         return;
       }
@@ -922,7 +940,7 @@ export function createTaskControlRouteHandlers(input: {
         dispatchRoot, verdict, attestation, verifier, expectedReviewerBotAppId: designated.reviewerBotAppId,
         expectedReviewerId: designated.reviewerId, now: new Date().toISOString(),
       });
-      if (head.status !== 'active') {
+      if (head.status !== 'active' && head.status !== 'revoked') {
         jsonRes(res, 409, { ok: false, error: head.reason ?? 'task_control_reviewer_verdict_unproven' });
         return;
       }

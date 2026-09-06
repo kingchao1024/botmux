@@ -6,11 +6,13 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-const binary = process.argv[2] ? resolve(process.argv[2]) : undefined;
+const production = process.argv.includes('--production');
+const binaryArg = process.argv.slice(2).find(value => value !== '--production');
+const binary = binaryArg ? resolve(binaryArg) : undefined;
 if (!binary || !existsSync(binary)) {
   console.error('usage: node scripts/smoke-bun-daemon-nonempty.mjs <binary>');
   process.exit(2);
@@ -20,7 +22,7 @@ const root = mkdtempSync(join(tmpdir(), 'botmux-nonempty-daemon-smoke-'));
 const dataDir = join(root, 'data');
 const botmuxDir = join(root, '.botmux');
 const botsPath = join(botmuxDir, 'bots.json');
-const port = 19751;
+const port = 20_000 + Math.floor(Math.random() * 10_000);
 mkdirSync(dataDir, { recursive: true });
 mkdirSync(botmuxDir, { recursive: true });
 const bots = [{
@@ -31,6 +33,11 @@ const bots = [{
 }];
 const botsJson = JSON.stringify(bots);
 writeFileSync(botsPath, botsJson);
+if (production) {
+  const secretPath = join(botmuxDir, '.dashboard-secret');
+  writeFileSync(secretPath, 'compiled-production-smoke-host-secret');
+  chmodSync(secretPath, 0o600);
+}
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const canonicalJson = value => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -47,7 +54,12 @@ const child = spawn(binary, ['__daemon'], {
   env: {
     ...process.env, HOME: root, BOTS_CONFIG: botsPath, SESSION_DATA_DIR: dataDir, BOTMUX_BOT_INDEX: '0',
     BOTMUX_EXPECTED_APP_ID: bots[0].larkAppId, BOTMUX_ROSTER_REVISION: rosterRevision,
-    BOTMUX_DAEMON_IPC_BASE_PORT: String(port), BOTMUX_WEB_PROXY_BASE_PORT: '19780',
+    BOTMUX_DAEMON_IPC_BASE_PORT: String(port), BOTMUX_WEB_PROXY_BASE_PORT: String(port + 100),
+    ...(production ? {
+      TASK_CONTROL_PLANE_PRODUCTION: 'true', TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
+      TASK_CONTROL_PLANE_PUMP_ENABLED: 'true', TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
+      TASK_CONTROL_PLANE_SHADOW_ENABLED: 'false',
+    } : {}),
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -55,8 +67,13 @@ let output = '';
 child.stdout.on('data', chunk => { output += String(chunk); });
 child.stderr.on('data', chunk => { output += String(chunk); });
 
-function cleanup() {
+async function cleanup() {
   if (child.exitCode === null) { try { child.kill('SIGTERM'); } catch {} }
+  if (child.exitCode === null) await Promise.race([
+    new Promise(resolve => child.once('exit', resolve)),
+    new Promise(resolve => setTimeout(resolve, 3_000)),
+  ]);
+  if (child.exitCode === null) { try { child.kill('SIGKILL'); } catch {} }
   try { rmSync(root, { recursive: true, force: true }); } catch {}
 }
 
@@ -72,11 +89,11 @@ try {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   if (!ready) throw new Error(`daemon did not reach healthz: ${output.slice(-800)}`);
-  console.log('smoke: ✅ nonempty apiOnly daemon reached __health');
+  console.log(`smoke: ✅ nonempty apiOnly ${production ? 'production-flag ' : ''}daemon reached __health`);
 } catch (error) {
   console.error(`smoke: FAIL [nonempty-daemon] ${error instanceof Error ? error.message : String(error)}`);
-  cleanup();
+  await cleanup();
   process.exit(1);
 }
-cleanup();
+await cleanup();
 process.exit(0);

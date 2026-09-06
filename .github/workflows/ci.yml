@@ -220,6 +220,7 @@ jobs:
               # native loads; no separate PTY step is needed.
               node scripts/smoke-bun-binary.mjs dist-bin/botmux-linux-x64-musl
               node scripts/smoke-bun-daemon-nonempty.mjs dist-bin/botmux-linux-x64-musl
+              node scripts/smoke-bun-daemon-nonempty.mjs dist-bin/botmux-linux-x64-musl --production
 
               # The legacy-pm2 reaper identifies processes and sockets before it
               # signals or deletes anything, and BusyBox answers those questions

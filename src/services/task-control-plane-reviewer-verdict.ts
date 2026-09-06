@@ -195,12 +195,12 @@ export function reviewerCapabilityHash(capability: string): string {
 
 /** Stable controller/reviewer rendezvous id for one review round. It is derived
  * only from controller-bound dispatch scope and the selected reviewer app. */
-export function reviewerDesignationRef(dispatchRoot: string, reviewerBotAppId: string, reviewRound: number): string {
+export function reviewerDesignationRef(dispatchRoot: string, reviewerBotAppId: string, reviewRound: number, generation: string | number = 1): string {
   if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot) || !validAppId(reviewerBotAppId)
-    || !Number.isSafeInteger(reviewRound) || reviewRound < 1) {
+    || !Number.isSafeInteger(reviewRound) || reviewRound < 1 || (typeof generation !== 'number' && !nonBlank(generation)) || (typeof generation === 'number' && (!Number.isSafeInteger(generation) || generation < 1))) {
     throw new Error('task_control_reviewer_designation_ref_invalid');
   }
-  return `dr_${createHash('sha256').update(`${REVIEWER_VERDICT_TRUST_DOMAIN}\0${dispatchRoot}\0${reviewerBotAppId}\0${reviewRound}`).digest('hex').slice(0, 48)}`;
+  return `dr_${createHash('sha256').update(`${REVIEWER_VERDICT_TRUST_DOMAIN}\0${dispatchRoot}\0${reviewerBotAppId}\0${reviewRound}\0${String(generation)}`).digest('hex').slice(0, 48)}`;
 }
 
 export function reviewerVerdictSourceVersionHash(source: ReviewerVerdictMessageSource | ReviewerVerdictCommentSource): string {

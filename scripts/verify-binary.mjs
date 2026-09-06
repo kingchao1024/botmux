@@ -135,6 +135,14 @@ if (daemonSmoke.status !== 0) {
   console.error('\n❌ nonempty daemon smoke failed; the compiled daemon bootstrap is not release-safe.');
   process.exit(1);
 }
+const productionDaemonSmoke = spawnSync('node', [join(REPO_ROOT, 'scripts', 'smoke-bun-daemon-nonempty.mjs'), out, '--production'], {
+  cwd: REPO_ROOT,
+  stdio: 'inherit',
+});
+if (productionDaemonSmoke.status !== 0) {
+  console.error('\n❌ production-flag daemon lifecycle smoke failed; the compiled control-plane bootstrap is not release-safe.');
+  process.exit(1);
+}
 
 if (!keep) {
   try { rmSync(out); } catch { /* best effort — a 170MB artifact, not worth failing over */ }

@@ -764,6 +764,7 @@ jobs:
           if [ ! -x "$BIN" ]; then echo "host-arch binary $BIN not built on this runner"; exit 1; fi
           node scripts/smoke-bun-binary.mjs "$BIN"
           node scripts/smoke-bun-daemon-nonempty.mjs "$BIN"
+          node scripts/smoke-bun-daemon-nonempty.mjs "$BIN" --production
 
       - name: Checksums
         # `sha256sum` is GNU coreutils and DOES NOT EXIST on the macOS runner —
@@ -899,6 +900,7 @@ jobs:
               if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
               node scripts/smoke-bun-binary.mjs "$BIN"
               node scripts/smoke-bun-daemon-nonempty.mjs "$BIN"
+              node scripts/smoke-bun-daemon-nonempty.mjs "$BIN" --production
 
               # The process/socket probes in the legacy-pm2 reaper, exercised against
               # BusyBox. Mirrors the PR gate deliberately: `bun run test` runs on

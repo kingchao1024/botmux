@@ -104,6 +104,7 @@ docker run --rm \
     bun scripts/build-bun-binary.mjs --target "$BUILD_TARGET" --out "dist-bin/$OUTPUT_NAME"
     node scripts/smoke-bun-binary.mjs "dist-bin/$OUTPUT_NAME"
     node scripts/smoke-bun-daemon-nonempty.mjs "dist-bin/$OUTPUT_NAME"
+    node scripts/smoke-bun-daemon-nonempty.mjs "dist-bin/$OUTPUT_NAME" --production
     cp "dist-bin/$OUTPUT_NAME" "/out/$OUTPUT_NAME"
     chown "$HOST_UID:$HOST_GID" "/out/$OUTPUT_NAME" 2>/dev/null || true
   '

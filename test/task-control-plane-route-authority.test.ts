@@ -99,6 +99,7 @@ const handlers = createTaskControlRouteHandlers({
         return { status: 'unknown', reason: 'reviewer_verdict_designation_unproven' };
       }
       if (!verifier.verifyVerdict(verdict)) return { status: 'unknown', reason: 'reviewer_verdict_unverified' };
+      if (verdict.kind === 'revocation') return { status: 'revoked', verdict };
       const canonical = JSON.stringify(verdict);
       const prior = context.seenVerdicts.get(verdict.verdictId);
       if (prior && prior !== canonical) return { status: 'unknown', reason: 'reviewer_verdict_id_conflict' };
@@ -457,6 +458,31 @@ describe('task-control mapping/freeze controlled IPC', () => {
     const ingress = await post(TASK_CONTROL_REVIEWER_INGRESS_ROUTE, reviewerIngressPayload({ verdictId: 'rv-production-1' }), false);
     expect(ingress.status).toBe(201);
     expect(context.reviewedCalls).toBe(1);
+  });
+
+  it('replaces a same-app designation with a new signed ref and forwards a signed revocation', async () => {
+    reset();
+    writeRegistry();
+    context.sourceMessageId = 'om_review_1';
+    const first = await post(TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, designationPayload({ sourceMessageId: 'om_review_1' }));
+    expect(first.status).toBe(201);
+    const firstRef = (await first.json() as { designatedReviewerRef: string }).designatedReviewerRef;
+    context.sourceMessageId = 'om_review_2';
+    const replacement = await post(TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, designationPayload({
+      sourceMessageId: 'om_review_2', supersedesDesignatedReviewerRef: firstRef,
+    }));
+    expect(replacement.status).toBe(201);
+    const replacementRef = (await replacement.json() as { designatedReviewerRef: string }).designatedReviewerRef;
+    expect(replacementRef).not.toBe(firstRef);
+    expect(context.designation).toMatchObject({ designatedReviewerRef: replacementRef, supersedesDesignatedReviewerRef: firstRef });
+
+    context.selfAppId = 'reviewer-app';
+    const revocation = await post(TASK_CONTROL_REVIEWER_INGRESS_ROUTE, reviewerIngressPayload({
+      sourceMessageId: 'om_review_2', verdictId: 'rv-revoke-1', verdict: 'revocation',
+      revokesVerdictId: 'prior-pass-verdict', conditionIds: [], resolvedConditionEvidence: {},
+    }), false);
+    expect(revocation.status).toBe(201);
+    expect(context.lastForwarded?.verdict).toMatchObject({ kind: 'revocation', revokesVerdictId: 'prior-pass-verdict' });
   });
 
   it('requires current controller turn authority before and after resolving the reviewer source', async () => {
