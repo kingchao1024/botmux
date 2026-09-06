@@ -4,6 +4,7 @@ import {
   type TaskControlAuthentication,
   DaemonTaskControlAuthority,
   type VerifiedTaskControlGateResolution,
+  type VerifiedWriteExecutionGrant,
 } from './task-control-plane-authority.js';
 import type { TaskControlEventObservation } from './task-control-plane-events.js';
 import { taskControlMappingFacts, type TaskControlMappingProof } from './task-control-plane-mapping-trust.js';
@@ -59,6 +60,10 @@ export interface DaemonTaskControlApprovalSource {
     gate: TaskControlApprovalGateBinding;
   }): Omit<VerifiedTaskControlGateResolution,
     'approvalRef' | 'projectId' | 'phaseId' | 'taskSetSnapshot' | 'acceptorId'> | undefined;
+  /** Durable human authorization for one exact write; absent means fail closed. */
+  getWriteExecution?(input: {
+    grantRef: string; larkAppId: string; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string;
+  }): Pick<VerifiedWriteExecutionGrant, 'issuedAt' | 'expiresAt'> | undefined;
 }
 
 export type TaskControlBridgeEvent = Omit<TaskControlEventObservation, 'authentication' | 'projectId' | 'phaseId' | 'taskGuid' | 'topicRootId'> & {
@@ -239,6 +244,24 @@ export class DaemonTaskControlBridge {
     return this.authority.issueVerifiedGateApproval({
       ...source, approvalRef: ref, projectId: mapping.projectId, phaseId: mapping.phaseId,
       taskSetSnapshot: mapping.phaseTaskGuids, acceptorId: mapping.acceptorId,
+    });
+  }
+
+  /** Explicit daemon-only write authority; no dispatch brief or report text is parsed. */
+  issueWriteExecutionGrant(input: Omit<VerifiedWriteExecutionGrant, 'issuedAt' | 'expiresAt'> & { dispatchRoot: string }): unknown | undefined {
+    const mapping = this.mappings.get(input.dispatchRoot);
+    if (!mapping || mapping.projectId !== input.projectId || mapping.phaseId !== input.phaseId || mapping.taskGuid !== input.taskGuid
+      || mapping.acceptorId !== input.operatorId || !nonBlank(input.candidate) || !nonBlank(input.action)
+      || !Number.isSafeInteger(input.attempt) || input.attempt < 1) return undefined;
+    const source = this.input.approvals.getWriteExecution?.({
+      grantRef: input.grantRef, larkAppId: this.input.larkAppId, projectId: input.projectId, phaseId: input.phaseId, taskGuid: input.taskGuid,
+      candidate: input.candidate, action: input.action, attempt: input.attempt, operatorId: input.operatorId,
+    });
+    if (!source) return undefined;
+    return this.authority.issueVerifiedWriteExecutionGrant({
+      grantRef: input.grantRef, projectId: input.projectId, phaseId: input.phaseId, taskGuid: input.taskGuid,
+      candidate: input.candidate, action: input.action, attempt: input.attempt, operatorId: input.operatorId,
+      issuedAt: source.issuedAt, expiresAt: source.expiresAt,
     });
   }
 

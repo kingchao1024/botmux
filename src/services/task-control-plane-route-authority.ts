@@ -139,6 +139,7 @@ function sameControllerTurn(left: Extract<ControllerTurnAuthorization, { ok: tru
 
 export const TASK_CONTROL_MAPPING_REGISTER_ROUTE = '/api/task-control/mappings';
 export const TASK_CONTROL_FREEZE_ROUTE = '/api/task-control/freeze';
+export const TASK_CONTROL_WRITE_EXECUTION_ROUTE = '/api/task-control/write-execution';
 export const TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE = '/api/task-control/designated-reviewers';
 export const TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE = '/api/task-control/designated-reviewers/resolve';
 /** Reviewer-daemon HMAC-only source resolver used by the controller designation path. */
@@ -157,6 +158,9 @@ type RouteIntegration = {
   issueAuthentication(dispatchRoot: string, principal: 'controller' | 'acceptor'): unknown | undefined;
   approval(dispatchRoot: string, approvalRef: string): unknown | undefined;
   requestFreeze(dispatchRoot: string, requestId: string): boolean;
+  consumeWriteExecutionGrant(input: {
+    dispatchRoot: string; grantRef: string; candidate: string; action: string; attempt: number; operatorId: string; now?: string;
+  }): { ok: true } | { ok: false; reason: string };
   setReviewerVerdictVerifier(verifier: { verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean; verifyVerdict(value: ReviewerVerdictV1): boolean }): void;
   currentDesignatedReviewer(dispatchRoot: string, reviewRound: number, now?: string): DesignatedReviewerMapping | undefined;
   registerVerifiedDesignatedReviewer(input: {
@@ -417,6 +421,7 @@ export function createTaskControlRouteHandlers(input: {
 }): {
   mapping(req: IncomingMessage, res: ServerResponse): Promise<void>;
   freeze(req: IncomingMessage, res: ServerResponse): Promise<void>;
+  writeExecution(req: IncomingMessage, res: ServerResponse): Promise<void>;
   designatedReviewer(req: IncomingMessage, res: ServerResponse): Promise<void>;
   designatedReviewerResolve(req: IncomingMessage, res: ServerResponse): Promise<void>;
   reviewerSource(req: IncomingMessage, res: ServerResponse): Promise<void>;
@@ -532,6 +537,55 @@ export function createTaskControlRouteHandlers(input: {
       } catch (error) {
         jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
       }
+    },
+
+    async writeExecution(req, res): Promise<void> {
+      const integration = input.integration();
+      if (!isTrustedHostIpcRequest(req) || !integration) {
+        jsonRes(res, 403, { ok: false, error: 'task_control_write_execution_unavailable' });
+        return;
+      }
+      let raw: unknown;
+      try { raw = await readJsonBody<unknown>(req, TASK_CONTROL_FREEZE_MAX_BYTES); }
+      catch (error) {
+        jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, { ok: false, error: 'bad_json' });
+        return;
+      }
+      const body = object(raw);
+      const dispatchRoot = text(body?.dispatchRoot);
+      const grantRef = text(body?.grantRef);
+      const candidate = text(body?.candidate);
+      const action = text(body?.action);
+      const attempt = body?.attempt;
+      if (!body || !hasOnlyKeys(body, ['dispatchRoot', 'grantRef', 'candidate', 'action', 'attempt',
+        'controllerSessionId', 'originCapability', 'originTurnId', 'workerGeneration'])
+        || !dispatchRoot || !grantRef || !candidate || !action || !positiveSafeInteger(attempt) || !text(body.controllerSessionId)) {
+        jsonRes(res, 400, { ok: false, error: 'task_control_write_execution_invalid' });
+        return;
+      }
+      const routeAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!routeAuthority.ok) {
+        jsonRes(res, 403, { ok: false, error: `task_control_write_execution_${routeAuthority.error}` });
+        return;
+      }
+      const mapping = integration.mapping(dispatchRoot);
+      const currentRouteAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!mapping || !sameControllerTurn(routeAuthority, currentRouteAuthority)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_write_execution_origin_changed' });
+        return;
+      }
+      const result = integration.consumeWriteExecutionGrant({
+        dispatchRoot, grantRef, candidate, action, attempt, operatorId: mapping.acceptorId,
+      });
+      jsonRes(res, result.ok ? 201 : 409, result);
     },
 
     async designatedReviewer(req, res): Promise<void> {

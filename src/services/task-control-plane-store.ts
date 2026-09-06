@@ -19,8 +19,9 @@ import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import {
   reviewerCapabilityHash, reviewerVerdictPayloadHash, type DesignatedReviewerMapping, type ReviewerConditionEvidence, type ReviewerVerdictAttestation, type ReviewerVerdictV1,
 } from './task-control-plane-reviewer-verdict.js';
+import type { VerifiedWriteExecutionGrant } from './task-control-plane-authority.js';
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const DATABASE_NAME = 'botmux-task-control-plane.sqlite';
 
 export type TaskControlEventType =
@@ -107,6 +108,10 @@ export interface TaskControlAuthority {
     acceptorId: string;
     now: string;
   }): VerifiedTaskControlApproval | undefined;
+  /** Optional because legacy/read-only authorities may not execute writes. */
+  verifyWriteExecutionGrant?(input: {
+    grant: unknown; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string; now: string;
+  }): VerifiedWriteExecutionGrant | undefined;
 }
 
 export interface AppendTaskControlEventInput {
@@ -400,6 +405,18 @@ export interface ApprovalConsumption {
   consumedAt: string;
 }
 
+export interface WriteExecutionConsumption {
+  grantRef: string;
+  projectId: string;
+  phaseId: string;
+  taskGuid: string;
+  candidate: string;
+  action: string;
+  attempt: number;
+  operatorId: string;
+  consumedAt: string;
+}
+
 /** Durable, host-authenticated control identity. This is a reference record, not a task body. */
 export interface TrustedTaskControlMappingRecord {
   dispatchRoot: string;
@@ -647,6 +664,16 @@ const SCHEMA = `
   BEGIN SELECT RAISE(ABORT,'control_approval_consumption_immutable'); END;
   CREATE TRIGGER IF NOT EXISTS control_approval_consumptions_no_delete BEFORE DELETE ON control_approval_consumptions
   BEGIN SELECT RAISE(ABORT,'control_approval_consumption_immutable'); END;
+
+  CREATE TABLE IF NOT EXISTS control_write_execution_consumptions(
+    lark_app_id TEXT NOT NULL, grant_ref TEXT NOT NULL, project_id TEXT NOT NULL, phase_id TEXT NOT NULL, task_guid TEXT NOT NULL,
+    candidate TEXT NOT NULL, action TEXT NOT NULL, attempt INTEGER NOT NULL CHECK(attempt >= 1), operator_id TEXT NOT NULL, consumed_at TEXT NOT NULL,
+    PRIMARY KEY(lark_app_id,grant_ref)
+  );
+  CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_update BEFORE UPDATE ON control_write_execution_consumptions
+  BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_delete BEFORE DELETE ON control_write_execution_consumptions
+  BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
 
   CREATE TABLE IF NOT EXISTS control_trusted_mappings(
     lark_app_id TEXT NOT NULL,
@@ -1205,6 +1232,19 @@ function migrateSchema(db: DatabaseSyncLike, fromVersion: number): void {
     add('control_trusted_mappings', 'phase_registration_refs_json', 'phase_registration_refs_json TEXT');
     add('control_trusted_mappings', 'doc_revision', 'doc_revision INTEGER');
   }
+  if (fromVersion < 13) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS control_write_execution_consumptions(
+        lark_app_id TEXT NOT NULL, grant_ref TEXT NOT NULL, project_id TEXT NOT NULL, phase_id TEXT NOT NULL, task_guid TEXT NOT NULL,
+        candidate TEXT NOT NULL, action TEXT NOT NULL, attempt INTEGER NOT NULL CHECK(attempt >= 1), operator_id TEXT NOT NULL, consumed_at TEXT NOT NULL,
+        PRIMARY KEY(lark_app_id,grant_ref)
+      );
+      CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_update BEFORE UPDATE ON control_write_execution_consumptions
+      BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_delete BEFORE DELETE ON control_write_execution_consumptions
+      BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
+    `);
+  }
 }
 
 function taskEvent(type: TaskControlEventType): boolean {
@@ -1346,6 +1386,14 @@ function approvalConsumptionFromRow(row: Record<string, unknown>): ApprovalConsu
     freezeIdempotencyKey: String(row.freeze_idempotency_key),
     frozenEventId: String(row.frozen_event_id),
     approvedAt: String(row.approved_at),
+    consumedAt: String(row.consumed_at),
+  };
+}
+
+function writeExecutionConsumptionFromRow(row: Record<string, unknown>): WriteExecutionConsumption {
+  return {
+    grantRef: String(row.grant_ref), projectId: String(row.project_id), phaseId: String(row.phase_id), taskGuid: String(row.task_guid),
+    candidate: String(row.candidate), action: String(row.action), attempt: Number(row.attempt), operatorId: String(row.operator_id),
     consumedAt: String(row.consumed_at),
   };
 }
@@ -2166,6 +2214,50 @@ export class TaskControlPlaneStore {
     const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE approval_ref=? AND lark_app_id=?')
       .get(approvalRef, this.larkAppId) as Record<string, unknown> | undefined;
     return row ? approvalConsumptionFromRow(row) : undefined;
+  }
+
+  getWriteExecutionConsumption(grantRef: string): WriteExecutionConsumption | undefined {
+    const row = this.db.prepare('SELECT * FROM control_write_execution_consumptions WHERE grant_ref=? AND lark_app_id=?')
+      .get(grantRef, this.larkAppId) as Record<string, unknown> | undefined;
+    return row ? writeExecutionConsumptionFromRow(row) : undefined;
+  }
+
+  /** Atomically validates and consumes one exact daemon-minted write grant. */
+  consumeWriteExecutionGrant(input: {
+    grant: unknown; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string; now?: string;
+  }): WriteExecutionConsumption {
+    return this.withImmediateWrite(() => {
+      const now = input.now ?? new Date().toISOString();
+      const grant = this.authority?.verifyWriteExecutionGrant?.({ ...input, now });
+      if (!grant || this.getWriteExecutionConsumption(grant.grantRef)) {
+        throw new Error('task_control_write_execution_grant_unavailable');
+      }
+      const mapping = this.mappingForTask(input.taskGuid);
+      const phase = this.getPhaseProjection(input.projectId, input.phaseId);
+      const task = this.getTaskProjection(input.taskGuid, now);
+      const review = task.independentReview;
+      const invalidatingEvidence = this.listEvents({ projectId: input.projectId, phaseId: input.phaseId }).some(event =>
+        event.occurredAt >= grant.issuedAt && (
+          event.eventType === 'phase.blocked' || event.eventType === 'phase.failed' || event.eventType === 'phase.cancelled'
+          || (event.taskGuid === input.taskGuid && (event.eventType === 'task.blocked' || event.eventType === 'task.failed' || event.eventType === 'task.cancelled'))
+          || (event.taskGuid === input.taskGuid && (event.eventType === 'task.reviewed' || event.eventType === 'task.review_corrected')
+            && ['fail', 'conditional', 'unknown'].includes(String(event.payload.verdict)))
+        ),
+      );
+      if (!mapping || mapping.projectId !== input.projectId || mapping.phaseId !== input.phaseId
+        || phase.state === 'blocked' || phase.state === 'failed' || phase.state === 'cancelled'
+        || task.state === 'blocked' || task.state === 'failed' || task.state === 'cancelled'
+        || invalidatingEvidence || (review && (review.verdict === 'fail' || review.verdict === 'conditional' || review.verdict === 'unknown'))) {
+        throw new Error('task_control_write_execution_grant_invalidated');
+      }
+      this.db.prepare(`INSERT INTO control_write_execution_consumptions(
+        lark_app_id,grant_ref,project_id,phase_id,task_guid,candidate,action,attempt,operator_id,consumed_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        this.larkAppId, grant.grantRef, grant.projectId, grant.phaseId, grant.taskGuid, grant.candidate, grant.action, grant.attempt, grant.operatorId, now,
+      );
+      return { grantRef: grant.grantRef, projectId: grant.projectId, phaseId: grant.phaseId, taskGuid: grant.taskGuid,
+        candidate: grant.candidate, action: grant.action, attempt: grant.attempt, operatorId: grant.operatorId, consumedAt: now };
+    });
   }
 
   private approvalConsumptionForFreezeIdempotency(key: string): ApprovalConsumption | undefined {

@@ -97,6 +97,7 @@ import {
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
   TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE,
   TASK_CONTROL_FREEZE_ROUTE,
+  TASK_CONTROL_WRITE_EXECUTION_ROUTE,
   TASK_CONTROL_MAPPING_REGISTER_ROUTE,
   TASK_CONTROL_REVIEWER_INGRESS_ROUTE,
   TASK_CONTROL_REVIEWER_SOURCE_ROUTE,
@@ -6014,6 +6015,7 @@ ipcRoute('POST', TASK_CONTROL_MAPPING_REGISTER_ROUTE, taskControlRouteHandlers.m
 // or report output. The lifecycle also checks the disabled flag so even a valid
 // host request cannot turn a default-off daemon into an enforcing daemon.
 ipcRoute('POST', TASK_CONTROL_FREEZE_ROUTE, taskControlRouteHandlers.freeze);
+ipcRoute('POST', TASK_CONTROL_WRITE_EXECUTION_ROUTE, taskControlRouteHandlers.writeExecution);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, taskControlRouteHandlers.designatedReviewer);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE, taskControlRouteHandlers.designatedReviewerResolve);
 ipcRoute('POST', TASK_CONTROL_REVIEWER_SOURCE_ROUTE, taskControlRouteHandlers.reviewerSource);

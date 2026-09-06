@@ -49,6 +49,23 @@ interface StoredApproval {
   approval: VerifiedTaskControlApproval;
 }
 
+export interface VerifiedWriteExecutionGrant {
+  grantRef: string;
+  projectId: string;
+  phaseId: string;
+  taskGuid: string;
+  candidate: string;
+  action: string;
+  attempt: number;
+  operatorId: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+interface StoredWriteExecutionGrant {
+  grant: VerifiedWriteExecutionGrant;
+}
+
 function nonBlank(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
 }
@@ -72,6 +89,7 @@ function canonicalTaskSet(value: readonly string[]): string[] {
 export class DaemonTaskControlAuthority implements TaskControlAuthority {
   private readonly authentications = new WeakMap<object, StoredAuthentication>();
   private readonly approvals = new WeakMap<object, StoredApproval>();
+  private readonly writeExecutionGrants = new WeakMap<object, StoredWriteExecutionGrant>();
 
   constructor(private readonly input: DaemonAuthorityInput) {}
 
@@ -126,6 +144,31 @@ export class DaemonTaskControlAuthority implements TaskControlAuthority {
       approvalRef, projectId, phaseId, taskSetSnapshot, acceptorId, approvedAt, expiresAt,
     } });
     return token;
+  }
+
+  /** An opaque daemon-only capability for one exact write execution. */
+  issueVerifiedWriteExecutionGrant(source: VerifiedWriteExecutionGrant): unknown | undefined {
+    const fields = [source.grantRef, source.projectId, source.phaseId, source.taskGuid, source.candidate, source.action, source.operatorId, source.issuedAt, source.expiresAt];
+    if (fields.some(value => !nonBlank(value)) || !Number.isSafeInteger(source.attempt) || source.attempt < 1
+      || !Number.isFinite(Date.parse(source.issuedAt)) || !Number.isFinite(Date.parse(source.expiresAt))
+      || Date.parse(source.expiresAt) <= Date.parse(source.issuedAt)) return undefined;
+    const token = Object.freeze({}) as object;
+    this.writeExecutionGrants.set(token, { grant: { ...source } });
+    return token;
+  }
+
+  verifyWriteExecutionGrant(input: {
+    grant: unknown; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string; now: string;
+  }): VerifiedWriteExecutionGrant | undefined {
+    if (!input.grant || typeof input.grant !== 'object') return undefined;
+    const stored = this.writeExecutionGrants.get(input.grant);
+    const grant = stored?.grant;
+    const now = Date.parse(input.now);
+    if (!grant || !Number.isFinite(now) || Date.parse(grant.expiresAt) <= now
+      || grant.projectId !== input.projectId || grant.phaseId !== input.phaseId || grant.taskGuid !== input.taskGuid
+      || grant.candidate !== input.candidate || grant.action !== input.action || grant.attempt !== input.attempt
+      || grant.operatorId !== input.operatorId) return undefined;
+    return { ...grant };
   }
 
   authenticate(authentication: unknown): AuthenticatedTaskControlPrincipal | undefined {

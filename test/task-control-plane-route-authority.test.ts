@@ -20,6 +20,7 @@ import {
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
   TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE,
   TASK_CONTROL_FREEZE_ROUTE,
+  TASK_CONTROL_WRITE_EXECUTION_ROUTE,
   TASK_CONTROL_MAPPING_REGISTER_ROUTE,
   TASK_CONTROL_REVIEWER_INGRESS_ROUTE,
   TASK_CONTROL_REVIEWER_SOURCE_ROUTE,
@@ -91,6 +92,9 @@ const handlers = createTaskControlRouteHandlers({
     issueAuthentication: () => ({ kind: 'acceptor-proof' }),
     approval: () => context.approval,
     requestFreeze: () => !!context.approval,
+    consumeWriteExecutionGrant: ({ candidate, action, attempt, operatorId }: any) =>
+      candidate === 'candidate-c8' && action === 'git.commit' && attempt === 2 && operatorId === 'acceptor-1'
+        ? { ok: true } : { ok: false, reason: 'write_execution_grant_unproven' },
     setReviewerVerdictVerifier: () => {},
     currentDesignatedReviewer: () => context.designation,
     registerVerifiedDesignatedReviewer: ({ mapping }: any) => { context.designationCalls++; context.designation = mapping; return true; },
@@ -207,6 +211,7 @@ const handlers = createTaskControlRouteHandlers({
 // pure authority function directly.
 ipcRoute('POST', TASK_CONTROL_MAPPING_REGISTER_ROUTE, handlers.mapping);
 ipcRoute('POST', TASK_CONTROL_FREEZE_ROUTE, handlers.freeze);
+ipcRoute('POST', TASK_CONTROL_WRITE_EXECUTION_ROUTE, handlers.writeExecution);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, handlers.designatedReviewer);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE, handlers.designatedReviewerResolve);
 ipcRoute('POST', TASK_CONTROL_REVIEWER_SOURCE_ROUTE, handlers.reviewerSource);
@@ -445,6 +450,26 @@ describe('task-control mapping/freeze controlled IPC', () => {
     });
     expect(response.status).toBe(403);
     expect(context.freezeCalls).toBe(0);
+  });
+
+  it('consumes only a controller-bound exact structured write execution grant', async () => {
+    reset();
+    writeRegistry();
+    const body = {
+      dispatchRoot: 'om_orch_root', grantRef: 'grant:write-1', candidate: 'candidate-c8', action: 'git.commit', attempt: 2,
+      controllerSessionId: 'session-1', originCapability: 'cap-1', originTurnId: 'turn-1', workerGeneration: 7,
+    };
+    const accepted = await post(TASK_CONTROL_WRITE_EXECUTION_ROUTE, body);
+    expect(accepted.status).toBe(201);
+    expect(await accepted.json()).toEqual({ ok: true });
+    const candidateDrift = await post(TASK_CONTROL_WRITE_EXECUTION_ROUTE, { ...body, candidate: 'candidate-other' });
+    expect(candidateDrift.status).toBe(409);
+    expect(await candidateDrift.json()).toEqual({ ok: false, reason: 'write_execution_grant_unproven' });
+    const unstructured = await post(TASK_CONTROL_WRITE_EXECUTION_ROUTE, { ...body, title: 'PASS' });
+    expect(unstructured.status).toBe(400);
+    context.controllerGeneration = 8;
+    const stale = await post(TASK_CONTROL_WRITE_EXECUTION_ROUTE, body);
+    expect(stale.status).toBe(403);
   });
 
   it('uses app-scoped source re-read for designation and accepts only a current reviewer ingress', async () => {

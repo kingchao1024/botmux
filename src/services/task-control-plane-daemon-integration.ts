@@ -384,6 +384,32 @@ export class DaemonTaskControlIntegration {
     this.adapters.enqueue('task.dispatch_requested', { ...event, payload: { dispatchRoot, sourceSessionId } });
   }
 
+  /**
+   * Explicit, structured daemon ingress for a write task. The normal dispatch
+   * path has no trusted candidate/action/attempt tuple and therefore cannot
+   * advance through this gate.
+   */
+  consumeWriteExecutionGrant(input: {
+    dispatchRoot: string; grantRef: string; candidate: string; action: string; attempt: number; operatorId: string; now?: string;
+  }): { ok: true } | { ok: false; reason: string } {
+    const mapping = this.input.bridge.mapping(input.dispatchRoot);
+    if (!mapping || mapping.acceptorId !== input.operatorId) return { ok: false, reason: 'write_execution_mapping_unproven' };
+    const grant = this.input.bridge.issueWriteExecutionGrant({
+      dispatchRoot: input.dispatchRoot, grantRef: input.grantRef, projectId: mapping.projectId, phaseId: mapping.phaseId, taskGuid: mapping.taskGuid,
+      candidate: input.candidate, action: input.action, attempt: input.attempt, operatorId: input.operatorId,
+    });
+    if (!grant) return { ok: false, reason: 'write_execution_grant_unproven' };
+    try {
+      this.input.store.consumeWriteExecutionGrant({
+        grant, projectId: mapping.projectId, phaseId: mapping.phaseId, taskGuid: mapping.taskGuid, candidate: input.candidate,
+        action: input.action, attempt: input.attempt, operatorId: input.operatorId, now: input.now,
+      });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : 'write_execution_grant_rejected' };
+    }
+  }
+
   workerAccepted(dispatchRoot: string, sourceRef: string, occurredAt?: string): void {
     this.appendMapped('task.accepted', dispatchRoot, 'worker', sourceRef, occurredAt);
   }

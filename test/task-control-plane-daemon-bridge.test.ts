@@ -23,6 +23,8 @@ function source() {
       runId: binding.runId, nodeId: binding.nodeId, instanceId: binding.instanceId, waitId: binding.waitId,
       operatorId: binding.operatorId, approvedAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T00:00:00.000Z',
     }),
+    getWriteExecution: ({ candidate, action, attempt, operatorId }: any) => candidate === '3928820' && action === 'git.commit' && attempt === 2 && operatorId === 'acceptor-1'
+      ? { issuedAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T01:00:00.000Z' } : undefined,
   };
 }
 
@@ -63,5 +65,14 @@ describe('DaemonTaskControlBridge', () => {
     });
     expect(wrongSource.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
     expect(wrongSource.approval('om_root', 'approval:gate-1')).toBeUndefined();
+  });
+
+  it('mints write authority only from an exact durable structured source', () => {
+    const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+    expect(bridge.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+    const exact = { dispatchRoot: 'om_root', grantRef: 'grant:write-1', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', candidate: '3928820', action: 'git.commit', attempt: 2, operatorId: 'acceptor-1' };
+    expect(bridge.issueWriteExecutionGrant(exact)).toBeTruthy();
+    expect(bridge.issueWriteExecutionGrant({ ...exact, candidate: 'other' })).toBeUndefined();
+    expect(bridge.issueWriteExecutionGrant({ ...exact, operatorId: 'worker-1' })).toBeUndefined();
   });
 });

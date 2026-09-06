@@ -40,6 +40,9 @@ function source() {
       runId: binding.runId, nodeId: binding.nodeId, instanceId: binding.instanceId, waitId: binding.waitId,
       operatorId: binding.operatorId, approvedAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T00:00:00.000Z',
     }),
+    getWriteExecution: ({ grantRef, candidate, action, attempt, operatorId }: any) =>
+      (grantRef === 'grant:write-1' || grantRef === 'grant:write-2') && candidate === 'candidate-c8' && action === 'git.commit' && attempt === 2 && operatorId === 'acceptor-1'
+        ? { issuedAt: '2026-09-05T00:00:00.000Z', expiresAt: '2026-09-05T01:00:00.000Z' } : undefined,
   };
 }
 
@@ -52,6 +55,59 @@ function reviewerProvider() {
 }
 
 describe('DaemonTaskControlIntegration', () => {
+  it('rejects a stale write grant after FAIL then PASS and consumes one exact new grant once', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-write-grant-'));
+    try {
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const store = lifecycle.getStore()!;
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} } });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const worker = bridge.issueAuthentication('om_root', 'worker')!;
+      store.appendEvent({ eventId: 'd1-fail', eventType: 'task.failed', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', authentication: worker, idempotencyKey: 'd1-fail', occurredAt: '2026-09-05T00:10:00.000Z' });
+      // A later technical PASS is evidence only; it cannot revive a consumed or invalidated grant.
+      store.appendEvent({ eventId: 'c8-pass', eventType: 'unknown.declared', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', authentication: worker, idempotencyKey: 'c8-pass', occurredAt: '2026-09-05T00:20:00.000Z', payload: { unknownKey: 'technical-pass:c8' } });
+      const input = { dispatchRoot: 'om_root', grantRef: 'grant:write-1', candidate: 'candidate-c8', action: 'git.commit', attempt: 2, operatorId: 'acceptor-1', now: '2026-09-05T00:30:00.000Z' };
+      expect(integration.consumeWriteExecutionGrant(input)).toEqual({ ok: false, reason: 'task_control_write_execution_grant_invalidated' });
+      expect(integration.consumeWriteExecutionGrant({ ...input, grantRef: 'grant:write-2' })).toEqual({ ok: false, reason: 'task_control_write_execution_grant_invalidated' });
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('allows one exact fresh grant once and rejects replay or mismatched execution facts', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-write-grant-once-'));
+    try {
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store: lifecycle.getStore()!, bridge, logger: { warn: () => {} } });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const input = { dispatchRoot: 'om_root', grantRef: 'grant:write-1', candidate: 'candidate-c8', action: 'git.commit', attempt: 2, operatorId: 'acceptor-1', now: '2026-09-05T00:30:00.000Z' };
+      expect(integration.consumeWriteExecutionGrant(input)).toEqual({ ok: true });
+      expect(integration.consumeWriteExecutionGrant(input)).toEqual({ ok: false, reason: 'task_control_write_execution_grant_unavailable' });
+      expect(integration.consumeWriteExecutionGrant({ ...input, grantRef: 'grant:write-2', candidate: 'other-candidate' })).toEqual({ ok: false, reason: 'write_execution_grant_unproven' });
+      expect(integration.consumeWriteExecutionGrant({ ...input, grantRef: 'grant:write-2', attempt: 3 })).toEqual({ ok: false, reason: 'write_execution_grant_unproven' });
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('keeps a consumed grant consumed after daemon restart', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-write-grant-restart-'));
+    try {
+      const input = { dispatchRoot: 'om_root', grantRef: 'grant:write-1', candidate: 'candidate-c8', action: 'git.commit', attempt: 2, operatorId: 'acceptor-1', now: '2026-09-05T00:30:00.000Z' };
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store: lifecycle.getStore()!, bridge, logger: { warn: () => {} } });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      expect(integration.consumeWriteExecutionGrant(input)).toEqual({ ok: true });
+      await lifecycle.close();
+
+      const restartedBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const restarted = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: restartedBridge.authority, logger: { warn: () => {} } });
+      const restartedIntegration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle: restarted, store: restarted.getStore()!, bridge: restartedBridge, logger: { warn: () => {} } });
+      expect(restartedIntegration.consumeWriteExecutionGrant(input)).toEqual({ ok: false, reason: 'task_control_write_execution_grant_unavailable' });
+      await restarted.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
   it('persists controller mapping in SQLite and restores it without a JSON sidecar', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-integration-'));
     try {
