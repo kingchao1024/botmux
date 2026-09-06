@@ -611,3 +611,61 @@ export class DaemonTaskControlIntegration {
     return records;
   }
 }
+
+/**
+ * Narrow first-canary reader. It has no bridge, mapping, delivery, review or
+ * freeze methods, so an exact task target cannot acquire control authority.
+ */
+export class DaemonTaskControlShadowCollector {
+  readonly collector: TaskControlActiveCollector;
+
+  constructor(
+    private readonly input: {
+      larkAppId: string;
+      taskGuid: string;
+      lifecycle: TaskControlPlaneLifecycle;
+      logger: { warn(message: string): void };
+    },
+  ) {
+    this.collector = new TaskControlActiveCollector(input.lifecycle, {
+      list: async ({ kind }) => ({
+        records: kind === 'task' || kind === 'task_comment' ? await this.collectReferences(kind) : [],
+      }),
+    });
+  }
+
+  async collectAll(): Promise<void> {
+    await Promise.all((['task', 'task_comment'] as const).map(async kind => {
+      try { await this.collector.collect(kind); }
+      catch (error) { this.input.logger.warn(`[task-control] ${kind} collector failed: ${String(error)}`); }
+    }));
+  }
+
+  private async collectReferences(kind: 'task' | 'task_comment') {
+    const { larkAppId, taskGuid } = this.input;
+    try {
+      if (kind === 'task_comment') {
+        const response = await larkGet(getBotClient(larkAppId), '/open-apis/task/v2/comments', {
+          resource_type: 'task', resource_id: taskGuid, page_size: 1,
+        });
+        const commentId = nonBlank(response?.data?.items?.[0]?.id);
+        if (!commentId) return [];
+        const sourceRef = reference('task-comment', commentId);
+        return [{ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` }];
+      }
+      const response = await larkGet(getBotClient(larkAppId), `/open-apis/task/v2/tasks/${encodeURIComponent(taskGuid)}`);
+      const updatedAt = nonBlank(response?.data?.task?.updated_at);
+      const sourceRef = reference('task', updatedAt ? `${taskGuid}@${updatedAt}` : taskGuid);
+      const records = [{ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` }];
+      if (response?.data?.task?.status === 'done') {
+        const doneRef = reference('task-done-unverified', updatedAt ? `${taskGuid}@${updatedAt}` : taskGuid);
+        records.push({ kind, sourceRef: doneRef, eventId: DaemonTaskControlBridge.observationId(kind, doneRef), idempotencyKey: `tcp-collect:${kind}:${doneRef}` });
+      }
+      return records;
+    } catch (error) {
+      this.input.logger.warn(`[task-control] ${kind} reference unavailable for ${taskGuid}: ${String(error)}`);
+      const sourceRef = reference('collection-error', `${kind}:${taskGuid}`);
+      return [{ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` }];
+    }
+  }
+}

@@ -16,6 +16,13 @@ export interface TaskControlPlaneFlags {
   freezeEnforcement: boolean;
 }
 
+export interface ScopedTaskControlPlaneConfig {
+  flags: TaskControlPlaneFlags;
+  /** Present only for the one exact app+task read-only Shadow canary. */
+  shadowTaskGuid?: string;
+  disabledReason?: string;
+}
+
 export interface TaskControlPlaneLogger {
   warn(message: string): void;
 }
@@ -87,6 +94,48 @@ export function taskControlPlaneFlags(env: NodeJS.ProcessEnv = process.env): Tas
     pumpEnabled: enabled('TASK_CONTROL_PLANE_PUMP_ENABLED'),
     freezeEnforcement: enabled('TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT'),
   };
+}
+
+const LARK_APP_ID_PATTERN = /^cli_[A-Za-z0-9]{16,64}$/;
+const TASK_GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Production daemon gate for the first real Shadow canary. Any enabled flag
+ * requires one exact app+task scope and the read-only ledger+shadow flag set.
+ * Missing, malformed, cross-app or write-capable configurations fail closed.
+ */
+export function scopedTaskControlPlaneConfig(
+  selfLarkAppId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ScopedTaskControlPlaneConfig {
+  const flags = taskControlPlaneFlags(env);
+  const disabled = (): TaskControlPlaneFlags => ({ ...DEFAULT_FLAGS });
+  const flagNames = [
+    'TASK_CONTROL_PLANE_LEDGER_ENABLED',
+    'TASK_CONTROL_PLANE_SHADOW_ENABLED',
+    'TASK_CONTROL_PLANE_PUMP_ENABLED',
+    'TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT',
+  ];
+  if (flagNames.some(name => env[name] !== undefined && !/^(true|false)$/i.test(env[name]!.trim()))) {
+    return { flags: disabled(), disabledReason: 'flag_value_invalid' };
+  }
+  if (!Object.values(flags).some(Boolean)) return { flags: disabled() };
+
+  const targetLarkAppId = env.TASK_CONTROL_PLANE_TARGET_LARK_APP_ID?.trim();
+  const targetTaskGuid = env.TASK_CONTROL_PLANE_TARGET_TASK_GUID?.trim();
+  if (!targetLarkAppId || !targetTaskGuid) {
+    return { flags: disabled(), disabledReason: 'target_scope_required' };
+  }
+  if (!LARK_APP_ID_PATTERN.test(targetLarkAppId) || !TASK_GUID_PATTERN.test(targetTaskGuid)) {
+    return { flags: disabled(), disabledReason: 'target_scope_invalid' };
+  }
+  if (targetLarkAppId !== selfLarkAppId) {
+    return { flags: disabled(), disabledReason: 'target_app_mismatch' };
+  }
+  if (!flags.ledgerEnabled || !flags.shadowEnabled || flags.pumpEnabled || flags.freezeEnforcement) {
+    return { flags: disabled(), disabledReason: 'scoped_shadow_read_only_required' };
+  }
+  return { flags, shadowTaskGuid: targetTaskGuid };
 }
 
 function validateFlags(flags: TaskControlPlaneFlags, hasDelivery: boolean, hasCollector: boolean): void {

@@ -87,9 +87,7 @@ import { setDisplayNameRefresher, findConfigField, applyConfigField } from './se
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { DaemonTaskControlAuthority } from './services/task-control-plane-authority.js';
-import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
-import { DaemonTaskControlIntegration } from './services/task-control-plane-daemon-integration.js';
-import { createV3TaskControlApprovalSource } from './services/task-control-plane-v3-approval.js';
+import { DaemonTaskControlIntegration, DaemonTaskControlShadowCollector } from './services/task-control-plane-daemon-integration.js';
 import {
   createTaskControlRouteHandlers,
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
@@ -100,7 +98,7 @@ import {
   TASK_CONTROL_REVIEWER_SOURCE_ROUTE,
   TASK_CONTROL_REVIEWER_VERDICT_ROUTE,
 } from './services/task-control-plane-route-authority.js';
-import { startTaskControlPlaneRuntime, taskControlPlaneFlags, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
+import { scopedTaskControlPlaneConfig, startTaskControlPlaneRuntime, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -21918,7 +21916,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // P2-6 stays opt-in: default false means this isolated ledger has no effect on
   // legacy dispatch/report/session paths.  Its authentication adapter is owned
   // here (not exposed to callers), and bootstrap failure returns a no-op handle.
-  const taskControlFlags = taskControlPlaneFlags();
+  const taskControlConfig = scopedTaskControlPlaneConfig(cfg.larkAppId);
+  const taskControlFlags = taskControlConfig.flags;
+  if (taskControlConfig.disabledReason && taskControlConfig.disabledReason !== 'target_app_mismatch') {
+    logger.warn(`[task-control] scoped Shadow disabled: ${taskControlConfig.disabledReason}`);
+  }
   taskControlIntegration = undefined;
   if (!taskControlFlags.ledgerEnabled) {
     // Do not create keys, databases, timers or files while the feature is off.
@@ -21929,32 +21931,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
   } else {
     try {
-      const taskControlBridge = new DaemonTaskControlBridge({
-        approvals: createV3TaskControlApprovalSource({ baseDir: v3DefaultBaseDir() }),
-        larkAppId: cfg.larkAppId,
-      });
-      let integration: DaemonTaskControlIntegration | undefined;
+      const shadowTaskGuid = taskControlConfig.shadowTaskGuid;
+      if (!shadowTaskGuid) throw new Error('task_control_shadow_target_unavailable');
+      let shadowCollector: DaemonTaskControlShadowCollector | undefined;
       taskControlPlane = await startTaskControlPlaneRuntime({
-        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags, authority: taskControlBridge.authority, logger, deferStart: true,
-        // The integration itself owns no remote writes. Shadow polls only stable
-        // task/comment/topic/doc references; the outbox can only verify a typed
-        // destination or degrade for subsequent active reconciliation.
-        deliver: row => integration?.deliver(row) ?? Promise.resolve({ kind: 'degraded', error: 'integration_unavailable' }),
-        collect: () => integration?.collectAll() ?? Promise.resolve(),
+        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags,
+        authority: new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
+        logger, deferStart: true,
+        collect: () => shadowCollector?.collectAll() ?? Promise.resolve(),
       });
       const taskControlStore = taskControlPlane.getStore();
       if (!taskControlStore) throw new Error('task_control_store_unavailable');
-      integration = new DaemonTaskControlIntegration({
-        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore,
-        bridge: taskControlBridge, logger,
-        isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
-          const live = findActiveBySessionId(sessionId);
-          return !!live && live.worker !== null
-            && live.workerGeneration === workerGeneration
-            && live.session.workerGeneration === workerGeneration;
-        },
+      shadowCollector = new DaemonTaskControlShadowCollector({
+        larkAppId: cfg.larkAppId, taskGuid: shadowTaskGuid, lifecycle: taskControlPlane, logger,
       });
-      taskControlIntegration = integration;
+      // Scoped Shadow deliberately exposes no integration to daemon hooks or
+      // IPC routes. The canary can read references but cannot map, review,
+      // deliver, pump or freeze.
+      taskControlIntegration = undefined;
       // No recovery claim may run before its daemon-owned delivery/collector
       // adapters exist. This prevents a restored outbox row being degraded as
       // `integration_unavailable` during bootstrap.
