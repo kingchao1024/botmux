@@ -239,7 +239,10 @@ export function scopedTaskControlPlaneConfig(
     return { flags: disabled(), disabledReason: 'freeze_canary_gate_required' };
   }
   return {
-    flags,
+    // Shadow is a controller-owned read model. Worker/reviewer daemons still
+    // share the exact canary ledger, but must not poll Lark task/comment APIs
+    // with identities that are not task members.
+    flags: { ...flags, shadowEnabled: flags.shadowEnabled && role === 'controller' },
     canary: { role, projectId, phaseId, taskGuids: [...P2_7_TASK_CONTROL_CANARY.taskGuids], controllerAppId, workerAppId, reviewerAppId, docToken },
   };
 }

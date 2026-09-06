@@ -83,7 +83,14 @@ describe('task control plane runtime', () => {
       .toMatchObject({ flags: { ledgerEnabled: true, shadowEnabled: true, pumpEnabled: false, freezeEnforcement: true } });
     expect(scopedTaskControlPlaneConfig('cli_aa1e53f7aaf81bc6', { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'true', TASK_CONTROL_PLANE_PUMP_CANARY_ENABLED: 'true' }))
       .toEqual({ flags: off, disabledReason: 'pump_canary_gate_required' });
-    expect(scopedTaskControlPlaneConfig('cli_aa1e4c5508f8dbd3', enabled)).toMatchObject({ canary: { role: 'reviewer' } });
+    expect(scopedTaskControlPlaneConfig('cli_aa1e53f7aaf81bc6', enabled)).toMatchObject({
+      flags: { ledgerEnabled: true, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false },
+      canary: { role: 'worker' },
+    });
+    expect(scopedTaskControlPlaneConfig('cli_aa1e4c5508f8dbd3', enabled)).toMatchObject({
+      flags: { ledgerEnabled: true, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false },
+      canary: { role: 'reviewer' },
+    });
     expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'tru' }))
       .toEqual({ flags: off, disabledReason: 'flag_value_invalid' });
     expect(scopedTaskControlPlaneConfig(appId, { TASK_CONTROL_PLANE_LEDGER_ENABLED: '1' }))
