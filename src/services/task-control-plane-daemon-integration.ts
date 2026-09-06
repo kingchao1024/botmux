@@ -325,14 +325,17 @@ export class DaemonTaskControlIntegration {
   }
 
   workerAccepted(dispatchRoot: string, sourceRef: string, occurredAt?: string): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     this.appendMapped('task.accepted', dispatchRoot, 'worker', sourceRef, occurredAt);
   }
 
   workerExecutionStarted(dispatchRoot: string, sourceRef: string, occurredAt?: string): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     this.appendMapped('task.execution_started', dispatchRoot, 'worker', sourceRef, occurredAt);
   }
 
   firstSubmitted(dispatchRoot: string, sourceRef: string, input: { docToken: string; docRevision: number; evidenceRef: string }): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     this.appendMapped('task.first_submitted', dispatchRoot, 'worker', sourceRef, undefined, input);
   }
 
@@ -399,6 +402,7 @@ export class DaemonTaskControlIntegration {
   delivered(dispatchRoot: string, sourceRef: string, input: {
     docToken: string; docRevision: number; destinationId: string; receiptRef: string; evidenceRef: string;
   }): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     const event = this.bridgeEvent('task.delivered', dispatchRoot, 'worker', sourceRef, {
       docToken: input.docToken, docRevision: input.docRevision,
     }, input.evidenceRef, [input.destinationId], true);
@@ -448,6 +452,7 @@ export class DaemonTaskControlIntegration {
     sourceRef: string,
     input: { sessionId: string; workerGeneration: number; destinationId: string; receiptRef: string; docToken?: string },
   ): Promise<void> {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     if (this.input.canary && !this.mapping(dispatchRoot)) return;
     if (!this.receiptOwnerStillLive(input)) {
       this.deliveryReceiptUnknown(dispatchRoot, sourceRef, input, 'receipt_worker_generation_unproven');
@@ -493,6 +498,10 @@ export class DaemonTaskControlIntegration {
     // current worker ownership, so it must remain UNKNOWN rather than becoming
     // a terminal ledger fact.
     return this.input.isLiveReceiptOwner?.(input) === true;
+  }
+
+  private canAdvanceWorkerLifecycle(): boolean {
+    return !this.input.canary || this.input.canary.role === 'worker';
   }
 
   /** A stale provider receipt is retained only as reference-only UNKNOWN. */

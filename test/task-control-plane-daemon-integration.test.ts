@@ -81,7 +81,7 @@ function canaryMapping(taskGuid = 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf', overri
 }
 
 describe('DaemonTaskControlIntegration', () => {
-  it('accepts only the fixed P2-7 three-task mapping and drops non-target lifecycle noise', async () => {
+  it('accepts only the fixed P2-7 three-task mapping and keeps controller callbacks non-advancing', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-canary-'));
     try {
       const config = scopedTaskControlPlaneConfig('cli_aac926f0eb795bc1', P2_7_ENV);
@@ -100,7 +100,8 @@ describe('DaemonTaskControlIntegration', () => {
       integration.workerAccepted('om_other', 'other-input');
       integration.terminalWithoutRevision('om_other', 'other-terminal', { reason: 'other' });
       integration.workerAccepted('om_p2_7_root', 'target-input');
-      await waitFor(() => expect(store.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' }).some(event => event.eventType === 'task.accepted')).toBe(true));
+      expect(store.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' }).map(event => event.eventType))
+        .toEqual(['mapping.registered']);
       expect(store.listObservations()).toEqual([]);
       await lifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
@@ -117,6 +118,48 @@ describe('DaemonTaskControlIntegration', () => {
       expect(integration.registerMapping('om_p2_7_root', canaryMapping(), 'controller-1')).toBe(false);
       expect(integration.mapping('om_p2_7_root')).toBeUndefined();
       await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('keeps reviewer-restored mappings from advancing worker lifecycle or delivery state', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-canary-reviewer-restored-'));
+    try {
+      const controllerConfig = scopedTaskControlPlaneConfig('cli_aac926f0eb795bc1', P2_7_ENV);
+      const controllerBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: controllerConfig.canary!.controllerAppId });
+      const controllerLifecycle = await startTaskControlPlaneRuntime({
+        dataDir, larkAppId: controllerConfig.canary!.controllerAppId, flags: controllerConfig.flags, authority: controllerBridge.authority, logger: { warn: () => {} }, collect: async () => {},
+      });
+      const controller = new DaemonTaskControlIntegration({
+        dataDir, larkAppId: controllerConfig.canary!.controllerAppId, lifecycle: controllerLifecycle, store: controllerLifecycle.getStore()!, bridge: controllerBridge, logger: { warn: () => {} }, canary: controllerConfig.canary,
+      });
+      expect(controller.registerMapping('om_p2_7_root', canaryMapping(), 'controller-1')).toBe(true);
+      await controllerLifecycle.close();
+
+      const reviewerConfig = scopedTaskControlPlaneConfig('cli_aa1e4c5508f8dbd3', P2_7_ENV);
+      const reviewerBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: reviewerConfig.canary!.controllerAppId });
+      const reviewerLifecycle = await startTaskControlPlaneRuntime({
+        dataDir, larkAppId: reviewerConfig.canary!.controllerAppId, flags: reviewerConfig.flags, authority: reviewerBridge.authority, logger: { warn: () => {} }, collect: async () => {},
+      });
+      const reviewer = new DaemonTaskControlIntegration({
+        dataDir, larkAppId: reviewerConfig.canary!.reviewerAppId, lifecycle: reviewerLifecycle, store: reviewerLifecycle.getStore()!, bridge: reviewerBridge, logger: { warn: () => {} }, canary: reviewerConfig.canary,
+        isLiveReceiptOwner: () => true,
+      });
+      expect(reviewer.mapping('om_p2_7_root')).toMatchObject({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' });
+      reviewer.workerAccepted('om_p2_7_root', 'reviewer-input');
+      reviewer.workerExecutionStarted('om_p2_7_root', 'reviewer-execution');
+      reviewer.firstSubmitted('om_p2_7_root', 'reviewer-submitted', { docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc', docRevision: 1, evidenceRef: 'topic-message:om_reviewer_submit' });
+      reviewer.delivered('om_p2_7_root', 'reviewer-delivery', {
+        docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc', docRevision: 1, destinationId: 'topic-message:om_p2_7_root', receiptRef: 'topic-message:om_reviewer_receipt', evidenceRef: 'topic-message:om_reviewer_receipt',
+      });
+      await reviewer.finalDeliveryReceived('om_p2_7_root', 'reviewer-final-delivery', {
+        sessionId: 'reviewer-session', workerGeneration: 1, destinationId: 'topic-message:om_p2_7_root', receiptRef: 'topic-message:om_reviewer_final', docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc',
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(reviewerLifecycle.getStore()!.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' }).map(event => event.eventType))
+        .toEqual(['mapping.registered']);
+      expect(reviewerLifecycle.getStore()!.listOutbox()).toEqual([]);
+      expect(reviewerLifecycle.getStore()!.listObservations()).toEqual([]);
+      await reviewerLifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
@@ -150,7 +193,20 @@ describe('DaemonTaskControlIntegration', () => {
       expect(worker.mapping('om_p2_7_root_1')).toMatchObject({ taskGuid: '7637c5bc-729e-4e58-978d-20ab9f9679a8' });
       expect(worker.mapping('om_p2_7_root_2')).toMatchObject({ taskGuid: 'a151cdaa-fb8f-4800-be3c-cdf273e56d23' });
       worker.workerAccepted('om_p2_7_root_0', 'worker-input');
-      await waitFor(() => expect(workerLifecycle.getStore()!.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' }).some(event => event.eventType === 'task.accepted')).toBe(true));
+      worker.workerExecutionStarted('om_p2_7_root_0', 'worker-execution');
+      worker.firstSubmitted('om_p2_7_root_0', 'worker-submitted', {
+        docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc', docRevision: 1, evidenceRef: 'topic-message:om_worker_submit',
+      });
+      worker.delivered('om_p2_7_root_0', 'worker-delivery', {
+        docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc', docRevision: 1, destinationId: 'topic-message:om_p2_7_root_0',
+        receiptRef: 'topic-message:om_worker_receipt', evidenceRef: 'topic-message:om_worker_receipt',
+      });
+      await waitFor(() => expect(workerLifecycle.getStore()!.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' }).map(event => event.eventType))
+        .toEqual(expect.arrayContaining(['task.accepted', 'task.execution_started', 'task.first_submitted', 'task.delivered'])));
+      const delivered = workerLifecycle.getStore()!.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' })
+        .find(event => event.eventType === 'task.delivered')!;
+      expect(workerLifecycle.getStore()!.listOutbox({ eventId: delivered.eventId }))
+        .toEqual([expect.objectContaining({ status: 'delivered', destinationId: 'topic-message:om_p2_7_root_0' })]);
       expect(workerLifecycle.getStore()!.getPhaseProjection('p2-7-canary', 'phase-1').expectedTaskGuids)
         .toEqual([...controllerConfig.canary!.taskGuids].sort());
       await workerLifecycle.close();
