@@ -56,7 +56,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, larkGet, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -64,6 +64,7 @@ import {
   isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
+  getBotClient,
   getAllBots,
   getOwnerOpenId,
   getDashboardAdminOpenIds,
@@ -85,6 +86,21 @@ import {
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { DaemonTaskControlAuthority } from './services/task-control-plane-authority.js';
+import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
+import { DaemonTaskControlIntegration } from './services/task-control-plane-daemon-integration.js';
+import { createV3TaskControlApprovalSource } from './services/task-control-plane-v3-approval.js';
+import {
+  createTaskControlRouteHandlers,
+  TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
+  TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE,
+  TASK_CONTROL_FREEZE_ROUTE,
+  TASK_CONTROL_MAPPING_REGISTER_ROUTE,
+  TASK_CONTROL_REVIEWER_INGRESS_ROUTE,
+  TASK_CONTROL_REVIEWER_SOURCE_ROUTE,
+  TASK_CONTROL_REVIEWER_VERDICT_ROUTE,
+} from './services/task-control-plane-route-authority.js';
+import { startTaskControlPlaneRuntime, taskControlPlaneFlags, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -255,6 +271,7 @@ import {
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
+
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -448,6 +465,52 @@ let selfV3BootInstanceId: string | undefined;
 /** Generic daemon identity used by internal receiver endpoints. Unlike the
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
+let taskControlPlane: TaskControlPlaneLifecycle | undefined;
+let taskControlIntegration: DaemonTaskControlIntegration | undefined;
+const taskControlRouteHandlers = createTaskControlRouteHandlers({
+  dataDir: () => config.session.dataDir,
+  selfLarkAppId: () => selfDaemonLarkAppId,
+  integration: () => taskControlIntegration,
+  lifecycle: () => taskControlPlane,
+  findActiveBySessionId,
+  findReviewerSession: findActiveBySessionId,
+  listReviewerSessions: () => [...new Set(activeSessions.values())],
+  hostSecret: () => {
+    try { return loadDaemonIpcSecret(); } catch { return undefined; }
+  },
+  readMessageDetail: getMessageDetail,
+  readDocumentRevision: async (larkAppId, docToken) => {
+    const response = await larkGet(getBotClient(larkAppId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`);
+    const revision = Number(response?.data?.document?.revision_id);
+    return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined;
+  },
+  resolveReviewerSource: async (reviewerLarkAppId, body) => {
+    const target = findOnlineDaemon(reviewerLarkAppId);
+    if (!target) return undefined;
+    const response = await fetchDaemonIpc(target.ipcPort, TASK_CONTROL_REVIEWER_SOURCE_ROUTE, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => undefined) as { source?: unknown } | undefined;
+    return { status: response.status, ...(payload?.source && typeof payload.source === 'object' ? { source: payload.source as never } : {}) };
+  },
+  resolveReviewerDesignation: async (controllerLarkAppId, body) => {
+    const target = findOnlineDaemon(controllerLarkAppId);
+    if (!target) return undefined;
+    const response = await fetchDaemonIpc(target.ipcPort, TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => undefined) as { resolved?: unknown } | undefined;
+    return { status: response.status, ...(payload?.resolved && typeof payload.resolved === 'object' ? { resolved: payload.resolved as never } : {}) };
+  },
+  forwardReviewerVerdict: async (controllerLarkAppId, body) => {
+    const target = findOnlineDaemon(controllerLarkAppId);
+    if (!target) return undefined;
+    const response = await fetchDaemonIpc(target.ipcPort, TASK_CONTROL_REVIEWER_VERDICT_ROUTE, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    return { status: response.status };
+  },
+});
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -5926,6 +5989,22 @@ workflowDaemonMutationRoute('grant', async (reply, params, body, identity) => {
 
 // ─── report session relay：隔离 CLI 的 dispatch 完成回注 ──────────────────
 //
+// Controller-owned P2 bindings. This endpoint is deliberately host-HMAC only:
+// a sandboxed worker may report a dispatch, but cannot assign its own project,
+// phase, owner, reviewer or acceptor. Every field is an opaque identifier; no
+// title/body/status is accepted as a substitute for a typed registration.
+ipcRoute('POST', TASK_CONTROL_MAPPING_REGISTER_ROUTE, taskControlRouteHandlers.mapping);
+
+// Freeze is an explicit controller command, never a side-effect of task status
+// or report output. The lifecycle also checks the disabled flag so even a valid
+// host request cannot turn a default-off daemon into an enforcing daemon.
+ipcRoute('POST', TASK_CONTROL_FREEZE_ROUTE, taskControlRouteHandlers.freeze);
+ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, taskControlRouteHandlers.designatedReviewer);
+ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE, taskControlRouteHandlers.designatedReviewerResolve);
+ipcRoute('POST', TASK_CONTROL_REVIEWER_SOURCE_ROUTE, taskControlRouteHandlers.reviewerSource);
+ipcRoute('POST', TASK_CONTROL_REVIEWER_INGRESS_ROUTE, taskControlRouteHandlers.reviewerIngress);
+ipcRoute('POST', TASK_CONTROL_REVIEWER_VERDICT_ROUTE, taskControlRouteHandlers.reviewerVerdict);
+
 // Linux credential-only bwrap / macOS read isolation 都
 // 不允许 CLI 读取 `.dashboard-secret`。这里验证 source session 当前轮换的
 // capability，并把 dispatch root 与 daemon 自己的 live session 绑定；目标
@@ -6029,6 +6108,14 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
+  // The dispatch root is a real daemon event, but this route has no verified
+  // project/phase/task mapping. Preserve only a stable UNKNOWN observation;
+  // never promote title, seed text, report body, exit status, or task done into
+  // a lifecycle state. A later trusted mapping bridge may correlate sourceRef.
+  // Dispatch availability is primary. The control-plane sidecar never enters
+  // SQLite on this IPC response path; a bounded asynchronous queue preserves
+  // the observation best-effort and drops it loudly on sidecar pressure.
+  taskControlIntegration?.dispatchRequested(dispatchRoot, ds.session.sessionId, issuedAt);
   return jsonRes(res, 201, { ok: true, dispatchRoot });
 });
 
@@ -6089,6 +6176,10 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
 
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
   if (!targetDaemon) {
+    taskControlIntegration?.reportFallbackUnknown(
+      `report:${decision.source.sessionId}:${decision.target.larkAppId}:offline`,
+      'orchestrator_daemon_offline',
+    );
     return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
   }
   const trigger = buildOrchestratorReportTrigger(decision, {
@@ -6109,6 +6200,10 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       reportTarget: decision.target,
     });
   } catch (error) {
+    taskControlIntegration?.reportFallbackUnknown(
+      `report:${decision.source.sessionId}:${decision.target.larkAppId}:unreachable`,
+      'orchestrator_daemon_unreachable',
+    );
     return jsonRes(res, 502, {
       ok: false,
       error: 'orchestrator_daemon_unreachable',
@@ -21820,6 +21915,58 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // P2-6 stays opt-in: default false means this isolated ledger has no effect on
+  // legacy dispatch/report/session paths.  Its authentication adapter is owned
+  // here (not exposed to callers), and bootstrap failure returns a no-op handle.
+  const taskControlFlags = taskControlPlaneFlags();
+  taskControlIntegration = undefined;
+  if (!taskControlFlags.ledgerEnabled) {
+    // Do not create keys, databases, timers or files while the feature is off.
+    // A deliberately empty verifier keeps the disabled lifecycle inert.
+    taskControlPlane = await startTaskControlPlaneRuntime({
+      dataDir: config.session.dataDir, flags: taskControlFlags, logger,
+      authority: new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
+    });
+  } else {
+    try {
+      const taskControlBridge = new DaemonTaskControlBridge({
+        approvals: createV3TaskControlApprovalSource({ baseDir: v3DefaultBaseDir() }),
+        larkAppId: cfg.larkAppId,
+      });
+      let integration: DaemonTaskControlIntegration | undefined;
+      taskControlPlane = await startTaskControlPlaneRuntime({
+        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags, authority: taskControlBridge.authority, logger, deferStart: true,
+        // The integration itself owns no remote writes. Shadow polls only stable
+        // task/comment/topic/doc references; the outbox can only verify a typed
+        // destination or degrade for subsequent active reconciliation.
+        deliver: row => integration?.deliver(row) ?? Promise.resolve({ kind: 'degraded', error: 'integration_unavailable' }),
+        collect: () => integration?.collectAll() ?? Promise.resolve(),
+      });
+      const taskControlStore = taskControlPlane.getStore();
+      if (!taskControlStore) throw new Error('task_control_store_unavailable');
+      integration = new DaemonTaskControlIntegration({
+        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore,
+        bridge: taskControlBridge, logger,
+        isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
+          const live = findActiveBySessionId(sessionId);
+          return !!live && live.worker !== null
+            && live.workerGeneration === workerGeneration
+            && live.session.workerGeneration === workerGeneration;
+        },
+      });
+      taskControlIntegration = integration;
+      // No recovery claim may run before its daemon-owned delivery/collector
+      // adapters exist. This prevents a restored outbox row being degraded as
+      // `integration_unavailable` during bootstrap.
+      taskControlPlane.activate();
+    } catch (error) {
+      logger.warn(`[task-control] trust bootstrap failed; continuing with ledger disabled: ${String(error)}`);
+      taskControlPlane = await startTaskControlPlaneRuntime({
+        dataDir: config.session.dataDir, flags: { ...taskControlFlags, ledgerEnabled: false }, logger,
+        authority: new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
+      });
+    }
+  }
   // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
   // disabled still opens the shared feedback DB here for turn-completion
   // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
@@ -22275,8 +22422,49 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
+    onTurnInputCommitted(ds, context) {
+      taskControlIntegration?.workerAccepted(
+        ds.session.rootMessageId ?? '',
+        `input-commit:${ds.session.sessionId}:${context.workerGeneration}:${context.turnId}`,
+      );
+    },
+    onTurnExecutionStarted(ds, context) {
+      taskControlIntegration?.workerExecutionStarted(
+        ds.session.rootMessageId ?? '',
+        `execution:${ds.session.sessionId}:${context.workerGeneration}:${context.turnId}`,
+      );
+    },
+    onTurnDeliveryReceipt(ds, context) {
+      const sourceRef = `delivery:${context.sessionId}:${context.workerGeneration}:${context.turnId}:${context.receiptRef}`;
+      const live = findActiveBySessionId(context.sessionId);
+      if (!live || live !== ds || live.worker === null
+        || live.workerGeneration !== context.workerGeneration
+        || live.session.workerGeneration !== context.workerGeneration) {
+        taskControlIntegration?.deliveryReceiptUnknown(sourceRef, context, 'receipt_worker_generation_unproven');
+        return;
+      }
+      const dispatchRoot = live.session.rootMessageId ?? '';
+      if (!dispatchRoot) {
+        taskControlIntegration?.deliveryReceiptUnknown(sourceRef, context, 'receipt_dispatch_root_unproven');
+        return;
+      }
+      // A normal final reply supplies a provider receipt, but not the mapped
+      // terminal document revision. Keep this boundary UNKNOWN; only the
+      // doc-comment path may carry a concrete doc token, and its revision is
+      // still verified by the active collector before any lifecycle advance.
+      void taskControlIntegration?.finalDeliveryReceived(
+        dispatchRoot,
+        sourceRef,
+        context,
+      ).catch(error => logger.warn(`[task-control] final delivery verifier failed: ${String(error)}`));
+    },
     onQueuedActivationSubmitted,
     async onTurnTerminal(ds, terminal, context) {
+      taskControlIntegration?.terminalWithoutRevision(
+        ds.session.rootMessageId ?? '',
+        `terminal:${ds.session.sessionId}:${context.workerGeneration}:${terminal.turnId}`,
+        { sessionId: ds.session.sessionId, workerGeneration: context.workerGeneration, reason: 'terminal_doc_revision_unavailable' },
+      );
       // VC reconcile first: it is in-memory and latency-sensitive, and must not
       // sit behind a synchronous SQLite write. (Master did only this enqueue.)
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
@@ -23679,6 +23867,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
+    // The task-control ledger is an optional sidecar.  It drains/owns only its
+    // own outbox; failure is contained so existing daemon shutdown semantics do
+    // not depend on this default-off feature.
+    try { await taskControlPlane?.close(remainingBudget()); }
+    catch (error) { logger.warn(`[task-control] shutdown close failed: ${String(error)}`); }
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on

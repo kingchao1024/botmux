@@ -10339,6 +10339,116 @@ async function postCurrentSessionDaemonRoute(input: {
   });
 }
 
+const REVIEWER_VERDICT_COMMAND_USAGE = [
+  '用法: botmux reviewer-verdict submit --source-message-id <om_message> --verdict-id <id>',
+  '       --verdict <pass|fail|conditional> --doc-token <token> --doc-revision <positive-int> --review-round <positive-int>',
+  '       [--condition-id <id> ...] [--condition-evidence <id>=<ref>@<ISO-8601> ...]',
+].join('\n');
+
+function reviewerVerdictInteger(args: string[], flag: string): number | undefined {
+  const raw = argValue(args, flag);
+  if (!raw || !/^[1-9][0-9]*$/.test(raw)) return undefined;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function reviewerConditionEvidence(args: string[]): Record<string, { evidenceRef: string; observedAt: string }> | undefined {
+  const values = argValues(args, '--condition-evidence');
+  const out: Record<string, { evidenceRef: string; observedAt: string }> = {};
+  for (const value of values) {
+    const separator = value.indexOf('=');
+    const at = value.lastIndexOf('@');
+    if (separator <= 0 || at <= separator + 1 || at === value.length - 1) return undefined;
+    const conditionId = value.slice(0, separator).trim();
+    const evidenceRef = value.slice(separator + 1, at).trim();
+    const observedAt = value.slice(at + 1).trim();
+    if (!conditionId || !evidenceRef || !Number.isFinite(Date.parse(observedAt)) || out[conditionId]) return undefined;
+    out[conditionId] = { evidenceRef, observedAt: new Date(Date.parse(observedAt)).toISOString() };
+  }
+  return out;
+}
+
+/** The single reviewer-worker action: it contributes only typed review fields.
+ * Session, generation, turn capability, reviewer app and controller target all
+ * remain daemon-derived on the existing narrow ingress route. */
+async function cmdReviewerVerdict(rest: string[]): Promise<void> {
+  if (rest[0] !== 'submit' || rest.includes('--help') || rest.includes('-h')) {
+    console.error(REVIEWER_VERDICT_COMMAND_USAGE);
+    process.exit(rest[0] === 'submit' ? 0 : 2);
+  }
+  const args = rest.slice(1);
+  const unknown = unknownFlags(args, {
+    valueFlags: [
+      '--source-message-id', '--verdict-id', '--verdict', '--doc-token', '--doc-revision', '--review-round',
+      '--condition-id', '--condition-evidence',
+    ],
+  });
+  if (unknown.length > 0) {
+    console.error(`botmux reviewer-verdict: 未知参数: ${unknown.join(', ')}`);
+    process.exit(2);
+  }
+  const sourceMessageId = argValue(args, '--source-message-id');
+  const verdictId = argValue(args, '--verdict-id');
+  const verdict = argValue(args, '--verdict');
+  const docToken = argValue(args, '--doc-token');
+  const docRevision = reviewerVerdictInteger(args, '--doc-revision');
+  const reviewRound = reviewerVerdictInteger(args, '--review-round');
+  const conditionIds = argValues(args, '--condition-id');
+  const resolvedConditionEvidence = reviewerConditionEvidence(args);
+  if (!sourceMessageId || !verdictId || !docToken || !docRevision || !reviewRound
+    || (verdict !== 'pass' && verdict !== 'fail' && verdict !== 'conditional')
+    || !resolvedConditionEvidence
+    || new Set(conditionIds).size !== conditionIds.length
+    || conditionIds.some(conditionId => !conditionId.trim())
+    || (verdict === 'conditional') !== (conditionIds.length > 0)
+    || Object.keys(resolvedConditionEvidence).some(conditionId => !conditionIds.includes(conditionId))) {
+    console.error(REVIEWER_VERDICT_COMMAND_USAGE);
+    process.exit(2);
+  }
+  const session = findAncestorSessionContext();
+  if (!session?.sessionId || !session.turnId) {
+    console.error('botmux reviewer-verdict: 当前 reviewer worker 缺少受信 session/turn 上下文');
+    process.exit(2);
+  }
+  let discoveredPort: number | undefined;
+  try { discoveredPort = findDaemon(process.env.BOTMUX_LARK_APP_ID)?.ipcPort; } catch { /* isolated worker uses injected port */ }
+  const ipcPort = resolveDaemonIpcPort(discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('botmux reviewer-verdict: 当前 daemon 不在线');
+    process.exit(1);
+  }
+  const claim = readManagedOriginCapability(
+    resolveDataDir(), session.sessionId, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  );
+  if (!claim?.capability) {
+    console.error('botmux reviewer-verdict: 当前 reviewer worker capability 不可用');
+    process.exit(2);
+  }
+  const body = {
+    originCapability: claim.capability, originTurnId: session.turnId,
+    sourceMessageId, verdictId, verdict, docToken, docRevision, reviewRound, conditionIds, resolvedConditionEvidence,
+  };
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* capability path below */ }
+  }
+  try {
+    const init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } satisfies RequestInit;
+    const response = hostSecret
+      ? await fetchDaemonIpc(ipcPort, '/api/task-control/reviewer-verdicts/submit', init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${ipcPort}/api/task-control/reviewer-verdicts/submit`, init);
+    const result = await response.json().catch(() => ({})) as { ok?: unknown; error?: unknown; verdictId?: unknown };
+    if (response.status !== 201 || result.ok !== true || result.verdictId !== verdictId) {
+      console.error(`botmux reviewer-verdict: ${typeof result.error === 'string' ? result.error : `daemon HTTP ${response.status}`}`);
+      process.exit(1);
+    }
+    process.stdout.write(`${JSON.stringify({ ok: true, verdictId })}\n`);
+  } catch {
+    console.error('botmux reviewer-verdict: 无法连接当前 daemon');
+    process.exit(1);
+  }
+}
+
 async function cmdDispatch(rest: string[]): Promise<void> {
   const parsedArgs = parseDispatchArgs(rest);
   if (!parsedArgs.ok) {
@@ -14324,6 +14434,7 @@ switch (command) {
   }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'preview': await cmdPreview(process.argv.slice(3)); break;
+  case 'reviewer-verdict': await cmdReviewerVerdict(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
