@@ -853,6 +853,11 @@ let mojoContainmentReconciledThisBoot = false;
 const VC_MEETING_DELIVERY_LEASE_MS = 15 * 60_000;
 const VC_MEETING_DELIVERY_LEASE_SCAN_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_ACK_TIMEOUT_MS = 3_000;
+// Every daemon serializes its full restore + authority bootstrap under the
+// shared bots.json generation lock. A seven-bot cold start can legitimately
+// queue behind several restores, so the generic 5s writer budget is too short
+// for this startup-only admission path. Other config writers keep the default.
+const DAEMON_STARTUP_ADMISSION_LOCK_WAIT_MS = 60_000;
 const VC_MEETING_RUNTIME_EXPIRY_TEARDOWN_MS = 8_000;
 const VC_MEETING_RUNTIME_EXPIRY_REPROBE_MS = 5_000;
 const VC_MEETING_PERSISTENT_BACKENDS = ['tmux', 'herdr', 'zellij', 'zmx'] as const;
@@ -23149,7 +23154,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         desc.lastHeartbeat = Date.now();
         assertTargetStable();
         writeDaemonDescriptor(desc, { publish: true });
-      }));
+      }), { maxWaitMs: DAEMON_STARTUP_ADMISSION_LOCK_WAIT_MS });
   } catch (error) {
     // A failed startup must not leave a fresh discoverable descriptor whose IPC
     // readiness promise can never resolve, and it must withdraw only THIS
