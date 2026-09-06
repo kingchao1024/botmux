@@ -1,4 +1,3 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
 import type {
   AuthenticatedTaskControlPrincipal,
   TaskControlAuthority,
@@ -15,9 +14,12 @@ export interface TaskControlAuthentication {
   readonly [daemonAuthenticationBrand]: true;
 }
 
-/** A signed durable-gate observation after the daemon has verified its source. */
-export interface TaskControlApprovalObservation {
-  keyId: string;
+/**
+ * A v3 humanGate resolution after its wait file and journal have been verified
+ * by the daemon. This is source material only: it is never accepted from IPC
+ * and becomes an opaque one-shot verifier handle below.
+ */
+export interface VerifiedTaskControlGateResolution {
   approvalRef: string;
   projectId: string;
   phaseId: string;
@@ -25,20 +27,26 @@ export interface TaskControlApprovalObservation {
   acceptorId: string;
   approvedAt: string;
   expiresAt: string;
-  signature: string;
+  runId: string;
+  nodeId: string;
+  instanceId: string;
+  waitId: string;
+  operatorId: string;
 }
 
 interface DaemonAuthorityInput {
   /** Resolve the current daemon-owned session/generation/capability principal. */
   resolvePrincipal(authenticationId: string): AuthenticatedTaskControlPrincipal | undefined;
-  /** Fixed daemon-owned verification keys, selected only by a known key id. */
-  approvalKeys: ReadonlyMap<string, Buffer | string>;
   now?: () => number;
 }
 
 interface StoredAuthentication {
   authenticationId: string;
   principal?: AuthenticatedTaskControlPrincipal;
+}
+
+interface StoredApproval {
+  approval: VerifiedTaskControlApproval;
 }
 
 function nonBlank(value: unknown): string | undefined {
@@ -55,37 +63,15 @@ function canonicalTaskSet(value: readonly string[]): string[] {
   return [...set].sort();
 }
 
-function approvalMaterial(input: Omit<TaskControlApprovalObservation, 'signature'>): string {
-  return JSON.stringify({
-    keyId: input.keyId,
-    approvalRef: input.approvalRef,
-    projectId: input.projectId,
-    phaseId: input.phaseId,
-    taskSetSnapshot: canonicalTaskSet(input.taskSetSnapshot),
-    acceptorId: input.acceptorId,
-    approvedAt: input.approvedAt,
-    expiresAt: input.expiresAt,
-  });
-}
-
-function signatureFor(key: Buffer | string, input: Omit<TaskControlApprovalObservation, 'signature'>): Buffer {
-  return createHmac('sha256', key).update(approvalMaterial(input)).digest();
-}
-
-function sameSignature(actual: string, expected: Buffer): boolean {
-  if (!/^[0-9a-f]{64}$/i.test(actual)) return false;
-  const supplied = Buffer.from(actual, 'hex');
-  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
-}
-
 /**
  * Daemon-owned trust adapter used by the default-off task-control runtime.
- * Authentication and approval proofs are opaque capabilities, accepted only
- * after a final liveness/expiry/domain check.  Approval references are consumed
- * before returning success, making replay fail closed.
+ * Authentication and approval proofs are opaque capabilities. A v3 durable
+ * wait+journal adapter is the only production path that can mint an approval
+ * handle; a transport HMAC, request body, or deserialized proof has no value.
  */
 export class DaemonTaskControlAuthority implements TaskControlAuthority {
   private readonly authentications = new WeakMap<object, StoredAuthentication>();
+  private readonly approvals = new WeakMap<object, StoredApproval>();
 
   constructor(private readonly input: DaemonAuthorityInput) {}
 
@@ -114,6 +100,34 @@ export class DaemonTaskControlAuthority implements TaskControlAuthority {
     return token;
   }
 
+  /**
+   * Mint an opaque verifier handle only after the bridge has independently
+   * checked a v3 durable humanGate resolution. The extra provenance fields are
+   * intentionally not persisted in the ledger payload, but their presence here
+   * prevents a generic signed JSON blob from becoming a phase approval.
+   */
+  issueVerifiedGateApproval(source: VerifiedTaskControlGateResolution): unknown | undefined {
+    const approvalRef = nonBlank(source.approvalRef);
+    const projectId = nonBlank(source.projectId);
+    const phaseId = nonBlank(source.phaseId);
+    const acceptorId = nonBlank(source.acceptorId);
+    const approvedAt = nonBlank(source.approvedAt);
+    const expiresAt = nonBlank(source.expiresAt);
+    if (!approvalRef || !projectId || !phaseId || !acceptorId || !approvedAt || !expiresAt
+      || !nonBlank(source.runId) || !nonBlank(source.nodeId) || !nonBlank(source.instanceId)
+      || !nonBlank(source.waitId) || !nonBlank(source.operatorId)) return undefined;
+    let taskSetSnapshot: string[];
+    try { taskSetSnapshot = canonicalTaskSet(source.taskSetSnapshot); } catch { return undefined; }
+    const approvedAtMs = Date.parse(approvedAt);
+    const expiresAtMs = Date.parse(expiresAt);
+    if (!Number.isFinite(approvedAtMs) || !Number.isFinite(expiresAtMs) || expiresAtMs <= approvedAtMs) return undefined;
+    const token = Object.freeze({}) as object;
+    this.approvals.set(token, { approval: {
+      approvalRef, projectId, phaseId, taskSetSnapshot, acceptorId, approvedAt, expiresAt,
+    } });
+    return token;
+  }
+
   authenticate(authentication: unknown): AuthenticatedTaskControlPrincipal | undefined {
     if (!authentication || typeof authentication !== 'object') return undefined;
     const stored = this.authentications.get(authentication);
@@ -130,44 +144,24 @@ export class DaemonTaskControlAuthority implements TaskControlAuthority {
     acceptorId: string;
     now: string;
   }): VerifiedTaskControlApproval | undefined {
-    const proof = input.approval;
-    if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return undefined;
-    const raw = proof as Partial<TaskControlApprovalObservation>;
-    const approvalRef = nonBlank(raw.approvalRef);
-    const projectId = nonBlank(raw.projectId);
-    const phaseId = nonBlank(raw.phaseId);
-    const acceptorId = nonBlank(raw.acceptorId);
-    const approvedAt = nonBlank(raw.approvedAt);
-    const expiresAt = nonBlank(raw.expiresAt);
-    const keyId = nonBlank(raw.keyId);
-    if (!keyId || !approvalRef || !projectId || !phaseId || !acceptorId || !approvedAt || !expiresAt
-      || typeof raw.signature !== 'string' || !Array.isArray(raw.taskSetSnapshot)) return undefined;
-    let taskSetSnapshot: string[];
+    if (!input.approval || typeof input.approval !== 'object') return undefined;
+    const stored = this.approvals.get(input.approval);
+    if (!stored) return undefined;
+    const proof = stored.approval;
+    let expectedTaskSet: string[];
     let now: number;
     try {
-      taskSetSnapshot = canonicalTaskSet(raw.taskSetSnapshot);
+      expectedTaskSet = canonicalTaskSet(input.taskSetSnapshot);
       now = Date.parse(input.now);
     } catch { return undefined; }
-    const approvedAtMs = Date.parse(approvedAt);
-    const expiresAtMs = Date.parse(expiresAt);
-    const key = this.input.approvalKeys.get(keyId);
-    if (!key || !Number.isFinite(now) || !Number.isFinite(approvedAtMs) || !Number.isFinite(expiresAtMs)
+    const approvedAtMs = Date.parse(proof.approvedAt);
+    const expiresAtMs = Date.parse(proof.expiresAt);
+    if (!Number.isFinite(now) || !Number.isFinite(approvedAtMs) || !Number.isFinite(expiresAtMs)
       || approvedAtMs > now || expiresAtMs <= now || expiresAtMs <= approvedAtMs
-      || projectId !== input.projectId
-      || phaseId !== input.phaseId
-      || acceptorId !== input.acceptorId
-      || JSON.stringify(taskSetSnapshot) !== JSON.stringify(canonicalTaskSet(input.taskSetSnapshot))) return undefined;
-    const unsigned = { keyId, approvalRef, projectId, phaseId, taskSetSnapshot, acceptorId, approvedAt, expiresAt };
-    if (!sameSignature(raw.signature, signatureFor(key, unsigned))) return undefined;
-    return { ...unsigned };
+      || proof.projectId !== input.projectId
+      || proof.phaseId !== input.phaseId
+      || proof.acceptorId !== input.acceptorId
+      || JSON.stringify(proof.taskSetSnapshot) !== JSON.stringify(expectedTaskSet)) return undefined;
+    return { ...proof, taskSetSnapshot: [...proof.taskSetSnapshot] };
   }
-}
-
-/** Test/daemon helper: signs the normalized proof payload without exposing the verifier key through a receipt. */
-export function signTaskControlApproval(
-  key: Buffer | string,
-  input: Omit<TaskControlApprovalObservation, 'signature'>,
-): TaskControlApprovalObservation {
-  const normalized = { ...input, taskSetSnapshot: canonicalTaskSet(input.taskSetSnapshot) };
-  return { ...normalized, signature: signatureFor(key, normalized).toString('hex') };
 }

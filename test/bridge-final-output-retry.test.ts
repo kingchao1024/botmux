@@ -2361,6 +2361,89 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(secondUuid).not.toBe(firstUuid);
   });
 
+  it('does not emit a task-control receipt when ordinary provider delivery resolves after worker generation A is replaced by B', async () => {
+    let resolveReply!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolveReply = resolve; }));
+    const onTurnDeliveryReceipt = vi.fn();
+    initWorkerPool({
+      sessionReply, onTurnDeliveryReceipt,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.workerGeneration = 1; ds.session.workerGeneration = 1;
+    const workerA = ds.worker;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    ds.worker = makeDs().worker;
+    ds.workerGeneration = 2; ds.session.workerGeneration = 2;
+    expect(ds.worker).not.toBe(workerA);
+    resolveReply('om_provider_reply');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onTurnDeliveryReceipt).not.toHaveBeenCalled();
+  });
+
+  it('emits an ordinary task-control receipt for the same worker generation', async () => {
+    const sessionReply = vi.fn(async () => 'om_provider_reply');
+    const onTurnDeliveryReceipt = vi.fn();
+    initWorkerPool({
+      sessionReply, onTurnDeliveryReceipt,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.workerGeneration = 1; ds.session.workerGeneration = 1;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(onTurnDeliveryReceipt).toHaveBeenCalledWith(ds, {
+      sessionId: 'sid-final-out', turnId: 'turn-1', workerGeneration: 1,
+      destinationId: 'topic-message:om_root', receiptRef: 'topic-message:om_provider_reply',
+    });
+  });
+
+  it('does not emit a task-control receipt after a doc-comment provider await crosses from generation A to B', async () => {
+    let resolveComment!: (value: { commentId: string; replyId: string }) => void;
+    replyToDocCommentMock.mockImplementationOnce(() => new Promise(resolve => { resolveComment = resolve as typeof resolveComment; }));
+    const onTurnDeliveryReceipt = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), onTurnDeliveryReceipt,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.workerGeneration = 1; ds.session.workerGeneration = 1;
+    ds.docCommentTurns = new Map([['turn-1', { fileToken: 'doc-token', fileType: 'docx', commentId: 'comment-1' }]]);
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(replyToDocCommentMock).toHaveBeenCalledOnce();
+    ds.worker = makeDs().worker;
+    ds.workerGeneration = 2; ds.session.workerGeneration = 2;
+    resolveComment({ commentId: 'comment-1', replyId: 'reply-1' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onTurnDeliveryReceipt).not.toHaveBeenCalled();
+    expect(ds.docCommentTurns?.has('turn-1')).toBe(true);
+  });
+
+  it('emits a doc-comment task-control receipt for the same worker generation', async () => {
+    replyToDocCommentMock.mockImplementationOnce(async () => ({ commentId: 'comment-1', replyId: 'reply-1' }));
+    const onTurnDeliveryReceipt = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), onTurnDeliveryReceipt,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.workerGeneration = 1; ds.session.workerGeneration = 1;
+    ds.docCommentTurns = new Map([['turn-1', { fileToken: 'doc-token', fileType: 'docx', commentId: 'comment-1' }]]);
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(onTurnDeliveryReceipt).toHaveBeenCalledWith(ds, {
+      sessionId: 'sid-final-out', turnId: 'turn-1', workerGeneration: 1,
+      destinationId: 'task-comment:comment-1', receiptRef: 'task-comment:reply-1', docToken: 'doc-token',
+    });
+  });
+
   it('reads a sandboxed Claude transcript through the daemon reply-card boundary', async () => {
     const actualCostCalculator =
       await vi.importActual<typeof import('../src/core/cost-calculator.js')>(
