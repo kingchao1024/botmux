@@ -2090,14 +2090,24 @@ export class TaskControlPlaneStore {
         }
         return { kind: 'duplicate', mapping: existingMapping };
       }
-      const phaseRef = `phase:${registrationRef}`;
-      const phaseResult = this.appendEventLocked({
-        eventId: stableId('evt_phase', phaseRef), eventType: 'phase.opened', projectId, phaseId,
-        actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: phaseRef,
-        occurredAt: mapping.createdAt, sourceRef: phaseRef,
-        payload: { taskGuids: phaseTaskGuids, designatedAcceptorId: acceptorId },
-      });
-      if (phaseResult.kind === 'conflict') throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
+      const opened = this.listEvents({ projectId, phaseId })
+        .find(event => event.eventType === 'phase.opened' && !event.taskGuid);
+      if (opened) {
+        const openedTaskGuids = exactTaskSetSnapshot(opened.payload.taskGuids, 'phase.opened.taskGuids');
+        const openedAcceptorId = nonEmpty(opened.payload.designatedAcceptorId, 'phase.opened.designatedAcceptorId');
+        if (JSON.stringify(openedTaskGuids) !== JSON.stringify(phaseTaskGuids) || openedAcceptorId !== acceptorId) {
+          throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
+        }
+      } else {
+        const phaseRef = `phase:${registrationRef}`;
+        const phaseResult = this.appendEventLocked({
+          eventId: stableId('evt_phase', phaseRef), eventType: 'phase.opened', projectId, phaseId,
+          actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: phaseRef,
+          occurredAt: mapping.createdAt, sourceRef: phaseRef,
+          payload: { taskGuids: phaseTaskGuids, designatedAcceptorId: acceptorId },
+        });
+        if (phaseResult.kind === 'conflict') throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
+      }
       const mappingRef = `mapping:${registrationRef}`;
       const mappingResult = this.appendEventLocked({
         eventId: stableId('evt_mapping', mappingRef), eventType: 'mapping.registered', projectId, phaseId, taskGuid, topicRootId,

@@ -52,6 +52,8 @@ type TestContext = {
   documentRevision: number;
   selfAppId: string;
   integrationEnabled: boolean;
+  canaryRole?: 'controller' | 'worker' | 'reviewer';
+  canaryReviewerAppId?: string;
   sourceReads: number;
   designationRequests: number;
   documentReads: number;
@@ -88,6 +90,8 @@ const handlers = createTaskControlRouteHandlers({
     }),
     issueAuthentication: () => ({ kind: 'acceptor-proof' }),
     approval: () => context.approval,
+    canaryRole: () => context.canaryRole,
+    canaryScope: () => context.canaryRole ? { reviewerAppId: context.canaryReviewerAppId ?? 'reviewer-app' } : undefined,
     setReviewerVerdictVerifier: () => {},
     currentDesignatedReviewer: () => context.designation,
     registerVerifiedDesignatedReviewer: ({ mapping }: any) => { context.designationCalls++; context.designation = mapping; return true; },
@@ -379,6 +383,27 @@ describe('task-control mapping/freeze controlled IPC', () => {
     expect(await response.json()).toEqual({ ok: true, dispatchRoot: 'om_orch_root' });
     expect(context.registrationCalls).toBe(1);
     expect(context.frozenWrites).toBe(0);
+  });
+
+  it('keeps canary worker/reviewer roles out of controller routes and locks the reviewer app', async () => {
+    reset();
+    context.canaryRole = 'worker';
+    expect((await post(TASK_CONTROL_MAPPING_REGISTER_ROUTE, mappingPayload())).status).toBe(403);
+    expect(context.registrationCalls).toBe(0);
+
+    context.canaryRole = 'reviewer';
+    const freeze = await post(TASK_CONTROL_FREEZE_ROUTE, {
+      dispatchRoot: 'om_orch_root', approvalRef: 'approval:gate-1', eventId: 'freeze-role', idempotencyKey: 'freeze-role',
+    });
+    expect(freeze.status).toBe(403);
+    expect(context.freezeCalls).toBe(0);
+
+    context.canaryRole = 'controller';
+    writeRegistry();
+    const designation = await post(TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, designationPayload({ reviewerBotAppId: 'other-reviewer-app' }));
+    expect(designation.status).toBe(409);
+    expect(await designation.json()).toMatchObject({ error: 'task_control_designated_reviewer_scope_unproven' });
+    expect(context.sourceReads).toBe(0);
   });
 
   it('keeps unproven/disabled freeze requests out of the ledger and returns 201 only after an enabled freeze', async () => {

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DaemonTaskControlAuthority } from '../src/services/task-control-plane-authority.js';
 import { DaemonTaskControlBridge } from '../src/services/task-control-plane-daemon-bridge.js';
 import { DaemonTaskControlIntegration } from '../src/services/task-control-plane-daemon-integration.js';
-import { startTaskControlPlaneRuntime } from '../src/services/task-control-plane-runtime.js';
+import { scopedTaskControlPlaneConfig, startTaskControlPlaneRuntime } from '../src/services/task-control-plane-runtime.js';
 import { DaemonReviewerVerdictProvider } from '../src/services/task-control-plane-reviewer-verdict.js';
 
 function gate() {
@@ -41,7 +41,156 @@ function reviewerProvider() {
   return new DaemonReviewerVerdictProvider({ key: Buffer.from('integration-reviewer-key'), keyId: 'integration-reviewer-key', now: () => Date.parse('2026-09-05T00:30:00.000Z') });
 }
 
+const P2_7_ENV = {
+  TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
+  TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true',
+  TASK_CONTROL_PLANE_PUMP_ENABLED: 'false',
+  TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
+  TASK_CONTROL_PLANE_PROJECT_ID: 'p2-7-canary',
+  TASK_CONTROL_PLANE_PHASE_ID: 'phase-1',
+  TASK_CONTROL_PLANE_TASK_GUIDS: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf,7637c5bc-729e-4e58-978d-20ab9f9679a8,a151cdaa-fb8f-4800-be3c-cdf273e56d23',
+  TASK_CONTROL_PLANE_CONTROLLER_LARK_APP_ID: 'cli_aac926f0eb795bc1',
+  TASK_CONTROL_PLANE_WORKER_LARK_APP_ID: 'cli_aa1e53f7aaf81bc6',
+  TASK_CONTROL_PLANE_REVIEWER_LARK_APP_ID: 'cli_aa1e4c5508f8dbd3',
+  TASK_CONTROL_PLANE_DOC_TOKEN: 'Rk2VdXPb8oRcBFxdZp9morIlyZc',
+};
+
+const collectorMocks = vi.hoisted(() => ({
+  getBotClient: vi.fn(() => ({})),
+  larkGet: vi.fn(),
+}));
+
+vi.mock('../src/bot-registry.js', () => ({ getBotClient: collectorMocks.getBotClient }));
+vi.mock('../src/im/lark/client.js', () => ({
+  getMessageDetail: vi.fn(),
+  larkGet: collectorMocks.larkGet,
+}));
+
+function canaryMapping(taskGuid = 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf', overrides: Record<string, unknown> = {}) {
+  return {
+    projectId: 'p2-7-canary', phaseId: 'phase-1',
+    phaseTaskGuids: [
+      'dddcc370-e210-4dd1-b7b9-9dabddc38ddf',
+      '7637c5bc-729e-4e58-978d-20ab9f9679a8',
+      'a151cdaa-fb8f-4800-be3c-cdf273e56d23',
+    ],
+    taskGuid, topicRootId: 'om_p2_7_root', ownerId: 'worker-1', reviewerId: 'reviewer-1',
+    acceptorId: 'acceptor-1', registrationRef: 'task-comment:123', docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc', approvalGate: gate(),
+    ...overrides,
+  };
+}
+
 describe('DaemonTaskControlIntegration', () => {
+  it('accepts only the fixed P2-7 three-task mapping and drops non-target lifecycle noise', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-canary-'));
+    try {
+      const config = scopedTaskControlPlaneConfig('cli_aac926f0eb795bc1', P2_7_ENV);
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'cli_aac926f0eb795bc1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'cli_aac926f0eb795bc1', flags: config.flags, authority: bridge.authority, logger: { warn: () => {} }, collect: async () => {} });
+      const store = lifecycle.getStore()!;
+      const integration = new DaemonTaskControlIntegration({
+        dataDir, larkAppId: 'cli_aac926f0eb795bc1', lifecycle, store, bridge, logger: { warn: () => {} }, canary: config.canary,
+      });
+      expect(integration.registerMapping('om_p2_7_root', canaryMapping(), 'controller-1')).toBe(true);
+      expect(integration.registerMapping('om_other', canaryMapping('dddcc370-e210-4dd1-b7b9-9dabddc38ddf', { projectId: 'other' }), 'controller-1')).toBe(false);
+      expect(integration.registerMapping('om_extra', canaryMapping('dddcc370-e210-4dd1-b7b9-9dabddc38ddf', {
+        phaseTaskGuids: ['dddcc370-e210-4dd1-b7b9-9dabddc38ddf', '7637c5bc-729e-4e58-978d-20ab9f9679a8', 'a151cdaa-fb8f-4800-be3c-cdf273e56d23', '11111111-1111-1111-1111-111111111111'],
+      }), 'controller-1')).toBe(false);
+      expect(integration.registerMapping('om_wrong_task', canaryMapping('11111111-1111-1111-1111-111111111111'), 'controller-1')).toBe(false);
+      integration.workerAccepted('om_other', 'other-input');
+      integration.terminalWithoutRevision('om_other', 'other-terminal', { reason: 'other' });
+      integration.workerAccepted('om_p2_7_root', 'target-input');
+      await waitFor(() => expect(store.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' }).some(event => event.eventType === 'task.accepted')).toBe(true));
+      expect(store.listObservations()).toEqual([]);
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('permits the canary reviewer only to read the fixed scope, never to register a mapping', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-canary-reviewer-'));
+    try {
+      const config = scopedTaskControlPlaneConfig('cli_aa1e4c5508f8dbd3', P2_7_ENV);
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'cli_aa1e4c5508f8dbd3' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'cli_aa1e4c5508f8dbd3', flags: config.flags, authority: bridge.authority, logger: { warn: () => {} }, collect: async () => {} });
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'cli_aa1e4c5508f8dbd3', lifecycle, store: lifecycle.getStore()!, bridge, logger: { warn: () => {} }, canary: config.canary });
+      expect(integration.canaryRole()).toBe('reviewer');
+      expect(integration.registerMapping('om_p2_7_root', canaryMapping(), 'controller-1')).toBe(false);
+      expect(integration.mapping('om_p2_7_root')).toBeUndefined();
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('restores the controller-owned mapping partition for the fixed worker role only', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-canary-worker-'));
+    try {
+      const controllerConfig = scopedTaskControlPlaneConfig('cli_aac926f0eb795bc1', P2_7_ENV);
+      const controllerBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'cli_aac926f0eb795bc1' });
+      const controllerLifecycle = await startTaskControlPlaneRuntime({
+        dataDir, larkAppId: controllerConfig.canary!.controllerAppId, flags: controllerConfig.flags, authority: controllerBridge.authority, logger: { warn: () => {} }, collect: async () => {},
+      });
+      const controller = new DaemonTaskControlIntegration({
+        dataDir, larkAppId: controllerConfig.canary!.controllerAppId, lifecycle: controllerLifecycle, store: controllerLifecycle.getStore()!, bridge: controllerBridge, logger: { warn: () => {} }, canary: controllerConfig.canary,
+      });
+      for (const [index, taskGuid] of controllerConfig.canary!.taskGuids.entries()) {
+        expect(controller.registerMapping(`om_p2_7_root_${index}`, canaryMapping(taskGuid, {
+          topicRootId: `om_p2_7_root_${index}`, registrationRef: `task-comment:${123 + index}`,
+        }), 'controller-1')).toBe(true);
+      }
+      await controllerLifecycle.close();
+
+      const workerConfig = scopedTaskControlPlaneConfig('cli_aa1e53f7aaf81bc6', P2_7_ENV);
+      const workerBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: workerConfig.canary!.controllerAppId });
+      const workerLifecycle = await startTaskControlPlaneRuntime({
+        dataDir, larkAppId: workerConfig.canary!.controllerAppId, flags: workerConfig.flags, authority: workerBridge.authority, logger: { warn: () => {} }, collect: async () => {},
+      });
+      const worker = new DaemonTaskControlIntegration({
+        dataDir, larkAppId: workerConfig.canary!.workerAppId, lifecycle: workerLifecycle, store: workerLifecycle.getStore()!, bridge: workerBridge, logger: { warn: () => {} }, canary: workerConfig.canary,
+      });
+      expect(worker.mapping('om_p2_7_root_0')).toMatchObject({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' });
+      expect(worker.mapping('om_p2_7_root_1')).toMatchObject({ taskGuid: '7637c5bc-729e-4e58-978d-20ab9f9679a8' });
+      expect(worker.mapping('om_p2_7_root_2')).toMatchObject({ taskGuid: 'a151cdaa-fb8f-4800-be3c-cdf273e56d23' });
+      worker.workerAccepted('om_p2_7_root_0', 'worker-input');
+      await waitFor(() => expect(workerLifecycle.getStore()!.listEvents({ taskGuid: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf' }).some(event => event.eventType === 'task.accepted')).toBe(true));
+      expect(workerLifecycle.getStore()!.getPhaseProjection('p2-7-canary', 'phase-1').expectedTaskGuids)
+        .toEqual([...controllerConfig.canary!.taskGuids].sort());
+      await workerLifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('collects only the fixed three task references and probes an unreadable comment source once per process', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-canary-collector-'));
+    try {
+      const config = scopedTaskControlPlaneConfig('cli_aac926f0eb795bc1', P2_7_ENV);
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'cli_aac926f0eb795bc1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'cli_aac926f0eb795bc1', flags: config.flags, authority: bridge.authority, logger: { warn: () => {} }, collect: async () => {} });
+      const store = lifecycle.getStore()!;
+      collectorMocks.larkGet.mockImplementation(async (_client, path, query) => {
+        if (path.startsWith('/open-apis/task/v2/tasks/')) return { code: 0, data: { task: { status: 'todo' } } };
+        if (path === '/open-apis/task/v2/comments') {
+          expect(config.canary!.taskGuids).toContain(query.resource_id);
+          throw new Error('permission_denied');
+        }
+        throw new Error(`unexpected:${path}`);
+      });
+      const integration = new DaemonTaskControlIntegration({
+        dataDir, larkAppId: 'cli_aac926f0eb795bc1', lifecycle, store, bridge, logger: { warn: () => {} }, canary: config.canary, shadowTaskGuids: config.canary!.taskGuids,
+      });
+      await integration.collectAll();
+      await integration.collectAll();
+      await waitFor(() => expect(store.listObservations()).toHaveLength(4));
+      const taskReads = collectorMocks.larkGet.mock.calls.filter(([, path]) => String(path).startsWith('/open-apis/task/v2/tasks/'));
+      const commentReads = collectorMocks.larkGet.mock.calls.filter(([, path]) => path === '/open-apis/task/v2/comments');
+      expect(taskReads).toHaveLength(6);
+      expect(new Set(taskReads.map(([, path]) => String(path).split('/').at(-1)))).toEqual(new Set(config.canary!.taskGuids));
+      expect(commentReads).toHaveLength(1);
+      expect(store.listEvents()).toEqual([]);
+      await lifecycle.close();
+    } finally {
+      collectorMocks.larkGet.mockReset();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('persists controller mapping in SQLite and restores it without a JSON sidecar', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-integration-'));
     try {

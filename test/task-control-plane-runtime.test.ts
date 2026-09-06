@@ -33,43 +33,64 @@ describe('task control plane runtime', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it('enables only one exact read-only app+task Shadow scope and otherwise fails closed', () => {
+  it('enables only the exact P2-7 project/phase/task/app scope and otherwise fails closed', () => {
     const appId = 'cli_aac926f0eb795bc1';
-    const taskGuid = '2cd616e9-910b-47e1-a081-349b4808ee5a';
+    const taskGuids = [
+      'dddcc370-e210-4dd1-b7b9-9dabddc38ddf',
+      '7637c5bc-729e-4e58-978d-20ab9f9679a8',
+      'a151cdaa-fb8f-4800-be3c-cdf273e56d23',
+    ];
     const enabled = {
       TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
       TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true',
       TASK_CONTROL_PLANE_PUMP_ENABLED: 'false',
       TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
-      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: appId,
-      TASK_CONTROL_PLANE_TARGET_TASK_GUID: taskGuid,
+      TASK_CONTROL_PLANE_PROJECT_ID: 'p2-7-canary',
+      TASK_CONTROL_PLANE_PHASE_ID: 'phase-1',
+      TASK_CONTROL_PLANE_TASK_GUIDS: taskGuids.join(','),
+      TASK_CONTROL_PLANE_CONTROLLER_LARK_APP_ID: appId,
+      TASK_CONTROL_PLANE_WORKER_LARK_APP_ID: 'cli_aa1e53f7aaf81bc6',
+      TASK_CONTROL_PLANE_REVIEWER_LARK_APP_ID: 'cli_aa1e4c5508f8dbd3',
+      TASK_CONTROL_PLANE_DOC_TOKEN: 'Rk2VdXPb8oRcBFxdZp9morIlyZc',
     };
-    expect(scopedTaskControlPlaneConfig(appId, enabled)).toEqual({
+    expect(scopedTaskControlPlaneConfig(appId, enabled)).toMatchObject({
       flags: { ledgerEnabled: true, shadowEnabled: true, pumpEnabled: false, freezeEnforcement: false },
-      shadowTaskGuid: taskGuid,
+      canary: { role: 'controller', projectId: 'p2-7-canary', phaseId: 'phase-1', taskGuids, docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc' },
     });
     const off = { ledgerEnabled: false, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false };
     expect(scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', enabled)).toEqual({ flags: off, disabledReason: 'target_app_mismatch' });
-    expect(scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', {
-      ...enabled,
-      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: 'cli_bbbbbbbbbbbbbbbb',
-      TASK_CONTROL_PLANE_TARGET_TASK_GUID: '11111111-1111-1111-1111-111111111111',
-    })).toEqual({ flags: off, disabledReason: 'target_scope_unauthorized' });
-    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TARGET_TASK_GUID: '' }))
-      .toEqual({ flags: off, disabledReason: 'target_scope_required' });
-    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TARGET_TASK_GUID: `${taskGuid},other` }))
-      .toEqual({ flags: off, disabledReason: 'target_scope_invalid' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TASK_GUIDS: taskGuids.slice(0, 2).join(',') }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_unauthorized' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TASK_GUIDS: [...taskGuids, taskGuids[0]].join(',') }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_unauthorized' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PROJECT_ID: 'other' }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_unauthorized' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PHASE_ID: 'phase-2' }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_unauthorized' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_WORKER_LARK_APP_ID: appId }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_unauthorized' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_DOC_TOKEN: 'other' }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_unauthorized' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TASK_GUIDS: '' }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_required' });
     expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'true' }))
-      .toEqual({ flags: off, disabledReason: 'scoped_shadow_read_only_required' });
+      .toEqual({ flags: off, disabledReason: 'pump_canary_gate_required' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'true', TASK_CONTROL_PLANE_PUMP_CANARY_ENABLED: 'true' }))
+      .toMatchObject({ flags: { ledgerEnabled: true, shadowEnabled: true, pumpEnabled: true, freezeEnforcement: false } });
     expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'true' }))
-      .toEqual({ flags: off, disabledReason: 'scoped_shadow_read_only_required' });
+      .toEqual({ flags: off, disabledReason: 'freeze_canary_gate_required' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'true', TASK_CONTROL_PLANE_FREEZE_CANARY_ENABLED: 'true' }))
+      .toMatchObject({ flags: { ledgerEnabled: true, shadowEnabled: true, pumpEnabled: false, freezeEnforcement: true } });
+    expect(scopedTaskControlPlaneConfig('cli_aa1e53f7aaf81bc6', { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'true', TASK_CONTROL_PLANE_PUMP_CANARY_ENABLED: 'true' }))
+      .toEqual({ flags: off, disabledReason: 'pump_canary_gate_required' });
+    expect(scopedTaskControlPlaneConfig('cli_aa1e4c5508f8dbd3', enabled)).toMatchObject({ canary: { role: 'reviewer' } });
     expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'tru' }))
       .toEqual({ flags: off, disabledReason: 'flag_value_invalid' });
     expect(scopedTaskControlPlaneConfig(appId, { TASK_CONTROL_PLANE_LEDGER_ENABLED: '1' }))
       .toEqual({ flags: off, disabledReason: 'flag_value_invalid' });
-    expect(scopedTaskControlPlaneConfig(appId, {
-      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: appId, TASK_CONTROL_PLANE_TARGET_TASK_GUID: taskGuid,
-    })).toEqual({ flags: off });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_UNRELATED: '1' }))
+      .toEqual({ flags: off, disabledReason: 'canary_scope_extra' });
+    expect(scopedTaskControlPlaneConfig(appId, {})).toEqual({ flags: off });
   });
 
   it('does not create SQLite for a non-target app even when the scoped Shadow flags are enabled', async () => {
@@ -79,8 +100,13 @@ describe('task control plane runtime', () => {
       TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true',
       TASK_CONTROL_PLANE_PUMP_ENABLED: 'false',
       TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
-      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: 'cli_aac926f0eb795bc1',
-      TASK_CONTROL_PLANE_TARGET_TASK_GUID: '2cd616e9-910b-47e1-a081-349b4808ee5a',
+      TASK_CONTROL_PLANE_PROJECT_ID: 'p2-7-canary',
+      TASK_CONTROL_PLANE_PHASE_ID: 'phase-1',
+      TASK_CONTROL_PLANE_TASK_GUIDS: 'dddcc370-e210-4dd1-b7b9-9dabddc38ddf,7637c5bc-729e-4e58-978d-20ab9f9679a8,a151cdaa-fb8f-4800-be3c-cdf273e56d23',
+      TASK_CONTROL_PLANE_CONTROLLER_LARK_APP_ID: 'cli_aac926f0eb795bc1',
+      TASK_CONTROL_PLANE_WORKER_LARK_APP_ID: 'cli_aa1e53f7aaf81bc6',
+      TASK_CONTROL_PLANE_REVIEWER_LARK_APP_ID: 'cli_aa1e4c5508f8dbd3',
+      TASK_CONTROL_PLANE_DOC_TOKEN: 'Rk2VdXPb8oRcBFxdZp9morIlyZc',
     });
     try {
       const lifecycle = await (await import('../src/services/task-control-plane-runtime.js')).startTaskControlPlaneRuntime({
@@ -352,15 +378,13 @@ describe('task control plane runtime', () => {
       dataDir: mkdtempSync(join(tmpdir(), 'botmux-task-control-flags-')),
       flags: { ledgerEnabled: true, pumpEnabled: true }, authority, logger: { warn: () => {} },
     })).rejects.toMatchObject({ code: 'pump_delivery_required' });
-    await expect(runtime.startTaskControlPlaneRuntime({
+    const combined = await runtime.startTaskControlPlaneRuntime({
       dataDir: mkdtempSync(join(tmpdir(), 'botmux-task-control-flags-')),
-      flags: { ledgerEnabled: true, shadowEnabled: true, pumpEnabled: true }, authority, logger: { warn: () => {} },
-      deliver: async () => ({ kind: 'retry' }), collect: async () => {},
-    })).rejects.toMatchObject({ code: 'shadow_pump_mutually_exclusive' });
-    await expect(runtime.startTaskControlPlaneRuntime({
-      dataDir: mkdtempSync(join(tmpdir(), 'botmux-task-control-flags-')),
-      flags: { ledgerEnabled: true, shadowEnabled: true, freezeEnforcement: true }, authority, logger: { warn: () => {} }, collect: async () => {},
-    })).rejects.toMatchObject({ code: 'shadow_freeze_mutually_exclusive' });
+      flags: { ledgerEnabled: true, shadowEnabled: true, pumpEnabled: true, freezeEnforcement: true }, authority, logger: { warn: () => {} },
+      deliver: async () => ({ kind: 'retry' as const }), collect: async () => {},
+    });
+    expect(combined.enabled).toBe(true);
+    await combined.close();
   });
 
   it('pins all control-plane state to the declared SQLite filename', () => {

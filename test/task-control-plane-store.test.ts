@@ -262,6 +262,25 @@ function seedFreezableTask(store: TaskControlPlaneStore, opts: {
 }
 
 describe('TaskControlPlaneStore event ledger', () => {
+  it('shares one phase.opened event across exact task mappings and rejects a changed phase tuple', async () => {
+    const { store } = await fixture();
+    const taskGuids = ['task-1', 'task-2', 'task-3'];
+    const base = trustedMappingInput();
+    for (const [index, taskGuid] of taskGuids.entries()) {
+      expect(store.registerTrustedMapping({
+        ...base, dispatchRoot: `om_phase_${index}`, topicRootId: `om_phase_${index}`, taskGuid,
+        phaseTaskGuids: taskGuids, registrationRef: `task-comment:${101 + index}`,
+      })).toMatchObject({ kind: 'registered' });
+    }
+    expect(store.listEvents({ projectId: 'project-1', phaseId: 'phase-1' })
+      .filter(event => event.eventType === 'phase.opened')).toHaveLength(1);
+    expect(() => store.registerTrustedMapping({
+      ...base, dispatchRoot: 'om_phase_changed', topicRootId: 'om_phase_changed', taskGuid: 'task-4',
+      phaseTaskGuids: ['task-1', 'task-2', 'task-4'], registrationRef: 'task-comment:104',
+    })).toThrow('task_control_mapping_phase_conflict');
+    store.close();
+  });
+
   it('fails closed when no trusted authority is supplied or authentication is unknown', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-task-control-auth-'));
     dirs.push(dir);

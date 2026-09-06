@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { JsonBodyTooLargeError, isTrustedHostIpcRequest, jsonRes, readJsonBody } from '../core/dashboard-ipc-server.js';
 import type { DaemonTaskControlMapping, DaemonTaskControlMappingRegistration } from './task-control-plane-daemon-bridge.js';
 import type { TaskControlPlaneLifecycle } from './task-control-plane-runtime.js';
+import { P2_7_TASK_CONTROL_CANARY } from './task-control-plane-runtime.js';
 import type { DesignatedReviewerMapping, ReviewerConditionEvidence, ReviewerVerdictV1 } from './task-control-plane-reviewer-verdict.js';
 import {
   createDaemonReviewerVerdictVerifier,
@@ -157,6 +158,8 @@ type RouteIntegration = {
   mapping(dispatchRoot: string): DaemonTaskControlMapping | undefined;
   issueAuthentication(dispatchRoot: string, principal: 'acceptor'): unknown | undefined;
   approval(dispatchRoot: string, approvalRef: string): unknown | undefined;
+  canaryRole?(): 'controller' | 'worker' | 'reviewer' | undefined;
+  canaryScope?(): { reviewerAppId: string } | undefined;
   setReviewerVerdictVerifier(verifier: { verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean; verifyVerdict(value: ReviewerVerdictV1): boolean }): void;
   currentDesignatedReviewer(dispatchRoot: string, reviewRound: number, now?: string): DesignatedReviewerMapping | undefined;
   registerVerifiedDesignatedReviewer(input: {
@@ -171,6 +174,14 @@ type RouteIntegration = {
   }): { status: string; reason?: string; verdict?: ReviewerVerdictV1 };
   reviewerVerdictUnknown(dispatchRoot: string, verdictId: string, reason: string, sourceRef?: string): void;
 };
+
+function canaryRoleAllows(
+  integration: RouteIntegration,
+  allowedRole: 'controller' | 'reviewer',
+): boolean {
+  const role = integration.canaryRole?.();
+  return role === undefined || role === allowedRole;
+}
 
 type RouteLiveSession = {
   session: { sessionId: string; rootMessageId?: string };
@@ -419,7 +430,7 @@ export function createTaskControlRouteHandlers(input: {
   return {
     async mapping(req, res): Promise<void> {
       const integration = input.integration();
-      if (!isTrustedHostIpcRequest(req) || !integration) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !canaryRoleAllows(integration, 'controller')) {
         jsonRes(res, 403, { ok: false, error: 'task_control_mapping_unavailable' });
         return;
       }
@@ -466,7 +477,7 @@ export function createTaskControlRouteHandlers(input: {
     async freeze(req, res): Promise<void> {
       const integration = input.integration();
       const lifecycle = input.lifecycle();
-      if (!isTrustedHostIpcRequest(req) || !integration || !lifecycle) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !lifecycle || !canaryRoleAllows(integration, 'controller')) {
         jsonRes(res, 403, { ok: false, error: 'task_control_freeze_unavailable' });
         return;
       }
@@ -507,7 +518,7 @@ export function createTaskControlRouteHandlers(input: {
       const integration = input.integration();
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret || !canaryRoleAllows(integration, 'controller')) {
         jsonRes(res, 403, { ok: false, error: 'task_control_designated_reviewer_unavailable' });
         return;
       }
@@ -535,6 +546,10 @@ export function createTaskControlRouteHandlers(input: {
         || !effectiveAt || !expiresAt || !Number.isFinite(Date.parse(effectiveAt))
         || !Number.isFinite(Date.parse(expiresAt)) || !sameStrings(taskSetSnapshot, mapping.phaseTaskGuids)) {
         jsonRes(res, 400, { ok: false, error: 'task_control_designated_reviewer_invalid' });
+        return;
+      }
+      if (integration.canaryRole?.() === 'controller' && reviewerBotAppId !== integration.canaryScope?.()?.reviewerAppId) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_scope_unproven' });
         return;
       }
       const routeAuthority = authorizeControllerTurn({
@@ -590,7 +605,8 @@ export function createTaskControlRouteHandlers(input: {
 
     async reviewerSource(req, res): Promise<void> {
       const selfAppId = input.selfLarkAppId();
-      if (!isTrustedHostIpcRequest(req) || !selfAppId || !input.integration()) {
+      const integration = input.integration();
+      if (!isTrustedHostIpcRequest(req) || !selfAppId || !integration || !canaryRoleAllows(integration, 'reviewer')) {
         jsonRes(res, 403, { ok: false, error: 'task_control_reviewer_source_unavailable' });
         return;
       }
@@ -624,7 +640,8 @@ export function createTaskControlRouteHandlers(input: {
     async reviewerIngress(req, res): Promise<void> {
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      if (!selfAppId || !hostSecret || !input.integration()) {
+      const integration = input.integration();
+      if (!selfAppId || !hostSecret || !integration || !canaryRoleAllows(integration, 'reviewer')) {
         jsonRes(res, 503, { ok: false, error: 'task_control_reviewer_ingress_unavailable' });
         return;
       }
@@ -660,6 +677,10 @@ export function createTaskControlRouteHandlers(input: {
       });
       if (!reviewer) {
         jsonRes(res, 403, { ok: false, error: 'task_control_reviewer_ingress_origin_unproven' });
+        return;
+      }
+      if (integration.canaryRole?.() === 'reviewer' && selfAppId !== P2_7_TASK_CONTROL_CANARY.reviewerAppId) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_scope_unproven' });
         return;
       }
       const dispatchRoot = reviewer.rootMessageId;
@@ -754,7 +775,7 @@ export function createTaskControlRouteHandlers(input: {
       const integration = input.integration();
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret || !canaryRoleAllows(integration, 'controller')) {
         jsonRes(res, 403, { ok: false, error: 'task_control_designation_resolve_unavailable' });
         return;
       }
@@ -806,7 +827,7 @@ export function createTaskControlRouteHandlers(input: {
       const integration = input.integration();
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret || !canaryRoleAllows(integration, 'controller')) {
         jsonRes(res, 403, { ok: false, error: 'task_control_reviewer_verdict_unavailable' });
         return;
       }

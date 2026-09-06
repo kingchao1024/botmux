@@ -7,7 +7,7 @@ import {
   type DaemonTaskControlMappingRegistration,
 } from './task-control-plane-daemon-bridge.js';
 import { TaskControlEventAdapters, taskControlEventIdempotencyKey } from './task-control-plane-events.js';
-import type { TaskControlPlaneDeliveryResult, TaskControlPlaneLifecycle } from './task-control-plane-runtime.js';
+import { matchesTaskControlPlaneCanaryMapping, type TaskControlPlaneCanaryScope, type TaskControlPlaneDeliveryResult, type TaskControlPlaneLifecycle } from './task-control-plane-runtime.js';
 import { TaskControlPlaneStore, type DeliveryOutboxRow, type ReviewerVerdictHead } from './task-control-plane-store.js';
 import type {
   DesignatedReviewerMapping,
@@ -91,6 +91,7 @@ async function collectLatestTaskCommentReference(larkAppId: string, taskGuid: st
 export class DaemonTaskControlIntegration {
   readonly adapters: TaskControlEventAdapters;
   readonly collector: TaskControlActiveCollector;
+  private taskCommentsUnavailable = false;
 
   constructor(
     private readonly input: {
@@ -100,6 +101,10 @@ export class DaemonTaskControlIntegration {
       store: TaskControlPlaneStore;
       bridge: DaemonTaskControlBridge;
       logger: { warn(message: string): void };
+      /** Fixed P2-7 scope; absent keeps the pre-canary generic test seam. */
+      canary?: TaskControlPlaneCanaryScope;
+      /** Read-only Shadow references may cover the fixed task set before mappings exist. */
+      shadowTaskGuids?: readonly string[];
       /** Production injection: a receipt must still name the live worker generation. */
       isLiveReceiptOwner?: (input: { sessionId: string; workerGeneration: number }) => boolean;
     },
@@ -111,6 +116,7 @@ export class DaemonTaskControlIntegration {
 
   private restoreMappings(): void {
     for (const mapping of this.input.store.listTrustedMappings()) {
+      if (!this.mappingInScope(mapping)) continue;
       if (!this.input.bridge.restoreMapping(mapping)) {
         this.input.logger.warn('[task-control] ignored invalid persisted mapping reference');
       }
@@ -122,6 +128,7 @@ export class DaemonTaskControlIntegration {
     mapping: DaemonTaskControlMappingRegistration,
     controllerId: string,
   ): boolean {
+    if (this.input.canary && (this.input.canary.role !== 'controller' || !this.mappingInScope(mapping))) return false;
     const controllerMapping: DaemonTaskControlMapping = {
       ...mapping, controllerId, approvalGate: DaemonTaskControlBridge.bindApprovalGate(mapping.approvalGate),
     };
@@ -145,18 +152,27 @@ export class DaemonTaskControlIntegration {
 
   /** Read-only bridge accessors keep daemon routes out of bridge internals. */
   mapping(dispatchRoot: string): DaemonTaskControlMapping | undefined {
-    return this.input.bridge.mapping(dispatchRoot);
+    const mapping = this.input.bridge.mapping(dispatchRoot);
+    return mapping && this.mappingInScope(mapping) ? mapping : undefined;
+  }
+
+  canaryRole(): TaskControlPlaneCanaryScope['role'] | undefined {
+    return this.input.canary?.role;
+  }
+
+  canaryScope(): TaskControlPlaneCanaryScope | undefined {
+    return this.input.canary;
   }
 
   issueAuthentication(
     dispatchRoot: string,
     principal: 'controller' | 'worker' | 'reviewer' | 'acceptor' | 'collector',
   ) {
-    return this.input.bridge.issueAuthentication(dispatchRoot, principal);
+    return this.mapping(dispatchRoot) ? this.input.bridge.issueAuthentication(dispatchRoot, principal) : undefined;
   }
 
   approval(dispatchRoot: string, approvalRef: string) {
-    return this.input.bridge.approval(dispatchRoot, approvalRef);
+    return this.mapping(dispatchRoot) ? this.input.bridge.approval(dispatchRoot, approvalRef) : undefined;
   }
 
   /**
@@ -172,7 +188,7 @@ export class DaemonTaskControlIntegration {
     verifyVerdict: (value: ReviewerVerdictV1) => boolean;
     now?: string;
   }): ReviewerVerdictHead {
-    const mapping = this.input.bridge.mapping(input.dispatchRoot);
+    const mapping = this.mapping(input.dispatchRoot);
     if (!mapping
       || input.verdict.projectId !== mapping.projectId
       || input.verdict.phaseId !== mapping.phaseId
@@ -216,6 +232,9 @@ export class DaemonTaskControlIntegration {
     expectedReviewerId: string;
     now?: string;
   }): ReviewerVerdictHead {
+    if (this.input.canary && this.input.canary.role !== 'controller') {
+      return { status: 'unknown', reason: 'reviewer_verdict_controller_unproven' };
+    }
     const authentication = this.input.bridge.issueAuthentication(input.dispatchRoot, 'reviewer');
     if (!authentication) {
       this.reviewerVerdictUnknown(input.dispatchRoot, input.verdict.verdictId, 'reviewer_verdict_authentication_unproven');
@@ -249,6 +268,7 @@ export class DaemonTaskControlIntegration {
     mapping: DesignatedReviewerMapping;
     verifier: ReviewerVerdictVerifier;
   }): boolean {
+    if (this.input.canary && this.input.canary.role !== 'controller') return false;
     const authentication = this.input.bridge.issueAuthentication(this.dispatchRootForMapping(input.mapping), 'controller');
     if (!authentication || input.mapping.controllerBotAppId !== this.input.larkAppId) return false;
     try {
@@ -262,11 +282,12 @@ export class DaemonTaskControlIntegration {
   }
 
   setReviewerVerdictVerifier(verifier: ReviewerVerdictVerifier): void {
+    if (this.input.canary && this.input.canary.role !== 'controller') return;
     this.input.store.setReviewerVerdictVerifier(verifier);
   }
 
   currentDesignatedReviewer(dispatchRoot: string, reviewRound: number, now?: string): DesignatedReviewerMapping | undefined {
-    const mapping = this.input.bridge.mapping(dispatchRoot);
+    const mapping = this.mapping(dispatchRoot);
     if (!mapping) return undefined;
     return this.input.store.getCurrentDesignatedReviewer({
       projectId: mapping.projectId, phaseId: mapping.phaseId, taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId,
@@ -278,12 +299,13 @@ export class DaemonTaskControlIntegration {
     for (const { dispatchRoot, mapping: trusted } of this.input.bridge.listMappings()) {
       if (trusted.projectId === mapping.projectId && trusted.phaseId === mapping.phaseId
         && trusted.taskGuid === mapping.taskGuid && trusted.topicRootId === mapping.topicRootId
-        && trusted.phaseTaskGuids.includes(mapping.taskGuid)) return dispatchRoot;
+        && trusted.phaseTaskGuids.includes(mapping.taskGuid) && this.mappingInScope(trusted)) return dispatchRoot;
     }
     return '';
   }
 
   dispatchRequested(dispatchRoot: string, sourceSessionId: string, occurredAt: string): void {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return;
     const event = this.input.bridge.event({
       dispatchRoot, principal: 'controller',
       eventId: `tcp-dispatch:${dispatchRoot}`,
@@ -353,6 +375,7 @@ export class DaemonTaskControlIntegration {
   }
 
   reviewerVerdictUnknown(dispatchRoot: string, verdictId: string, reason: string, sourceRef = `reviewer-verdict:${verdictId}`): void {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return;
     this.input.lifecycle.enqueueUnknownObservation({
       eventId: `tcp-unknown-reviewed:${sourceRef}`, attemptedEventType: 'task.reviewed', sourceRef,
       idempotencyKey: `tcp-unknown-reviewed:${sourceRef}`,
@@ -361,6 +384,7 @@ export class DaemonTaskControlIntegration {
   }
 
   reworkStarted(dispatchRoot: string, sourceRef: string, evidenceRef: string): void {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return;
     // No revision-63 daemon-owned rework producer is wired yet. A worker/report
     // hint is retained as UNKNOWN rather than promoting FAIL/CONDITIONAL into a
     // state transition. A future producer must bind the active verdict id and a
@@ -404,6 +428,7 @@ export class DaemonTaskControlIntegration {
   }
 
   terminalWithoutRevision(dispatchRoot: string, sourceRef: string, payload: Record<string, unknown>): void {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return;
     this.input.lifecycle.enqueueUnknownObservation({
       eventId: `tcp-unknown-terminal:${sourceRef}`, attemptedEventType: 'task.delivered', sourceRef,
       idempotencyKey: `tcp-unknown-terminal:${sourceRef}`,
@@ -423,8 +448,9 @@ export class DaemonTaskControlIntegration {
     sourceRef: string,
     input: { sessionId: string; workerGeneration: number; destinationId: string; receiptRef: string; docToken?: string },
   ): Promise<void> {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return;
     if (!this.receiptOwnerStillLive(input)) {
-      this.deliveryReceiptUnknown(sourceRef, input, 'receipt_worker_generation_unproven');
+      this.deliveryReceiptUnknown(dispatchRoot, sourceRef, input, 'receipt_worker_generation_unproven');
       return;
     }
     const mapping = this.input.bridge.mapping(dispatchRoot);
@@ -444,7 +470,7 @@ export class DaemonTaskControlIntegration {
       // The document read is an external await. Recheck the captured worker
       // generation before this receipt can create submission/delivery facts.
       if (!this.receiptOwnerStillLive(input)) {
-        this.deliveryReceiptUnknown(sourceRef, input, 'receipt_worker_generation_changed_during_verification');
+        this.deliveryReceiptUnknown(dispatchRoot, sourceRef, input, 'receipt_worker_generation_changed_during_verification');
         return;
       }
       this.firstSubmitted(dispatchRoot, `${sourceRef}:submitted`, {
@@ -471,10 +497,12 @@ export class DaemonTaskControlIntegration {
 
   /** A stale provider receipt is retained only as reference-only UNKNOWN. */
   deliveryReceiptUnknown(
+    dispatchRoot: string,
     sourceRef: string,
     input: { sessionId: string; workerGeneration: number; destinationId: string; receiptRef: string; docToken?: string },
     reason: string,
   ): void {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return;
     this.input.lifecycle.enqueueUnknownObservation({
       eventId: `tcp-unknown-delivery:${sourceRef}`, attemptedEventType: 'task.delivered', sourceRef,
       idempotencyKey: `tcp-unknown-delivery:${sourceRef}`,
@@ -488,6 +516,7 @@ export class DaemonTaskControlIntegration {
   }
 
   reportFallbackUnknown(sourceRef: string, errorClass: string): void {
+    if (this.input.canary) return;
     this.input.lifecycle.enqueueUnknownObservation({
       eventId: `tcp-unknown-report:${sourceRef}`, attemptedEventType: 'task.delivery_fallback_verified', sourceRef,
       idempotencyKey: `tcp-unknown-report:${sourceRef}`,
@@ -503,6 +532,7 @@ export class DaemonTaskControlIntegration {
     occurredAt?: string,
     details: Record<string, unknown> = {},
   ): void {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return;
     const evidenceRef = typeof details.evidenceRef === 'string' ? details.evidenceRef : undefined;
     const { evidenceRef: _evidenceRef, ...payload } = details;
     const event = this.bridgeEvent(eventType, dispatchRoot, principal, sourceRef, payload, evidenceRef);
@@ -527,6 +557,7 @@ export class DaemonTaskControlIntegration {
     deliverTo?: readonly string[],
     terminal?: boolean,
   ) {
+    if (this.input.canary && !this.mapping(dispatchRoot)) return undefined;
     const event = this.input.bridge.event({
       dispatchRoot, principal, eventId: `tcp-${eventType}:${sourceRef}`,
       idempotencyKey: taskControlEventIdempotencyKey(eventType, sourceRef), sourceRef, payload, evidenceRef,
@@ -581,6 +612,7 @@ export class DaemonTaskControlIntegration {
   fallbackVerified(input: {
     dispatchRoot: string; deliveryEventId: string; destinationId: string; method: 'task_comment' | 'topic_message' | 'active_collection'; receiptRef: string;
   }): void {
+    if (this.input.canary && !this.mapping(input.dispatchRoot)) return;
     const event = this.input.bridge.event({
       dispatchRoot: input.dispatchRoot, principal: 'collector',
       eventId: `tcp-fallback:${input.deliveryEventId}:${input.destinationId}:${input.receiptRef}`,
@@ -607,7 +639,31 @@ export class DaemonTaskControlIntegration {
 
   private async collectReferences(kind: TaskControlCollectionKind, _cursor?: string) {
     const records: Array<{ kind: TaskControlCollectionKind; sourceRef: string; eventId: string; idempotencyKey: string; occurredAt?: string }> = [];
-    for (const { dispatchRoot, mapping } of this.input.bridge.listMappings().slice(0, MAX_REFERENCE_POLL)) {
+    const mappings = this.input.bridge.listMappings().filter(({ mapping }) => this.mappingInScope(mapping)).slice(0, MAX_REFERENCE_POLL);
+    const taskGuids = [...new Set([
+      ...mappings.map(({ mapping }) => mapping.taskGuid),
+      ...(this.input.shadowTaskGuids ?? []),
+    ])].slice(0, MAX_REFERENCE_POLL);
+    if (kind === 'task' || kind === 'task_comment') {
+      for (const taskGuid of taskGuids) {
+        if (kind === 'task_comment' && this.taskCommentsUnavailable) break;
+        try {
+          records.push(...(kind === 'task'
+            ? await collectTaskReferences(this.input.larkAppId, taskGuid)
+            : await collectLatestTaskCommentReference(this.input.larkAppId, taskGuid)));
+        } catch (error) {
+          if (kind === 'task_comment') this.taskCommentsUnavailable = true;
+          this.input.logger.warn(`[task-control] ${kind} reference unavailable for ${taskGuid}: ${String(error)}`);
+          const sourceRef = reference('collection-error', `${kind}:${taskGuid}`);
+          records.push({
+            kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef),
+            idempotencyKey: `tcp-collect:${kind}:${sourceRef}`,
+          });
+        }
+      }
+      return records;
+    }
+    for (const { dispatchRoot, mapping } of mappings) {
       try {
         if (kind === 'topic') {
           await getMessageDetail(this.input.larkAppId, dispatchRoot, { userCardContent: false });
@@ -620,10 +676,6 @@ export class DaemonTaskControlIntegration {
             const sourceRef = reference('doc-revision', `${mapping.docToken}@${revision}`);
             records.push({ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` });
           }
-        } else if (kind === 'task_comment') {
-          records.push(...await collectLatestTaskCommentReference(this.input.larkAppId, mapping.taskGuid));
-        } else if (kind === 'task') {
-          records.push(...await collectTaskReferences(this.input.larkAppId, mapping.taskGuid));
         }
       } catch (error) {
         this.input.logger.warn(`[task-control] ${kind} reference unavailable for ${dispatchRoot}: ${String(error)}`);
@@ -635,6 +687,10 @@ export class DaemonTaskControlIntegration {
       }
     }
     return records;
+  }
+
+  private mappingInScope(mapping: Pick<DaemonTaskControlMapping, 'projectId' | 'phaseId' | 'phaseTaskGuids' | 'taskGuid' | 'docToken'>): boolean {
+    return !this.input.canary || matchesTaskControlPlaneCanaryMapping(this.input.canary, mapping);
   }
 }
 

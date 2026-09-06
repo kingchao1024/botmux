@@ -87,7 +87,9 @@ import { setDisplayNameRefresher, findConfigField, applyConfigField } from './se
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { DaemonTaskControlAuthority } from './services/task-control-plane-authority.js';
-import { DaemonTaskControlIntegration, DaemonTaskControlShadowCollector } from './services/task-control-plane-daemon-integration.js';
+import { DaemonTaskControlIntegration } from './services/task-control-plane-daemon-integration.js';
+import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
+import { createV3TaskControlApprovalSource } from './services/task-control-plane-v3-approval.js';
 import {
   createTaskControlRouteHandlers,
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
@@ -21931,24 +21933,35 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
   } else {
     try {
-      const shadowTaskGuid = taskControlConfig.shadowTaskGuid;
-      if (!shadowTaskGuid) throw new Error('task_control_shadow_target_unavailable');
-      let shadowCollector: DaemonTaskControlShadowCollector | undefined;
+      const canary = taskControlConfig.canary;
+      if (!canary) throw new Error('task_control_canary_scope_unavailable');
+      const bridge = new DaemonTaskControlBridge({
+        // The three canary daemons share one controller-owned SQLite partition
+        // so a worker/reviewer can restore the controller's exact mapping.
+        // Remote Lark reads below still use each daemon's own app identity.
+        larkAppId: canary.controllerAppId,
+        approvals: createV3TaskControlApprovalSource({ baseDir: v3DefaultBaseDir() }),
+      });
+      let integration: DaemonTaskControlIntegration | undefined;
       taskControlPlane = await startTaskControlPlaneRuntime({
-        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags,
-        authority: new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
+        dataDir: config.session.dataDir, larkAppId: canary.controllerAppId, flags: taskControlFlags,
+        authority: bridge.authority,
         logger, deferStart: true,
-        collect: () => shadowCollector?.collectAll() ?? Promise.resolve(),
+        collect: () => integration?.collectAll() ?? Promise.resolve(),
+        deliver: async row => integration?.deliver(row) ?? { kind: 'degraded', error: 'integration_unavailable' },
       });
       const taskControlStore = taskControlPlane.getStore();
       if (!taskControlStore) throw new Error('task_control_store_unavailable');
-      shadowCollector = new DaemonTaskControlShadowCollector({
-        larkAppId: cfg.larkAppId, taskGuid: shadowTaskGuid, lifecycle: taskControlPlane, logger,
+      integration = new DaemonTaskControlIntegration({
+        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore, bridge, logger, canary,
+        shadowTaskGuids: canary.taskGuids,
+        isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
+          const live = findActiveBySessionId(sessionId);
+          return !!live && live.worker !== null && live.workerGeneration === workerGeneration
+            && live.session.workerGeneration === workerGeneration;
+        },
       });
-      // Scoped Shadow deliberately exposes no integration to daemon hooks or
-      // IPC routes. The canary can read references but cannot map, review,
-      // deliver, pump or freeze.
-      taskControlIntegration = undefined;
+      taskControlIntegration = integration;
       // No recovery claim may run before its daemon-owned delivery/collector
       // adapters exist. This prevents a restored outbox row being degraded as
       // `integration_unavailable` during bootstrap.
@@ -22434,12 +22447,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!live || live !== ds || live.worker === null
         || live.workerGeneration !== context.workerGeneration
         || live.session.workerGeneration !== context.workerGeneration) {
-        taskControlIntegration?.deliveryReceiptUnknown(sourceRef, context, 'receipt_worker_generation_unproven');
+        taskControlIntegration?.deliveryReceiptUnknown(ds.session.rootMessageId ?? '', sourceRef, context, 'receipt_worker_generation_unproven');
         return;
       }
       const dispatchRoot = live.session.rootMessageId ?? '';
       if (!dispatchRoot) {
-        taskControlIntegration?.deliveryReceiptUnknown(sourceRef, context, 'receipt_dispatch_root_unproven');
+        taskControlIntegration?.deliveryReceiptUnknown(dispatchRoot, sourceRef, context, 'receipt_dispatch_root_unproven');
         return;
       }
       // A normal final reply supplies a provider receipt, but not the mapped

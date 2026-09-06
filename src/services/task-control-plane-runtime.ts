@@ -18,10 +18,42 @@ export interface TaskControlPlaneFlags {
 
 export interface ScopedTaskControlPlaneConfig {
   flags: TaskControlPlaneFlags;
-  /** Present only for the one exact app+task read-only Shadow canary. */
-  shadowTaskGuid?: string;
+  /** Present only for the fixed P2-7 project/phase/task integration canary. */
+  canary?: TaskControlPlaneCanaryScope;
   disabledReason?: string;
 }
+
+export type TaskControlPlaneCanaryRole = 'controller' | 'worker' | 'reviewer';
+
+/**
+ * This is deliberately a fixed rollout tuple, not a general policy mechanism.
+ * It gives the existing daemon control-plane paths one narrow integration
+ * target while every other project remains disabled.
+ */
+export interface TaskControlPlaneCanaryScope {
+  role: TaskControlPlaneCanaryRole;
+  projectId: string;
+  phaseId: string;
+  taskGuids: readonly string[];
+  controllerAppId: string;
+  workerAppId: string;
+  reviewerAppId: string;
+  docToken: string;
+}
+
+export const P2_7_TASK_CONTROL_CANARY = Object.freeze({
+  projectId: 'p2-7-canary',
+  phaseId: 'phase-1',
+  taskGuids: [
+    'dddcc370-e210-4dd1-b7b9-9dabddc38ddf',
+    '7637c5bc-729e-4e58-978d-20ab9f9679a8',
+    'a151cdaa-fb8f-4800-be3c-cdf273e56d23',
+  ] as readonly string[],
+  controllerAppId: 'cli_aac926f0eb795bc1',
+  workerAppId: 'cli_aa1e53f7aaf81bc6',
+  reviewerAppId: 'cli_aa1e4c5508f8dbd3',
+  docToken: 'Rk2VdXPb8oRcBFxdZp9morIlyZc',
+});
 
 export interface TaskControlPlaneLogger {
   warn(message: string): void;
@@ -98,13 +130,58 @@ export function taskControlPlaneFlags(env: NodeJS.ProcessEnv = process.env): Tas
 
 const LARK_APP_ID_PATTERN = /^cli_[A-Za-z0-9]{16,64}$/;
 const TASK_GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SCOPED_SHADOW_LARK_APP_ID = 'cli_aac926f0eb795bc1';
-const SCOPED_SHADOW_TASK_GUID = '2cd616e9-910b-47e1-a081-349b4808ee5a';
+const CANARY_SCOPE_ENV_NAMES = [
+  'TASK_CONTROL_PLANE_PROJECT_ID',
+  'TASK_CONTROL_PLANE_PHASE_ID',
+  'TASK_CONTROL_PLANE_TASK_GUIDS',
+  'TASK_CONTROL_PLANE_CONTROLLER_LARK_APP_ID',
+  'TASK_CONTROL_PLANE_WORKER_LARK_APP_ID',
+  'TASK_CONTROL_PLANE_REVIEWER_LARK_APP_ID',
+  'TASK_CONTROL_PLANE_DOC_TOKEN',
+] as const;
+const CANARY_GATE_ENV_NAMES = [
+  'TASK_CONTROL_PLANE_PUMP_CANARY_ENABLED',
+  'TASK_CONTROL_PLANE_FREEZE_CANARY_ENABLED',
+] as const;
+const KNOWN_TASK_CONTROL_ENV_NAMES = new Set<string>([
+  'TASK_CONTROL_PLANE_LEDGER_ENABLED',
+  'TASK_CONTROL_PLANE_SHADOW_ENABLED',
+  'TASK_CONTROL_PLANE_PUMP_ENABLED',
+  'TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT',
+  ...CANARY_SCOPE_ENV_NAMES,
+  ...CANARY_GATE_ENV_NAMES,
+]);
+
+function exactTaskSet(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length
+    && new Set(actual).size === actual.length
+    && actual.every(taskGuid => expected.includes(taskGuid));
+}
+
+function parseTaskGuids(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const taskGuids = value.split(',').map(item => item.trim());
+  return taskGuids.length > 0 && taskGuids.every(taskGuid => TASK_GUID_PATTERN.test(taskGuid))
+    ? taskGuids
+    : undefined;
+}
+
+/** Exact, set-based canary mapping check; duplicate task values are rejected. */
+export function matchesTaskControlPlaneCanaryMapping(
+  canary: TaskControlPlaneCanaryScope,
+  mapping: { projectId: string; phaseId: string; phaseTaskGuids: readonly string[]; taskGuid: string; docToken?: string },
+): boolean {
+  return mapping.projectId === canary.projectId
+    && mapping.phaseId === canary.phaseId
+    && mapping.docToken === canary.docToken
+    && canary.taskGuids.includes(mapping.taskGuid)
+    && exactTaskSet(mapping.phaseTaskGuids, canary.taskGuids);
+}
 
 /**
- * Production daemon gate for the first real Shadow canary. Any enabled flag
- * requires one exact app+task scope and the read-only ledger+shadow flag set.
- * Missing, malformed, cross-app or write-capable configurations fail closed.
+ * Production daemon gate for the fixed P2-7 integration canary. Any enabled
+ * flag requires the exact project/phase/three-task/app-role/doc tuple. Pump and
+ * freeze each additionally require their own exact canary gate.
  */
 export function scopedTaskControlPlaneConfig(
   selfLarkAppId: string,
@@ -118,29 +195,53 @@ export function scopedTaskControlPlaneConfig(
     'TASK_CONTROL_PLANE_PUMP_ENABLED',
     'TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT',
   ];
-  if (flagNames.some(name => env[name] !== undefined && !/^(true|false)$/i.test(env[name]!.trim()))) {
+  if ([...flagNames, ...CANARY_GATE_ENV_NAMES].some(name => env[name] !== undefined && !/^(true|false)$/i.test(env[name]!.trim()))) {
     return { flags: disabled(), disabledReason: 'flag_value_invalid' };
+  }
+  if (Object.keys(env).some(name => name.startsWith('TASK_CONTROL_PLANE_') && !KNOWN_TASK_CONTROL_ENV_NAMES.has(name))) {
+    return { flags: disabled(), disabledReason: 'canary_scope_extra' };
   }
   if (!Object.values(flags).some(Boolean)) return { flags: disabled() };
 
-  const targetLarkAppId = env.TASK_CONTROL_PLANE_TARGET_LARK_APP_ID?.trim();
-  const targetTaskGuid = env.TASK_CONTROL_PLANE_TARGET_TASK_GUID?.trim();
-  if (!targetLarkAppId || !targetTaskGuid) {
-    return { flags: disabled(), disabledReason: 'target_scope_required' };
+  const projectId = env.TASK_CONTROL_PLANE_PROJECT_ID?.trim();
+  const phaseId = env.TASK_CONTROL_PLANE_PHASE_ID?.trim();
+  const taskGuids = parseTaskGuids(env.TASK_CONTROL_PLANE_TASK_GUIDS);
+  const controllerAppId = env.TASK_CONTROL_PLANE_CONTROLLER_LARK_APP_ID?.trim();
+  const workerAppId = env.TASK_CONTROL_PLANE_WORKER_LARK_APP_ID?.trim();
+  const reviewerAppId = env.TASK_CONTROL_PLANE_REVIEWER_LARK_APP_ID?.trim();
+  const docToken = env.TASK_CONTROL_PLANE_DOC_TOKEN?.trim();
+  if (CANARY_SCOPE_ENV_NAMES.some(name => !env[name]?.trim())) {
+    return { flags: disabled(), disabledReason: 'canary_scope_required' };
   }
-  if (!LARK_APP_ID_PATTERN.test(targetLarkAppId) || !TASK_GUID_PATTERN.test(targetTaskGuid)) {
-    return { flags: disabled(), disabledReason: 'target_scope_invalid' };
+  if (!taskGuids || !controllerAppId || !workerAppId || !reviewerAppId || !docToken
+    || !LARK_APP_ID_PATTERN.test(controllerAppId) || !LARK_APP_ID_PATTERN.test(workerAppId) || !LARK_APP_ID_PATTERN.test(reviewerAppId)) {
+    return { flags: disabled(), disabledReason: 'canary_scope_invalid' };
   }
-  if (targetLarkAppId !== SCOPED_SHADOW_LARK_APP_ID || targetTaskGuid !== SCOPED_SHADOW_TASK_GUID) {
-    return { flags: disabled(), disabledReason: 'target_scope_unauthorized' };
+  if (projectId !== P2_7_TASK_CONTROL_CANARY.projectId || phaseId !== P2_7_TASK_CONTROL_CANARY.phaseId
+    || !exactTaskSet(taskGuids, P2_7_TASK_CONTROL_CANARY.taskGuids)
+    || controllerAppId !== P2_7_TASK_CONTROL_CANARY.controllerAppId
+    || workerAppId !== P2_7_TASK_CONTROL_CANARY.workerAppId
+    || reviewerAppId !== P2_7_TASK_CONTROL_CANARY.reviewerAppId
+    || docToken !== P2_7_TASK_CONTROL_CANARY.docToken) {
+    return { flags: disabled(), disabledReason: 'canary_scope_unauthorized' };
   }
-  if (targetLarkAppId !== selfLarkAppId) {
-    return { flags: disabled(), disabledReason: 'target_app_mismatch' };
+  const role = selfLarkAppId === controllerAppId ? 'controller'
+    : selfLarkAppId === workerAppId ? 'worker'
+      : selfLarkAppId === reviewerAppId ? 'reviewer' : undefined;
+  if (!role) return { flags: disabled(), disabledReason: 'target_app_mismatch' };
+  if (!flags.ledgerEnabled || !flags.shadowEnabled) {
+    return { flags: disabled(), disabledReason: 'canary_ledger_shadow_required' };
   }
-  if (!flags.ledgerEnabled || !flags.shadowEnabled || flags.pumpEnabled || flags.freezeEnforcement) {
-    return { flags: disabled(), disabledReason: 'scoped_shadow_read_only_required' };
+  if (flags.pumpEnabled && (role !== 'controller' || env.TASK_CONTROL_PLANE_PUMP_CANARY_ENABLED?.trim().toLowerCase() !== 'true')) {
+    return { flags: disabled(), disabledReason: 'pump_canary_gate_required' };
   }
-  return { flags, shadowTaskGuid: targetTaskGuid };
+  if (flags.freezeEnforcement && (role !== 'controller' || env.TASK_CONTROL_PLANE_FREEZE_CANARY_ENABLED?.trim().toLowerCase() !== 'true')) {
+    return { flags: disabled(), disabledReason: 'freeze_canary_gate_required' };
+  }
+  return {
+    flags,
+    canary: { role, projectId, phaseId, taskGuids: [...P2_7_TASK_CONTROL_CANARY.taskGuids], controllerAppId, workerAppId, reviewerAppId, docToken },
+  };
 }
 
 function validateFlags(flags: TaskControlPlaneFlags, hasDelivery: boolean, hasCollector: boolean): void {
@@ -149,9 +250,6 @@ function validateFlags(flags: TaskControlPlaneFlags, hasDelivery: boolean, hasCo
   if (flags.freezeEnforcement && !flags.ledgerEnabled) throw new TaskControlPlaneFlagError('freeze_enforcement_requires_ledger');
   if (flags.pumpEnabled && !flags.ledgerEnabled) throw new TaskControlPlaneFlagError('pump_requires_ledger');
   if (flags.pumpEnabled && !hasDelivery) throw new TaskControlPlaneFlagError('pump_delivery_required');
-  if (flags.shadowEnabled && flags.pumpEnabled) throw new TaskControlPlaneFlagError('shadow_pump_mutually_exclusive');
-  if (flags.shadowEnabled && flags.freezeEnforcement) throw new TaskControlPlaneFlagError('shadow_freeze_mutually_exclusive');
-  if (flags.pumpEnabled && flags.freezeEnforcement) throw new TaskControlPlaneFlagError('pump_freeze_mutually_exclusive');
 }
 
 function retryDelay(attempt: number): number {
