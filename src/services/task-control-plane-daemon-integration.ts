@@ -568,7 +568,7 @@ export class DaemonTaskControlIntegration {
   async collectAll(): Promise<void> {
     await Promise.all((['task', 'task_comment', 'topic', 'doc_revision'] as const).map(async kind => {
       try { await this.collector.collect(kind); }
-      catch (error) { this.input.logger.warn(`[task-control] ${kind} collector failed: ${String(error)}`); }
+      catch (error) { this.#input.logger.warn(`[task-control] ${kind} collector failed: ${String(error)}`); }
     }));
   }
 
