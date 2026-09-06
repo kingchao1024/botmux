@@ -10,7 +10,6 @@ import {
   deriveDaemonDesignatedReviewerProvider,
   deriveDaemonReviewerVerdictProvider,
   reviewerDesignationRef,
-  reviewerVerdictKeyId,
   reviewerMessageSourceFromLarkDetail,
 } from './task-control-plane-reviewer-verdict.js';
 
@@ -399,6 +398,9 @@ export function createTaskControlRouteHandlers(input: {
   findReviewerSession: (sessionId: string) => ReviewerLiveSession | undefined;
   listReviewerSessions: () => ReviewerLiveSession[];
   hostSecret: () => string | undefined;
+  previousHostSecret?: () => string | undefined;
+  reviewerAllowedKeyIds?: () => readonly string[] | undefined;
+  reviewerRevokedKeyIds?: () => readonly string[] | undefined;
   readMessageDetail: (larkAppId: string, messageId: string) => Promise<unknown>;
   readDocumentRevision: (larkAppId: string, docToken: string) => Promise<number | undefined>;
   resolveMappingRegistration: (larkAppId: string, input: { dispatchRoot: string; registrationRef: string; controllerId: string }) => Promise<DaemonTaskControlMappingRegistration | undefined>;
@@ -606,7 +608,7 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 400, { ok: false, error: 'task_control_designated_reviewer_invalid' });
         return;
       }
-      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, controllerBotAppId: selfAppId });
+      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       if (!integration.registerVerifiedDesignatedReviewer({ mapping: designation, verifier })) {
         jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_unproven' });
         return;
@@ -744,6 +746,20 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_document_unproven' });
         return;
       }
+      let reread: ReturnType<typeof reviewerMessageSourceFromLarkDetail>;
+      try {
+        reread = reviewerMessageSourceFromLarkDetail({
+          detail: await input.readMessageDetail(selfAppId, sourceMessageId),
+          expectedMessageId: sourceMessageId, expectedTopicRootId: dispatchRoot, expectedReviewerId: source.senderId,
+        });
+      } catch { reread = undefined; }
+      if (!reviewerStillLive(reviewer, input.findReviewerSession)
+        || !sameControllerBinding(controller, controllerBindingFromRegistry(input.dataDir(), dispatchRoot))
+        || !reread || reread.sourceVersionHash !== source.sourceVersionHash
+        || reread.sourceMessageId !== source.sourceMessageId || reread.senderId !== source.senderId) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_source_changed' });
+        return;
+      }
       const signer = deriveDaemonReviewerVerdictProvider({ hostSecret, reviewerBotAppId: selfAppId });
       const expiresAt = reviewerVerdictExpiresAt(source.createdAt);
       let verdict: ReviewerVerdictV1;
@@ -805,7 +821,7 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 409, { ok: false, error: 'task_control_designation_resolve_controller_unproven' });
         return;
       }
-      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, controllerBotAppId: selfAppId });
+      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       integration.setReviewerVerdictVerifier(verifier);
       const designation = integration.currentDesignatedReviewer(dispatchRoot, reviewRound);
       if (!designation || designation.reviewerBotAppId !== reviewerBotAppId
@@ -883,7 +899,7 @@ export function createTaskControlRouteHandlers(input: {
         return;
       }
       mapping = currentMapping;
-      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, controllerBotAppId: selfAppId });
+      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       integration.setReviewerVerdictVerifier(verifier);
       const designated = integration.currentDesignatedReviewer(dispatchRoot, verdict.reviewRound);
       if (!mapping || !mapping.docToken || !designated
@@ -894,7 +910,7 @@ export function createTaskControlRouteHandlers(input: {
         || verdict.projectId !== mapping.projectId || verdict.phaseId !== mapping.phaseId
         || verdict.taskGuid !== mapping.taskGuid || verdict.topicRootId !== mapping.topicRootId
         || verdict.docToken !== mapping.docToken
-        || verdict.keyId !== reviewerVerdictKeyId(designated.reviewerBotAppId)
+        || !verifier.verifyVerdict(verdict)
         || attestation.reviewerId !== verdict.reviewerId || attestation.reviewerBotAppId !== verdict.reviewerBotAppId
         || attestation.sessionId !== verdict.sessionId || attestation.workerGeneration !== verdict.workerGeneration
         || attestation.capabilityHash !== verdict.capabilityHash) {

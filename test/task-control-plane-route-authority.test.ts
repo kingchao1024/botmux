@@ -71,6 +71,7 @@ type TestContext = {
   designationGate?: { promise: Promise<void>; release: () => void };
   documentGate?: { promise: Promise<void>; release: () => void };
   receiverDocumentGate?: { promise: Promise<void>; release: () => void };
+  sourceVersion?: string;
   realIntegrations?: Map<string, DaemonTaskControlIntegration>;
   realLifecycles?: TaskControlPlaneLifecycle[];
   controllerSessions?: Map<string, { larkAppId: string; rootMessageId: string; workerGeneration: number }>;
@@ -139,6 +140,7 @@ const handlers = createTaskControlRouteHandlers({
     await context.messageGate?.promise;
     return { items: [{
     message_id: context.sourceMessageId, root_id: context.sourceRoot, create_time: '2026-09-05T18:00:00.000Z',
+    ...(context.sourceVersion ? { update_time: context.sourceVersion } : {}),
     sender: { id: context.sourceSender },
     }] };
   },
@@ -509,6 +511,24 @@ describe('task-control mapping/freeze controlled IPC', () => {
       expect(await response.json()).toMatchObject({ error: 'task_control_reviewer_ingress_origin_changed' });
       expect(context.reviewedCalls, stage).toBe(0);
     }
+  });
+
+  it('re-reads the reviewer source after designation and document awaits', async () => {
+    reset();
+    writeRegistry();
+    expect((await post(TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, designationPayload())).status).toBe(201);
+    context.selfAppId = 'reviewer-app';
+    const gate = deferred();
+    context.documentGate = gate;
+    const pending = post(TASK_CONTROL_REVIEWER_INGRESS_ROUTE, reviewerIngressPayload({ verdictId: 'source-toctou' }), false);
+    await vi.waitFor(() => expect(context.documentReads).toBe(1), { timeout: 100 });
+    context.sourceVersion = '2026-09-05T18:01:00.000Z';
+    gate.release();
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'task_control_reviewer_ingress_source_changed' });
+    expect(context.sourceReads).toBe(3);
+    expect(context.reviewedCalls).toBe(0);
   });
 
   it('rejects a receiver verdict when controller mapping/live binding changes during its document read', async () => {

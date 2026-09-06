@@ -84,6 +84,32 @@ describe('task control plane runtime', () => {
       .toMatchObject({ disabledReason: 'production_ledger_required' });
   });
 
+  it('boots, activates, and closes an isolated production-flag lifecycle without widening the scope', async () => {
+    const appId = 'cli_aac926f0eb795bc1';
+    const config = productionTaskControlPlaneConfig({ larkAppId: appId, env: {
+      TASK_CONTROL_PLANE_PRODUCTION: 'true', TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
+      TASK_CONTROL_PLANE_PUMP_ENABLED: 'true', TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
+    } });
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-production-runtime-'));
+    const warnings: string[] = [];
+    let deliveries = 0;
+    try {
+      const runtime = await import('../src/services/task-control-plane-runtime.js');
+      const authority = new (await import('../src/services/task-control-plane-authority.js')).DaemonTaskControlAuthority({ resolvePrincipal: () => undefined });
+      const lifecycle = await runtime.startTaskControlPlaneRuntime({
+        dataDir, larkAppId: appId, flags: config.flags, authority, deferStart: true, intervalMs: 5,
+        logger: { warn: value => warnings.push(value) }, deliver: async () => { deliveries++; return { kind: 'retry' }; },
+      });
+      expect(lifecycle.enabled).toBe(true);
+      expect(existsSync(taskControlPlaneDatabasePath(dataDir))).toBe(true);
+      expect(deliveries).toBe(0);
+      lifecycle.activate();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      await lifecycle.close();
+      expect(warnings).toEqual([]);
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
   it('does not create SQLite for a non-target app even when the scoped Shadow flags are enabled', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-scope-off-'));
     const config = scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', {

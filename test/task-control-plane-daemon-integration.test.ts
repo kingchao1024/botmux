@@ -197,6 +197,8 @@ describe('DaemonTaskControlIntegration', () => {
         listTaskComments: async () => ({ code: 0, data: { items: comments, has_more: false } }),
         createTaskComment: async ({ content }: { taskGuid: string; content: string }) => { creates++; comments.push({ id: '2001', content }); return { code: 0, commentId: '2001' }; },
         replyTopic: async () => 'om_unused',
+        readTopicMessage: async () => ({ items: [] }),
+        listTopicMessages: async () => ({ items: [], hasMore: false }),
       };
       const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
       expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
@@ -233,6 +235,7 @@ describe('DaemonTaskControlIntegration', () => {
         createTaskComment: async () => ({ code: 1470403 }),
         replyTopic: async ({ content }: { topicRootId: string; content: string; uuid: string }) => { topicReplies++; topicContent = content; return 'om_abc123'; },
         readTopicMessage: async () => ({ items: [{ message_id: 'om_abc123', body: { content: topicContent } }] }),
+        listTopicMessages: async () => ({ items: [], hasMore: false }),
       };
       const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
       expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
@@ -253,7 +256,7 @@ describe('DaemonTaskControlIntegration', () => {
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
-  it('uses the topic reply UUID plus signed reread to reconcile a post-write crash without duplicate fallback', async () => {
+  it('reconciles a post-write topic crash past UUID TTL by searching the signed marker before any retry', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-topic-crash-'));
     try {
       const trust = new TaskControlMappingTrust({ hostSecret: 'topic-crash-host-secret', larkAppId: 'app-1' });
@@ -262,20 +265,19 @@ describe('DaemonTaskControlIntegration', () => {
       const store = lifecycle.getStore()!;
       let replies = 0;
       let topicContent = '';
-      const replyIds = new Map<string, string>();
+      const topicMessages: Array<{ message_id: string; body: { content: string } }> = [];
       const deliveryClient = {
         listTaskComments: async () => ({ code: 0, data: { items: [], has_more: false } }),
         createTaskComment: async () => ({ code: 1470403 }),
-        replyTopic: async ({ content, uuid }: { topicRootId: string; content: string; uuid: string }) => {
+        replyTopic: async ({ content }: { topicRootId: string; content: string; uuid: string }) => {
           topicContent = content;
-          const prior = replyIds.get(uuid);
-          if (prior) return prior;
           replies++;
           const messageId = 'om_topiccrash';
-          replyIds.set(uuid, messageId);
+          topicMessages.push({ message_id: messageId, body: { content } });
           return messageId;
         },
         readTopicMessage: async () => ({ items: [{ message_id: 'om_topiccrash', body: { content: topicContent } }] }),
+        listTopicMessages: async () => ({ items: topicMessages, hasMore: false }),
       };
       const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
       expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
@@ -289,6 +291,7 @@ describe('DaemonTaskControlIntegration', () => {
       expect(await integration.deliver(fallback)).toEqual({ kind: 'delivered', receiptRef: 'topic-message:om_topiccrash' });
       expect(replies).toBe(1);
       // Simulate a crash after provider acknowledgement and source reread but before settle.
+      // The provider's one-hour UUID map is intentionally absent after restart.
       await lifecycle.close();
       const restartedBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
       const restarted = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: restartedBridge.authority, logger: { warn: () => {} } });
@@ -298,6 +301,50 @@ describe('DaemonTaskControlIntegration', () => {
       const retry = restartedStore.claimOutbox({ now: Date.now() + 61_000, limit: 1, claimToken: 'retry' })[0]!;
       expect(await restartedIntegration.deliver(retry)).toEqual({ kind: 'delivered', receiptRef: 'topic-message:om_topiccrash' });
       expect(replies).toBe(1);
+      await restarted.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('never re-sends a topic fallback when a prior effect cannot be reread after UUID expiry', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-topic-uncertain-'));
+    try {
+      const trust = new TaskControlMappingTrust({ hostSecret: 'topic-uncertain-host-secret', larkAppId: 'app-1' });
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const store = lifecycle.getStore()!;
+      let providerWrites = 0;
+      let topicContent = '';
+      const deliveryClient = {
+        listTaskComments: async () => ({ code: 0, data: { items: [], has_more: false } }),
+        createTaskComment: async () => ({ code: 1470403 }),
+        replyTopic: async ({ content }: { topicRootId: string; content: string; uuid: string }) => { providerWrites++; topicContent = content; return 'om_topicfirst'; },
+        readTopicMessage: async () => ({ items: [{ message_id: 'om_topicfirst', body: { content: topicContent } }] }),
+        listTopicMessages: async () => ({ items: [], hasMore: false }),
+      };
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const worker = bridge.issueAuthentication('om_root', 'worker')!;
+      store.appendEvent({ eventId: 'delivered', eventType: 'task.delivered', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', authentication: worker, idempotencyKey: 'delivered', terminal: true, deliverTo: ['task-comment:task-1'], payload: { docToken: 'doc-final', docRevision: 1 } });
+      const primary = store.claimOutbox({ now: Date.now(), limit: 1, claimToken: 'primary' })[0]!;
+      const rejected = await integration.deliver(primary);
+      store.degradeOutboxWithFallback({ eventId: primary.eventId, sourceDestinationId: primary.destinationId, fallbackDestinationId: rejected.fallbackDestinationId!, claimToken: 'primary', error: rejected.error!, now: Date.now() });
+      const fallback = store.claimOutbox({ now: Date.now(), limit: 1, claimToken: 'fallback' })[0]!;
+      expect(await integration.deliver(fallback)).toEqual({ kind: 'delivered', receiptRef: 'topic-message:om_topicfirst' });
+      expect(providerWrites).toBe(1);
+      await lifecycle.close();
+
+      const restartedBridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const restarted = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: restartedBridge.authority, logger: { warn: () => {} } });
+      const restartedStore = restarted.getStore()!;
+      const restartedIntegration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle: restarted, store: restartedStore, bridge: restartedBridge, logger: { warn: () => {} }, mappingTrust: trust, controlledWriteback: true, deliveryClient });
+      restartedStore.resetExpiredOutboxClaims(Date.now() + 3_700_000, 60_000);
+      const retry = restartedStore.claimOutbox({ now: Date.now() + 3_700_000, limit: 1, claimToken: 'retry' })[0]!;
+      expect(await restartedIntegration.deliver(retry)).toEqual({ kind: 'degraded', error: 'topic_effect_uncertain' });
+      expect(providerWrites).toBe(1);
+      expect(restartedStore.listEvents({ taskGuid: 'task-1' })).toEqual(expect.arrayContaining([
+        expect.objectContaining({ eventType: 'unknown.required', payload: expect.objectContaining({ unknownKey: expect.stringContaining('topic-effect:') }) }),
+        expect.objectContaining({ eventType: 'unknown.required', payload: expect.objectContaining({ unknownKey: expect.stringContaining(':unreadable') }) }),
+      ]));
       await restarted.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });

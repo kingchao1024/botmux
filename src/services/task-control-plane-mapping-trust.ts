@@ -125,7 +125,7 @@ export class TaskControlMappingTrust {
     return { ...unsigned, signature: signature(this.deliveryReceiptKey, deliveryReceiptPayload(unsigned)) };
   }
 
-  verifyDeliveryReceiptMarker(marker: unknown, expected: { eventId: string; destinationId: string }): marker is TaskControlDeliveryReceiptMarker {
+  verifyDeliveryReceiptMarker(marker: unknown, expected: { eventId: string; destinationId: string }, options: { allowedKeyIds?: readonly string[]; revokedKeyIds?: readonly string[] } = {}): marker is TaskControlDeliveryReceiptMarker {
     if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return false;
     const value = marker as Record<string, unknown>;
     const allowed = ['schemaVersion', 'larkAppId', 'eventId', 'destinationId', 'issuedAt', 'keyId', 'signature'];
@@ -133,7 +133,9 @@ export class TaskControlMappingTrust {
     if (value.schemaVersion !== 'TaskControlDeliveryReceipt.v1' || value.larkAppId !== this.larkAppId
       || value.eventId !== expected.eventId || value.destinationId !== expected.destinationId
       || typeof value.issuedAt !== 'string' || !Number.isFinite(Date.parse(value.issuedAt))
-      || typeof value.keyId !== 'string' || typeof value.signature !== 'string') return false;
+      || typeof value.keyId !== 'string' || typeof value.signature !== 'string'
+      || options.revokedKeyIds?.includes(value.keyId)
+      || (options.allowedKeyIds !== undefined && !options.allowedKeyIds.includes(value.keyId))) return false;
     const unsigned: Omit<TaskControlDeliveryReceiptMarker, 'signature'> = {
       schemaVersion: value.schemaVersion, larkAppId: value.larkAppId, eventId: value.eventId, destinationId: value.destinationId,
       issuedAt: value.issuedAt, keyId: value.keyId,

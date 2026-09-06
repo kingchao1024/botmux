@@ -87,4 +87,13 @@ describe('task control production mapping trust', () => {
     expect(overlap.verifyMapping(proof, facts, { allowedKeyIds: [overlap.mappingKeyId, overlap.previousMappingKeyId!], revokedKeyIds: [overlap.previousMappingKeyId!] })).toBe(false);
     expect(new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: APP }).verifyMapping(proof, facts)).toBe(false);
   });
+
+  it('applies the same allow and revoke policy to prior delivery receipt markers', () => {
+    const oldTrust = new TaskControlMappingTrust({ hostSecret: 'old-host-root', larkAppId: APP });
+    const marker = oldTrust.issueDeliveryReceiptMarker({ eventId: 'evt-old', destinationId: 'task-comment:task-a', issuedAt: '2026-09-06T01:02:03.000Z' });
+    const overlap = new TaskControlMappingTrust({ hostSecret: HOST_SECRET, previousHostSecret: 'old-host-root', larkAppId: APP });
+    const expected = { eventId: 'evt-old', destinationId: 'task-comment:task-a' };
+    expect(overlap.verifyDeliveryReceiptMarker(marker, expected, { allowedKeyIds: [overlap.deliveryReceiptKeyId, overlap.previousDeliveryReceiptKeyId!] })).toBe(true);
+    expect(overlap.verifyDeliveryReceiptMarker(marker, expected, { allowedKeyIds: [overlap.deliveryReceiptKeyId, overlap.previousDeliveryReceiptKeyId!], revokedKeyIds: [overlap.previousDeliveryReceiptKeyId!] })).toBe(false);
+  });
 });

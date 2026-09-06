@@ -29,6 +29,8 @@ type TaskControlDeliveryClient = {
   createTaskComment(input: { taskGuid: string; content: string }): Promise<{ code?: number; commentId?: string }>;
   replyTopic(input: { topicRootId: string; content: string; uuid: string }): Promise<string>;
   readTopicMessage(input: { larkAppId: string; messageId: string }): Promise<unknown>;
+  /** Read the entire topic before a fallback effect; unreadable means fail closed. */
+  listTopicMessages(input: { larkAppId: string; topicRootId: string; pageToken?: string }): Promise<{ items: unknown[]; pageToken?: string; hasMore?: boolean }>;
 };
 
 function nonBlank(value: unknown): string | undefined {
@@ -107,6 +109,8 @@ export class DaemonTaskControlIntegration {
       isLiveReceiptOwner?: (input: { sessionId: string; workerGeneration: number }) => boolean;
       /** Set only by the production daemon after host-only trust bootstrap. */
       mappingTrust?: TaskControlMappingTrust;
+      receiptAllowedKeyIds?: readonly string[];
+      receiptRevokedKeyIds?: readonly string[];
       /** Enable only when Pump is live; tests and Shadow keep receipt projection inert. */
       controlledWriteback?: boolean;
       /** Narrow test seam; production defaults to the existing Lark client. */
@@ -116,6 +120,10 @@ export class DaemonTaskControlIntegration {
     this.adapters = new TaskControlEventAdapters(input.lifecycle);
     this.collector = new TaskControlActiveCollector(input.lifecycle, this.collectionSource());
     this.restoreMappings();
+  }
+
+  private receiptMarkerOptions() {
+    return { allowedKeyIds: this.input.receiptAllowedKeyIds, revokedKeyIds: this.input.receiptRevokedKeyIds };
   }
 
   private restoreMappings(): void {
@@ -706,6 +714,19 @@ export class DaemonTaskControlIntegration {
       replyTopic: ({ topicRootId, content, uuid: replyUuid }: { topicRootId: string; content: string; uuid: string }) =>
         replyMessage(this.input.larkAppId, topicRootId, content, 'text', true, replyUuid),
       readTopicMessage: ({ messageId }: { larkAppId: string; messageId: string }) => getMessageDetail(this.input.larkAppId, messageId),
+      listTopicMessages: async ({ topicRootId, pageToken }: { larkAppId: string; topicRootId: string; pageToken?: string }) => {
+        const root = await getMessageDetail(this.input.larkAppId, topicRootId);
+        const rootItem = root && typeof root === 'object' && Array.isArray((root as Record<string, unknown>).items)
+          ? (root as Record<string, any>).items[0] : undefined;
+        const threadId = typeof rootItem?.thread_id === 'string' ? rootItem.thread_id : undefined;
+        if (!threadId) throw new Error('topic_thread_unreadable');
+        const response = await larkGet(getBotClient(this.input.larkAppId), '/open-apis/im/v1/messages', {
+          container_id_type: 'thread', container_id: threadId, page_size: 50, sort_type: 'ByCreateTimeDesc',
+          ...(pageToken ? { page_token: pageToken } : {}),
+        });
+        if (response?.code !== 0 || !Array.isArray(response?.data?.items)) throw new Error('topic_messages_unreadable');
+        return { items: response.data.items, ...(response.data.page_token ? { pageToken: response.data.page_token } : {}), hasMore: response.data.has_more === true };
+      },
     };
     try {
       if (row.destinationId === `task-comment:${event.taskGuid}`) {
@@ -735,11 +756,28 @@ export class DaemonTaskControlIntegration {
         return { kind: 'delivered', receiptRef: `task-comment:${receiptRef}` };
       }
       if (row.destinationId === `topic-message:${event.topicRootId}`) {
+        const prior = await this.findTopicReceipt({ event, destinationId: row.destinationId, marker, deliveryClient });
+        if (prior.kind === 'found') {
+          this.resolveTopicEffectUnknown(event, row);
+          this.recordTopicFallback(event, row, `topic-message:${prior.messageId}`, `topic-message:${prior.messageId}`);
+          return { kind: 'delivered', receiptRef: `topic-message:${prior.messageId}` };
+        }
+        if (prior.kind === 'unreadable') {
+          return { kind: 'retry', error: 'topic_receipt_scan_unproven' };
+        }
+        if (!this.startTopicEffectUnknown(event, row)) {
+          // A previous process reached the durable pre-effect journal but no
+          // matching signed receipt is readable now. UUID expiry can no longer
+          // prove a retry is safe, so preserve UNKNOWN and never write again.
+          this.requireTopicEffectUnknown(event, row);
+          return { kind: 'degraded', error: 'topic_effect_uncertain' };
+        }
         const receiptRef = await deliveryClient.replyTopic({ topicRootId: event.topicRootId, content, uuid });
         const reread = await deliveryClient.readTopicMessage({ larkAppId: this.input.larkAppId, messageId: receiptRef });
         if (!this.topicReceiptMatches(reread, receiptRef, event, marker)) {
-          return { kind: 'retry', error: 'topic_receipt_reread_unproven' };
+          return { kind: 'degraded', error: 'topic_effect_uncertain' };
         }
+        this.resolveTopicEffectUnknown(event, row);
         this.recordTopicFallback(event, row, `topic-message:${receiptRef}`, `topic-message:${receiptRef}`);
         return { kind: 'delivered', receiptRef: `topic-message:${receiptRef}` };
       }
@@ -760,13 +798,102 @@ export class DaemonTaskControlIntegration {
     try { payload = JSON.parse(content); } catch { return false; }
     const record = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload as Record<string, unknown> : undefined;
     return !!record && record.task_control_event_id === event.eventId && record.task_guid === event.taskGuid
-      && !!this.input.mappingTrust?.verifyDeliveryReceiptMarker(record.task_control_delivery_receipt, { eventId: event.eventId, destinationId: `topic-message:${event.topicRootId}` });
+      && !!this.input.mappingTrust?.verifyDeliveryReceiptMarker(record.task_control_delivery_receipt, { eventId: event.eventId, destinationId: `topic-message:${event.topicRootId}` }, this.receiptMarkerOptions());
+  }
+
+  private topicReceiptItemMatches(item: unknown, event: ReturnType<TaskControlPlaneStore['listEvents']>[number], marker: unknown): string | undefined {
+    const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
+    const messageId = typeof record?.message_id === 'string' ? record.message_id : undefined;
+    const content = record?.body && typeof record.body === 'object' && !Array.isArray(record.body)
+      ? (record.body as Record<string, unknown>).content : record?.content;
+    if (!messageId || typeof content !== 'string') return undefined;
+    let payload: unknown;
+    try { payload = JSON.parse(content); } catch { return undefined; }
+    const payloadRecord = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload as Record<string, unknown> : undefined;
+    return payloadRecord?.task_control_event_id === event.eventId
+      && payloadRecord.task_guid === event.taskGuid
+      && this.input.mappingTrust?.verifyDeliveryReceiptMarker(payloadRecord.task_control_delivery_receipt, { eventId: event.eventId, destinationId: `topic-message:${event.topicRootId}` }, this.receiptMarkerOptions())
+      ? messageId : undefined;
+  }
+
+  private async findTopicReceipt(input: { event: ReturnType<TaskControlPlaneStore['listEvents']>[number]; destinationId: string; marker: unknown; deliveryClient: TaskControlDeliveryClient }): Promise<{ kind: 'found'; messageId: string } | { kind: 'missing' } | { kind: 'unreadable' }> {
+    if (!input.event.topicRootId || !this.input.mappingTrust?.verifyDeliveryReceiptMarker(input.marker, { eventId: input.event.eventId, destinationId: input.destinationId }, this.receiptMarkerOptions())) return { kind: 'unreadable' };
+    let pageToken: string | undefined;
+    try {
+      for (let page = 0; page < 100; page++) {
+        const response = await input.deliveryClient.listTopicMessages({ larkAppId: this.input.larkAppId, topicRootId: input.event.topicRootId, ...(pageToken ? { pageToken } : {}) });
+        for (const item of response.items) {
+          const messageId = this.topicReceiptItemMatches(item, input.event, input.marker);
+          if (messageId) return { kind: 'found', messageId };
+        }
+        if (!response.hasMore || !response.pageToken) return { kind: 'missing' };
+        pageToken = response.pageToken;
+      }
+    } catch { return { kind: 'unreadable' }; }
+    return { kind: 'unreadable' };
+  }
+
+  private topicEffectUnknownKey(event: ReturnType<TaskControlPlaneStore['listEvents']>[number], row: DeliveryOutboxRow): string {
+    return `topic-effect:${event.eventId}:${row.destinationId}`;
+  }
+
+  private startTopicEffectUnknown(event: ReturnType<TaskControlPlaneStore['listEvents']>[number], row: DeliveryOutboxRow): boolean {
+    const unknownKey = this.topicEffectUnknownKey(event, row);
+    const existing = this.input.store.listEvents({ taskGuid: event.taskGuid }).some(candidate =>
+      candidate.eventType === 'unknown.required' && candidate.payload.unknownKey === unknownKey,
+    );
+    if (existing) return false;
+    const authentication = this.input.bridge.issueAuthentication(event.topicRootId ?? '', 'collector');
+    if (!authentication || !event.taskGuid || !event.topicRootId) return false;
+    try {
+      const result = this.input.store.appendEvent({
+        eventId: `tcp-unknown-topic-effect:${event.eventId}:${row.destinationId}`, eventType: 'unknown.required',
+        projectId: event.projectId, phaseId: event.phaseId, taskGuid: event.taskGuid, topicRootId: event.topicRootId, authentication,
+        sourceRef: `topic-message:${event.topicRootId}`, idempotencyKey: taskControlEventIdempotencyKey('unknown.required', unknownKey),
+        payload: { unknownKey },
+      });
+      return result.kind === 'appended';
+    } catch { return false; }
+  }
+
+  private resolveTopicEffectUnknown(event: ReturnType<TaskControlPlaneStore['listEvents']>[number], row: DeliveryOutboxRow): void {
+    const unknownKey = this.topicEffectUnknownKey(event, row);
+    const authentication = this.input.bridge.issueAuthentication(event.topicRootId ?? '', 'collector');
+    if (!authentication || !event.taskGuid || !event.topicRootId) return;
+    try {
+      this.input.store.appendEvent({
+        eventId: `tcp-unknown-topic-effect-declared:${event.eventId}:${row.destinationId}`, eventType: 'unknown.declared',
+        projectId: event.projectId, phaseId: event.phaseId, taskGuid: event.taskGuid, topicRootId: event.topicRootId, authentication,
+        sourceRef: `topic-message:${event.topicRootId}`, idempotencyKey: taskControlEventIdempotencyKey('unknown.declared', unknownKey),
+        payload: { unknownKey },
+      });
+      this.input.store.appendEvent({
+        eventId: `tcp-unknown-topic-effect-resolved:${event.eventId}:${row.destinationId}`, eventType: 'unknown.resolved',
+        projectId: event.projectId, phaseId: event.phaseId, taskGuid: event.taskGuid, topicRootId: event.topicRootId, authentication,
+        sourceRef: `topic-message:${event.topicRootId}`, idempotencyKey: taskControlEventIdempotencyKey('unknown.resolved', unknownKey),
+        payload: { unknownKey },
+      });
+    } catch { /* the delivered receipt remains unproven until a later recovery scan */ }
+  }
+
+  private requireTopicEffectUnknown(event: ReturnType<TaskControlPlaneStore['listEvents']>[number], row: DeliveryOutboxRow): void {
+    const unknownKey = `${this.topicEffectUnknownKey(event, row)}:unreadable`;
+    const authentication = this.input.bridge.issueAuthentication(event.topicRootId ?? '', 'collector');
+    if (!authentication || !event.taskGuid || !event.topicRootId) return;
+    try {
+      this.input.store.appendEvent({
+        eventId: `tcp-unknown-topic-effect-unreadable:${event.eventId}:${row.destinationId}`, eventType: 'unknown.required',
+        projectId: event.projectId, phaseId: event.phaseId, taskGuid: event.taskGuid, topicRootId: event.topicRootId, authentication,
+        sourceRef: `topic-message:${event.topicRootId}`, idempotencyKey: taskControlEventIdempotencyKey('unknown.required', unknownKey),
+        payload: { unknownKey },
+      });
+    } catch { /* durable delivery degradation remains the independent freeze block */ }
   }
 
   private async findTaskCommentReceipt(input: {
     taskGuid: string; eventId: string; destinationId: string; marker: unknown;
   }): Promise<string | undefined> {
-    if (!this.input.mappingTrust || !this.input.mappingTrust.verifyDeliveryReceiptMarker(input.marker, input)) return undefined;
+    if (!this.input.mappingTrust || !this.input.mappingTrust.verifyDeliveryReceiptMarker(input.marker, input, this.receiptMarkerOptions())) return undefined;
     let pageToken: string | undefined;
     for (let page = 0; page < 50; page++) {
       const deliveryClient = this.input.deliveryClient;
@@ -784,7 +911,7 @@ export class DaemonTaskControlIntegration {
         if (!body || typeof body !== 'object' || Array.isArray(body)) continue;
         const record = body as Record<string, unknown>;
         if (record.task_control_event_id !== input.eventId || record.task_guid !== input.taskGuid
-          || !this.input.mappingTrust.verifyDeliveryReceiptMarker(record.task_control_delivery_receipt, input)) continue;
+          || !this.input.mappingTrust.verifyDeliveryReceiptMarker(record.task_control_delivery_receipt, input, this.receiptMarkerOptions())) continue;
         return commentId;
       }
       if (!response.data.has_more || typeof response.data.page_token !== 'string' || !response.data.page_token) return undefined;

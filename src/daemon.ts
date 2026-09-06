@@ -90,7 +90,8 @@ import { DaemonTaskControlAuthority } from './services/task-control-plane-author
 import { DaemonTaskControlIntegration, DaemonTaskControlShadowCollector } from './services/task-control-plane-daemon-integration.js';
 import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
 import { createV3TaskControlApprovalSource } from './services/task-control-plane-v3-approval.js';
-import { TaskControlMappingTrust, createTaskControlProductionMappingVerifier } from './services/task-control-plane-mapping-trust.js';
+import { TaskControlMappingTrust, createTaskControlProductionMappingVerifier, parseKeyIdSet } from './services/task-control-plane-mapping-trust.js';
+import { resolveTaskControlMappingRegistration } from './services/task-control-plane-mapping-source.js';
 import {
   createTaskControlRouteHandlers,
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
@@ -479,64 +480,25 @@ const taskControlRouteHandlers = createTaskControlRouteHandlers({
   hostSecret: () => {
     try { return loadDaemonIpcSecret(); } catch { return undefined; }
   },
+  previousHostSecret: () => process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+  reviewerAllowedKeyIds: () => parseKeyIdSet(process.env.TASK_CONTROL_PLANE_ALLOWED_KEY_IDS),
+  reviewerRevokedKeyIds: () => parseKeyIdSet(process.env.TASK_CONTROL_PLANE_REVOKED_KEY_IDS),
   readMessageDetail: getMessageDetail,
   readDocumentRevision: async (larkAppId, docToken) => {
     const response = await larkGet(getBotClient(larkAppId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`);
     const revision = Number(response?.data?.document?.revision_id);
     return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined;
   },
-  resolveMappingRegistration: async (larkAppId, input) => {
-    const commentId = input.registrationRef.startsWith('task-comment:') ? input.registrationRef.slice('task-comment:'.length) : '';
-    if (!/^[0-9]+$/.test(commentId)) return undefined;
-    const commentResponse = await larkGet(getBotClient(larkAppId), `/open-apis/task/v2/comments/${encodeURIComponent(commentId)}`);
-    const comment = commentResponse?.data?.comment;
-    const taskGuid = typeof comment?.resource_id === 'string' ? comment.resource_id : undefined;
-    if (!taskGuid || comment?.resource_type !== 'task' || comment?.creator?.id !== input.controllerId) return undefined;
-    let raw: Record<string, unknown> | undefined;
-    try { raw = JSON.parse(String(comment.content)) as Record<string, unknown>; } catch { return undefined; }
-    const docToken = typeof raw.docToken === 'string' ? raw.docToken : undefined;
-    const topicRootId = typeof raw.topicRootId === 'string' ? raw.topicRootId : undefined;
-    if (!docToken || !topicRootId || raw.taskGuid !== taskGuid || raw.registrationVersion !== comment?.updated_at
-      || !Array.isArray(raw.phaseTaskGuids) || new Set(raw.phaseTaskGuids).size !== raw.phaseTaskGuids.length || raw.phaseTaskGuids.length < 2) return undefined;
-    const phaseTaskGuids = raw.phaseTaskGuids as unknown[];
-    const phaseRegistrationRefs = raw.phaseRegistrationRefs as Record<string, unknown> | undefined;
-    if (!phaseRegistrationRefs || Object.keys(phaseRegistrationRefs).length !== phaseTaskGuids.length
-      || phaseTaskGuids.some(candidate => typeof phaseRegistrationRefs[String(candidate)] !== 'string')) return undefined;
-    const phaseCommentIds = phaseTaskGuids.map(candidate => String(phaseRegistrationRefs[String(candidate)]).replace(/^task-comment:/, ''));
-    if (phaseCommentIds.some(id => !/^[0-9]+$/.test(id))) return undefined;
-    const [taskResponse, topicDetail, documentRevision, ...phaseSources] = await Promise.all([
-      larkGet(getBotClient(larkAppId), `/open-apis/task/v2/tasks/${encodeURIComponent(taskGuid)}`),
-      getMessageDetail(larkAppId, topicRootId),
-      larkGet(getBotClient(larkAppId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`),
-      ...phaseTaskGuids.map(candidate => larkGet(getBotClient(larkAppId), `/open-apis/task/v2/tasks/${encodeURIComponent(String(candidate))}`)),
-      ...phaseCommentIds.map(id => larkGet(getBotClient(larkAppId), `/open-apis/task/v2/comments/${encodeURIComponent(id)}`)),
-    ]);
-    const topic = Array.isArray(topicDetail?.items) && topicDetail.items.length === 1 ? topicDetail.items[0] : undefined;
-    const revision = Number(documentRevision?.data?.document?.revision_id);
-    const gate = raw.approvalGate as Record<string, unknown> | undefined;
-    const values = [raw.projectId, raw.phaseId, raw.ownerId, raw.reviewerId, raw.acceptorId, gate?.runId, gate?.nodeId, gate?.instanceId, gate?.waitId, gate?.operatorId];
-    const phaseTasks = phaseSources.slice(0, phaseTaskGuids.length);
-    const phaseComments = phaseSources.slice(phaseTaskGuids.length);
-    const allTasksMatch = phaseTasks.length === phaseTaskGuids.length && phaseTasks.every((response, index) => response?.data?.task?.guid === phaseTaskGuids[index]);
-    const allCommentsMatch = phaseComments.length === phaseTaskGuids.length && phaseComments.every((response, index) => {
-      const source = response?.data?.comment;
-      if (source?.resource_type !== 'task' || source?.resource_id !== phaseTaskGuids[index] || source?.creator?.id !== input.controllerId) return false;
-      try {
-        const registration = JSON.parse(String(source.content));
-        return registration?.schemaVersion === 'TaskControlMappingRegistration.v1' && registration?.projectId === raw.projectId
-          && registration?.phaseId === raw.phaseId && registration?.taskGuid === phaseTaskGuids[index]
-          && registration?.topicRootId === topicRootId && JSON.stringify(registration?.phaseTaskGuids) === JSON.stringify(phaseTaskGuids);
-      } catch { return false; }
-    });
-    if (taskResponse?.data?.task?.guid !== taskGuid || !allTasksMatch || !allCommentsMatch || topic?.message_id !== topicRootId || (topic?.root_id ?? topic?.message_id) !== topicRootId
-      || revision !== raw.docRevision || values.some(value => typeof value !== 'string' || !value.trim())
-      || !Array.isArray(gate?.approverPolicy) || gate.approverPolicy.some(value => typeof value !== 'string' || !value.trim())) return undefined;
-    return {
-      projectId: raw.projectId as string, phaseId: raw.phaseId as string, phaseTaskGuids: raw.phaseTaskGuids as string[], taskGuid, topicRootId,
-      ownerId: raw.ownerId as string, reviewerId: raw.reviewerId as string, acceptorId: raw.acceptorId as string, registrationRef: input.registrationRef, registrationVersion: typeof raw.registrationVersion === 'string' ? raw.registrationVersion : undefined, phaseRegistrationRefs: phaseRegistrationRefs as Record<string, string>, docToken, docRevision: revision,
-      approvalGate: { runId: gate!.runId as string, nodeId: gate!.nodeId as string, instanceId: gate!.instanceId as string, waitId: gate!.waitId as string, operatorId: gate!.operatorId as string, approverPolicy: gate!.approverPolicy as string[] },
-    };
-  },
+  resolveMappingRegistration: (larkAppId, input) => resolveTaskControlMappingRegistration({
+    readTaskComment: (appId, commentId) => larkGet(getBotClient(appId), `/open-apis/task/v2/comments/${encodeURIComponent(commentId)}`),
+    readTask: (appId, taskGuid) => larkGet(getBotClient(appId), `/open-apis/task/v2/tasks/${encodeURIComponent(taskGuid)}`),
+    readTopic: getMessageDetail,
+    readDocumentRevision: async (appId, docToken) => {
+      const response = await larkGet(getBotClient(appId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`);
+      const revision = Number(response?.data?.document?.revision_id);
+      return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined;
+    },
+  }, larkAppId, input),
   resolveReviewerSource: async (reviewerLarkAppId, body) => {
     const target = findOnlineDaemon(reviewerLarkAppId);
     if (!target) return undefined;
@@ -22021,6 +21983,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         productionIntegration = new DaemonTaskControlIntegration({
           dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore, bridge: bridge!, logger,
           mappingTrust: new TaskControlMappingTrust({ hostSecret: hostSecret!, previousHostSecret, larkAppId: cfg.larkAppId }),
+          receiptAllowedKeyIds: productionTaskControlConfig.allowedKeyIds,
+          receiptRevokedKeyIds: productionTaskControlConfig.revokedKeyIds,
           controlledWriteback: taskControlFlags.pumpEnabled,
           isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
             const live = findActiveBySessionId(sessionId);
