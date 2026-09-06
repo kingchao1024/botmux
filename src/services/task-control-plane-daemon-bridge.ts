@@ -20,9 +20,12 @@ export interface DaemonTaskControlMapping {
   acceptorId: string;
   /** The controller-owned registration reference, never a task title or body. */
   registrationRef: string;
+  registrationVersion?: string;
+  phaseRegistrationRefs?: Record<string, string>;
   /** Exact durable v3 humanGate that may authorize phase freeze. */
   approvalGate: TaskControlApprovalGateBinding;
   docToken?: string;
+  docRevision?: number;
   /** Controller-issued, app/purpose-scoped proof; never sourced from worker payload. */
   mappingProof?: TaskControlMappingProof;
 }
@@ -101,9 +104,11 @@ export class DaemonTaskControlBridge {
     return this.registerMapping(record.dispatchRoot, {
       controllerId: record.controllerId, projectId: record.projectId, phaseId: record.phaseId, phaseTaskGuids: record.phaseTaskGuids,
       taskGuid: record.taskGuid, topicRootId: record.topicRootId, ownerId: record.ownerId,
-      reviewerId: record.reviewerId, acceptorId: record.acceptorId, registrationRef: record.registrationRef,
+      reviewerId: record.reviewerId, acceptorId: record.acceptorId, registrationRef: record.registrationRef, ...(record.registrationVersion ? { registrationVersion: record.registrationVersion } : {}),
+      ...(record.phaseRegistrationRefs ? { phaseRegistrationRefs: record.phaseRegistrationRefs } : {}),
       approvalGate: record.approvalGate,
       ...(record.docToken ? { docToken: record.docToken } : {}),
+      ...(record.docRevision ? { docRevision: record.docRevision } : {}),
       ...(record.mappingProof ? { mappingProof: record.mappingProof } : {}),
     }, record.controllerId);
   }
@@ -122,6 +127,7 @@ export class DaemonTaskControlBridge {
       || mapping.ownerId === mapping.acceptorId
       || !Array.isArray(mapping.phaseTaskGuids)
       || !mapping.phaseTaskGuids.every(taskGuid => !!nonBlank(taskGuid))
+      || new Set(mapping.phaseTaskGuids).size !== mapping.phaseTaskGuids.length
       || !mapping.phaseTaskGuids.includes(mapping.taskGuid)
       || !Array.isArray(mapping.approvalGate?.approverPolicy)
       || !mapping.approvalGate.approverPolicy.every(approver => !!nonBlank(approver))
@@ -139,8 +145,8 @@ export class DaemonTaskControlBridge {
       || !production.verifyMapping(mapping.mappingProof, taskControlMappingFacts({
         dispatchRoot: root, projectId: mapping.projectId, phaseId: mapping.phaseId, phaseTaskGuids: mapping.phaseTaskGuids,
         taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId,
-        acceptorId: mapping.acceptorId, registrationRef: mapping.registrationRef, controllerId: controller,
-        approvalGate: mapping.approvalGate, docToken: mapping.docToken,
+        acceptorId: mapping.acceptorId, registrationRef: mapping.registrationRef, registrationVersion: mapping.registrationVersion, controllerId: controller,
+        ...(mapping.phaseRegistrationRefs ? { phaseRegistrationRefs: mapping.phaseRegistrationRefs } : {}), approvalGate: mapping.approvalGate, docToken: mapping.docToken, docRevision: mapping.docRevision,
       })))) return false;
     const prior = this.mappings.get(root);
     if (prior && JSON.stringify(prior) !== JSON.stringify(mapping)) return false;

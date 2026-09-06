@@ -74,17 +74,27 @@ function deliveryReceiptPayload(marker: Omit<TaskControlDeliveryReceiptMarker, '
 export class TaskControlMappingTrust {
   private readonly mappingKey: Buffer;
   private readonly deliveryReceiptKey: Buffer;
+  private readonly previousMappingKey?: Buffer;
+  private readonly previousDeliveryReceiptKey?: Buffer;
   readonly mappingKeyId: string;
   readonly deliveryReceiptKeyId: string;
+  readonly previousMappingKeyId?: string;
+  readonly previousDeliveryReceiptKeyId?: string;
   readonly larkAppId: string;
 
-  constructor(private readonly input: { hostSecret: string; larkAppId: string }) {
+  constructor(private readonly input: { hostSecret: string; previousHostSecret?: string; larkAppId: string }) {
     if (!nonBlank(input.hostSecret) || !nonBlank(input.larkAppId)) throw new Error('task_control_mapping_trust_root_invalid');
     this.larkAppId = input.larkAppId;
     this.mappingKey = keyFor(input.hostSecret, TASK_CONTROL_MAPPING_TRUST_DOMAIN, input.larkAppId);
     this.deliveryReceiptKey = keyFor(input.hostSecret, TASK_CONTROL_DELIVERY_RECEIPT_TRUST_DOMAIN, input.larkAppId);
+    if (input.previousHostSecret && input.previousHostSecret !== input.hostSecret) {
+      this.previousMappingKey = keyFor(input.previousHostSecret, TASK_CONTROL_MAPPING_TRUST_DOMAIN, input.larkAppId);
+      this.previousDeliveryReceiptKey = keyFor(input.previousHostSecret, TASK_CONTROL_DELIVERY_RECEIPT_TRUST_DOMAIN, input.larkAppId);
+    }
     this.mappingKeyId = keyId(this.mappingKey, 'tcm1');
     this.deliveryReceiptKeyId = keyId(this.deliveryReceiptKey, 'tcr1');
+    this.previousMappingKeyId = this.previousMappingKey ? keyId(this.previousMappingKey, 'tcm1') : undefined;
+    this.previousDeliveryReceiptKeyId = this.previousDeliveryReceiptKey ? keyId(this.previousDeliveryReceiptKey, 'tcr1') : undefined;
   }
 
   issueMapping(facts: Record<string, unknown>, issuedAt = new Date().toISOString()): TaskControlMappingProof {
@@ -96,10 +106,12 @@ export class TaskControlMappingTrust {
 
   verifyMapping(proof: TaskControlMappingProof | undefined, facts: Record<string, unknown>, options: { allowedKeyIds?: readonly string[]; revokedKeyIds?: readonly string[] } = {}): boolean {
     if (!proof || proof.schemaVersion !== 'TaskControlMapping.v1' || proof.larkAppId !== this.input.larkAppId
-      || !Number.isFinite(Date.parse(proof.issuedAt)) || proof.keyId !== this.mappingKeyId
+      || !Number.isFinite(Date.parse(proof.issuedAt))
       || options.revokedKeyIds?.includes(proof.keyId)
       || (options.allowedKeyIds !== undefined && !options.allowedKeyIds.includes(proof.keyId))) return false;
-    return equalSignature(proof.signature, signature(this.mappingKey, mappingPayload(proof, facts)));
+    const key = proof.keyId === this.mappingKeyId ? this.mappingKey
+      : proof.keyId === this.previousMappingKeyId ? this.previousMappingKey : undefined;
+    return !!key && equalSignature(proof.signature, signature(key, mappingPayload(proof, facts)));
   }
 
   issueDeliveryReceiptMarker(input: { eventId: string; destinationId: string; issuedAt: string }): TaskControlDeliveryReceiptMarker {
@@ -121,12 +133,14 @@ export class TaskControlMappingTrust {
     if (value.schemaVersion !== 'TaskControlDeliveryReceipt.v1' || value.larkAppId !== this.larkAppId
       || value.eventId !== expected.eventId || value.destinationId !== expected.destinationId
       || typeof value.issuedAt !== 'string' || !Number.isFinite(Date.parse(value.issuedAt))
-      || value.keyId !== this.deliveryReceiptKeyId || typeof value.signature !== 'string') return false;
+      || typeof value.keyId !== 'string' || typeof value.signature !== 'string') return false;
     const unsigned: Omit<TaskControlDeliveryReceiptMarker, 'signature'> = {
       schemaVersion: value.schemaVersion, larkAppId: value.larkAppId, eventId: value.eventId, destinationId: value.destinationId,
       issuedAt: value.issuedAt, keyId: value.keyId,
     };
-    return equalSignature(value.signature, signature(this.deliveryReceiptKey, deliveryReceiptPayload(unsigned)));
+    const key = value.keyId === this.deliveryReceiptKeyId ? this.deliveryReceiptKey
+      : value.keyId === this.previousDeliveryReceiptKeyId ? this.previousDeliveryReceiptKey : undefined;
+    return !!key && equalSignature(value.signature, signature(key, deliveryReceiptPayload(unsigned)));
   }
 
 }
@@ -134,13 +148,14 @@ export class TaskControlMappingTrust {
 /** Keep signer and verifier on one exact canonical mapping contract. */
 export function taskControlMappingFacts(input: {
   dispatchRoot: string; projectId: string; phaseId: string; phaseTaskGuids: readonly string[]; taskGuid: string; topicRootId: string;
-  ownerId: string; reviewerId: string; acceptorId: string; registrationRef: string; controllerId: string; approvalGate: unknown; docToken?: string;
+  ownerId: string; reviewerId: string; acceptorId: string; registrationRef: string; registrationVersion?: string; phaseRegistrationRefs?: Record<string, string>; controllerId: string; approvalGate: unknown; docToken?: string; docRevision?: number;
 }): Record<string, unknown> {
   return {
-    dispatchRoot: input.dispatchRoot, projectId: input.projectId, phaseId: input.phaseId, phaseTaskGuids: [...input.phaseTaskGuids].sort(),
+    dispatchRoot: input.dispatchRoot, projectId: input.projectId, phaseId: input.phaseId, phaseTaskGuids: [...new Set(input.phaseTaskGuids)].sort(),
     taskGuid: input.taskGuid, topicRootId: input.topicRootId, ownerId: input.ownerId, reviewerId: input.reviewerId,
-    acceptorId: input.acceptorId, registrationRef: input.registrationRef, controllerId: input.controllerId, approvalGate: input.approvalGate,
-    ...(input.docToken ? { docToken: input.docToken } : {}),
+    acceptorId: input.acceptorId, registrationRef: input.registrationRef, ...(input.registrationVersion ? { registrationVersion: input.registrationVersion } : {}),
+    ...(input.phaseRegistrationRefs ? { phaseRegistrationRefs: Object.fromEntries(Object.entries(input.phaseRegistrationRefs).sort(([a], [b]) => a.localeCompare(b))) } : {}),
+    controllerId: input.controllerId, approvalGate: input.approvalGate, ...(input.docToken ? { docToken: input.docToken } : {}), ...(input.docRevision ? { docRevision: input.docRevision } : {}),
   };
 }
 

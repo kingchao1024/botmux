@@ -404,7 +404,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     upgraded.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(10);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(12);
       expect(verify.prepare('SELECT lark_app_id FROM control_events WHERE event_id=?').get('legacy-event')).toEqual({ lark_app_id: 'legacy:v4' });
       expect(verify.prepare('SELECT COUNT(*) AS n FROM control_events').get()).toEqual({ n: 1 });
     } finally { verify.close(); }
@@ -450,7 +450,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     upgraded.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(10);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(12);
       expect(verify.prepare('SELECT topic_root_id FROM control_designated_reviewers WHERE designated_reviewer_ref=?').get('legacy-reviewer')).toEqual({ topic_root_id: '' });
       expect(verify.prepare('PRAGMA table_info(control_designated_reviewers)').all().filter((row: any) => row.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((row: any) => row.name)).toEqual(['lark_app_id', 'designated_reviewer_ref']);
       expect(verify.prepare('PRAGMA table_info(control_reviewer_verdicts)').all().filter((row: any) => row.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((row: any) => row.name)).toEqual(['lark_app_id', 'verdict_id']);
@@ -502,7 +502,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     migrated.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)).toBe(10);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)).toBe(12);
       for (const table of ['control_events', 'control_observations', 'control_approval_consumptions', 'control_trusted_mappings', 'control_outbox', 'control_delivery_receipts']) {
         const expected = table === 'control_events' || table === 'control_observations' ? 2 : 1;
         expect(verify.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: expected });

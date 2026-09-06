@@ -28,6 +28,7 @@ type TaskControlDeliveryClient = {
   listTaskComments(input: { taskGuid: string; pageToken?: string }): Promise<any>;
   createTaskComment(input: { taskGuid: string; content: string }): Promise<{ code?: number; commentId?: string }>;
   replyTopic(input: { topicRootId: string; content: string; uuid: string }): Promise<string>;
+  readTopicMessage(input: { larkAppId: string; messageId: string }): Promise<unknown>;
 };
 
 function nonBlank(value: unknown): string | undefined {
@@ -132,11 +133,17 @@ export class DaemonTaskControlIntegration {
   ): boolean {
     const prior = this.input.bridge.mapping(dispatchRoot);
     if (prior) {
-      return prior.controllerId === controllerId
-        && prior.projectId === mapping.projectId && prior.phaseId === mapping.phaseId && prior.taskGuid === mapping.taskGuid
-        && prior.topicRootId === mapping.topicRootId && prior.ownerId === mapping.ownerId && prior.reviewerId === mapping.reviewerId
-        && prior.acceptorId === mapping.acceptorId && prior.registrationRef === mapping.registrationRef
-        && prior.docToken === mapping.docToken && sameTaskSet(prior.phaseTaskGuids, mapping.phaseTaskGuids);
+      return JSON.stringify({
+        controllerId: prior.controllerId, projectId: prior.projectId, phaseId: prior.phaseId, phaseTaskGuids: [...prior.phaseTaskGuids].sort(),
+        taskGuid: prior.taskGuid, topicRootId: prior.topicRootId, ownerId: prior.ownerId, reviewerId: prior.reviewerId, acceptorId: prior.acceptorId,
+        registrationRef: prior.registrationRef, registrationVersion: prior.registrationVersion, phaseRegistrationRefs: prior.phaseRegistrationRefs,
+        approvalGate: prior.approvalGate, docToken: prior.docToken, docRevision: prior.docRevision,
+      }) === JSON.stringify({
+        controllerId, projectId: mapping.projectId, phaseId: mapping.phaseId, phaseTaskGuids: [...mapping.phaseTaskGuids].sort(),
+        taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId, acceptorId: mapping.acceptorId,
+        registrationRef: mapping.registrationRef, registrationVersion: mapping.registrationVersion, phaseRegistrationRefs: mapping.phaseRegistrationRefs,
+        approvalGate: DaemonTaskControlBridge.bindApprovalGate(mapping.approvalGate), docToken: mapping.docToken, docRevision: mapping.docRevision,
+      });
     }
     let controllerMapping: DaemonTaskControlMapping = {
       ...mapping, controllerId, approvalGate: DaemonTaskControlBridge.bindApprovalGate(mapping.approvalGate),
@@ -147,8 +154,8 @@ export class DaemonTaskControlIntegration {
         mappingProof: this.input.mappingTrust.issueMapping(taskControlMappingFacts({
           dispatchRoot, projectId: controllerMapping.projectId, phaseId: controllerMapping.phaseId, phaseTaskGuids: controllerMapping.phaseTaskGuids,
           taskGuid: controllerMapping.taskGuid, topicRootId: controllerMapping.topicRootId, ownerId: controllerMapping.ownerId,
-          reviewerId: controllerMapping.reviewerId, acceptorId: controllerMapping.acceptorId, registrationRef: controllerMapping.registrationRef,
-          controllerId, approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken,
+          reviewerId: controllerMapping.reviewerId, acceptorId: controllerMapping.acceptorId, registrationRef: controllerMapping.registrationRef, registrationVersion: controllerMapping.registrationVersion,
+          phaseRegistrationRefs: controllerMapping.phaseRegistrationRefs, controllerId, approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken, docRevision: controllerMapping.docRevision,
         })),
       };
     }
@@ -159,8 +166,8 @@ export class DaemonTaskControlIntegration {
       const registered = this.input.store.registerTrustedMapping({
         dispatchRoot, projectId: controllerMapping.projectId, phaseId: controllerMapping.phaseId, phaseTaskGuids: controllerMapping.phaseTaskGuids,
         taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId,
-        acceptorId: mapping.acceptorId, registrationRef: mapping.registrationRef, controllerId,
-        approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken, authentication,
+        acceptorId: mapping.acceptorId, registrationRef: mapping.registrationRef, registrationVersion: mapping.registrationVersion, phaseRegistrationRefs: mapping.phaseRegistrationRefs, controllerId,
+        approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken, docRevision: controllerMapping.docRevision, authentication,
         ...(controllerMapping.mappingProof ? { mappingProof: controllerMapping.mappingProof } : {}),
       });
       return registered.kind === 'registered' || registered.kind === 'duplicate';
@@ -185,6 +192,40 @@ export class DaemonTaskControlIntegration {
 
   approval(dispatchRoot: string, approvalRef: string) {
     return this.input.bridge.approval(dispatchRoot, approvalRef);
+  }
+
+  /** Controller-owned freeze request; readiness is recomputed by the store. */
+  requestFreeze(dispatchRoot: string, requestId = `legacy:${dispatchRoot}`): boolean {
+    const mapping = this.input.bridge.mapping(dispatchRoot);
+    const authentication = this.input.bridge.issueAuthentication(dispatchRoot, 'controller');
+    if (!mapping || !authentication) return false;
+    const requestRef = `approval:${requestId.replace(/[^A-Za-z0-9._:-]/g, '_')}`;
+    const eventId = `tcp-phase.freeze_requested:${requestRef}`;
+    // A retry of the same authenticated application is defined by its stable
+    // request reference. Return the persisted event before recomputing current
+    // readiness, whose underlying facts may legitimately have changed.
+    const prior = this.input.store.listEvents({ projectId: mapping.projectId, phaseId: mapping.phaseId })
+      .find(event => event.eventId === eventId);
+    if (prior) {
+      const priorTaskGuids = Array.isArray(prior.payload.taskGuids)
+        ? prior.payload.taskGuids.filter((taskGuid): taskGuid is string => typeof taskGuid === 'string')
+        : [];
+      return prior.eventType === 'phase.freeze_requested'
+        && prior.sourceRef === requestRef
+        && prior.payload.requestRef === requestRef
+        && JSON.stringify([...priorTaskGuids].sort()) === JSON.stringify([...mapping.phaseTaskGuids].sort());
+    }
+    const openIssueCodes = this.input.store.validateProspectivePhaseFreeze(mapping.projectId, mapping.phaseId).issues
+      .map(issue => issue.code).sort();
+    try {
+      const result = this.input.store.appendEvent({
+        eventId, eventType: 'phase.freeze_requested',
+        projectId: mapping.projectId, phaseId: mapping.phaseId, authentication, sourceRef: requestRef,
+        idempotencyKey: taskControlEventIdempotencyKey('phase.freeze_requested', requestRef),
+        payload: { taskGuids: mapping.phaseTaskGuids, openIssueCodes, requestRef },
+      });
+      return result.kind === 'appended' || result.kind === 'duplicate';
+    } catch { return false; }
   }
 
   /**
@@ -229,6 +270,9 @@ export class DaemonTaskControlIntegration {
     if (!reviewed.ok) {
       this.reviewerVerdictUnknown(input.dispatchRoot, verdict.verdictId, reviewed.reason, `reviewer-verdict:${verdict.verdictId}`);
       return { status: 'unknown', reason: reviewed.reason };
+    }
+    if (this.input.controlledWriteback && verdict.verdict === 'pass' && verdict.conditionIds.length === 0) {
+      this.deliverAfterReview(input.dispatchRoot, verdict, `reviewer-verdict:${verdict.verdictId}`);
     }
     return head;
   }
@@ -336,6 +380,26 @@ export class DaemonTaskControlIntegration {
 
   workerExecutionStarted(dispatchRoot: string, sourceRef: string, occurredAt?: string): void {
     this.appendMapped('task.execution_started', dispatchRoot, 'worker', sourceRef, occurredAt);
+    // The lifecycle hook is intentionally asynchronous. Wait for its durable
+    // event before producing rework so accepted/executing order stays intact.
+    setImmediate(() => this.startReworkAfterExecution(dispatchRoot, sourceRef));
+  }
+
+  private startReworkAfterExecution(dispatchRoot: string, sourceRef: string): void {
+    const mapping = this.input.bridge.mapping(dispatchRoot);
+    if (!mapping) return;
+    const execution = this.input.store.listEvents({ taskGuid: mapping.taskGuid }).find(event =>
+      event.eventType === 'task.execution_started' && event.sourceRef === sourceRef,
+    );
+    if (!execution) return;
+    const task = this.input.store.getTaskProjection(mapping.taskGuid);
+    const review = task.independentReview;
+    if (review?.reviewerVerdictId && (review.verdict === 'fail' || (review.verdict === 'conditional' && task.unresolvedReviewConditionIds.length > 0))) {
+      this.beginRework({
+        dispatchRoot, sourceRef: `rework:${execution.eventId}`, sourceReviewerVerdictId: review.reviewerVerdictId,
+        newExecutionEventId: execution.eventId, evidenceRef: sourceRef,
+      });
+    }
   }
 
   firstSubmitted(dispatchRoot: string, sourceRef: string, input: { docToken: string; docRevision: number; evidenceRef: string }): void {
@@ -452,6 +516,22 @@ export class DaemonTaskControlIntegration {
     this.input.store.settleOutboxDelivered(claimed.outboxId, claimToken, { receiptRef });
   }
 
+  private deliverAfterReview(dispatchRoot: string, verdict: ReviewerVerdictV1, sourceRef: string): void {
+    const mapping = this.input.bridge.mapping(dispatchRoot);
+    const authentication = this.input.bridge.issueAuthentication(dispatchRoot, 'worker');
+    if (!mapping || !authentication) return;
+    try {
+      this.input.store.appendEvent({
+        eventId: `tcp-task.delivered:${sourceRef}`, eventType: 'task.delivered', projectId: mapping.projectId, phaseId: mapping.phaseId,
+        taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, authentication, sourceRef, evidenceRef: `topic-message:${verdict.sourceMessageId}`,
+        idempotencyKey: taskControlEventIdempotencyKey('task.delivered', sourceRef), terminal: true, deliverTo: [`task-comment:${mapping.taskGuid}`],
+        payload: { docToken: verdict.docToken, docRevision: verdict.docRevision, reviewerVerdictId: verdict.verdictId },
+      });
+    } catch {
+      this.reviewerVerdictUnknown(dispatchRoot, verdict.verdictId, 'delivery_after_review_unproven', sourceRef);
+    }
+  }
+
   doneMarked(dispatchRoot: string, sourceRef: string, evidenceRef?: string): void {
     this.appendMapped('task.done_marked', dispatchRoot, 'controller', sourceRef, undefined, evidenceRef ? { evidenceRef } : {});
   }
@@ -500,13 +580,11 @@ export class DaemonTaskControlIntegration {
         this.deliveryReceiptUnknown(sourceRef, input, 'receipt_worker_generation_changed_during_verification');
         return;
       }
-      this.firstSubmitted(dispatchRoot, `${sourceRef}:submitted`, {
-        docToken: input.docToken, docRevision: revision, evidenceRef: input.receiptRef,
-      });
-      this.delivered(dispatchRoot, sourceRef, {
-        docToken: input.docToken, docRevision: revision, destinationId: input.destinationId,
-        receiptRef: input.receiptRef, evidenceRef: input.receiptRef,
-      });
+      const submitted = this.bridgeEvent('task.first_submitted', dispatchRoot, 'worker', `${sourceRef}:submitted`,
+        { docToken: input.docToken, docRevision: revision }, input.receiptRef);
+      if (!submitted) throw new Error('submission_mapping_unproven');
+      const result = this.input.store.appendEvent({ ...submitted, eventType: 'task.first_submitted' });
+      if (result.kind === 'conflict') throw new Error('submission_append_conflict');
     } catch (error) {
       this.terminalWithoutRevision(dispatchRoot, sourceRef, {
         destinationId: input.destinationId, receiptRef: input.receiptRef,
@@ -627,6 +705,7 @@ export class DaemonTaskControlIntegration {
       },
       replyTopic: ({ topicRootId, content, uuid: replyUuid }: { topicRootId: string; content: string; uuid: string }) =>
         replyMessage(this.input.larkAppId, topicRootId, content, 'text', true, replyUuid),
+      readTopicMessage: ({ messageId }: { larkAppId: string; messageId: string }) => getMessageDetail(this.input.larkAppId, messageId),
     };
     try {
       if (row.destinationId === `task-comment:${event.taskGuid}`) {
@@ -657,13 +736,31 @@ export class DaemonTaskControlIntegration {
       }
       if (row.destinationId === `topic-message:${event.topicRootId}`) {
         const receiptRef = await deliveryClient.replyTopic({ topicRootId: event.topicRootId, content, uuid });
-        this.recordTopicFallback(event, row, receiptRef, `topic-message:${receiptRef}`);
+        const reread = await deliveryClient.readTopicMessage({ larkAppId: this.input.larkAppId, messageId: receiptRef });
+        if (!this.topicReceiptMatches(reread, receiptRef, event, marker)) {
+          return { kind: 'retry', error: 'topic_receipt_reread_unproven' };
+        }
+        this.recordTopicFallback(event, row, `topic-message:${receiptRef}`, `topic-message:${receiptRef}`);
         return { kind: 'delivered', receiptRef: `topic-message:${receiptRef}` };
       }
       return { kind: 'degraded', error: 'delivery_destination_unrecognized' };
     } catch (error) {
       return { kind: 'retry', error: `delivery_write_failed:${String(error)}` };
     }
+  }
+
+  private topicReceiptMatches(detail: unknown, messageId: string, event: ReturnType<TaskControlPlaneStore['listEvents']>[number], marker: unknown): boolean {
+    const root = detail && typeof detail === 'object' && !Array.isArray(detail) ? detail as Record<string, unknown> : undefined;
+    const item = Array.isArray(root?.items) && root!.items.length === 1 && root!.items[0] && typeof root!.items[0] === 'object'
+      ? root!.items[0] as Record<string, unknown> : undefined;
+    const content = typeof item?.body === 'object' && item.body && !Array.isArray(item.body)
+      ? (item.body as Record<string, unknown>).content : item?.content;
+    if (item?.message_id !== messageId || typeof content !== 'string') return false;
+    let payload: unknown;
+    try { payload = JSON.parse(content); } catch { return false; }
+    const record = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload as Record<string, unknown> : undefined;
+    return !!record && record.task_control_event_id === event.eventId && record.task_guid === event.taskGuid
+      && !!this.input.mappingTrust?.verifyDeliveryReceiptMarker(record.task_control_delivery_receipt, { eventId: event.eventId, destinationId: `topic-message:${event.topicRootId}` });
   }
 
   private async findTaskCommentReceipt(input: {
@@ -705,7 +802,7 @@ export class DaemonTaskControlIntegration {
       eventType: 'task.delivery_fallback_verified', projectId: event.projectId, phaseId: event.phaseId, taskGuid: event.taskGuid, topicRootId: event.topicRootId,
       authentication, sourceRef: evidenceRef,
       idempotencyKey: taskControlEventIdempotencyKey('task.delivery_fallback_verified', `${event.eventId}:${primaryDestinationId}:${receiptRef}`),
-      payload: { deliveryEventId: event.eventId, destinationId: primaryDestinationId, method: 'topic_message', receiptRef: evidenceRef },
+      payload: { deliveryEventId: event.eventId, destinationId: primaryDestinationId, method: 'topic_message', receiptRef },
     });
     if (result.kind === 'conflict') throw new Error('topic_fallback_receipt_conflict');
     void row;

@@ -72,7 +72,7 @@ export function authorizeTaskControlMappingRoute(input: {
   if (!origin || input.originCapability !== origin.capability || input.originTurnId !== origin.turnId) {
     return { ok: false, error: 'capability_unproven' };
   }
-  return { ok: true, controllerId: `daemon:${selfAppId}` };
+  return { ok: true, controllerId: selfAppId };
 }
 
 type ControllerTurnAuthorization = Exclude<TaskControlRouteAuthorization, { ok: true }> | {
@@ -155,8 +155,9 @@ export const TASK_CONTROL_REVIEWER_MAX_BYTES = 16 * 1024;
 type RouteIntegration = {
   registerMapping(dispatchRoot: string, mapping: DaemonTaskControlMappingRegistration, controllerId: string): boolean;
   mapping(dispatchRoot: string): DaemonTaskControlMapping | undefined;
-  issueAuthentication(dispatchRoot: string, principal: 'acceptor'): unknown | undefined;
+  issueAuthentication(dispatchRoot: string, principal: 'controller' | 'acceptor'): unknown | undefined;
   approval(dispatchRoot: string, approvalRef: string): unknown | undefined;
+  requestFreeze(dispatchRoot: string, requestId: string): boolean;
   setReviewerVerdictVerifier(verifier: { verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean; verifyVerdict(value: ReviewerVerdictV1): boolean }): void;
   currentDesignatedReviewer(dispatchRoot: string, reviewRound: number, now?: string): DesignatedReviewerMapping | undefined;
   registerVerifiedDesignatedReviewer(input: {
@@ -400,6 +401,7 @@ export function createTaskControlRouteHandlers(input: {
   hostSecret: () => string | undefined;
   readMessageDetail: (larkAppId: string, messageId: string) => Promise<unknown>;
   readDocumentRevision: (larkAppId: string, docToken: string) => Promise<number | undefined>;
+  resolveMappingRegistration: (larkAppId: string, input: { dispatchRoot: string; registrationRef: string; controllerId: string }) => Promise<DaemonTaskControlMappingRegistration | undefined>;
   resolveReviewerSource: (reviewerLarkAppId: string, input: {
     sourceMessageId: string; topicRootId: string;
   }) => Promise<{ status: number; source?: ResolvedReviewerSource } | undefined>;
@@ -431,6 +433,12 @@ export function createTaskControlRouteHandlers(input: {
       }
       const body = object(raw);
       const dispatchRoot = text(body?.dispatchRoot);
+      const registrationRef = text(body?.registrationRef);
+      if (!body || !hasOnlyKeys(body, ['dispatchRoot', 'registrationRef', 'originCapability', 'originTurnId', 'workerGeneration'])
+        || !dispatchRoot || !registrationRef) {
+        jsonRes(res, 400, { ok: false, error: 'task_control_mapping_invalid' });
+        return;
+      }
       const routeAuthority = authorizeControllerTurn({
         transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
         findActiveBySessionId: input.findActiveBySessionId, originCapability: body?.originCapability,
@@ -440,23 +448,17 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 403, { ok: false, error: `task_control_mapping_${routeAuthority.error}` });
         return;
       }
-      const approvalGate = object(body?.approvalGate);
-      const mapping: DaemonTaskControlMappingRegistration = {
-        projectId: text(body?.projectId) ?? '', phaseId: text(body?.phaseId) ?? '',
-        phaseTaskGuids: Array.isArray(body?.phaseTaskGuids) ? body!.phaseTaskGuids.filter((item): item is string => typeof item === 'string') : [],
-        taskGuid: text(body?.taskGuid) ?? '', topicRootId: text(body?.topicRootId) ?? '',
-        ownerId: text(body?.ownerId) ?? '', reviewerId: text(body?.reviewerId) ?? '',
-        acceptorId: text(body?.acceptorId) ?? '', registrationRef: text(body?.registrationRef) ?? '',
-        approvalGate: {
-          runId: text(approvalGate?.runId) ?? '', nodeId: text(approvalGate?.nodeId) ?? '',
-          instanceId: text(approvalGate?.instanceId) ?? '', waitId: text(approvalGate?.waitId) ?? '',
-          operatorId: text(approvalGate?.operatorId) ?? '',
-          approverPolicy: Array.isArray(approvalGate?.approverPolicy)
-            ? approvalGate.approverPolicy.filter((item): item is string => typeof item === 'string') : [],
-        },
-        ...(text(body?.docToken) ? { docToken: text(body?.docToken)! } : {}),
-      };
-      if (!dispatchRoot || !integration.registerMapping(dispatchRoot, mapping, routeAuthority.controllerId)) {
+      const mapping = await input.resolveMappingRegistration(input.selfLarkAppId() ?? '', { dispatchRoot, registrationRef, controllerId: routeAuthority.controllerId }).catch(() => undefined);
+      const currentRouteAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        findActiveBySessionId: input.findActiveBySessionId, originCapability: body.originCapability,
+        originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!sameControllerTurn(routeAuthority, currentRouteAuthority)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_mapping_origin_changed' });
+        return;
+      }
+      if (!mapping || !integration.registerMapping(dispatchRoot, mapping, routeAuthority.controllerId)) {
         jsonRes(res, 400, { ok: false, error: 'task_control_mapping_invalid_or_conflict' });
         return;
       }
@@ -481,8 +483,19 @@ export function createTaskControlRouteHandlers(input: {
       const approvalRef = text(body?.approvalRef);
       const eventId = text(body?.eventId);
       const idempotencyKey = text(body?.idempotencyKey);
-      if (!dispatchRoot || !approvalRef || !eventId || !idempotencyKey) {
+      if (!body || !hasOnlyKeys(body, ['dispatchRoot', 'approvalRef', 'eventId', 'idempotencyKey',
+        'controllerSessionId', 'originCapability', 'originTurnId', 'workerGeneration'])
+        || !dispatchRoot || !approvalRef || !eventId || !idempotencyKey || !text(body.controllerSessionId)) {
         jsonRes(res, 400, { ok: false, error: 'task_control_freeze_invalid' });
+        return;
+      }
+      const routeAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!routeAuthority.ok) {
+        jsonRes(res, 403, { ok: false, error: `task_control_freeze_${routeAuthority.error}` });
         return;
       }
       let mapping = integration.mapping(dispatchRoot);
@@ -490,6 +503,19 @@ export function createTaskControlRouteHandlers(input: {
       const approval = integration.approval(dispatchRoot, approvalRef);
       if (!mapping || !authentication || !approval) {
         jsonRes(res, 403, { ok: false, error: 'task_control_freeze_unproven' });
+        return;
+      }
+      const currentRouteAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!sameControllerTurn(routeAuthority, currentRouteAuthority)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_freeze_origin_changed' });
+        return;
+      }
+      if (!integration.requestFreeze(dispatchRoot, `${eventId}:${approvalRef}`)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_freeze_request_unproven' });
         return;
       }
       try {

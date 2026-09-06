@@ -38,6 +38,7 @@ let dataDir: string | undefined;
 
 type TestContext = {
   registrationCalls: number;
+  registrationResolveCalls: number;
   freezeCalls: number;
   frozenWrites: number;
   registrationAllowed: boolean;
@@ -88,6 +89,7 @@ const handlers = createTaskControlRouteHandlers({
     }),
     issueAuthentication: () => ({ kind: 'acceptor-proof' }),
     approval: () => context.approval,
+    requestFreeze: () => !!context.approval,
     setReviewerVerdictVerifier: () => {},
     currentDesignatedReviewer: () => context.designation,
     registerVerifiedDesignatedReviewer: ({ mapping }: any) => { context.designationCalls++; context.designation = mapping; return true; },
@@ -149,6 +151,16 @@ const handlers = createTaskControlRouteHandlers({
     }
     await context.documentGate?.promise;
     return context.documentRevision;
+  },
+  resolveMappingRegistration: async (_app, input) => {
+    context.registrationResolveCalls++;
+    const taskGuid = input.registrationRef === 'task-comment:101' ? 'task-1' : input.registrationRef === 'task-comment:102' ? 'task-2' : undefined;
+    if (!taskGuid) return undefined;
+    return {
+      projectId: 'project-1', phaseId: 'phase-1', phaseTaskGuids: ['task-1', 'task-2'], taskGuid, topicRootId: input.dispatchRoot,
+      ownerId: `worker-${taskGuid}`, reviewerId: `reviewer-${taskGuid}`, acceptorId: `acceptor-${taskGuid}`, registrationRef: input.registrationRef, registrationVersion: 'v1', docToken: 'doc-token-12345678',
+      approvalGate: { runId: 'run-1', nodeId: 'gate-1', instanceId: 'gate-1#1', waitId: 'wait-1', operatorId: `acceptor-${taskGuid}`, approverPolicy: [`acceptor-${taskGuid}`] },
+    };
   },
   resolveReviewerDesignation: async (controllerApp, payload) => {
     context.designationRequests++;
@@ -218,7 +230,7 @@ async function server(): Promise<IpcServerHandle> {
 function reset(): void {
   dataDir = mkdtempSync(join(tmpdir(), 'task-control-route-'));
   context = {
-    registrationCalls: 0, freezeCalls: 0, frozenWrites: 0, registrationAllowed: true, approval: undefined, freezeMode: 'disabled',
+    registrationCalls: 0, registrationResolveCalls: 0, freezeCalls: 0, frozenWrites: 0, registrationAllowed: true, approval: undefined, freezeMode: 'disabled',
     designationCalls: 0, reviewedCalls: 0, unknowns: [], sourceSender: 'reviewer-open-id', sourceRoot: 'om_orch_root', sourceMessageId: 'om_review',
     documentRevision: 9, selfAppId: 'app-1', integrationEnabled: true, sourceReads: 0, designationRequests: 0, documentReads: 0, receiverDocumentReads: 0, seenVerdicts: new Map(),
     reviewerGeneration: 3, reviewerWorker: {}, reviewerCapability: 'review-cap', reviewerTurnId: 'review-turn', reviewerRoot: 'om_orch_root',
@@ -229,9 +241,7 @@ function reset(): void {
 function mappingPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     dispatchRoot: 'om_orch_root', originCapability: 'cap-1', originTurnId: 'turn-1', workerGeneration: 7,
-    projectId: 'project-1', phaseId: 'phase-1', phaseTaskGuids: ['task-1'], taskGuid: 'task-1', topicRootId: 'om_orch_root',
-    ownerId: 'worker-1', reviewerId: 'reviewer-1', acceptorId: 'acceptor-1', registrationRef: 'task-comment:101',
-    approvalGate: { runId: 'run-1', nodeId: 'gate-1', instanceId: 'gate-1#1', waitId: 'wait-1', operatorId: 'acceptor-1', approverPolicy: ['acceptor-1'] },
+    registrationRef: 'task-comment:101',
     ...overrides,
   };
 }
@@ -282,9 +292,9 @@ function approvalSource() {
 
 function realMapping(appId: string, dispatchRoot: string) {
   return {
-    projectId: 'project-1', phaseId: 'phase-1', phaseTaskGuids: ['task-1'], taskGuid: 'task-1', topicRootId: dispatchRoot,
+    projectId: 'project-1', phaseId: 'phase-1', phaseTaskGuids: ['task-1', 'task-2'], taskGuid: 'task-1', topicRootId: dispatchRoot,
     ownerId: `worker:${appId}`, reviewerId: `reviewer:${appId}`, acceptorId: `acceptor:${appId}`,
-    registrationRef: `task-comment:${appId === 'app-a' ? '101' : '102'}`, docToken: 'doc-token-12345678',
+    registrationRef: `task-comment:${appId === 'app-a' ? '101' : '102'}`, registrationVersion: 'v1', docToken: 'doc-token-12345678',
     approvalGate: { runId: `run:${appId}`, nodeId: `node:${appId}`, instanceId: `node:${appId}#1`, waitId: `wait:${appId}`, operatorId: `acceptor:${appId}`, approverPolicy: [`acceptor:${appId}`] },
   };
 }
@@ -297,7 +307,7 @@ async function createRealController(appId: string, dispatchRoot: string): Promis
   const integration = new DaemonTaskControlIntegration({
     dataDir: dataDir!, larkAppId: appId, lifecycle, store: lifecycle.getStore()!, bridge, logger: { warn: () => {} },
   });
-  expect(integration.registerMapping(dispatchRoot, realMapping(appId, dispatchRoot), `daemon:${appId}`)).toBe(true);
+  expect(integration.registerMapping(dispatchRoot, realMapping(appId, dispatchRoot), appId)).toBe(true);
   integration.workerAccepted(dispatchRoot, `accept:${appId}`);
   integration.workerExecutionStarted(dispatchRoot, `execute:${appId}`);
   integration.firstSubmitted(dispatchRoot, `submit:${appId}`, { docToken: 'doc-token-12345678', docRevision: 9, evidenceRef: `topic-message:om_submit_${appId}` });
@@ -338,7 +348,7 @@ function input() {
 
 describe('task-control mapping route authority', () => {
   it('requires transport, registry, current session/generation/capability and exact bot identity', () => {
-    expect(authorizeTaskControlMappingRoute(input())).toEqual({ ok: true, controllerId: 'daemon:app-1' });
+    expect(authorizeTaskControlMappingRoute(input())).toEqual({ ok: true, controllerId: 'app-1' });
     expect(authorizeTaskControlMappingRoute({ ...input(), transportTrusted: false })).toMatchObject({ ok: false, error: 'transport_untrusted' });
     expect(authorizeTaskControlMappingRoute({ ...input(), registry: { ...input().registry, orchAppId: 'app-other' } })).toMatchObject({ ok: false, error: 'registry_unproven' });
     expect(authorizeTaskControlMappingRoute({ ...input(), liveSession: { ...input().liveSession, sessionId: 'session-other' } })).toMatchObject({ ok: false, error: 'session_unproven' });
@@ -378,18 +388,35 @@ describe('task-control mapping/freeze controlled IPC', () => {
     expect(response.status).toBe(201);
     expect(await response.json()).toEqual({ ok: true, dispatchRoot: 'om_orch_root' });
     expect(context.registrationCalls).toBe(1);
+    expect(context.registrationResolveCalls).toBe(1);
     expect(context.frozenWrites).toBe(0);
+  });
+
+  it('accepts only a registration reference and rechecks the controller turn after resolver IO', async () => {
+    reset();
+    writeRegistry();
+    const rejectedBody = await post(TASK_CONTROL_MAPPING_REGISTER_ROUTE, { ...mappingPayload(), taskGuid: 'forged' });
+    expect(rejectedBody.status).toBe(400);
+    expect(context.registrationCalls).toBe(0);
+    context.registrationResolveCalls = 0;
+    const original = handlers;
+    void original;
+    context.controllerGeneration = 8;
+    const stale = await post(TASK_CONTROL_MAPPING_REGISTER_ROUTE, mappingPayload());
+    expect(stale.status).toBe(403);
+    expect(context.registrationCalls).toBe(0);
   });
 
   it('keeps unproven/disabled freeze requests out of the ledger and returns 201 only after an enabled freeze', async () => {
     reset();
-    const body = { dispatchRoot: 'om_orch_root', approvalRef: 'approval:gate-1', eventId: 'freeze-1', idempotencyKey: 'freeze-key-1' };
+    const body = { dispatchRoot: 'om_orch_root', approvalRef: 'approval:gate-1', eventId: 'freeze-1', idempotencyKey: 'freeze-key-1', controllerSessionId: 'session-1', originCapability: 'cap-1', originTurnId: 'turn-1', workerGeneration: 7 };
     const unproven = await post(TASK_CONTROL_FREEZE_ROUTE, body);
     expect(unproven.status).toBe(403);
-    expect(await unproven.json()).toEqual({ ok: false, error: 'task_control_freeze_unproven' });
+    expect(await unproven.json()).toEqual({ ok: false, error: 'task_control_freeze_session_unproven' });
     expect(context.freezeCalls).toBe(0);
     expect(context.frozenWrites).toBe(0);
 
+    writeRegistry();
     context.approval = { kind: 'verified-v3-gate' };
     const disabled = await post(TASK_CONTROL_FREEZE_ROUTE, body);
     expect(disabled.status).toBe(409);
@@ -403,6 +430,18 @@ describe('task-control mapping/freeze controlled IPC', () => {
     expect(await accepted.json()).toMatchObject({ ok: true, result: { kind: 'frozen' } });
     expect(context.freezeCalls).toBe(2);
     expect(context.frozenWrites).toBe(1);
+  });
+
+  it('rejects freeze from a stale controller turn before creating a freeze request', async () => {
+    reset();
+    writeRegistry();
+    context.controllerGeneration = 8;
+    const response = await post(TASK_CONTROL_FREEZE_ROUTE, {
+      dispatchRoot: 'om_orch_root', approvalRef: 'approval:gate-1', eventId: 'freeze-stale', idempotencyKey: 'freeze-stale',
+      controllerSessionId: 'session-1', originCapability: 'cap-1', originTurnId: 'turn-1', workerGeneration: 7,
+    });
+    expect(response.status).toBe(403);
+    expect(context.freezeCalls).toBe(0);
   });
 
   it('uses app-scoped source re-read for designation and accepts only a current reviewer ingress', async () => {
@@ -521,7 +560,7 @@ describe('task-control mapping/freeze controlled IPC', () => {
         const issued = provider.issueDesignatedReviewer({
           designatedReviewerRef: reviewerDesignationRef(root, 'reviewer-app', 1),
           projectId: mapping.projectId, phaseId: mapping.phaseId, taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, taskSetSnapshot: mapping.phaseTaskGuids, reviewRound: 1,
-          reviewerId: 'reviewer-open-id', reviewerBotAppId: 'reviewer-app', controllerId: `daemon:${appId}`, controllerBotAppId: appId,
+          reviewerId: 'reviewer-open-id', reviewerBotAppId: 'reviewer-app', controllerId: appId, controllerBotAppId: appId,
           effectiveAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T00:00:00.000Z',
         });
         const verifier = createDaemonReviewerVerdictVerifier({ hostSecret: HOST_SECRET, controllerBotAppId: appId });
@@ -578,7 +617,7 @@ describe('task-control mapping/freeze controlled IPC', () => {
     context.selfAppId = 'reviewer-app';
     expect(reviewer.integration.registerMapping('om_controller_a', {
       ...realMapping('app-a', 'om_controller_a'), reviewerId: 'reviewer-open-id',
-    }, 'daemon:reviewer-app')).toBe(true);
+    }, 'reviewer-app')).toBe(true);
     context.controllerSessions = new Map([
       ['session-a', { larkAppId: 'app-a', rootMessageId: 'om_controller_a', workerGeneration: 1 }],
       ['session-b', { larkAppId: 'app-b', rootMessageId: 'om_controller_b', workerGeneration: 1 }],
@@ -593,7 +632,7 @@ describe('task-control mapping/freeze controlled IPC', () => {
       context.sourceRoot = root;
       const response = await post(TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, designationPayload({
         dispatchRoot: root, controllerSessionId: `session-${appId.slice(-1)}`, originCapability: `cap:session-${appId.slice(-1)}`,
-        originTurnId: `turn:session-${appId.slice(-1)}`, workerGeneration: 1,
+        originTurnId: `turn:session-${appId.slice(-1)}`, workerGeneration: 1, taskSetSnapshot: ['task-1', 'task-2'],
       }));
       expect(response.status).toBe(201);
     };

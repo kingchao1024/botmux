@@ -15,7 +15,7 @@ function approvalGate() {
 
 function mapping(taskGuid: string, topicRootId: string, registrationRef: string) {
   return {
-    controllerId: 'daemon:app-production', projectId: 'project', phaseId: 'phase', phaseTaskGuids: ['task-a', 'task-b'], taskGuid, topicRootId,
+    controllerId: APP, projectId: 'project', phaseId: 'phase', phaseTaskGuids: ['task-a', 'task-b'], taskGuid, topicRootId,
     ownerId: `worker-${taskGuid}`, reviewerId: `reviewer-${taskGuid}`, acceptorId: 'acceptor', registrationRef, approvalGate: approvalGate(), docToken: 'doc-token-12345678',
   };
 }
@@ -45,13 +45,23 @@ describe('task control production mapping trust', () => {
     const second = mapping('task-b', 'om_b', 'task-comment:102');
     first.mappingProof = trust.issueMapping(taskControlMappingFacts({ ...first, dispatchRoot: 'om_a' }));
     second.mappingProof = trust.issueMapping(taskControlMappingFacts({ ...second, dispatchRoot: 'om_b' }));
-    expect(bridge.registerMapping('om_a', first, 'daemon:app-production')).toBe(true);
-    expect(bridge.registerMapping('om_b', second, 'daemon:app-production')).toBe(true);
+    expect(bridge.registerMapping('om_a', first, APP)).toBe(true);
+    expect(bridge.registerMapping('om_b', second, APP)).toBe(true);
     expect(bridge.listMappings()).toHaveLength(2);
     const crossApp = new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: 'app-other' });
     const forged = { ...first, mappingProof: crossApp.issueMapping(taskControlMappingFacts({ ...first, dispatchRoot: 'om_a' })) };
     const another = new DaemonTaskControlBridge({ larkAppId: APP, approvals: source(), productionMapping: createTaskControlProductionMappingVerifier({ trust }) });
-    expect(another.registerMapping('om_a', forged, 'daemon:app-production')).toBe(false);
+    expect(another.registerMapping('om_a', forged, APP)).toBe(false);
+  });
+
+  it('rejects duplicate task GUIDs before production task-count or mapping-signature acceptance', () => {
+    const trust = new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: APP });
+    const bridge = new DaemonTaskControlBridge({
+      larkAppId: APP, approvals: source(), productionMapping: createTaskControlProductionMappingVerifier({ trust }),
+    });
+    const duplicate = { ...mapping('task-a', 'om_a', 'task-comment:101'), phaseTaskGuids: ['task-a', 'task-a'] };
+    duplicate.mappingProof = trust.issueMapping(taskControlMappingFacts({ ...duplicate, dispatchRoot: 'om_a' }));
+    expect(bridge.registerMapping('om_a', duplicate, APP)).toBe(false);
   });
 
   it('strictly verifies an independent receipt marker across restart and rejects tampering/cross-app markers', () => {
@@ -66,5 +76,15 @@ describe('task control production mapping trust', () => {
     expect(trust.verifyDeliveryReceiptMarker({ ...marker, signature: `${marker.signature.slice(0, -1)}0` }, { eventId: 'evt-1', destinationId: 'task-comment:task-a' })).toBe(false);
     expect(new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: 'app-other' })
       .verifyDeliveryReceiptMarker(marker, { eventId: 'evt-1', destinationId: 'task-comment:task-a' })).toBe(false);
+  });
+
+  it('accepts only the explicit previous root during overlap and rejects it after revoke', () => {
+    const oldTrust = new TaskControlMappingTrust({ hostSecret: 'old-host-root', larkAppId: APP });
+    const facts = taskControlMappingFacts({ ...mapping('task-a', 'om_a', 'task-comment:101'), dispatchRoot: 'om_a' });
+    const proof = oldTrust.issueMapping(facts);
+    const overlap = new TaskControlMappingTrust({ hostSecret: HOST_SECRET, previousHostSecret: 'old-host-root', larkAppId: APP });
+    expect(overlap.verifyMapping(proof, facts, { allowedKeyIds: [overlap.mappingKeyId, overlap.previousMappingKeyId!] })).toBe(true);
+    expect(overlap.verifyMapping(proof, facts, { allowedKeyIds: [overlap.mappingKeyId, overlap.previousMappingKeyId!], revokedKeyIds: [overlap.previousMappingKeyId!] })).toBe(false);
+    expect(new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: APP }).verifyMapping(proof, facts)).toBe(false);
   });
 });
