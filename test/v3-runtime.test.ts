@@ -541,6 +541,36 @@ describe('runWorkflow — edge activation', () => {
 });
 
 describe('runWorkflow — humanGate suspend mode', () => {
+  it('persists an authored write-execution binding into the wait and journal', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-write-gate-'));
+    try {
+      const writeExecution = {
+        grantRef: 'grant:write-1', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1',
+        candidate: 'candidate-c8', action: 'git.commit', attempt: 2, operatorId: 'acceptor-1',
+      };
+      const dag = validateDag({
+        runId: 'write-gate-run',
+        nodes: [{
+          id: 'authorize', type: 'goal', goal: 'authorize', depends: [], inputs: [],
+          humanGate: { prompt: 'Approve exact write?', approvers: ['acceptor-1'], writeExecution },
+        }],
+      });
+      const outcome = await runWorkflow(dag, {
+        runNode: async () => { throw new Error('gate must suspend before work'); },
+        validateManifest,
+        resolveBotSnapshot,
+      }, { baseDir: base, gateMode: 'suspend' });
+      expect(outcome).toMatchObject({ reason: 'awaitingGate', pendingWaits: [{ writeExecution }] });
+      const runDir = join(base, 'write-gate-run');
+      expect(readWait(runDir, 'authorize#001-gate')).toMatchObject({ writeExecution });
+      expect(readJournal(join(runDir, 'journal.ndjson'))).toContainEqual(expect.objectContaining({
+        type: 'gateDispatched', writeExecution,
+      }));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('suspend 模式：派 gate 后写 pending wait 并返回 awaitingGate；批准后 redrive 继续跑 work', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-rt-gate-'));
     try {

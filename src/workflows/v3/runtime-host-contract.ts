@@ -206,6 +206,7 @@ export interface GateResolutionRequest {
   waitId: string;
   runDir: string;
   hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+  writeExecution?: import('./dag.js').V3WriteExecutionBinding;
 }
 
 export interface GateResolution {

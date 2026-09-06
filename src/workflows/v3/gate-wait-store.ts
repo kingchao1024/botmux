@@ -41,7 +41,12 @@ import {
 import { dirname, join } from 'node:path';
 import { withFileLockSync } from '../../utils/file-lock.js';
 import { fsyncDirectorySyncPortable, fsyncRegularFileSync } from '../../utils/fs-durability.js';
-import { DEFAULT_HUMAN_GATE_OPTIONS } from './dag.js';
+import {
+  DEFAULT_HUMAN_GATE_OPTIONS,
+  MAX_WRITE_EXECUTION_FIELD_LENGTH,
+  V3_WRITE_EXECUTION_FIELDS,
+  type V3WriteExecutionBinding,
+} from './dag.js';
 import type { GateResolver } from './runtime-host-contract.js';
 
 export {
@@ -72,6 +77,8 @@ export interface GateWait {
   selected?: string;
   /** Host-only: the exact frozen provider input this approval covers. */
   hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+  /** Optional exact one-shot control-plane write authorized by this wait. */
+  writeExecution?: V3WriteExecutionBinding;
 }
 
 export type { GateResolver };
@@ -163,7 +170,7 @@ function assertPrivateRegularWaitFile(path: string, requirePrivate = true): void
 export function writePendingWait(
   runDir: string,
   input: { waitId: string; nodeId: string; prompt: string } &
-    Partial<Pick<GateWait, 'options' | 'approveOptions' | 'approvers' | 'instanceId' | 'hostApproval'>>,
+    Partial<Pick<GateWait, 'options' | 'approveOptions' | 'approvers' | 'instanceId' | 'hostApproval' | 'writeExecution'>>,
 ): GateWait {
   const options = input.options ?? [...DEFAULT_HUMAN_GATE_OPTIONS];
   const approveOptions = input.approveOptions ?? (options.includes('approve') ? ['approve'] : [options[0]!]);
@@ -176,6 +183,7 @@ export function writePendingWait(
     approveOptions,
     approvers: input.approvers ?? [],
     ...(input.hostApproval ? { hostApproval: input.hostApproval } : {}),
+    ...(input.writeExecution ? { writeExecution: input.writeExecution } : {}),
     status: 'pending',
     createdAt: Date.now(),
   };
@@ -193,8 +201,8 @@ export function readWait(runDir: string, waitId: string): GateWait | undefined {
     throw new Error('v3 human-gate: wait file must be a regular file');
   }
   const wait = normalizeWaitFile(JSON.parse(readFileSync(path, 'utf-8')) as Partial<GateWait>);
-  if (wait.hostApproval && (pathStat.mode & 0o077) !== 0) {
-    throw new Error('v3 human-gate: host wait file must not be group/world accessible');
+  if ((wait.hostApproval || wait.writeExecution) && (pathStat.mode & 0o077) !== 0) {
+    throw new Error('v3 human-gate: privileged wait file must not be group/world accessible');
   }
   return wait;
 }
@@ -287,6 +295,25 @@ function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
     }
     hostApproval = approval as unknown as NonNullable<GateWait['hostApproval']>;
   }
+  let writeExecution: GateWait['writeExecution'];
+  if (raw.writeExecution !== undefined) {
+    const grant = raw.writeExecution as unknown as Record<string, unknown>;
+    if (
+      !grant ||
+      typeof grant !== 'object' ||
+      Array.isArray(grant) ||
+      Object.keys(grant).sort().join(',') !== [...V3_WRITE_EXECUTION_FIELDS].sort().join(',') ||
+      V3_WRITE_EXECUTION_FIELDS.some((field) => field !== 'attempt'
+        && (typeof grant[field] !== 'string'
+          || !(grant[field] as string).trim()
+          || (grant[field] as string).length > MAX_WRITE_EXECUTION_FIELD_LENGTH)) ||
+      !Number.isSafeInteger(grant.attempt) ||
+      (grant.attempt as number) < 1
+    ) {
+      throw new Error('v3 human-gate: malformed writeExecution in wait file');
+    }
+    writeExecution = grant as unknown as NonNullable<GateWait['writeExecution']>;
+  }
   return {
     waitId: raw.waitId ?? '',
     nodeId: raw.nodeId ?? '',
@@ -301,6 +328,7 @@ function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
     by: raw.by,
     selected: raw.selected,
     ...(hostApproval ? { hostApproval } : {}),
+    ...(writeExecution ? { writeExecution } : {}),
   };
 }
 
@@ -319,8 +347,12 @@ function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
 export function createFileGate(deps: {
   awaitDecision: (wait: GateWait) => Promise<{ resolution: 'approved' | 'rejected'; by: string; selected?: string }>;
 }): GateResolver {
-  return async ({ nodeId, prompt, waitId, runDir, hostApproval }) => {
-    const wait = writePendingWait(runDir, { waitId, nodeId, prompt, ...(hostApproval ? { hostApproval } : {}) });
+  return async ({ nodeId, prompt, waitId, runDir, hostApproval, writeExecution }) => {
+    const wait = writePendingWait(runDir, {
+      waitId, nodeId, prompt,
+      ...(hostApproval ? { hostApproval } : {}),
+      ...(writeExecution ? { writeExecution } : {}),
+    });
     const { resolution, by, selected } = await deps.awaitDecision(wait);
     const settled = resolveWaitOnce(runDir, waitId, resolution, by, selected);
     return {

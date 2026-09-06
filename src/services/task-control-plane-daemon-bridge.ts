@@ -63,6 +63,7 @@ export interface DaemonTaskControlApprovalSource {
   /** Durable human authorization for one exact write; absent means fail closed. */
   getWriteExecution?(input: {
     grantRef: string; larkAppId: string; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string;
+    gate: TaskControlApprovalGateBinding;
   }): Pick<VerifiedWriteExecutionGrant, 'issuedAt' | 'expiresAt'> | undefined;
 }
 
@@ -256,6 +257,7 @@ export class DaemonTaskControlBridge {
     const source = this.input.approvals.getWriteExecution?.({
       grantRef: input.grantRef, larkAppId: this.input.larkAppId, projectId: input.projectId, phaseId: input.phaseId, taskGuid: input.taskGuid,
       candidate: input.candidate, action: input.action, attempt: input.attempt, operatorId: input.operatorId,
+      gate: mapping.approvalGate,
     });
     if (!source) return undefined;
     return this.authority.issueVerifiedWriteExecutionGrant({

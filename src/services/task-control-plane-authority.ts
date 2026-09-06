@@ -1,3 +1,4 @@
+import type { V3WriteExecutionBinding } from '../workflows/v3/dag.js';
 import type {
   AuthenticatedTaskControlPrincipal,
   TaskControlAuthority,
@@ -49,15 +50,7 @@ interface StoredApproval {
   approval: VerifiedTaskControlApproval;
 }
 
-export interface VerifiedWriteExecutionGrant {
-  grantRef: string;
-  projectId: string;
-  phaseId: string;
-  taskGuid: string;
-  candidate: string;
-  action: string;
-  attempt: number;
-  operatorId: string;
+export interface VerifiedWriteExecutionGrant extends V3WriteExecutionBinding {
   issuedAt: string;
   expiresAt: string;
 }
