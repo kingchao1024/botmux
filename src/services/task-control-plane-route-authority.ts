@@ -156,7 +156,7 @@ export const TASK_CONTROL_REVIEWER_MAX_BYTES = 16 * 1024;
 type RouteIntegration = {
   registerMapping(dispatchRoot: string, mapping: DaemonTaskControlMappingRegistration, controllerId: string): boolean;
   mapping(dispatchRoot: string): DaemonTaskControlMapping | undefined;
-  issueAuthentication(dispatchRoot: string, principal: 'acceptor'): unknown | undefined;
+  issueAcceptorAuthentication(dispatchRoot: string): unknown | undefined;
   approval(dispatchRoot: string, approvalRef: string): unknown | undefined;
   canaryRole?(): 'controller' | 'worker' | 'reviewer' | undefined;
   canaryScope?(): { reviewerAppId: string } | undefined;
@@ -497,7 +497,7 @@ export function createTaskControlRouteHandlers(input: {
         return;
       }
       let mapping = integration.mapping(dispatchRoot);
-      const authentication = integration.issueAuthentication(dispatchRoot, 'acceptor');
+      const authentication = integration.issueAcceptorAuthentication(dispatchRoot);
       const approval = integration.approval(dispatchRoot, approvalRef);
       if (!mapping || !authentication || !approval) {
         jsonRes(res, 403, { ok: false, error: 'task_control_freeze_unproven' });

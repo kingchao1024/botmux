@@ -88,7 +88,7 @@ const handlers = createTaskControlRouteHandlers({
       ownerId: 'worker-1', reviewerId: 'controller-view-reviewer', acceptorId: 'acceptor-1', registrationRef: 'task-comment:101',
       controllerId: 'daemon:app-1', approvalGate: { approvalRef: 'approval:gate-1' }, docToken: 'doc-token-12345678',
     }),
-    issueAuthentication: () => ({ kind: 'acceptor-proof' }),
+    issueAcceptorAuthentication: () => ({ kind: 'acceptor-proof' }),
     approval: () => context.approval,
     canaryRole: () => context.canaryRole,
     canaryScope: () => context.canaryRole ? { reviewerAppId: context.canaryReviewerAppId ?? 'reviewer-app' } : undefined,
