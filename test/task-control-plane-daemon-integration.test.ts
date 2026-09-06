@@ -86,6 +86,7 @@ describe('DaemonTaskControlIntegration', () => {
       expect(integration.consumeWriteExecutionGrant(input)).toEqual({ ok: false, reason: 'task_control_write_execution_grant_unavailable' });
       expect(integration.consumeWriteExecutionGrant({ ...input, grantRef: 'grant:write-2', candidate: 'other-candidate' })).toEqual({ ok: false, reason: 'write_execution_grant_unproven' });
       expect(integration.consumeWriteExecutionGrant({ ...input, grantRef: 'grant:write-2', attempt: 3 })).toEqual({ ok: false, reason: 'write_execution_grant_unproven' });
+      expect(integration.consumeWriteExecutionGrant({ ...input, dispatchRoot: 'om_other_topic' })).toEqual({ ok: false, reason: 'write_execution_mapping_unproven' });
       await lifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
@@ -106,6 +107,24 @@ describe('DaemonTaskControlIntegration', () => {
       const restartedIntegration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle: restarted, store: restarted.getStore()!, bridge: restartedBridge, logger: { warn: () => {} } });
       expect(restartedIntegration.consumeWriteExecutionGrant(input)).toEqual({ ok: false, reason: 'task_control_write_execution_grant_unavailable' });
       await restarted.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('serializes concurrent consumers so exactly one identical grant succeeds', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-write-grant-concurrent-'));
+    try {
+      const input = { dispatchRoot: 'om_root', grantRef: 'grant:write-1', candidate: 'candidate-c8', action: 'git.commit', attempt: 2, operatorId: 'acceptor-1', now: '2026-09-05T00:30:00.000Z' };
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store: lifecycle.getStore()!, bridge, logger: { warn: () => {} } });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const results = await Promise.all([
+        Promise.resolve().then(() => integration.consumeWriteExecutionGrant(input)),
+        Promise.resolve().then(() => integration.consumeWriteExecutionGrant(input)),
+      ]);
+      expect(results.filter(result => result.ok)).toHaveLength(1);
+      expect(results.filter(result => !result.ok)).toEqual([{ ok: false, reason: 'task_control_write_execution_grant_unavailable' }]);
+      await lifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
   it('persists controller mapping in SQLite and restores it without a JSON sidecar', async () => {
