@@ -184,6 +184,62 @@ describe('DaemonTaskControlIntegration', () => {
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
+  it('replaces a signed PASS verdict without a review transition violation and can still freeze', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-review-correction-'));
+    try {
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({
+        dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true, freezeEnforcement: true }, authority: bridge.authority, logger: { warn: () => {} },
+      });
+      const store = lifecycle.getStore()!;
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} } });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const provider = reviewerProvider();
+      store.setReviewerVerdictVerifier(provider);
+      const controller = bridge.issueAuthentication('om_root', 'controller')!;
+      const reviewer = bridge.issueAuthentication('om_root', 'reviewer')!;
+      const designation = provider.issueDesignatedReviewer({
+        projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1,
+        reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', controllerId: 'controller-1', controllerBotAppId: 'app-1',
+        effectiveAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T01:00:00.000Z',
+      });
+      integration.registerDesignatedReviewer({ mapping: designation, authentication: controller, verify: value => provider.verifyDesignatedReviewer(value) });
+      integration.workerAccepted('om_root', 'accept');
+      integration.workerExecutionStarted('om_root', 'execute');
+      integration.firstSubmitted('om_root', 'submit', { docToken: 'doc-final', docRevision: 1, evidenceRef: 'topic-message:om_submit' });
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('submitted'));
+      const issue = (verdictId: string, sourceMessageId: string, supersedesVerdictId?: string) => provider.issueVerdict({
+        verdictId, projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1,
+        designatedReviewerRef: designation.designatedReviewerRef, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app',
+        sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap', sourceMessageId, sourceVersionHash: `sha256:${sourceMessageId.slice(-1).repeat(64)}`,
+        kind: 'verdict', verdict: 'pass', conditionIds: [], resolvedConditionEvidence: {}, docToken: 'doc-final', docRevision: 1,
+        ...(supersedesVerdictId ? { supersedesVerdictId } : {}), expiresAt: '2099-09-05T01:00:00.000Z',
+      });
+      const first = issue('verdict-v1', 'om_review_a');
+      expect(integration.submitReviewerVerdict({
+        dispatchRoot: 'om_root', verdict: first, authentication: reviewer,
+        attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap' },
+        verifyVerdict: value => provider.verifyVerdict(value), now: '2026-09-05T00:30:00.000Z',
+      })).toMatchObject({ status: 'active' });
+      const correction = issue('verdict-v2', 'om_review_b', first.verdictId);
+      expect(integration.submitReviewerVerdict({
+        dispatchRoot: 'om_root', verdict: correction, authentication: reviewer,
+        attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap' },
+        verifyVerdict: value => provider.verifyVerdict(value), now: '2026-09-05T00:31:00.000Z',
+      })).toMatchObject({ status: 'active', verdict: { verdictId: correction.verdictId } });
+      await waitFor(() => expect(store.listEvents({ taskGuid: 'task-1' }).some(event => event.eventType === 'task.review_corrected')).toBe(true));
+      expect(store.getTaskProjection('task-1').transitionViolations).toEqual([]);
+      integration.delivered('om_root', 'deliver', { docToken: 'doc-final', docRevision: 1, destinationId: 'topic-message:om_delivery', receiptRef: 'topic-message:om_receipt', evidenceRef: 'topic-message:om_delivery' });
+      integration.doneMarked('om_root', 'done', 'task-comment:done');
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('task_done_pending_freeze'));
+      expect(integration.requestFreeze('om_root', 'correction-freeze')).toBe(true);
+      expect(store.validatePhaseFreeze('project-1', 'phase-1').ok).toBe(true);
+      const mapped = integration.mapping('om_root')!;
+      expect(lifecycle.freeze({ eventId: 'freeze-correction', projectId: mapped.projectId, phaseId: mapped.phaseId, authentication: bridge.issueAuthentication('om_root', 'acceptor')!, approval: integration.approval('om_root', mapped.approvalGate.approvalRef), idempotencyKey: 'freeze-correction' })).toMatchObject({ kind: 'frozen' });
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
   it('reconciles a post-write/pre-settle task comment across restart without a duplicate create', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-comment-crash-'));
     try {
@@ -492,6 +548,36 @@ describe('DaemonTaskControlIntegration', () => {
       });
       expect(integration.beginRework({ dispatchRoot: 'om_root', sourceRef: 'rework:bad', sourceReviewerVerdictId: verdict.verdictId, newExecutionEventId: 'missing', evidenceRef: 'task-comment:103' })).toMatchObject({ ok: false });
       expect(store.getTaskProjection('task-1').state).toBe('rework');
+      await lifecycle.close();
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('starts rework from a superseding FAIL only after a fresh execution fact', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-corrected-rework-'));
+    try {
+      const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
+      const lifecycle = await startTaskControlPlaneRuntime({ dataDir, larkAppId: 'app-1', flags: { ledgerEnabled: true }, authority: bridge.authority, logger: { warn: () => {} } });
+      const store = lifecycle.getStore()!;
+      const integration = new DaemonTaskControlIntegration({ dataDir, larkAppId: 'app-1', lifecycle, store, bridge, logger: { warn: () => {} } });
+      expect(integration.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);
+      const provider = reviewerProvider();
+      store.setReviewerVerdictVerifier(provider);
+      const controller = bridge.issueAuthentication('om_root', 'controller')!;
+      const reviewer = bridge.issueAuthentication('om_root', 'reviewer')!;
+      const designation = provider.issueDesignatedReviewer({ projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', controllerId: 'controller-1', controllerBotAppId: 'app-1', effectiveAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T01:00:00.000Z' });
+      integration.registerDesignatedReviewer({ mapping: designation, authentication: controller, verify: value => provider.verifyDesignatedReviewer(value) });
+      integration.workerAccepted('om_root', 'accept'); integration.workerExecutionStarted('om_root', 'execution-initial');
+      integration.firstSubmitted('om_root', 'submit', { docToken: 'doc-final', docRevision: 1, evidenceRef: 'topic-message:om_submit' });
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('submitted'));
+      const make = (verdictId: string, kind: 'pass' | 'fail', supersedesVerdictId?: string) => provider.issueVerdict({ verdictId, projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, designatedReviewerRef: designation.designatedReviewerRef, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap', sourceMessageId: `om_${verdictId}`, sourceVersionHash: `sha256:${verdictId.slice(-1).repeat(64)}`, kind: 'verdict', verdict: kind, conditionIds: [], resolvedConditionEvidence: {}, docToken: 'doc-final', docRevision: 1, ...(supersedesVerdictId ? { supersedesVerdictId } : {}), expiresAt: '2099-09-05T01:00:00.000Z' });
+      const first = make('review-v1', 'pass');
+      expect(integration.submitReviewerVerdict({ dispatchRoot: 'om_root', verdict: first, authentication: reviewer, attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap' }, verifyVerdict: value => provider.verifyVerdict(value) })).toMatchObject({ status: 'active' });
+      const corrected = make('review-v2', 'fail', first.verdictId);
+      expect(integration.submitReviewerVerdict({ dispatchRoot: 'om_root', verdict: corrected, authentication: reviewer, attestation: { reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'review-session', workerGeneration: 1, capability: 'review-cap' }, verifyVerdict: value => provider.verifyVerdict(value) })).toMatchObject({ status: 'active', verdict: { verdictId: corrected.verdictId } });
+      expect(store.getTaskProjection('task-1').state).toBe('reviewing');
+      integration.workerExecutionStarted('om_root', 'execution-after-correction');
+      await waitFor(() => expect(store.getTaskProjection('task-1').state).toBe('rework'));
+      expect(store.listEvents({ taskGuid: 'task-1' }).find(event => event.eventType === 'task.rework_started')).toMatchObject({ payload: { sourceReviewerVerdictId: corrected.verdictId } });
       await lifecycle.close();
     } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });

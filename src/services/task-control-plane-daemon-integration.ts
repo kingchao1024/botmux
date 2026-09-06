@@ -275,7 +275,7 @@ export class DaemonTaskControlIntegration {
       docToken: verdict.docToken, docRevision: verdict.docRevision,
       reviewerVerdictId: verdict.verdictId,
       evidenceRef: verdict.sourceCommentId ? `task-comment:${verdict.sourceCommentId}` : `topic-message:${verdict.sourceMessageId}`,
-    }, input.now);
+    }, input.now, verdict.supersedesVerdictId ? 'task.review_corrected' : 'task.reviewed');
     if (!reviewed.ok) {
       this.reviewerVerdictUnknown(input.dispatchRoot, verdict.verdictId, reviewed.reason, `reviewer-verdict:${verdict.verdictId}`);
       return { status: 'unknown', reason: reviewed.reason };
@@ -430,8 +430,8 @@ export class DaemonTaskControlIntegration {
     reviewRound: number; reviewCommentId: string; verdict: 'pass' | 'conditional' | 'fail';
     conditionIds: string[]; resolvedConditionEvidence: Record<string, ReviewerConditionEvidence>;
     docToken: string; docRevision: number; evidenceRef: string; reviewerVerdictId: string;
-  }, occurredAt?: string): { ok: true } | { ok: false; reason: string } {
-    const bound = this.bridgeEvent('task.reviewed', dispatchRoot, 'reviewer', sourceRef, { ...input, independent: true }, input.evidenceRef);
+  }, occurredAt?: string, eventType: 'task.reviewed' | 'task.review_corrected' = 'task.reviewed'): { ok: true } | { ok: false; reason: string } {
+    const bound = this.bridgeEvent(eventType, dispatchRoot, 'reviewer', sourceRef, { ...input, independent: true }, input.evidenceRef);
     if (!bound) {
       return { ok: false, reason: 'reviewer_verdict_mapping_unproven' };
     }
@@ -442,7 +442,7 @@ export class DaemonTaskControlIntegration {
     // review that only produced a runtime warning.
     try {
       const result = this.input.store.appendEvent({
-        ...bound, eventType: 'task.reviewed',
+        ...bound, eventType,
         payload: { ...input, independent: true },
         ...(occurredAt ? { occurredAt } : {}),
       });
@@ -636,7 +636,7 @@ export class DaemonTaskControlIntegration {
   }
 
   private appendMapped(
-    eventType: 'task.accepted' | 'task.execution_started' | 'task.first_submitted' | 'task.reviewed' | 'task.rework_started' | 'task.done_marked',
+    eventType: 'task.accepted' | 'task.execution_started' | 'task.first_submitted' | 'task.reviewed' | 'task.review_corrected' | 'task.rework_started' | 'task.done_marked',
     dispatchRoot: string,
     principal: 'worker' | 'reviewer' | 'controller',
     sourceRef: string,
@@ -658,7 +658,7 @@ export class DaemonTaskControlIntegration {
   }
 
   private bridgeEvent(
-    eventType: 'task.accepted' | 'task.execution_started' | 'task.first_submitted' | 'task.reviewed' | 'task.rework_started' | 'task.delivered' | 'task.done_marked',
+    eventType: 'task.accepted' | 'task.execution_started' | 'task.first_submitted' | 'task.reviewed' | 'task.review_corrected' | 'task.rework_started' | 'task.delivered' | 'task.done_marked',
     dispatchRoot: string,
     principal: 'worker' | 'reviewer' | 'controller',
     sourceRef: string,

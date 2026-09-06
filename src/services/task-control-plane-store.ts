@@ -34,6 +34,7 @@ export type TaskControlEventType =
   | 'task.execution_started'
   | 'task.first_submitted'
   | 'task.reviewed'
+  | 'task.review_corrected'
   | 'task.rework_started'
   | 'task.delivery_fallback_verified'
   | 'task.delivered'
@@ -537,6 +538,9 @@ const TASK_TRANSITIONS: Partial<Record<TaskControlEventType, TaskTransitionRule>
       return 'reviewing';
     },
   },
+  // A signed superseding verdict replaces review evidence but never repeats the
+  // submitted→reviewing lifecycle transition.
+  'task.review_corrected': { from: ['reviewing'], to: 'reviewing' },
   'task.rework_started': { from: ['reviewing'], to: 'rework' },
   'task.delivered': { from: ['reviewing'], to: 'delivered' },
   'task.done_marked': { from: ['delivered'], to: 'task_done_pending_freeze' },
@@ -1245,7 +1249,7 @@ function validateInput(input: AuthenticatedAppendTaskControlEventInput, allowFro
     nonEmpty(payload.docToken, 'payload.docToken');
     positiveInteger(payload.docRevision, 'payload.docRevision');
   }
-  if (input.eventType === 'task.reviewed') {
+  if (input.eventType === 'task.reviewed' || input.eventType === 'task.review_corrected') {
     if (input.actorRole !== 'reviewer') throw new Error('task_control_invalid:reviewer_role');
     positiveInteger(payload.reviewRound, 'payload.reviewRound');
     nonEmpty(payload.reviewCommentId, 'payload.reviewCommentId');
@@ -1435,7 +1439,8 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
         break;
       case 'task.accepted':
         explicitlyAccepted = true; acceptedEventId = event.eventId; acceptedActorId = event.actorId; break;
-      case 'task.reviewed': {
+      case 'task.reviewed':
+      case 'task.review_corrected': {
         const verdict = parseReviewVerdict(event.payload.verdict);
         if (event.payload.independent === true) {
           const conditionIds = event.payload.conditionIds === undefined
@@ -2313,7 +2318,7 @@ export class TaskControlPlaneStore {
 
   private appendEventLocked(input: AuthenticatedAppendTaskControlEventInput, allowFrozen = false): AppendTaskControlEventResult {
     validateInput(input, allowFrozen);
-    if (input.eventType === 'task.reviewed') this.assertReviewedVerdictCurrentLocked(input);
+    if (input.eventType === 'task.reviewed' || input.eventType === 'task.review_corrected') this.assertReviewedVerdictCurrentLocked(input);
     if (input.eventType === 'task.rework_started') this.assertReworkSourceCurrentLocked(input);
     const payloadHash = eventPayloadHash(input);
     const existing = this.eventByIdempotencyKey(input.idempotencyKey);
