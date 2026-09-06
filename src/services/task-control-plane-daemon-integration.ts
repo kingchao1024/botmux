@@ -39,6 +39,50 @@ function sameTaskSet(left: readonly string[], right: readonly string[]): boolean
   return JSON.stringify([...new Set(left)].sort()) === JSON.stringify([...new Set(right)].sort());
 }
 
+type CollectedReference = {
+  kind: 'task' | 'task_comment';
+  sourceRef: string;
+  eventId: string;
+  idempotencyKey: string;
+};
+
+function assertLarkReadSucceeded(response: any, resource: string): void {
+  if (response?.code !== 0) throw new Error(`${resource}_read_failed:${String(response?.code ?? 'missing_code')}`);
+}
+
+async function collectTaskReferences(larkAppId: string, taskGuid: string): Promise<CollectedReference[]> {
+  const response = await larkGet(getBotClient(larkAppId), `/open-apis/task/v2/tasks/${encodeURIComponent(taskGuid)}`);
+  assertLarkReadSucceeded(response, 'task');
+  const updatedAt = nonBlank(response.data?.task?.updated_at);
+  const sourceRef = reference('task', updatedAt ? `${taskGuid}@${updatedAt}` : taskGuid);
+  const records: CollectedReference[] = [{
+    kind: 'task', sourceRef, eventId: DaemonTaskControlBridge.observationId('task', sourceRef),
+    idempotencyKey: `tcp-collect:task:${sourceRef}`,
+  }];
+  if (response.data?.task?.status === 'done') {
+    const doneRef = reference('task-done-unverified', updatedAt ? `${taskGuid}@${updatedAt}` : taskGuid);
+    records.push({
+      kind: 'task', sourceRef: doneRef, eventId: DaemonTaskControlBridge.observationId('task', doneRef),
+      idempotencyKey: `tcp-collect:task:${doneRef}`,
+    });
+  }
+  return records;
+}
+
+async function collectLatestTaskCommentReference(larkAppId: string, taskGuid: string): Promise<CollectedReference[]> {
+  const response = await larkGet(getBotClient(larkAppId), '/open-apis/task/v2/comments', {
+    resource_type: 'task', resource_id: taskGuid, page_size: 1, direction: 'desc',
+  });
+  assertLarkReadSucceeded(response, 'task_comment');
+  const commentId = nonBlank(response.data?.items?.[0]?.id);
+  if (!commentId) return [];
+  const sourceRef = reference('task-comment', commentId);
+  return [{
+    kind: 'task_comment', sourceRef, eventId: DaemonTaskControlBridge.observationId('task_comment', sourceRef),
+    idempotencyKey: `tcp-collect:task_comment:${sourceRef}`,
+  }];
+}
+
 /**
  * The daemon-side integration intentionally owns only typed mappings and stable
  * remote references. It is not a report/body parser: if a controller has not
@@ -577,27 +621,9 @@ export class DaemonTaskControlIntegration {
             records.push({ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` });
           }
         } else if (kind === 'task_comment') {
-          const task = await larkGet(getBotClient(this.input.larkAppId), '/open-apis/task/v2/comments', { resource_type: 'task', resource_id: mapping.taskGuid, page_size: 1 });
-          const commentId = nonBlank(task?.data?.items?.[0]?.id);
-          if (commentId) {
-            const sourceRef = reference('task-comment', commentId);
-            records.push({ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` });
-          }
+          records.push(...await collectLatestTaskCommentReference(this.input.larkAppId, mapping.taskGuid));
         } else if (kind === 'task') {
-          const task = await larkGet(getBotClient(this.input.larkAppId), `/open-apis/task/v2/tasks/${encodeURIComponent(mapping.taskGuid)}`);
-          const updatedAt = nonBlank(task?.data?.task?.updated_at);
-          const sourceRef = reference('task', updatedAt ? `${mapping.taskGuid}@${updatedAt}` : mapping.taskGuid);
-          records.push({ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` });
-          // Task status is a readable reference only. It lacks a stable update
-          // id, authoritative actor/time and exact binding, so even `done`
-          // remains UNKNOWN rather than task.done_marked.
-          if (task?.data?.task?.status === 'done') {
-            const doneRef = reference('task-done-unverified', updatedAt ? `${mapping.taskGuid}@${updatedAt}` : mapping.taskGuid);
-            records.push({
-              kind, sourceRef: doneRef, eventId: DaemonTaskControlBridge.observationId(kind, doneRef),
-              idempotencyKey: `tcp-collect:${kind}:${doneRef}`,
-            });
-          }
+          records.push(...await collectTaskReferences(this.input.larkAppId, mapping.taskGuid));
         }
       } catch (error) {
         this.input.logger.warn(`[task-control] ${kind} reference unavailable for ${dispatchRoot}: ${String(error)}`);
@@ -644,24 +670,9 @@ export class DaemonTaskControlShadowCollector {
   private async collectReferences(kind: 'task' | 'task_comment') {
     const { larkAppId, taskGuid } = this.input;
     try {
-      if (kind === 'task_comment') {
-        const response = await larkGet(getBotClient(larkAppId), '/open-apis/task/v2/comments', {
-          resource_type: 'task', resource_id: taskGuid, page_size: 1,
-        });
-        const commentId = nonBlank(response?.data?.items?.[0]?.id);
-        if (!commentId) return [];
-        const sourceRef = reference('task-comment', commentId);
-        return [{ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` }];
-      }
-      const response = await larkGet(getBotClient(larkAppId), `/open-apis/task/v2/tasks/${encodeURIComponent(taskGuid)}`);
-      const updatedAt = nonBlank(response?.data?.task?.updated_at);
-      const sourceRef = reference('task', updatedAt ? `${taskGuid}@${updatedAt}` : taskGuid);
-      const records = [{ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` }];
-      if (response?.data?.task?.status === 'done') {
-        const doneRef = reference('task-done-unverified', updatedAt ? `${taskGuid}@${updatedAt}` : taskGuid);
-        records.push({ kind, sourceRef: doneRef, eventId: DaemonTaskControlBridge.observationId(kind, doneRef), idempotencyKey: `tcp-collect:${kind}:${doneRef}` });
-      }
-      return records;
+      return kind === 'task'
+        ? await collectTaskReferences(larkAppId, taskGuid)
+        : await collectLatestTaskCommentReference(larkAppId, taskGuid);
     } catch (error) {
       this.input.logger.warn(`[task-control] ${kind} reference unavailable for ${taskGuid}: ${String(error)}`);
       const sourceRef = reference('collection-error', `${kind}:${taskGuid}`);

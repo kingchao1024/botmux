@@ -50,6 +50,11 @@ describe('task control plane runtime', () => {
     });
     const off = { ledgerEnabled: false, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false };
     expect(scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', enabled)).toEqual({ flags: off, disabledReason: 'target_app_mismatch' });
+    expect(scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', {
+      ...enabled,
+      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: 'cli_bbbbbbbbbbbbbbbb',
+      TASK_CONTROL_PLANE_TARGET_TASK_GUID: '11111111-1111-1111-1111-111111111111',
+    })).toEqual({ flags: off, disabledReason: 'target_scope_unauthorized' });
     expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TARGET_TASK_GUID: '' }))
       .toEqual({ flags: off, disabledReason: 'target_scope_required' });
     expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TARGET_TASK_GUID: `${taskGuid},other` }))

@@ -98,6 +98,8 @@ export function taskControlPlaneFlags(env: NodeJS.ProcessEnv = process.env): Tas
 
 const LARK_APP_ID_PATTERN = /^cli_[A-Za-z0-9]{16,64}$/;
 const TASK_GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SCOPED_SHADOW_LARK_APP_ID = 'cli_aac926f0eb795bc1';
+const SCOPED_SHADOW_TASK_GUID = '2cd616e9-910b-47e1-a081-349b4808ee5a';
 
 /**
  * Production daemon gate for the first real Shadow canary. Any enabled flag
@@ -128,6 +130,9 @@ export function scopedTaskControlPlaneConfig(
   }
   if (!LARK_APP_ID_PATTERN.test(targetLarkAppId) || !TASK_GUID_PATTERN.test(targetTaskGuid)) {
     return { flags: disabled(), disabledReason: 'target_scope_invalid' };
+  }
+  if (targetLarkAppId !== SCOPED_SHADOW_LARK_APP_ID || targetTaskGuid !== SCOPED_SHADOW_TASK_GUID) {
+    return { flags: disabled(), disabledReason: 'target_scope_unauthorized' };
   }
   if (targetLarkAppId !== selfLarkAppId) {
     return { flags: disabled(), disabledReason: 'target_app_mismatch' };
