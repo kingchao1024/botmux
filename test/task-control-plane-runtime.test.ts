@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { scopedTaskControlPlaneConfig, taskControlPlaneDatabasePath, taskControlPlaneFlags } from '../src/services/task-control-plane-runtime.js';
+import { productionTaskControlPlaneConfig, scopedTaskControlPlaneConfig, taskControlPlaneDatabasePath, taskControlPlaneFlags } from '../src/services/task-control-plane-runtime.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 function collectChild(child: ReturnType<typeof spawnTsEvalWithRepoImports>): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -98,6 +98,44 @@ describe('task control plane runtime', () => {
     expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_UNRELATED: '1' }))
       .toEqual({ flags: off, disabledReason: 'canary_scope_extra' });
     expect(scopedTaskControlPlaneConfig(appId, {})).toEqual({ flags: off });
+  });
+
+  it('requires explicit production mode and validates only explicit key allow/revoke JSON', () => {
+    const appId = 'cli_aac926f0eb795bc1';
+    const base = { TASK_CONTROL_PLANE_PRODUCTION: 'true', TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true', TASK_CONTROL_PLANE_PUMP_ENABLED: 'true' };
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: base })).toMatchObject({ flags: { ledgerEnabled: true, pumpEnabled: true } });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_ALLOWED_KEY_IDS: 'not-json' } }))
+      .toMatchObject({ disabledReason: 'production_key_set_invalid' });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_PRODUCTION: 'false' } }))
+      .toMatchObject({ disabledReason: 'production_mode_required' });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true' } }))
+      .toMatchObject({ disabledReason: 'production_ledger_required' });
+  });
+
+  it('boots, activates, and closes an isolated production-flag lifecycle without widening the scope', async () => {
+    const appId = 'cli_aac926f0eb795bc1';
+    const config = productionTaskControlPlaneConfig({ larkAppId: appId, env: {
+      TASK_CONTROL_PLANE_PRODUCTION: 'true', TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
+      TASK_CONTROL_PLANE_PUMP_ENABLED: 'true', TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
+    } });
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-production-runtime-'));
+    const warnings: string[] = [];
+    let deliveries = 0;
+    try {
+      const runtime = await import('../src/services/task-control-plane-runtime.js');
+      const authority = new (await import('../src/services/task-control-plane-authority.js')).DaemonTaskControlAuthority({ resolvePrincipal: () => undefined });
+      const lifecycle = await runtime.startTaskControlPlaneRuntime({
+        dataDir, larkAppId: appId, flags: config.flags, authority, deferStart: true, intervalMs: 5,
+        logger: { warn: value => warnings.push(value) }, deliver: async () => { deliveries++; return { kind: 'retry' }; },
+      });
+      expect(lifecycle.enabled).toBe(true);
+      expect(existsSync(taskControlPlaneDatabasePath(dataDir))).toBe(true);
+      expect(deliveries).toBe(0);
+      lifecycle.activate();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      await lifecycle.close();
+      expect(warnings).toEqual([]);
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
   it('does not create SQLite for a non-target app even when the scoped Shadow flags are enabled', async () => {

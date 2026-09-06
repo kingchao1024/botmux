@@ -423,7 +423,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     upgraded.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(9);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(13);
       expect(verify.prepare('SELECT lark_app_id FROM control_events WHERE event_id=?').get('legacy-event')).toEqual({ lark_app_id: 'legacy:v4' });
       expect(verify.prepare('SELECT COUNT(*) AS n FROM control_events').get()).toEqual({ n: 1 });
     } finally { verify.close(); }
@@ -469,7 +469,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     upgraded.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(9);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(13);
       expect(verify.prepare('SELECT topic_root_id FROM control_designated_reviewers WHERE designated_reviewer_ref=?').get('legacy-reviewer')).toEqual({ topic_root_id: '' });
       expect(verify.prepare('PRAGMA table_info(control_designated_reviewers)').all().filter((row: any) => row.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((row: any) => row.name)).toEqual(['lark_app_id', 'designated_reviewer_ref']);
       expect(verify.prepare('PRAGMA table_info(control_reviewer_verdicts)').all().filter((row: any) => row.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((row: any) => row.name)).toEqual(['lark_app_id', 'verdict_id']);
@@ -521,7 +521,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     migrated.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)).toBe(9);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)).toBe(13);
       for (const table of ['control_events', 'control_observations', 'control_approval_consumptions', 'control_trusted_mappings', 'control_outbox', 'control_delivery_receipts']) {
         const expected = table === 'control_events' || table === 'control_observations' ? 2 : 1;
         expect(verify.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: expected });
@@ -1411,8 +1411,13 @@ describe('TaskControlPlaneStore freeze validator', () => {
       idempotencyKey: 'freeze-1', evidenceRef: 'review-comment:final',
     })).toMatchObject({ kind: 'frozen', event: { eventId: 'evt_freeze' } });
     expect(store.listEvents().filter(item => item.eventType === 'phase.frozen')).toHaveLength(1);
-    expect(() => store.appendEvent(taskEvent('14', 'task.execution_started')))
-      .toThrow('task_control_phase_already_frozen:phase-1');
+    const late = store.appendEvent(taskEvent('14', 'task.execution_started'));
+    expect(late).toMatchObject({ kind: 'conflict', conflictEvent: { eventType: 'event.conflict_detected', errorClass: 'late_after_frozen' } });
+    expect(store.getPhaseProjection('project-1', 'phase-1').state).toBe('frozen');
+    expect(store.appendEvent({
+      ...taskEvent('15', 'task.execution_started'), idempotencyKey: 'key-03', payload: { source: 'contradiction' },
+    })).toMatchObject({ kind: 'conflict', conflictEvent: { errorClass: 'idempotency_payload_conflict_after_frozen' } });
+    expect(store.getPhaseProjection('project-1', 'phase-1').state).toBe('frozen');
     store.close();
   });
 

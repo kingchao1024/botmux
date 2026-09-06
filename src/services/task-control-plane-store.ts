@@ -19,8 +19,9 @@ import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import {
   reviewerCapabilityHash, reviewerVerdictPayloadHash, type DesignatedReviewerMapping, type ReviewerConditionEvidence, type ReviewerVerdictAttestation, type ReviewerVerdictV1,
 } from './task-control-plane-reviewer-verdict.js';
+import type { VerifiedWriteExecutionGrant } from './task-control-plane-authority.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 13;
 const DATABASE_NAME = 'botmux-task-control-plane.sqlite';
 
 export type TaskControlEventType =
@@ -34,6 +35,7 @@ export type TaskControlEventType =
   | 'task.execution_started'
   | 'task.first_submitted'
   | 'task.reviewed'
+  | 'task.review_corrected'
   | 'task.rework_started'
   | 'task.delivery_fallback_verified'
   | 'task.delivered'
@@ -106,6 +108,10 @@ export interface TaskControlAuthority {
     acceptorId: string;
     now: string;
   }): VerifiedTaskControlApproval | undefined;
+  /** Optional because legacy/read-only authorities may not execute writes. */
+  verifyWriteExecutionGrant?(input: {
+    grant: unknown; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string; now: string;
+  }): VerifiedWriteExecutionGrant | undefined;
 }
 
 export interface AppendTaskControlEventInput {
@@ -399,6 +405,18 @@ export interface ApprovalConsumption {
   consumedAt: string;
 }
 
+export interface WriteExecutionConsumption {
+  grantRef: string;
+  projectId: string;
+  phaseId: string;
+  taskGuid: string;
+  candidate: string;
+  action: string;
+  attempt: number;
+  operatorId: string;
+  consumedAt: string;
+}
+
 /** Durable, host-authenticated control identity. This is a reference record, not a task body. */
 export interface TrustedTaskControlMappingRecord {
   dispatchRoot: string;
@@ -411,6 +429,8 @@ export interface TrustedTaskControlMappingRecord {
   reviewerId: string;
   acceptorId: string;
   registrationRef: string;
+  registrationVersion?: string;
+  phaseRegistrationRefs?: Record<string, string>;
   controllerId: string;
   approvalGate: {
     approvalRef: string;
@@ -422,6 +442,8 @@ export interface TrustedTaskControlMappingRecord {
     approverPolicy: readonly string[];
   };
   docToken?: string;
+  docRevision?: number;
+  mappingProof?: import('./task-control-plane-mapping-trust.js').TaskControlMappingProof;
   createdAt: string;
 }
 
@@ -436,9 +458,13 @@ export interface RegisterTrustedTaskControlMappingInput {
   reviewerId: string;
   acceptorId: string;
   registrationRef: string;
+  registrationVersion?: string;
+  phaseRegistrationRefs?: Record<string, string>;
   controllerId: string;
   approvalGate: TrustedTaskControlMappingRecord['approvalGate'];
   docToken?: string;
+  docRevision?: number;
+  mappingProof?: import('./task-control-plane-mapping-trust.js').TaskControlMappingProof;
   authentication: unknown;
   occurredAt?: string;
 }
@@ -528,6 +554,13 @@ const TASK_TRANSITIONS: Partial<Record<TaskControlEventType, TaskTransitionRule>
       if (verdict === 'unknown') return 'blocked';
       return 'reviewing';
     },
+  },
+  // A signed superseding verdict replaces review evidence. PASS preserves a
+  // delivered/done terminal projection; FAIL/CONDITIONAL reopen reviewing and
+  // require fresh execution before rework.
+  'task.review_corrected': {
+    from: ['reviewing', 'delivered', 'task_done_pending_freeze'],
+    to: (payload, current) => parseReviewVerdict(payload.verdict) === 'pass' ? current : 'reviewing',
   },
   'task.rework_started': { from: ['reviewing'], to: 'rework' },
   'task.delivered': { from: ['reviewing'], to: 'delivered' },
@@ -632,6 +665,16 @@ const SCHEMA = `
   CREATE TRIGGER IF NOT EXISTS control_approval_consumptions_no_delete BEFORE DELETE ON control_approval_consumptions
   BEGIN SELECT RAISE(ABORT,'control_approval_consumption_immutable'); END;
 
+  CREATE TABLE IF NOT EXISTS control_write_execution_consumptions(
+    lark_app_id TEXT NOT NULL, grant_ref TEXT NOT NULL, project_id TEXT NOT NULL, phase_id TEXT NOT NULL, task_guid TEXT NOT NULL,
+    candidate TEXT NOT NULL, action TEXT NOT NULL, attempt INTEGER NOT NULL CHECK(attempt >= 1), operator_id TEXT NOT NULL, consumed_at TEXT NOT NULL,
+    PRIMARY KEY(lark_app_id,grant_ref)
+  );
+  CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_update BEFORE UPDATE ON control_write_execution_consumptions
+  BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_delete BEFORE DELETE ON control_write_execution_consumptions
+  BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
+
   CREATE TABLE IF NOT EXISTS control_trusted_mappings(
     lark_app_id TEXT NOT NULL,
     dispatch_root TEXT NOT NULL,
@@ -644,9 +687,13 @@ const SCHEMA = `
     reviewer_id TEXT NOT NULL,
     acceptor_id TEXT NOT NULL,
     registration_ref TEXT NOT NULL,
+    registration_version TEXT,
+    phase_registration_refs_json TEXT,
     controller_id TEXT NOT NULL,
     approval_gate_json TEXT NOT NULL,
     doc_token TEXT,
+    doc_revision INTEGER,
+    mapping_proof_json TEXT,
     created_at TEXT NOT NULL,
     PRIMARY KEY(lark_app_id,dispatch_root),
     UNIQUE(lark_app_id,task_guid),
@@ -1179,6 +1226,25 @@ function migrateSchema(db: DatabaseSyncLike, fromVersion: number): void {
   // shape. Only the original v6/v7 layouts need the v8 table rebuild.
   if (fromVersion >= 6 && fromVersion < 8) migrateReviewerTablesToAppCompositeKeys(db);
   if (fromVersion < 9) migrateLogicalIdsToAppScope(db);
+  if (fromVersion < 10) add('control_trusted_mappings', 'mapping_proof_json', 'mapping_proof_json TEXT');
+  if (fromVersion < 11) add('control_trusted_mappings', 'registration_version', 'registration_version TEXT');
+  if (fromVersion < 12) {
+    add('control_trusted_mappings', 'phase_registration_refs_json', 'phase_registration_refs_json TEXT');
+    add('control_trusted_mappings', 'doc_revision', 'doc_revision INTEGER');
+  }
+  if (fromVersion < 13) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS control_write_execution_consumptions(
+        lark_app_id TEXT NOT NULL, grant_ref TEXT NOT NULL, project_id TEXT NOT NULL, phase_id TEXT NOT NULL, task_guid TEXT NOT NULL,
+        candidate TEXT NOT NULL, action TEXT NOT NULL, attempt INTEGER NOT NULL CHECK(attempt >= 1), operator_id TEXT NOT NULL, consumed_at TEXT NOT NULL,
+        PRIMARY KEY(lark_app_id,grant_ref)
+      );
+      CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_update BEFORE UPDATE ON control_write_execution_consumptions
+      BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS control_write_execution_consumptions_no_delete BEFORE DELETE ON control_write_execution_consumptions
+      BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
+    `);
+  }
 }
 
 function taskEvent(type: TaskControlEventType): boolean {
@@ -1227,7 +1293,7 @@ function validateInput(input: AuthenticatedAppendTaskControlEventInput, allowFro
     nonEmpty(payload.docToken, 'payload.docToken');
     positiveInteger(payload.docRevision, 'payload.docRevision');
   }
-  if (input.eventType === 'task.reviewed') {
+  if (input.eventType === 'task.reviewed' || input.eventType === 'task.review_corrected') {
     if (input.actorRole !== 'reviewer') throw new Error('task_control_invalid:reviewer_role');
     positiveInteger(payload.reviewRound, 'payload.reviewRound');
     nonEmpty(payload.reviewCommentId, 'payload.reviewCommentId');
@@ -1320,6 +1386,14 @@ function approvalConsumptionFromRow(row: Record<string, unknown>): ApprovalConsu
     freezeIdempotencyKey: String(row.freeze_idempotency_key),
     frozenEventId: String(row.frozen_event_id),
     approvedAt: String(row.approved_at),
+    consumedAt: String(row.consumed_at),
+  };
+}
+
+function writeExecutionConsumptionFromRow(row: Record<string, unknown>): WriteExecutionConsumption {
+  return {
+    grantRef: String(row.grant_ref), projectId: String(row.project_id), phaseId: String(row.phase_id), taskGuid: String(row.task_guid),
+    candidate: String(row.candidate), action: String(row.action), attempt: Number(row.attempt), operatorId: String(row.operator_id),
     consumedAt: String(row.consumed_at),
   };
 }
@@ -1417,9 +1491,11 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
         break;
       case 'task.accepted':
         explicitlyAccepted = true; acceptedEventId = event.eventId; acceptedActorId = event.actorId; break;
-      case 'task.reviewed': {
+      case 'task.reviewed':
+      case 'task.review_corrected': {
         const verdict = parseReviewVerdict(event.payload.verdict);
         if (event.payload.independent === true) {
+          if (event.eventType === 'task.review_corrected') unresolvedReviewConditions.clear();
           const conditionIds = event.payload.conditionIds === undefined
             ? []
             : exactTaskSetSnapshot(event.payload.conditionIds, 'payload.conditionIds');
@@ -1529,6 +1605,9 @@ function taskStateAfter(type: TaskControlEventType, payload: Record<string, unkn
 }
 
 function phaseStateAfter(type: TaskControlEventType, current: TaskControlPhaseState): TaskControlPhaseState {
+  // Late conflict evidence is append-only audit material. It must not reopen
+  // or overwrite a terminal frozen projection.
+  if (current === 'frozen' && type === 'event.conflict_detected') return 'frozen';
   return PHASE_TRANSITIONS[type]?.to ?? current;
 }
 
@@ -1694,8 +1773,12 @@ export class TaskControlPlaneStore {
         phaseTaskGuids: exactTaskSetSnapshot(JSON.parse(String(row.phase_task_guids_json)), 'phaseTaskGuids'),
         taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id), ownerId: String(row.owner_id),
         reviewerId: String(row.reviewer_id), acceptorId: String(row.acceptor_id), registrationRef: String(row.registration_ref),
+        ...(row.registration_version ? { registrationVersion: String(row.registration_version) } : {}),
+        ...(row.phase_registration_refs_json ? { phaseRegistrationRefs: JSON.parse(String(row.phase_registration_refs_json)) as Record<string, string> } : {}),
         controllerId: String(row.controller_id), approvalGate: parseApprovalGate(JSON.parse(String(row.approval_gate_json))),
         ...(row.doc_token ? { docToken: String(row.doc_token) } : {}),
+        ...(row.doc_revision !== null && row.doc_revision !== undefined ? { docRevision: Number(row.doc_revision) } : {}),
+        ...(row.mapping_proof_json ? { mappingProof: JSON.parse(String(row.mapping_proof_json)) } : {}),
         createdAt: String(row.created_at),
       }));
   }
@@ -2065,12 +2148,20 @@ export class TaskControlPlaneStore {
     const reviewerId = nonEmpty(input.reviewerId, 'reviewerId');
     const acceptorId = nonEmpty(input.acceptorId, 'acceptorId');
     const registrationRef = controlledEvidenceRef(input.registrationRef, 'registrationRef');
+    const registrationVersion = input.registrationVersion === undefined ? undefined : nonEmpty(input.registrationVersion, 'registrationVersion');
+    const phaseRegistrationRefs = input.phaseRegistrationRefs;
+    const docRevision = input.docRevision === undefined ? undefined : positiveInteger(input.docRevision, 'docRevision');
     const controllerId = nonEmpty(input.controllerId, 'controllerId');
     const approvalGate = parseApprovalGate(input.approvalGate);
     const docToken = input.docToken === undefined ? undefined : nonEmpty(input.docToken, 'docToken');
+    const mappingProof = input.mappingProof;
     if (!phaseTaskGuids.includes(taskGuid) || topicRootId !== dispatchRoot
       || ownerId === reviewerId || ownerId === acceptorId || reviewerId === acceptorId) {
       throw new Error('task_control_mapping_invalid');
+    }
+    if (phaseRegistrationRefs && (Object.keys(phaseRegistrationRefs).length !== phaseTaskGuids.length
+      || phaseTaskGuids.some(phaseTaskGuid => controlledEvidenceRef(phaseRegistrationRefs[phaseTaskGuid], `phaseRegistrationRefs.${phaseTaskGuid}`) === ''))) {
+      throw new Error('task_control_mapping_registration_refs_invalid');
     }
     const principal = this.authenticate(input.authentication);
     if (principal.actorRole !== 'controller' || principal.actorId !== controllerId) {
@@ -2078,7 +2169,7 @@ export class TaskControlPlaneStore {
     }
     const mapping: TrustedTaskControlMappingRecord = {
       dispatchRoot, projectId, phaseId, phaseTaskGuids, taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-      registrationRef, controllerId, approvalGate, ...(docToken ? { docToken } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
+      registrationRef, ...(registrationVersion ? { registrationVersion } : {}), ...(phaseRegistrationRefs ? { phaseRegistrationRefs } : {}), controllerId, approvalGate, ...(docToken ? { docToken } : {}), ...(docRevision ? { docRevision } : {}), ...(mappingProof ? { mappingProof } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
     };
     return this.withImmediateWrite(() => {
       const existing = this.db.prepare('SELECT * FROM control_trusted_mappings WHERE dispatch_root=? AND lark_app_id=?')
@@ -2090,6 +2181,8 @@ export class TaskControlPlaneStore {
         }
         return { kind: 'duplicate', mapping: existingMapping };
       }
+      // One phase opening is shared by every signed task mapping in its exact
+      // frozen task set. A new task-set hash must not create a second phase.
       const opened = this.listEvents({ projectId, phaseId })
         .find(event => event.eventType === 'phase.opened' && !event.taskGuid);
       if (opened) {
@@ -2099,7 +2192,7 @@ export class TaskControlPlaneStore {
           throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
         }
       } else {
-        const phaseRef = `phase:${registrationRef}`;
+        const phaseRef = `phase:${projectId}:${phaseId}:${taskSetHash(phaseTaskGuids)}:${acceptorId}`;
         const phaseResult = this.appendEventLocked({
           eventId: stableId('evt_phase', phaseRef), eventType: 'phase.opened', projectId, phaseId,
           actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: phaseRef,
@@ -2117,10 +2210,10 @@ export class TaskControlPlaneStore {
       });
       if (mappingResult.kind === 'conflict') throw new Error(`task_control_mapping_event_conflict:${dispatchRoot}`);
       this.db.prepare(`INSERT INTO control_trusted_mappings(
-        dispatch_root,lark_app_id,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,controller_id,approval_gate_json,doc_token,created_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        dispatch_root,lark_app_id,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,registration_version,phase_registration_refs_json,controller_id,approval_gate_json,doc_token,doc_revision,mapping_proof_json,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         dispatchRoot, this.larkAppId, projectId, phaseId, JSON.stringify(phaseTaskGuids), taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-        registrationRef, controllerId, JSON.stringify(approvalGate), docToken ?? null, mapping.createdAt,
+        registrationRef, registrationVersion ?? null, phaseRegistrationRefs ? JSON.stringify(phaseRegistrationRefs) : null, controllerId, JSON.stringify(approvalGate), docToken ?? null, docRevision ?? null, mappingProof ? JSON.stringify(mappingProof) : null, mapping.createdAt,
       );
       return { kind: 'registered', mapping };
     });
@@ -2130,6 +2223,50 @@ export class TaskControlPlaneStore {
     const row = this.db.prepare('SELECT * FROM control_approval_consumptions WHERE approval_ref=? AND lark_app_id=?')
       .get(approvalRef, this.larkAppId) as Record<string, unknown> | undefined;
     return row ? approvalConsumptionFromRow(row) : undefined;
+  }
+
+  getWriteExecutionConsumption(grantRef: string): WriteExecutionConsumption | undefined {
+    const row = this.db.prepare('SELECT * FROM control_write_execution_consumptions WHERE grant_ref=? AND lark_app_id=?')
+      .get(grantRef, this.larkAppId) as Record<string, unknown> | undefined;
+    return row ? writeExecutionConsumptionFromRow(row) : undefined;
+  }
+
+  /** Atomically validates and consumes one exact daemon-minted write grant. */
+  consumeWriteExecutionGrant(input: {
+    grant: unknown; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string; now?: string;
+  }): WriteExecutionConsumption {
+    return this.withImmediateWrite(() => {
+      const now = input.now ?? new Date().toISOString();
+      const grant = this.authority?.verifyWriteExecutionGrant?.({ ...input, now });
+      if (!grant || this.getWriteExecutionConsumption(grant.grantRef)) {
+        throw new Error('task_control_write_execution_grant_unavailable');
+      }
+      const mapping = this.mappingForTask(input.taskGuid);
+      const phase = this.getPhaseProjection(input.projectId, input.phaseId);
+      const task = this.getTaskProjection(input.taskGuid, now);
+      const review = task.independentReview;
+      const invalidatingEvidence = this.listEvents({ projectId: input.projectId, phaseId: input.phaseId }).some(event =>
+        event.occurredAt >= grant.issuedAt && (
+          event.eventType === 'phase.blocked' || event.eventType === 'phase.failed' || event.eventType === 'phase.cancelled'
+          || (event.taskGuid === input.taskGuid && (event.eventType === 'task.blocked' || event.eventType === 'task.failed' || event.eventType === 'task.cancelled'))
+          || (event.taskGuid === input.taskGuid && (event.eventType === 'task.reviewed' || event.eventType === 'task.review_corrected')
+            && ['fail', 'conditional', 'unknown'].includes(String(event.payload.verdict)))
+        ),
+      );
+      if (!mapping || mapping.projectId !== input.projectId || mapping.phaseId !== input.phaseId
+        || phase.state === 'blocked' || phase.state === 'failed' || phase.state === 'cancelled'
+        || task.state === 'blocked' || task.state === 'failed' || task.state === 'cancelled'
+        || invalidatingEvidence || (review && (review.verdict === 'fail' || review.verdict === 'conditional' || review.verdict === 'unknown'))) {
+        throw new Error('task_control_write_execution_grant_invalidated');
+      }
+      this.db.prepare(`INSERT INTO control_write_execution_consumptions(
+        lark_app_id,grant_ref,project_id,phase_id,task_guid,candidate,action,attempt,operator_id,consumed_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        this.larkAppId, grant.grantRef, grant.projectId, grant.phaseId, grant.taskGuid, grant.candidate, grant.action, grant.attempt, grant.operatorId, now,
+      );
+      return { grantRef: grant.grantRef, projectId: grant.projectId, phaseId: grant.phaseId, taskGuid: grant.taskGuid,
+        candidate: grant.candidate, action: grant.action, attempt: grant.attempt, operatorId: grant.operatorId, consumedAt: now };
+    });
   }
 
   private approvalConsumptionForFreezeIdempotency(key: string): ApprovalConsumption | undefined {
@@ -2287,7 +2424,7 @@ export class TaskControlPlaneStore {
 
   private appendEventLocked(input: AuthenticatedAppendTaskControlEventInput, allowFrozen = false): AppendTaskControlEventResult {
     validateInput(input, allowFrozen);
-    if (input.eventType === 'task.reviewed') this.assertReviewedVerdictCurrentLocked(input);
+    if (input.eventType === 'task.reviewed' || input.eventType === 'task.review_corrected') this.assertReviewedVerdictCurrentLocked(input);
     if (input.eventType === 'task.rework_started') this.assertReworkSourceCurrentLocked(input);
     const payloadHash = eventPayloadHash(input);
     const existing = this.eventByIdempotencyKey(input.idempotencyKey);
@@ -2295,7 +2432,9 @@ export class TaskControlPlaneStore {
       if (existing.payloadHash === payloadHash) return { kind: 'duplicate', event: existing };
       const existingPhase = reducePhase(this.listEvents({ projectId: existing.projectId, phaseId: existing.phaseId })
         .filter(event => !event.taskGuid));
-      if (existingPhase.lifecycleState === 'frozen') throw new Error(`task_control_phase_already_frozen:${existing.phaseId}`);
+      if (existingPhase.lifecycleState === 'frozen') {
+        return this.appendFrozenConflictLocked(input, payloadHash, existing, 'idempotency_payload_conflict_after_frozen');
+      }
       const conflictKeyHash = sha256(input.idempotencyKey).slice(7);
       const conflictEventId = stableId('evt_conflict', input.idempotencyKey, payloadHash);
       const conflictIdempotencyKey = `conflict:${conflictKeyHash}:${payloadHash.slice(7)}`;
@@ -2320,9 +2459,38 @@ export class TaskControlPlaneStore {
     }
     const phase = reducePhase(this.listEvents({ projectId: input.projectId, phaseId: input.phaseId })
       .filter(event => !event.taskGuid));
-    if (phase.lifecycleState === 'frozen') throw new Error(`task_control_phase_already_frozen:${input.phaseId}`);
+    if (phase.lifecycleState === 'frozen') {
+      return this.appendFrozenConflictLocked(input, payloadHash, undefined, 'late_after_frozen');
+    }
     this.validateMapping(input);
     return { kind: 'appended', event: this.insertEventLocked(input, payloadHash) };
+  }
+
+  /** Frozen is terminal: append late/contradictory evidence without reopening or overwriting it. */
+  private appendFrozenConflictLocked(
+    input: AuthenticatedAppendTaskControlEventInput, incomingPayloadHash: string, existing: TaskControlEvent | undefined, errorClass: string,
+  ): AppendTaskControlEventResult {
+    const frozen = this.listEvents({ projectId: input.projectId, phaseId: input.phaseId })
+      .filter(event => event.eventType === 'phase.frozen').at(-1);
+    if (!frozen) throw new Error(`task_control_phase_already_frozen:${input.phaseId}`);
+    const conflictKey = `frozen-conflict:${sha256(input.idempotencyKey).slice(7)}:${incomingPayloadHash.slice(7)}`;
+    const prior = this.eventByIdempotencyKey(conflictKey);
+    if (prior) return { kind: 'conflict', existingEvent: existing ?? frozen, conflictEvent: prior };
+    const conflictInput: AuthenticatedAppendTaskControlEventInput = {
+      eventId: stableId('evt_frozen_conflict', input.projectId, input.phaseId, input.idempotencyKey, incomingPayloadHash),
+      eventType: 'event.conflict_detected', projectId: input.projectId, phaseId: input.phaseId,
+      actorId: input.actorId, actorRole: input.actorRole, occurredAt: input.occurredAt,
+      sourceRef: input.sourceRef, evidenceRef: input.evidenceRef, idempotencyKey: conflictKey,
+      causationId: existing?.eventId ?? frozen.eventId, correlationId: input.correlationId, errorClass,
+      payload: {
+        frozenEventId: frozen.eventId, incomingEventId: input.eventId, incomingEventType: input.eventType,
+        incomingTaskGuid: input.taskGuid ?? null, incomingTopicRootId: input.topicRootId ?? null,
+        incomingIdempotencyKeyHash: sha256(input.idempotencyKey), incomingPayloadHash,
+        ...(existing ? { existingEventId: existing.eventId, existingPayloadHash: existing.payloadHash } : {}),
+      },
+    };
+    const conflictEvent = this.insertEventLocked(conflictInput, eventPayloadHash(conflictInput));
+    return { kind: 'conflict', existingEvent: existing ?? frozen, conflictEvent };
   }
 
   private insertEventLocked(input: AuthenticatedAppendTaskControlEventInput, payloadHash: string): TaskControlEvent {
@@ -2463,6 +2631,55 @@ export class TaskControlPlaneStore {
     });
   }
 
+  /**
+   * Atomically degrade an in-flight primary and queue its only fallback. This
+   * closes the crash window where both destinations could later be reclaimed.
+   */
+  degradeOutboxWithFallback(input: {
+    eventId: string; sourceDestinationId: string; fallbackDestinationId: string; claimToken: string; error: string; now?: number;
+  }): DeliveryOutboxRow {
+    const eventId = nonEmpty(input.eventId, 'eventId');
+    const sourceDestinationId = nonEmpty(input.sourceDestinationId, 'sourceDestinationId');
+    const fallbackDestinationId = nonEmpty(input.fallbackDestinationId, 'fallbackDestinationId');
+    const claimToken = nonEmpty(input.claimToken, 'claimToken');
+    const error = nonEmpty(input.error, 'error');
+    if (!fallbackDestinationId.startsWith('topic-message:')) throw new Error('task_control_fallback_destination_invalid');
+    const now = input.now ?? Date.now();
+    return this.withImmediateWrite(() => {
+      const source = this.db.prepare(`SELECT * FROM control_outbox
+        WHERE lark_app_id=? AND event_id=? AND destination_id=? AND status='inflight' AND claim_token=?`)
+        .get(this.larkAppId, eventId, sourceDestinationId, claimToken) as Record<string, unknown> | undefined;
+      if (!source) throw new Error('task_control_fallback_source_not_inflight');
+      const event = this.eventById(eventId);
+      if (!event || event.eventType !== 'task.delivered') throw new Error('task_control_fallback_event_invalid');
+      const existing = this.db.prepare(`SELECT * FROM control_outbox
+        WHERE lark_app_id=? AND event_id=? AND destination_id=?`)
+        .get(this.larkAppId, eventId, fallbackDestinationId) as Record<string, unknown> | undefined;
+      const occurredAt = new Date(now).toISOString();
+      let fallback = existing ? outboxFromRow(existing) : undefined;
+      if (!fallback) {
+        const outboxId = stableId('out', eventId, fallbackDestinationId);
+        this.db.prepare(`INSERT INTO control_outbox(
+          outbox_id,lark_app_id,event_id,destination_id,status,attempts,next_attempt_at,created_at,updated_at
+        ) VALUES(?,?,?,?,'pending',0,?,?,?)`).run(
+          outboxId, this.larkAppId, eventId, fallbackDestinationId, now, occurredAt, occurredAt,
+        );
+        const row = this.db.prepare('SELECT * FROM control_outbox WHERE lark_app_id=? AND outbox_id=?')
+          .get(this.larkAppId, outboxId) as Record<string, unknown> | undefined;
+        if (!row) throw new Error('task_control_fallback_outbox_insert_failed');
+        fallback = outboxFromRow(row);
+      }
+      const sourceOutbox = outboxFromRow(source);
+      const changed = this.db.prepare(`UPDATE control_outbox SET status='degraded',claim_token=NULL,claimed_at=NULL,last_error=?,updated_at=?
+        WHERE lark_app_id=? AND outbox_id=? AND status='inflight' AND claim_token=?`).run(
+        error, occurredAt, this.larkAppId, sourceOutbox.outboxId, claimToken,
+      );
+      if (Number(changed.changes) !== 1) throw new Error('task_control_fallback_primary_degrade_failed');
+      this.insertReceiptLocked(sourceOutbox, { state: 'degraded', error, createdAt: occurredAt });
+      return fallback;
+    });
+  }
+
   settleOutboxDelivered(
     outboxId: string,
     claimToken: string,
@@ -2599,8 +2816,14 @@ export class TaskControlPlaneStore {
     return this.validatePhaseFreezeFromEvents(projectId, phaseId, checkedAt, events);
   }
 
+  /** Current readiness before a new request exists: remove historic request wrappers, not their underlying task evidence. */
+  validateProspectivePhaseFreeze(projectId: string, phaseId: string, checkedAt = new Date().toISOString()): PhaseFreezeValidation {
+    const events = this.listEvents({ projectId, phaseId }).filter(event => event.eventType !== 'phase.freeze_requested');
+    return this.validatePhaseFreezeFromEvents(projectId, phaseId, checkedAt, events, { prospective: true });
+  }
+
   private validatePhaseFreezeFromEvents(
-    projectId: string, phaseId: string, checkedAt: string, events: readonly TaskControlEvent[],
+    projectId: string, phaseId: string, checkedAt: string, events: readonly TaskControlEvent[], options: { prospective?: boolean } = {},
   ): PhaseFreezeValidation {
     const issues: FreezeIssue[] = [];
     const phaseEvents = events.filter(event => !event.taskGuid);
@@ -2608,8 +2831,8 @@ export class TaskControlPlaneStore {
     const opened = [...phaseEvents].reverse().find(event => event.eventType === 'phase.opened');
     const freezeRequest = phase.latestFreezeRequest;
     if (!opened) issues.push({ code: 'phase_not_opened', message: 'phase.opened evidence is missing' });
-    if (!freezeRequest) issues.push({ code: 'phase_freeze_not_requested', message: 'phase.freeze_requested evidence is missing' });
-    if (phase.state !== 'freeze_pending' && phase.state !== 'frozen') {
+    if (!options.prospective && !freezeRequest) issues.push({ code: 'phase_freeze_not_requested', message: 'phase.freeze_requested evidence is missing' });
+    if (!options.prospective && phase.state !== 'freeze_pending' && phase.state !== 'frozen') {
       issues.push({ code: 'phase_state_not_ready', message: `phase state is ${phase.state}` });
     }
     for (const conflictEventId of phase.unresolvedConflictEventIds) {
@@ -2628,10 +2851,10 @@ export class TaskControlPlaneStore {
     if (unexpectedMappedTasks.length > 0) {
       issues.push({ code: 'phase_task_set_mismatch', message: `mapped tasks are absent from phase.opened snapshot: ${unexpectedMappedTasks.join(',')}` });
     }
-    if (freezeRequest && JSON.stringify([...freezeRequest.taskGuids].sort()) !== JSON.stringify(expectedTaskGuids)) {
+    if (!options.prospective && freezeRequest && JSON.stringify([...freezeRequest.taskGuids].sort()) !== JSON.stringify(expectedTaskGuids)) {
       issues.push({ code: 'phase_freeze_request_task_set_mismatch', message: 'freeze request task set differs from phase.opened snapshot', eventId: freezeRequest.eventId });
     }
-    if (freezeRequest && freezeRequest.openIssueCodes.length > 0) {
+    if (!options.prospective && freezeRequest && freezeRequest.openIssueCodes.length > 0) {
       issues.push({ code: 'phase_freeze_request_open_issues', message: `freeze request carries open issues: ${freezeRequest.openIssueCodes.join(',')}`, eventId: freezeRequest.eventId });
     }
     for (const taskGuid of expectedTaskGuids) {
@@ -2676,10 +2899,12 @@ export class TaskControlPlaneStore {
       if (task.doneEvent && task.terminalBody && task.doneEvent.seq < task.terminalBody.seq) {
         issues.push({ code: 'task_done_precedes_terminal_body', message: 'task done predates terminal body', taskGuid, eventId: task.doneEvent.eventId });
       }
-      if (task.doneEvent && review && task.doneEvent.seq < review.seq) {
+      const reviewEvent = review ? taskEvents.find(event => event.eventId === review.eventId) : undefined;
+      const isCorrection = reviewEvent?.eventType === 'task.review_corrected';
+      if (task.doneEvent && review && task.doneEvent.seq < review.seq && !isCorrection) {
         issues.push({ code: 'task_done_precedes_review', message: 'task done predates independent review', taskGuid, eventId: task.doneEvent.eventId });
       }
-      if (review && task.terminalBody && review.seq > task.terminalBody.seq) {
+      if (review && task.terminalBody && review.seq > task.terminalBody.seq && !isCorrection) {
         issues.push({ code: 'review_terminal_mismatch', message: 'independent review was recorded after terminal delivery', taskGuid, eventId: review.eventId });
       }
       if (task.state !== 'task_done_pending_freeze') {
@@ -2720,7 +2945,7 @@ export class TaskControlPlaneStore {
     const latestFreezeEvidenceSeq = Math.max(0, ...events
       .filter(event => !!event.taskGuid || event.eventType.startsWith('unknown.') || event.eventType.startsWith('event.conflict_'))
       .map(event => event.seq));
-    const freezeRequestEvent = freezeRequest ? events.find(event => event.eventId === freezeRequest.eventId) : undefined;
+    const freezeRequestEvent = !options.prospective && freezeRequest ? events.find(event => event.eventId === freezeRequest.eventId) : undefined;
     if (freezeRequestEvent && freezeRequestEvent.seq < latestFreezeEvidenceSeq) {
       issues.push({ code: 'phase_freeze_request_too_early', message: 'phase freeze request predates the latest task or boundary evidence', eventId: freezeRequestEvent.eventId });
     }

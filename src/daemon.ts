@@ -87,20 +87,23 @@ import { setDisplayNameRefresher, findConfigField, applyConfigField } from './se
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { DaemonTaskControlAuthority } from './services/task-control-plane-authority.js';
-import { DaemonTaskControlIntegration } from './services/task-control-plane-daemon-integration.js';
+import { DaemonTaskControlIntegration, DaemonTaskControlShadowCollector } from './services/task-control-plane-daemon-integration.js';
 import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
 import { createV3TaskControlApprovalSource } from './services/task-control-plane-v3-approval.js';
+import { TaskControlMappingTrust, createTaskControlProductionMappingVerifier, parseKeyIdSet } from './services/task-control-plane-mapping-trust.js';
+import { resolveTaskControlMappingRegistration } from './services/task-control-plane-mapping-source.js';
 import {
   createTaskControlRouteHandlers,
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
   TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE,
   TASK_CONTROL_FREEZE_ROUTE,
+  TASK_CONTROL_WRITE_EXECUTION_ROUTE,
   TASK_CONTROL_MAPPING_REGISTER_ROUTE,
   TASK_CONTROL_REVIEWER_INGRESS_ROUTE,
   TASK_CONTROL_REVIEWER_SOURCE_ROUTE,
   TASK_CONTROL_REVIEWER_VERDICT_ROUTE,
 } from './services/task-control-plane-route-authority.js';
-import { scopedTaskControlPlaneConfig, startTaskControlPlaneRuntime, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
+import { productionTaskControlPlaneConfig, scopedTaskControlPlaneConfig, startTaskControlPlaneRuntime, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -478,12 +481,25 @@ const taskControlRouteHandlers = createTaskControlRouteHandlers({
   hostSecret: () => {
     try { return loadDaemonIpcSecret(); } catch { return undefined; }
   },
+  previousHostSecret: () => process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+  reviewerAllowedKeyIds: () => parseKeyIdSet(process.env.TASK_CONTROL_PLANE_ALLOWED_KEY_IDS),
+  reviewerRevokedKeyIds: () => parseKeyIdSet(process.env.TASK_CONTROL_PLANE_REVOKED_KEY_IDS),
   readMessageDetail: getMessageDetail,
   readDocumentRevision: async (larkAppId, docToken) => {
     const response = await larkGet(getBotClient(larkAppId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`);
     const revision = Number(response?.data?.document?.revision_id);
     return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined;
   },
+  resolveMappingRegistration: (larkAppId, input) => resolveTaskControlMappingRegistration({
+    readTaskComment: (appId, commentId) => larkGet(getBotClient(appId), `/open-apis/task/v2/comments/${encodeURIComponent(commentId)}`),
+    readTask: (appId, taskGuid) => larkGet(getBotClient(appId), `/open-apis/task/v2/tasks/${encodeURIComponent(taskGuid)}`),
+    readTopic: getMessageDetail,
+    readDocumentRevision: async (appId, docToken) => {
+      const response = await larkGet(getBotClient(appId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`);
+      const revision = Number(response?.data?.document?.revision_id);
+      return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined;
+    },
+  }, larkAppId, input),
   resolveReviewerSource: async (reviewerLarkAppId, body) => {
     const target = findOnlineDaemon(reviewerLarkAppId);
     if (!target) return undefined;
@@ -6004,6 +6020,7 @@ ipcRoute('POST', TASK_CONTROL_MAPPING_REGISTER_ROUTE, taskControlRouteHandlers.m
 // or report output. The lifecycle also checks the disabled flag so even a valid
 // host request cannot turn a default-off daemon into an enforcing daemon.
 ipcRoute('POST', TASK_CONTROL_FREEZE_ROUTE, taskControlRouteHandlers.freeze);
+ipcRoute('POST', TASK_CONTROL_WRITE_EXECUTION_ROUTE, taskControlRouteHandlers.writeExecution);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, taskControlRouteHandlers.designatedReviewer);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE, taskControlRouteHandlers.designatedReviewerResolve);
 ipcRoute('POST', TASK_CONTROL_REVIEWER_SOURCE_ROUTE, taskControlRouteHandlers.reviewerSource);
@@ -21923,10 +21940,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // P2-6 stays opt-in: default false means this isolated ledger has no effect on
   // legacy dispatch/report/session paths.  Its authentication adapter is owned
   // here (not exposed to callers), and bootstrap failure returns a no-op handle.
-  const taskControlConfig = scopedTaskControlPlaneConfig(cfg.larkAppId);
+  const hostSecret = (() => { try { return loadDaemonIpcSecret(); } catch { return undefined; } })();
+  const previousHostSecret = process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET;
+  const productionTaskControlConfig = productionTaskControlPlaneConfig({ larkAppId: cfg.larkAppId });
+  // Once production mode was named, an invalid/missing production contract
+  // must never fall through to the legacy one-task Shadow allowlist.
+  const productionRequested = process.env.TASK_CONTROL_PLANE_PRODUCTION !== undefined;
+  const taskControlConfig = productionRequested
+    ? productionTaskControlConfig
+    : scopedTaskControlPlaneConfig(cfg.larkAppId);
   const taskControlFlags = taskControlConfig.flags;
   if (taskControlConfig.disabledReason && taskControlConfig.disabledReason !== 'target_app_mismatch') {
-    logger.warn(`[task-control] scoped Shadow disabled: ${taskControlConfig.disabledReason}`);
+    logger.warn(`[task-control] scope disabled: ${taskControlConfig.disabledReason}`);
   }
   taskControlIntegration = undefined;
   if (!taskControlFlags.ledgerEnabled) {
@@ -21938,35 +21963,49 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
   } else {
     try {
-      const canary = taskControlConfig.canary;
-      if (!canary) throw new Error('task_control_canary_scope_unavailable');
-      const bridge = new DaemonTaskControlBridge({
-        // The three canary daemons share one controller-owned SQLite partition
-        // so a worker/reviewer can restore the controller's exact mapping.
-        // Remote Lark reads below still use each daemon's own app identity.
-        larkAppId: canary.controllerAppId,
+      const production = productionRequested && productionTaskControlConfig.flags.ledgerEnabled;
+      const shadowTaskGuid = !production ? (taskControlConfig as ReturnType<typeof scopedTaskControlPlaneConfig>).shadowTaskGuid : undefined;
+      if (!production && !shadowTaskGuid) throw new Error('task_control_shadow_target_unavailable');
+      if (production && !hostSecret) throw new Error('task_control_host_secret_unavailable');
+      let shadowCollector: DaemonTaskControlShadowCollector | undefined;
+      let productionIntegration: DaemonTaskControlIntegration | undefined;
+      const bridge = production ? new DaemonTaskControlBridge({
+        larkAppId: cfg.larkAppId,
         approvals: createV3TaskControlApprovalSource({ baseDir: v3DefaultBaseDir() }),
-      });
-      let integration: DaemonTaskControlIntegration | undefined;
+        productionMapping: createTaskControlProductionMappingVerifier({
+          trust: new TaskControlMappingTrust({ hostSecret: hostSecret!, previousHostSecret, larkAppId: cfg.larkAppId }),
+          allowedKeyIds: productionTaskControlConfig.allowedKeyIds, revokedKeyIds: productionTaskControlConfig.revokedKeyIds,
+        }),
+      }) : undefined;
       taskControlPlane = await startTaskControlPlaneRuntime({
-        dataDir: config.session.dataDir, larkAppId: canary.controllerAppId, flags: taskControlFlags,
-        authority: bridge.authority,
+        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags,
+        authority: bridge?.authority ?? new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
         logger, deferStart: true,
-        collect: () => integration?.collectAll() ?? Promise.resolve(),
-        deliver: async row => integration?.deliver(row) ?? { kind: 'degraded', error: 'integration_unavailable' },
+        collect: () => shadowCollector?.collectAll() ?? productionIntegration?.collectAll() ?? Promise.resolve(),
+        deliver: production ? row => productionIntegration?.deliver(row) ?? Promise.resolve({ kind: 'retry' as const, error: 'integration_unavailable' }) : undefined,
       });
       const taskControlStore = taskControlPlane.getStore();
       if (!taskControlStore) throw new Error('task_control_store_unavailable');
-      integration = new DaemonTaskControlIntegration({
-        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore, bridge, logger, canary,
-        shadowTaskGuids: canary.taskGuids,
-        isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
-          const live = findActiveBySessionId(sessionId);
-          return !!live && live.worker !== null && live.workerGeneration === workerGeneration
-            && live.session.workerGeneration === workerGeneration;
-        },
-      });
-      taskControlIntegration = integration;
+      if (production) {
+        productionIntegration = new DaemonTaskControlIntegration({
+          dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore, bridge: bridge!, logger,
+          mappingTrust: new TaskControlMappingTrust({ hostSecret: hostSecret!, previousHostSecret, larkAppId: cfg.larkAppId }),
+          receiptAllowedKeyIds: productionTaskControlConfig.allowedKeyIds,
+          receiptRevokedKeyIds: productionTaskControlConfig.revokedKeyIds,
+          controlledWriteback: taskControlFlags.pumpEnabled,
+          isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
+            const live = findActiveBySessionId(sessionId);
+            return !!live && live.worker !== null && live.workerGeneration === workerGeneration && live.session.workerGeneration === workerGeneration;
+          },
+        });
+        taskControlIntegration = productionIntegration;
+      } else {
+        shadowCollector = new DaemonTaskControlShadowCollector({
+          larkAppId: cfg.larkAppId, taskGuid: shadowTaskGuid!, lifecycle: taskControlPlane, logger,
+        });
+        // Scoped Shadow deliberately exposes no integration to daemon hooks or IPC routes.
+        taskControlIntegration = undefined;
+      }
       // No recovery claim may run before its daemon-owned delivery/collector
       // adapters exist. This prevents a restored outbox row being degraded as
       // `integration_unavailable` during bootstrap.
@@ -22452,12 +22491,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (!live || live !== ds || live.worker === null
         || live.workerGeneration !== context.workerGeneration
         || live.session.workerGeneration !== context.workerGeneration) {
-        taskControlIntegration?.deliveryReceiptUnknown(ds.session.rootMessageId ?? '', sourceRef, context, 'receipt_worker_generation_unproven');
+        taskControlIntegration?.deliveryReceiptUnknown(sourceRef, context, 'receipt_worker_generation_unproven');
         return;
       }
       const dispatchRoot = live.session.rootMessageId ?? '';
       if (!dispatchRoot) {
-        taskControlIntegration?.deliveryReceiptUnknown(dispatchRoot, sourceRef, context, 'receipt_dispatch_root_unproven');
+        taskControlIntegration?.deliveryReceiptUnknown(sourceRef, context, 'receipt_dispatch_root_unproven');
         return;
       }
       // A normal final reply supplies a provider receipt, but not the mapped

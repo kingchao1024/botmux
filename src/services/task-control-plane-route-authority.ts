@@ -4,14 +4,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { JsonBodyTooLargeError, isTrustedHostIpcRequest, jsonRes, readJsonBody } from '../core/dashboard-ipc-server.js';
 import type { DaemonTaskControlMapping, DaemonTaskControlMappingRegistration } from './task-control-plane-daemon-bridge.js';
 import type { TaskControlPlaneLifecycle } from './task-control-plane-runtime.js';
-import { P2_7_TASK_CONTROL_CANARY } from './task-control-plane-runtime.js';
 import type { DesignatedReviewerMapping, ReviewerConditionEvidence, ReviewerVerdictV1 } from './task-control-plane-reviewer-verdict.js';
 import {
   createDaemonReviewerVerdictVerifier,
   deriveDaemonDesignatedReviewerProvider,
   deriveDaemonReviewerVerdictProvider,
   reviewerDesignationRef,
-  reviewerVerdictKeyId,
   reviewerMessageSourceFromLarkDetail,
 } from './task-control-plane-reviewer-verdict.js';
 
@@ -73,7 +71,7 @@ export function authorizeTaskControlMappingRoute(input: {
   if (!origin || input.originCapability !== origin.capability || input.originTurnId !== origin.turnId) {
     return { ok: false, error: 'capability_unproven' };
   }
-  return { ok: true, controllerId: `daemon:${selfAppId}` };
+  return { ok: true, controllerId: selfAppId };
 }
 
 type ControllerTurnAuthorization = Exclude<TaskControlRouteAuthorization, { ok: true }> | {
@@ -141,6 +139,7 @@ function sameControllerTurn(left: Extract<ControllerTurnAuthorization, { ok: tru
 
 export const TASK_CONTROL_MAPPING_REGISTER_ROUTE = '/api/task-control/mappings';
 export const TASK_CONTROL_FREEZE_ROUTE = '/api/task-control/freeze';
+export const TASK_CONTROL_WRITE_EXECUTION_ROUTE = '/api/task-control/write-execution';
 export const TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE = '/api/task-control/designated-reviewers';
 export const TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE = '/api/task-control/designated-reviewers/resolve';
 /** Reviewer-daemon HMAC-only source resolver used by the controller designation path. */
@@ -156,10 +155,12 @@ export const TASK_CONTROL_REVIEWER_MAX_BYTES = 16 * 1024;
 type RouteIntegration = {
   registerMapping(dispatchRoot: string, mapping: DaemonTaskControlMappingRegistration, controllerId: string): boolean;
   mapping(dispatchRoot: string): DaemonTaskControlMapping | undefined;
-  issueAcceptorAuthentication(dispatchRoot: string): unknown | undefined;
+  issueAuthentication(dispatchRoot: string, principal: 'controller' | 'acceptor'): unknown | undefined;
   approval(dispatchRoot: string, approvalRef: string): unknown | undefined;
-  canaryRole?(): 'controller' | 'worker' | 'reviewer' | undefined;
-  canaryScope?(): { reviewerAppId: string } | undefined;
+  requestFreeze(dispatchRoot: string, requestId: string): boolean;
+  consumeWriteExecutionGrant(input: {
+    dispatchRoot: string; grantRef: string; candidate: string; action: string; attempt: number; operatorId: string; now?: string;
+  }): { ok: true } | { ok: false; reason: string };
   setReviewerVerdictVerifier(verifier: { verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean; verifyVerdict(value: ReviewerVerdictV1): boolean }): void;
   currentDesignatedReviewer(dispatchRoot: string, reviewRound: number, now?: string): DesignatedReviewerMapping | undefined;
   registerVerifiedDesignatedReviewer(input: {
@@ -174,14 +175,6 @@ type RouteIntegration = {
   }): { status: string; reason?: string; verdict?: ReviewerVerdictV1 };
   reviewerVerdictUnknown(dispatchRoot: string, verdictId: string, reason: string, sourceRef?: string): void;
 };
-
-function canaryRoleAllows(
-  integration: RouteIntegration,
-  allowedRole: 'controller' | 'reviewer',
-): boolean {
-  const role = integration.canaryRole?.();
-  return role === undefined || role === allowedRole;
-}
 
 type RouteLiveSession = {
   session: { sessionId: string; rootMessageId?: string };
@@ -363,7 +356,7 @@ function forwardedVerdict(body: Record<string, unknown>): {
   if (!dispatchRoot || !rawVerdict || !rawAttestation || !hasOnlyKeys(rawVerdict, [
     'schemaVersion', 'provider', 'verdictId', 'projectId', 'phaseId', 'taskGuid', 'topicRootId', 'taskSetSnapshot', 'reviewRound',
     'designatedReviewerRef', 'reviewerId', 'reviewerBotAppId', 'sessionId', 'workerGeneration', 'capabilityHash', 'sourceMessageId',
-    'sourceVersionHash', 'kind', 'verdict', 'conditionIds', 'resolvedConditionEvidence', 'docToken', 'docRevision', 'issuedAt', 'expiresAt', 'keyId', 'signature',
+    'sourceVersionHash', 'kind', 'verdict', 'conditionIds', 'resolvedConditionEvidence', 'docToken', 'docRevision', 'issuedAt', 'expiresAt', 'keyId', 'signature', 'revokesVerdictId', 'supersedesVerdictId',
   ]) || !hasOnlyKeys(rawAttestation, ['reviewerId', 'reviewerBotAppId', 'sessionId', 'workerGeneration', 'capabilityHash'])) return undefined;
   const taskSetSnapshot = stringArray(rawVerdict.taskSetSnapshot);
   const conditionIds = stringArray(rawVerdict.conditionIds);
@@ -375,14 +368,17 @@ function forwardedVerdict(body: Record<string, unknown>): {
     sessionId: text(rawVerdict.sessionId), workerGeneration: rawVerdict.workerGeneration, capabilityHash: text(rawVerdict.capabilityHash),
     sourceMessageId: text(rawVerdict.sourceMessageId), sourceVersionHash: text(rawVerdict.sourceVersionHash), kind: rawVerdict.kind, verdict: rawVerdict.verdict,
     conditionIds, resolvedConditionEvidence, docToken: text(rawVerdict.docToken), docRevision: rawVerdict.docRevision, issuedAt: text(rawVerdict.issuedAt),
-    expiresAt: text(rawVerdict.expiresAt), keyId: text(rawVerdict.keyId), signature: text(rawVerdict.signature),
+    expiresAt: text(rawVerdict.expiresAt), keyId: text(rawVerdict.keyId), signature: text(rawVerdict.signature), revokesVerdictId: text(rawVerdict.revokesVerdictId), supersedesVerdictId: text(rawVerdict.supersedesVerdictId),
   };
   const reviewerId = text(rawAttestation.reviewerId);
   const reviewerBotAppId = text(rawAttestation.reviewerBotAppId);
   const sessionId = text(rawAttestation.sessionId);
   const capabilityHash = text(rawAttestation.capabilityHash);
-  if (verdict.schemaVersion !== 'ReviewerVerdict.v1' || verdict.provider !== 'ReviewerVerdict.v1' || verdict.kind !== 'verdict'
-    || (verdict.verdict !== 'pass' && verdict.verdict !== 'fail' && verdict.verdict !== 'conditional')
+  const ordinary = verdict.kind === 'verdict' && (verdict.verdict === 'pass' || verdict.verdict === 'fail' || verdict.verdict === 'conditional')
+    && !verdict.revokesVerdictId;
+  const revocation = verdict.kind === 'revocation' && verdict.verdict === undefined && !!verdict.revokesVerdictId && !verdict.supersedesVerdictId
+    && conditionIds?.length === 0 && Object.keys(resolvedConditionEvidence ?? {}).length === 0;
+  if (verdict.schemaVersion !== 'ReviewerVerdict.v1' || verdict.provider !== 'ReviewerVerdict.v1' || (!ordinary && !revocation)
     || !verdict.verdictId || !verdict.projectId || !verdict.phaseId || !verdict.taskGuid || !verdict.topicRootId || !taskSetSnapshot
     || !Number.isSafeInteger(verdict.reviewRound) || !verdict.designatedReviewerRef || !verdict.reviewerId || !safeAppId(verdict.reviewerBotAppId)
     || !verdict.sessionId || !Number.isSafeInteger(verdict.workerGeneration) || !verdict.capabilityHash || !verdict.sourceMessageId
@@ -409,8 +405,12 @@ export function createTaskControlRouteHandlers(input: {
   findReviewerSession: (sessionId: string) => ReviewerLiveSession | undefined;
   listReviewerSessions: () => ReviewerLiveSession[];
   hostSecret: () => string | undefined;
+  previousHostSecret?: () => string | undefined;
+  reviewerAllowedKeyIds?: () => readonly string[] | undefined;
+  reviewerRevokedKeyIds?: () => readonly string[] | undefined;
   readMessageDetail: (larkAppId: string, messageId: string) => Promise<unknown>;
   readDocumentRevision: (larkAppId: string, docToken: string) => Promise<number | undefined>;
+  resolveMappingRegistration: (larkAppId: string, input: { dispatchRoot: string; registrationRef: string; controllerId: string }) => Promise<DaemonTaskControlMappingRegistration | undefined>;
   resolveReviewerSource: (reviewerLarkAppId: string, input: {
     sourceMessageId: string; topicRootId: string;
   }) => Promise<{ status: number; source?: ResolvedReviewerSource } | undefined>;
@@ -421,6 +421,7 @@ export function createTaskControlRouteHandlers(input: {
 }): {
   mapping(req: IncomingMessage, res: ServerResponse): Promise<void>;
   freeze(req: IncomingMessage, res: ServerResponse): Promise<void>;
+  writeExecution(req: IncomingMessage, res: ServerResponse): Promise<void>;
   designatedReviewer(req: IncomingMessage, res: ServerResponse): Promise<void>;
   designatedReviewerResolve(req: IncomingMessage, res: ServerResponse): Promise<void>;
   reviewerSource(req: IncomingMessage, res: ServerResponse): Promise<void>;
@@ -430,7 +431,7 @@ export function createTaskControlRouteHandlers(input: {
   return {
     async mapping(req, res): Promise<void> {
       const integration = input.integration();
-      if (!isTrustedHostIpcRequest(req) || !integration || !canaryRoleAllows(integration, 'controller')) {
+      if (!isTrustedHostIpcRequest(req) || !integration) {
         jsonRes(res, 403, { ok: false, error: 'task_control_mapping_unavailable' });
         return;
       }
@@ -442,6 +443,12 @@ export function createTaskControlRouteHandlers(input: {
       }
       const body = object(raw);
       const dispatchRoot = text(body?.dispatchRoot);
+      const registrationRef = text(body?.registrationRef);
+      if (!body || !hasOnlyKeys(body, ['dispatchRoot', 'registrationRef', 'originCapability', 'originTurnId', 'workerGeneration'])
+        || !dispatchRoot || !registrationRef) {
+        jsonRes(res, 400, { ok: false, error: 'task_control_mapping_invalid' });
+        return;
+      }
       const routeAuthority = authorizeControllerTurn({
         transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
         findActiveBySessionId: input.findActiveBySessionId, originCapability: body?.originCapability,
@@ -451,23 +458,17 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 403, { ok: false, error: `task_control_mapping_${routeAuthority.error}` });
         return;
       }
-      const approvalGate = object(body?.approvalGate);
-      const mapping: DaemonTaskControlMappingRegistration = {
-        projectId: text(body?.projectId) ?? '', phaseId: text(body?.phaseId) ?? '',
-        phaseTaskGuids: Array.isArray(body?.phaseTaskGuids) ? body!.phaseTaskGuids.filter((item): item is string => typeof item === 'string') : [],
-        taskGuid: text(body?.taskGuid) ?? '', topicRootId: text(body?.topicRootId) ?? '',
-        ownerId: text(body?.ownerId) ?? '', reviewerId: text(body?.reviewerId) ?? '',
-        acceptorId: text(body?.acceptorId) ?? '', registrationRef: text(body?.registrationRef) ?? '',
-        approvalGate: {
-          runId: text(approvalGate?.runId) ?? '', nodeId: text(approvalGate?.nodeId) ?? '',
-          instanceId: text(approvalGate?.instanceId) ?? '', waitId: text(approvalGate?.waitId) ?? '',
-          operatorId: text(approvalGate?.operatorId) ?? '',
-          approverPolicy: Array.isArray(approvalGate?.approverPolicy)
-            ? approvalGate.approverPolicy.filter((item): item is string => typeof item === 'string') : [],
-        },
-        ...(text(body?.docToken) ? { docToken: text(body?.docToken)! } : {}),
-      };
-      if (!dispatchRoot || !integration.registerMapping(dispatchRoot, mapping, routeAuthority.controllerId)) {
+      const mapping = await input.resolveMappingRegistration(input.selfLarkAppId() ?? '', { dispatchRoot, registrationRef, controllerId: routeAuthority.controllerId }).catch(() => undefined);
+      const currentRouteAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        findActiveBySessionId: input.findActiveBySessionId, originCapability: body.originCapability,
+        originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!sameControllerTurn(routeAuthority, currentRouteAuthority)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_mapping_origin_changed' });
+        return;
+      }
+      if (!mapping || !integration.registerMapping(dispatchRoot, mapping, routeAuthority.controllerId)) {
         jsonRes(res, 400, { ok: false, error: 'task_control_mapping_invalid_or_conflict' });
         return;
       }
@@ -477,7 +478,7 @@ export function createTaskControlRouteHandlers(input: {
     async freeze(req, res): Promise<void> {
       const integration = input.integration();
       const lifecycle = input.lifecycle();
-      if (!isTrustedHostIpcRequest(req) || !integration || !lifecycle || !canaryRoleAllows(integration, 'controller')) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !lifecycle) {
         jsonRes(res, 403, { ok: false, error: 'task_control_freeze_unavailable' });
         return;
       }
@@ -492,15 +493,39 @@ export function createTaskControlRouteHandlers(input: {
       const approvalRef = text(body?.approvalRef);
       const eventId = text(body?.eventId);
       const idempotencyKey = text(body?.idempotencyKey);
-      if (!dispatchRoot || !approvalRef || !eventId || !idempotencyKey) {
+      if (!body || !hasOnlyKeys(body, ['dispatchRoot', 'approvalRef', 'eventId', 'idempotencyKey',
+        'controllerSessionId', 'originCapability', 'originTurnId', 'workerGeneration'])
+        || !dispatchRoot || !approvalRef || !eventId || !idempotencyKey || !text(body.controllerSessionId)) {
         jsonRes(res, 400, { ok: false, error: 'task_control_freeze_invalid' });
         return;
       }
+      const routeAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!routeAuthority.ok) {
+        jsonRes(res, 403, { ok: false, error: `task_control_freeze_${routeAuthority.error}` });
+        return;
+      }
       let mapping = integration.mapping(dispatchRoot);
-      const authentication = integration.issueAcceptorAuthentication(dispatchRoot);
+      const authentication = integration.issueAuthentication(dispatchRoot, 'acceptor');
       const approval = integration.approval(dispatchRoot, approvalRef);
       if (!mapping || !authentication || !approval) {
         jsonRes(res, 403, { ok: false, error: 'task_control_freeze_unproven' });
+        return;
+      }
+      const currentRouteAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!sameControllerTurn(routeAuthority, currentRouteAuthority)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_freeze_origin_changed' });
+        return;
+      }
+      if (!integration.requestFreeze(dispatchRoot, `${eventId}:${approvalRef}`)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_freeze_request_unproven' });
         return;
       }
       try {
@@ -514,11 +539,60 @@ export function createTaskControlRouteHandlers(input: {
       }
     },
 
+    async writeExecution(req, res): Promise<void> {
+      const integration = input.integration();
+      if (!isTrustedHostIpcRequest(req) || !integration) {
+        jsonRes(res, 403, { ok: false, error: 'task_control_write_execution_unavailable' });
+        return;
+      }
+      let raw: unknown;
+      try { raw = await readJsonBody<unknown>(req, TASK_CONTROL_FREEZE_MAX_BYTES); }
+      catch (error) {
+        jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, { ok: false, error: 'bad_json' });
+        return;
+      }
+      const body = object(raw);
+      const dispatchRoot = text(body?.dispatchRoot);
+      const grantRef = text(body?.grantRef);
+      const candidate = text(body?.candidate);
+      const action = text(body?.action);
+      const attempt = body?.attempt;
+      if (!body || !hasOnlyKeys(body, ['dispatchRoot', 'grantRef', 'candidate', 'action', 'attempt',
+        'controllerSessionId', 'originCapability', 'originTurnId', 'workerGeneration'])
+        || !dispatchRoot || !grantRef || !candidate || !action || !positiveSafeInteger(attempt) || !text(body.controllerSessionId)) {
+        jsonRes(res, 400, { ok: false, error: 'task_control_write_execution_invalid' });
+        return;
+      }
+      const routeAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!routeAuthority.ok) {
+        jsonRes(res, 403, { ok: false, error: `task_control_write_execution_${routeAuthority.error}` });
+        return;
+      }
+      const mapping = integration.mapping(dispatchRoot);
+      const currentRouteAuthority = authorizeControllerTurn({
+        transportTrusted: isTrustedHostIpcRequest(req), dataDir: input.dataDir(), selfLarkAppId: input.selfLarkAppId(), dispatchRoot,
+        controllerSessionId: body.controllerSessionId, findActiveBySessionId: input.findActiveBySessionId,
+        originCapability: body.originCapability, originTurnId: body.originTurnId, workerGeneration: body.workerGeneration,
+      });
+      if (!mapping || !sameControllerTurn(routeAuthority, currentRouteAuthority)) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_write_execution_origin_changed' });
+        return;
+      }
+      const result = integration.consumeWriteExecutionGrant({
+        dispatchRoot, grantRef, candidate, action, attempt, operatorId: mapping.acceptorId,
+      });
+      jsonRes(res, result.ok ? 201 : 409, result);
+    },
+
     async designatedReviewer(req, res): Promise<void> {
       const integration = input.integration();
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret || !canaryRoleAllows(integration, 'controller')) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret) {
         jsonRes(res, 403, { ok: false, error: 'task_control_designated_reviewer_unavailable' });
         return;
       }
@@ -546,10 +620,6 @@ export function createTaskControlRouteHandlers(input: {
         || !effectiveAt || !expiresAt || !Number.isFinite(Date.parse(effectiveAt))
         || !Number.isFinite(Date.parse(expiresAt)) || !sameStrings(taskSetSnapshot, mapping.phaseTaskGuids)) {
         jsonRes(res, 400, { ok: false, error: 'task_control_designated_reviewer_invalid' });
-        return;
-      }
-      if (integration.canaryRole?.() === 'controller' && reviewerBotAppId !== integration.canaryScope?.()?.reviewerAppId) {
-        jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_scope_unproven' });
         return;
       }
       const routeAuthority = authorizeControllerTurn({
@@ -580,11 +650,22 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_origin_changed' });
         return;
       }
+      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
+      integration.setReviewerVerdictVerifier(verifier);
+      const prior = integration.currentDesignatedReviewer(dispatchRoot, reviewRound);
+      if (supersedesDesignatedReviewerRef && prior?.designatedReviewerRef !== supersedesDesignatedReviewerRef) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_supersedes_unproven' });
+        return;
+      }
+      if (!supersedesDesignatedReviewerRef && prior) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_replacement_ref_required' });
+        return;
+      }
       const signer = deriveDaemonDesignatedReviewerProvider({ hostSecret, controllerBotAppId: selfAppId });
       let designatedReviewerRef: string;
       let designation: DesignatedReviewerMapping;
       try {
-        designatedReviewerRef = reviewerDesignationRef(dispatchRoot, reviewerBotAppId, reviewRound);
+        designatedReviewerRef = reviewerDesignationRef(dispatchRoot, reviewerBotAppId, reviewRound, prior ? sourceMessageId : 1);
         designation = signer.issueDesignatedReviewer({
           designatedReviewerRef, projectId: mapping.projectId, phaseId: mapping.phaseId, taskGuid: mapping.taskGuid,
           topicRootId: mapping.topicRootId, taskSetSnapshot, reviewRound, reviewerId, reviewerBotAppId,
@@ -595,7 +676,6 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 400, { ok: false, error: 'task_control_designated_reviewer_invalid' });
         return;
       }
-      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, controllerBotAppId: selfAppId });
       if (!integration.registerVerifiedDesignatedReviewer({ mapping: designation, verifier })) {
         jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_unproven' });
         return;
@@ -605,8 +685,7 @@ export function createTaskControlRouteHandlers(input: {
 
     async reviewerSource(req, res): Promise<void> {
       const selfAppId = input.selfLarkAppId();
-      const integration = input.integration();
-      if (!isTrustedHostIpcRequest(req) || !selfAppId || !integration || !canaryRoleAllows(integration, 'reviewer')) {
+      if (!isTrustedHostIpcRequest(req) || !selfAppId || !input.integration()) {
         jsonRes(res, 403, { ok: false, error: 'task_control_reviewer_source_unavailable' });
         return;
       }
@@ -640,8 +719,7 @@ export function createTaskControlRouteHandlers(input: {
     async reviewerIngress(req, res): Promise<void> {
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      const integration = input.integration();
-      if (!selfAppId || !hostSecret || !integration || !canaryRoleAllows(integration, 'reviewer')) {
+      if (!selfAppId || !hostSecret || !input.integration()) {
         jsonRes(res, 503, { ok: false, error: 'task_control_reviewer_ingress_unavailable' });
         return;
       }
@@ -655,6 +733,8 @@ export function createTaskControlRouteHandlers(input: {
       const sourceMessageId = text(body?.sourceMessageId);
       const verdictId = text(body?.verdictId);
       const verdictKind = body?.verdict;
+      const revokesVerdictId = text(body?.revokesVerdictId);
+      const supersedesVerdictId = text(body?.supersedesVerdictId);
       const docToken = text(body?.docToken);
       const docRevision = positiveSafeInteger(body?.docRevision) ? body.docRevision : undefined;
       const reviewRound = positiveSafeInteger(body?.reviewRound) ? body.reviewRound : undefined;
@@ -662,12 +742,15 @@ export function createTaskControlRouteHandlers(input: {
       const resolvedConditionEvidence = conditionEvidence(body?.resolvedConditionEvidence);
       if (!body || !hasOnlyKeys(body, [
         'originCapability', 'originTurnId',
-        'sourceMessageId', 'verdictId', 'verdict', 'docToken', 'docRevision', 'reviewRound', 'conditionIds', 'resolvedConditionEvidence',
+        'sourceMessageId', 'verdictId', 'verdict', 'revokesVerdictId', 'supersedesVerdictId', 'docToken', 'docRevision', 'reviewRound', 'conditionIds', 'resolvedConditionEvidence',
       ]) || !sourceMessageId || !verdictId || !docToken
-        || (verdictKind !== 'pass' && verdictKind !== 'fail' && verdictKind !== 'conditional')
+        || !(['pass', 'fail', 'conditional', 'revocation'].includes(String(verdictKind)))
+        || (verdictKind === 'revocation' && (!revokesVerdictId || supersedesVerdictId))
+        || (verdictKind !== 'revocation' && !!revokesVerdictId)
         || docRevision === undefined || reviewRound === undefined
         || !conditionIds || !resolvedConditionEvidence
-        || (verdictKind === 'conditional') !== (conditionIds.length > 0)) {
+        || (verdictKind === 'conditional') !== (conditionIds.length > 0)
+        || (verdictKind === 'revocation' && (conditionIds.length !== 0 || Object.keys(resolvedConditionEvidence).length !== 0))) {
         jsonRes(res, 400, { ok: false, error: 'task_control_reviewer_ingress_invalid' });
         return;
       }
@@ -677,10 +760,6 @@ export function createTaskControlRouteHandlers(input: {
       });
       if (!reviewer) {
         jsonRes(res, 403, { ok: false, error: 'task_control_reviewer_ingress_origin_unproven' });
-        return;
-      }
-      if (integration.canaryRole?.() === 'reviewer' && selfAppId !== P2_7_TASK_CONTROL_CANARY.reviewerAppId) {
-        jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_scope_unproven' });
         return;
       }
       const dispatchRoot = reviewer.rootMessageId;
@@ -718,7 +797,7 @@ export function createTaskControlRouteHandlers(input: {
       if (!designation
         || designation.reviewerBotAppId !== selfAppId
         || designation.reviewerId !== source.senderId
-        || designation.designatedReviewerRef !== reviewerDesignationRef(dispatchRoot, selfAppId, reviewRound)
+        || !designation.designatedReviewerRef.startsWith('dr_')
         || designation.topicRootId !== dispatchRoot) {
         jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_designation_unproven' });
         return;
@@ -739,6 +818,20 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_document_unproven' });
         return;
       }
+      let reread: ReturnType<typeof reviewerMessageSourceFromLarkDetail>;
+      try {
+        reread = reviewerMessageSourceFromLarkDetail({
+          detail: await input.readMessageDetail(selfAppId, sourceMessageId),
+          expectedMessageId: sourceMessageId, expectedTopicRootId: dispatchRoot, expectedReviewerId: source.senderId,
+        });
+      } catch { reread = undefined; }
+      if (!reviewerStillLive(reviewer, input.findReviewerSession)
+        || !sameControllerBinding(controller, controllerBindingFromRegistry(input.dataDir(), dispatchRoot))
+        || !reread || reread.sourceVersionHash !== source.sourceVersionHash
+        || reread.sourceMessageId !== source.sourceMessageId || reread.senderId !== source.senderId) {
+        jsonRes(res, 409, { ok: false, error: 'task_control_reviewer_ingress_source_changed' });
+        return;
+      }
       const signer = deriveDaemonReviewerVerdictProvider({ hostSecret, reviewerBotAppId: selfAppId });
       const expiresAt = reviewerVerdictExpiresAt(source.createdAt);
       let verdict: ReviewerVerdictV1;
@@ -747,7 +840,7 @@ export function createTaskControlRouteHandlers(input: {
           verdictId, projectId: designation.projectId, phaseId: designation.phaseId, taskGuid: designation.taskGuid, topicRootId: designation.topicRootId,
           taskSetSnapshot: designation.taskSetSnapshot, reviewRound, designatedReviewerRef: designation.designatedReviewerRef, reviewerId: source.senderId, reviewerBotAppId: selfAppId,
           sessionId: reviewer.sessionId, workerGeneration: reviewer.workerGeneration, capability: reviewer.capability,
-          sourceMessageId: source.sourceMessageId, sourceVersionHash: source.sourceVersionHash, kind: 'verdict', verdict: verdictKind,
+          sourceMessageId: source.sourceMessageId, sourceVersionHash: source.sourceVersionHash, kind: verdictKind === 'revocation' ? 'revocation' : 'verdict', ...(verdictKind === 'revocation' ? { revokesVerdictId } : { verdict: verdictKind as 'pass' | 'fail' | 'conditional', ...(supersedesVerdictId ? { supersedesVerdictId } : {}) }),
           conditionIds, resolvedConditionEvidence, docToken: resolved.docToken, docRevision, issuedAt: source.createdAt,
           expiresAt: expiresAt!,
         });
@@ -775,7 +868,7 @@ export function createTaskControlRouteHandlers(input: {
       const integration = input.integration();
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret || !canaryRoleAllows(integration, 'controller')) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret) {
         jsonRes(res, 403, { ok: false, error: 'task_control_designation_resolve_unavailable' });
         return;
       }
@@ -800,11 +893,11 @@ export function createTaskControlRouteHandlers(input: {
         jsonRes(res, 409, { ok: false, error: 'task_control_designation_resolve_controller_unproven' });
         return;
       }
-      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, controllerBotAppId: selfAppId });
+      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       integration.setReviewerVerdictVerifier(verifier);
       const designation = integration.currentDesignatedReviewer(dispatchRoot, reviewRound);
       if (!designation || designation.reviewerBotAppId !== reviewerBotAppId
-        || designation.designatedReviewerRef !== reviewerDesignationRef(dispatchRoot, reviewerBotAppId, reviewRound)) {
+        || !designation.designatedReviewerRef.startsWith('dr_')) {
         jsonRes(res, 409, { ok: false, error: 'task_control_designation_resolve_unproven' });
         return;
       }
@@ -827,7 +920,7 @@ export function createTaskControlRouteHandlers(input: {
       const integration = input.integration();
       const selfAppId = input.selfLarkAppId();
       const hostSecret = input.hostSecret();
-      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret || !canaryRoleAllows(integration, 'controller')) {
+      if (!isTrustedHostIpcRequest(req) || !integration || !selfAppId || !hostSecret) {
         jsonRes(res, 403, { ok: false, error: 'task_control_reviewer_verdict_unavailable' });
         return;
       }
@@ -878,7 +971,7 @@ export function createTaskControlRouteHandlers(input: {
         return;
       }
       mapping = currentMapping;
-      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, controllerBotAppId: selfAppId });
+      const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       integration.setReviewerVerdictVerifier(verifier);
       const designated = integration.currentDesignatedReviewer(dispatchRoot, verdict.reviewRound);
       if (!mapping || !mapping.docToken || !designated
@@ -889,7 +982,7 @@ export function createTaskControlRouteHandlers(input: {
         || verdict.projectId !== mapping.projectId || verdict.phaseId !== mapping.phaseId
         || verdict.taskGuid !== mapping.taskGuid || verdict.topicRootId !== mapping.topicRootId
         || verdict.docToken !== mapping.docToken
-        || verdict.keyId !== reviewerVerdictKeyId(designated.reviewerBotAppId)
+        || !verifier.verifyVerdict(verdict)
         || attestation.reviewerId !== verdict.reviewerId || attestation.reviewerBotAppId !== verdict.reviewerBotAppId
         || attestation.sessionId !== verdict.sessionId || attestation.workerGeneration !== verdict.workerGeneration
         || attestation.capabilityHash !== verdict.capabilityHash) {
@@ -901,7 +994,7 @@ export function createTaskControlRouteHandlers(input: {
         dispatchRoot, verdict, attestation, verifier, expectedReviewerBotAppId: designated.reviewerBotAppId,
         expectedReviewerId: designated.reviewerId, now: new Date().toISOString(),
       });
-      if (head.status !== 'active') {
+      if (head.status !== 'active' && head.status !== 'revoked') {
         jsonRes(res, 409, { ok: false, error: head.reason ?? 'task_control_reviewer_verdict_unproven' });
         return;
       }

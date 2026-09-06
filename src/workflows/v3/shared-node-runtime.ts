@@ -577,6 +577,7 @@ export interface V3PendingGate {
   approveOptions: string[];
   approvers: string[];
   hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+  writeExecution?: import('./dag.js').V3WriteExecutionBinding;
 }
 
 export type V3RunOutcome =
@@ -2919,6 +2920,7 @@ export async function runWorkflow(
     const waitId = v3GateWaitId(node.id, instanceId, material?.hostApproval);
     const gate = material?.gate ?? normalizeGateWaitInput(node.humanGate!);
     const hostApproval = material?.hostApproval;
+    const writeExecution = node.humanGate?.writeExecution;
     const resolveGate = deps.resolveGate;
     if (!resolveGate) {
       throw new Error(
@@ -2958,6 +2960,7 @@ export async function runWorkflow(
           by,
           ...(selected ? { selected } : {}),
           ...(hostApproval ? { hostApproval } : {}),
+          ...(writeExecution ? { writeExecution } : {}),
         });
       });
     };
@@ -2968,6 +2971,7 @@ export async function runWorkflow(
         waitId,
         runDir,
         ...(hostApproval ? { hostApproval } : {}),
+        ...(writeExecution ? { writeExecution } : {}),
       }))
       .then(({ resolution, by, selected }) => {
         // Carry instanceId (mirror gateDispatched + the daemon suspend path): a
@@ -3025,6 +3029,7 @@ export async function runWorkflow(
       ...(instanceId ? { instanceId } : {}),
       waitId,
       ...(hostApproval ? { hostApproval } : {}),
+      ...(node.humanGate!.writeExecution ? { writeExecution: node.humanGate!.writeExecution } : {}),
     })) return false;
 
     if (gateMode === 'suspend') {
@@ -3034,6 +3039,7 @@ export async function runWorkflow(
         ...(instanceId ? { instanceId } : {}),
         ...gate,
         ...(hostApproval ? { hostApproval } : {}),
+        ...(node.humanGate!.writeExecution ? { writeExecution: node.humanGate!.writeExecution } : {}),
       });
       return true;
     }

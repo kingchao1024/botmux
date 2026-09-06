@@ -121,14 +121,31 @@ const smoke = spawnSync('node', [join(REPO_ROOT, 'scripts', 'smoke-bun-binary.mj
 });
 const smokeSecs = ((Date.now() - smokeStart) / 1000).toFixed(1);
 
-if (!keep) {
-  try { rmSync(out); } catch { /* best effort — a 170MB artifact, not worth failing over */ }
-}
-
 if (smoke.status !== 0) {
   console.error(`\n❌ smoke failed after ${smokeSecs}s. The binary is broken in a way `
     + 'source-form development cannot show; fix before pushing.');
   process.exit(1);
+}
+
+const daemonSmoke = spawnSync('node', [join(REPO_ROOT, 'scripts', 'smoke-bun-daemon-nonempty.mjs'), out], {
+  cwd: REPO_ROOT,
+  stdio: 'inherit',
+});
+if (daemonSmoke.status !== 0) {
+  console.error('\n❌ nonempty daemon smoke failed; the compiled daemon bootstrap is not release-safe.');
+  process.exit(1);
+}
+const productionDaemonSmoke = spawnSync('node', [join(REPO_ROOT, 'scripts', 'smoke-bun-daemon-nonempty.mjs'), out, '--production'], {
+  cwd: REPO_ROOT,
+  stdio: 'inherit',
+});
+if (productionDaemonSmoke.status !== 0) {
+  console.error('\n❌ production-flag daemon lifecycle smoke failed; the compiled control-plane bootstrap is not release-safe.');
+  process.exit(1);
+}
+
+if (!keep) {
+  try { rmSync(out); } catch { /* best effort — a 170MB artifact, not worth failing over */ }
 }
 
 console.log(`\n✅ compiled form verified in ${smokeSecs}s of smoke`

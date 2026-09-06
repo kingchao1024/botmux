@@ -42,6 +42,7 @@ export interface PortableWorkflowPendingGate {
     approvalDigest: string;
     inputHash: string;
   };
+  writeExecution?: import('./dag.js').V3WriteExecutionBinding;
 }
 
 export {
