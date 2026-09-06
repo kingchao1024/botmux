@@ -161,4 +161,14 @@ describe('ask receipt authority startup ordering (source lock)', () => {
     expect(publishAt).toBeGreaterThan(clearAt);
     expect(publishAt).toBeGreaterThan(publishStableAt);
   });
+
+  it('gives fleet startup admission a dedicated lock wait budget', () => {
+    expect(daemonSource).toContain('const DAEMON_STARTUP_ADMISSION_LOCK_WAIT_MS = 60_000;');
+    const startup = region(
+      daemonSource,
+      'await withBotsJsonLock(startupRoster.requestedConfigPath, (lockedConfigPath, assertTargetStable) =>',
+      '\n  } catch (error) {',
+    );
+    expect(startup).toContain('maxWaitMs: DAEMON_STARTUP_ADMISSION_LOCK_WAIT_MS');
+  });
 });
