@@ -485,6 +485,22 @@ describe('task-control mapping/freeze controlled IPC', () => {
     expect(context.lastForwarded?.verdict).toMatchObject({ kind: 'revocation', revokesVerdictId: 'prior-pass-verdict' });
   });
 
+  it('forwards an ordinary signed superseding verdict while keeping revocation mutually exclusive', async () => {
+    reset();
+    writeRegistry();
+    expect((await post(TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, designationPayload())).status).toBe(201);
+    context.selfAppId = 'reviewer-app';
+    const supersede = await post(TASK_CONTROL_REVIEWER_INGRESS_ROUTE, reviewerIngressPayload({
+      verdictId: 'rv-supersede-1', verdict: 'pass', supersedesVerdictId: 'prior-pass-verdict', conditionIds: [], resolvedConditionEvidence: {},
+    }), false);
+    expect(supersede.status).toBe(201);
+    expect(context.lastForwarded?.verdict).toMatchObject({ kind: 'verdict', verdict: 'pass', supersedesVerdictId: 'prior-pass-verdict' });
+    const mutuallyExclusive = await post(TASK_CONTROL_REVIEWER_INGRESS_ROUTE, reviewerIngressPayload({
+      verdictId: 'rv-invalid-chain', verdict: 'pass', supersedesVerdictId: 'prior-pass-verdict', revokesVerdictId: 'other',
+    }), false);
+    expect(mutuallyExclusive.status).toBe(400);
+  });
+
   it('requires current controller turn authority before and after resolving the reviewer source', async () => {
     reset();
     writeRegistry();

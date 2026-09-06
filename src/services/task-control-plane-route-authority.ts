@@ -371,7 +371,7 @@ function forwardedVerdict(body: Record<string, unknown>): {
   const sessionId = text(rawAttestation.sessionId);
   const capabilityHash = text(rawAttestation.capabilityHash);
   const ordinary = verdict.kind === 'verdict' && (verdict.verdict === 'pass' || verdict.verdict === 'fail' || verdict.verdict === 'conditional')
-    && !verdict.revokesVerdictId && !verdict.supersedesVerdictId;
+    && !verdict.revokesVerdictId;
   const revocation = verdict.kind === 'revocation' && verdict.verdict === undefined && !!verdict.revokesVerdictId && !verdict.supersedesVerdictId
     && conditionIds?.length === 0 && Object.keys(resolvedConditionEvidence ?? {}).length === 0;
   if (verdict.schemaVersion !== 'ReviewerVerdict.v1' || verdict.provider !== 'ReviewerVerdict.v1' || (!ordinary && !revocation)
@@ -692,7 +692,7 @@ export function createTaskControlRouteHandlers(input: {
       ]) || !sourceMessageId || !verdictId || !docToken
         || !(['pass', 'fail', 'conditional', 'revocation'].includes(String(verdictKind)))
         || (verdictKind === 'revocation' && (!revokesVerdictId || supersedesVerdictId))
-        || (verdictKind !== 'revocation' && (!!revokesVerdictId || !!supersedesVerdictId))
+        || (verdictKind !== 'revocation' && !!revokesVerdictId)
         || docRevision === undefined || reviewRound === undefined
         || !conditionIds || !resolvedConditionEvidence
         || (verdictKind === 'conditional') !== (conditionIds.length > 0)
@@ -786,7 +786,7 @@ export function createTaskControlRouteHandlers(input: {
           verdictId, projectId: designation.projectId, phaseId: designation.phaseId, taskGuid: designation.taskGuid, topicRootId: designation.topicRootId,
           taskSetSnapshot: designation.taskSetSnapshot, reviewRound, designatedReviewerRef: designation.designatedReviewerRef, reviewerId: source.senderId, reviewerBotAppId: selfAppId,
           sessionId: reviewer.sessionId, workerGeneration: reviewer.workerGeneration, capability: reviewer.capability,
-          sourceMessageId: source.sourceMessageId, sourceVersionHash: source.sourceVersionHash, kind: verdictKind === 'revocation' ? 'revocation' : 'verdict', ...(verdictKind === 'revocation' ? { revokesVerdictId } : { verdict: verdictKind as 'pass' | 'fail' | 'conditional' }),
+          sourceMessageId: source.sourceMessageId, sourceVersionHash: source.sourceVersionHash, kind: verdictKind === 'revocation' ? 'revocation' : 'verdict', ...(verdictKind === 'revocation' ? { revokesVerdictId } : { verdict: verdictKind as 'pass' | 'fail' | 'conditional', ...(supersedesVerdictId ? { supersedesVerdictId } : {}) }),
           conditionIds, resolvedConditionEvidence, docToken: resolved.docToken, docRevision, issuedAt: source.createdAt,
           expiresAt: expiresAt!,
         });
