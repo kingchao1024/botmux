@@ -644,6 +644,7 @@ export class DaemonTaskControlIntegration {
  */
 export class DaemonTaskControlShadowCollector {
   readonly collector: TaskControlActiveCollector;
+  private taskCommentUnavailable = false;
 
   constructor(
     private readonly input: {
@@ -655,7 +656,9 @@ export class DaemonTaskControlShadowCollector {
   ) {
     this.collector = new TaskControlActiveCollector(input.lifecycle, {
       list: async ({ kind }) => ({
-        records: kind === 'task' || kind === 'task_comment' ? await this.collectReferences(kind) : [],
+        records: kind === 'task' || (kind === 'task_comment' && !this.taskCommentUnavailable)
+          ? await this.collectReferences(kind)
+          : [],
       }),
     });
   }
@@ -674,6 +677,7 @@ export class DaemonTaskControlShadowCollector {
         ? await collectTaskReferences(larkAppId, taskGuid)
         : await collectLatestTaskCommentReference(larkAppId, taskGuid);
     } catch (error) {
+      if (kind === 'task_comment') this.taskCommentUnavailable = true;
       this.input.logger.warn(`[task-control] ${kind} reference unavailable for ${taskGuid}: ${String(error)}`);
       const sourceRef = reference('collection-error', `${kind}:${taskGuid}`);
       return [{ kind, sourceRef, eventId: DaemonTaskControlBridge.observationId(kind, sourceRef), idempotencyKey: `tcp-collect:${kind}:${sourceRef}` }];

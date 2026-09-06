@@ -48,13 +48,15 @@ describe('scoped task control Shadow collector', () => {
         });
         scopedCollector = shadow;
         await shadow.collectAll();
+        await shadow.collectAll();
         await vi.waitFor(() => expect(lifecycle.getStore()!.listObservations()).toHaveLength(2), { interval: 5, timeout: 500 });
         expect(lifecycle.getStore()!.listTrustedMappings()).toEqual([]);
         expect(lifecycle.getStore()!.listEvents()).toEqual([]);
         await lifecycle.close();
       }
 
-      expect(mocks.larkGet).toHaveBeenCalledTimes(4);
+      expect(mocks.larkGet).toHaveBeenCalledTimes(6);
+      expect(mocks.larkGet.mock.calls.filter(([, path]) => path === '/open-apis/task/v2/comments')).toHaveLength(2);
       expect(mocks.larkGet.mock.calls.every(([, path, query]) =>
         path === `/open-apis/task/v2/tasks/${TASK_GUID}`
           || (path === '/open-apis/task/v2/comments' && query?.resource_id === TASK_GUID
