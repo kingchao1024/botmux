@@ -20118,6 +20118,35 @@ async function handleThreadReplyAdmitted(
   // where the caller is often not the session owner).
   const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   if (ds) {
+    if (pendingThreadWorkflowGoal) {
+      if (!threadSenderOpenId) {
+        await sessionReply(anchor, 'workflow run 创建失败：sender identity unavailable', 'text', larkAppId);
+        return;
+      }
+      try {
+        const run = birthWorkflowGrillRun({
+          goal: pendingThreadWorkflowGoal, larkAppId, chatId: ds.chatId, chatType: ds.chatType,
+          ...(ds.scope === 'thread' ? { rootMessageId: anchor } : {}),
+          sessionId: ds.session.sessionId, ownerOpenId: threadSenderOpenId, messageId: parsed.messageId,
+          isSessionClosed: sessionId => {
+            const owned = sessionStore.getOwnedSession(sessionId);
+            if (!owned || owned.larkAppId !== larkAppId) return false;
+            try {
+              const fresh = sessionStore.getSessionFresh(sessionId);
+              return fresh?.larkAppId === larkAppId && fresh.status === 'closed';
+            } catch {
+              return false;
+            }
+          },
+        });
+        const workflowPrompt = buildWorkflowGrillPrompt(pendingThreadWorkflowGoal, run);
+        promptContent = initialCodexAppMessageContext + initialCodexAppApplicationContext + workflowPrompt;
+        codexAppMessageContext = initialCodexAppMessageContext + workflowPrompt;
+      } catch (error) {
+        await sessionReply(anchor, `workflow run 创建失败：${error instanceof Error ? error.message : String(error)}`, 'text', larkAppId);
+        return;
+      }
+    }
     markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
@@ -20151,35 +20180,6 @@ async function handleThreadReplyAdmitted(
       ds.session.lastCallerOpenId = callerOpenId;
     }
     sessionStore.updateSession(ds.session);
-    if (pendingThreadWorkflowGoal) {
-      if (!threadSenderOpenId) {
-        await sessionReply(anchor, 'workflow run 创建失败：sender identity unavailable', 'text', larkAppId);
-        return;
-      }
-      try {
-        const run = birthWorkflowGrillRun({
-          goal: pendingThreadWorkflowGoal, larkAppId, chatId: ds.chatId, chatType: ds.chatType,
-          ...(ds.scope === 'thread' ? { rootMessageId: anchor } : {}),
-          sessionId: ds.session.sessionId, ownerOpenId: threadSenderOpenId, messageId: parsed.messageId,
-          isSessionClosed: sessionId => {
-            const owned = sessionStore.getOwnedSession(sessionId);
-            if (!owned || owned.larkAppId !== larkAppId) return false;
-            try {
-              const fresh = sessionStore.getSessionFresh(sessionId);
-              return fresh?.larkAppId === larkAppId && fresh.status === 'closed';
-            } catch {
-              return false;
-            }
-          },
-        });
-        const workflowPrompt = buildWorkflowGrillPrompt(pendingThreadWorkflowGoal, run);
-        promptContent = initialCodexAppMessageContext + initialCodexAppApplicationContext + workflowPrompt;
-        codexAppMessageContext = initialCodexAppMessageContext + workflowPrompt;
-      } catch (error) {
-        await sessionReply(anchor, `workflow run 创建失败：${error instanceof Error ? error.message : String(error)}`, 'text', larkAppId);
-        return;
-      }
-    }
   }
 
   // The first owner may have failed while this handler was awaiting resource

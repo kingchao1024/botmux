@@ -214,7 +214,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 import { birthWorkflowGrillRun } from '../src/im/lark/workflow-slash-command.js';
-import { readGrillState } from '../src/workflows/v3/grill-state.js';
+import { GRILL_STATUS_FILE, readGrillState } from '../src/workflows/v3/grill-state.js';
 
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
@@ -1437,6 +1437,78 @@ describe('/rename production routing — must not pre-create a session (review P
       delete process.env.BOTMUX_WORKFLOW_ENABLED;
     }
   });
+
+  it.each(['conflict', 'corrupt'] as const)(
+    'existing thread: %s birth failure leaves session and reply provenance unchanged',
+    async (failure) => {
+      const rootId = `om_workflow_${failure}_root`;
+      const messageId = `om_workflow_${failure}_message`;
+      const ds = seedThreadSession(rootId, 'workflow failure');
+      ds.worker = { killed: false, send: vi.fn() } as any;
+      ds.lastMessageAt = 1_700_000_000_000;
+      ds.lastHumanMessageAt = 1_700_000_000_000;
+      Object.assign(ds.session, {
+        lastMessageAt: '2023-11-14T22:13:20.000Z',
+        lastHumanMessageAt: '2023-11-14T22:13:20.000Z',
+        quoteTargetId: 'om_previous_quote',
+        quoteTargetSenderOpenId: 'ou_previous_caller',
+        quoteTargetSenderIsBot: true,
+        lastCallerOpenId: 'ou_previous_caller',
+        replyTargets: {
+          om_previous_turn: {
+            updatedAt: '2023-11-14T22:13:20.000Z',
+            senderOpenId: 'ou_previous_caller',
+            participants: [{ openId: 'ou_previous_caller' }],
+          },
+        },
+        turnReplyContexts: {
+          om_previous_turn: {
+            target: { mode: 'thread', rootMessageId: rootId },
+            quoteTargetId: 'om_previous_quote',
+          },
+        },
+      });
+      const before = structuredClone({
+        lastMessageAt: ds.lastMessageAt,
+        lastHumanMessageAt: ds.lastHumanMessageAt,
+        session: ds.session,
+      });
+      const existing = birthWorkflowGrillRun({
+        goal: failure === 'conflict' ? '不同目标' : '会失败的目标',
+        larkAppId: APP, chatId: CHAT, chatType: 'group', rootMessageId: rootId,
+        sessionId: ds.session.sessionId, ownerOpenId: OWNER, messageId,
+      });
+      if (failure === 'corrupt') {
+        writeFileSync(
+          join(workflowRunsPath(), existing.runId, GRILL_STATUS_FILE),
+          '{"schemaVersion":"invalid"}',
+        );
+      }
+
+      process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+      try {
+        await handleThreadReply(
+          makeEventData(messageId, '/workflow new 会失败的目标', rootId),
+          makeCtx(rootId, messageId),
+        );
+
+        expect(repliedText()).toContain(
+          failure === 'conflict'
+            ? `workflow_ingress_run_conflict:${existing.runId}`
+            : `workflow_ingress_run_corrupt:${existing.runId}`,
+        );
+        expect((ds.worker as any).send).not.toHaveBeenCalled();
+        expect(mocks.updateSession).not.toHaveBeenCalled();
+        expect({
+          lastMessageAt: ds.lastMessageAt,
+          lastHumanMessageAt: ds.lastHumanMessageAt,
+          session: ds.session,
+        }).toEqual(before);
+      } finally {
+        delete process.env.BOTMUX_WORKFLOW_ENABLED;
+      }
+    },
+  );
 
   it.each([
     ['new topic', false],
