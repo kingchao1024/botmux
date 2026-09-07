@@ -199,6 +199,7 @@ import {
 } from './workflows/v3/daemon-ipc-client.js';
 import {
   postWorkflowSessionRunMutation,
+  readWorkflowProcessRelayContext,
   readWorkflowSessionRelayContext,
 } from './workflows/v3/session-relay-client.js';
 import type { V3SessionRunMutation } from './workflows/v3/session-relay.js';
@@ -5702,7 +5703,9 @@ async function cmdWorkflowAuthoringViaSessionRelay(
   runId: string | undefined,
   rest: string[],
 ): Promise<boolean> {
-  const context = readWorkflowSessionRelayContext({ env: process.env, dataDir: resolveDataDir() });
+  const dataDir = resolveDataDir();
+  const context = readWorkflowSessionRelayContext({ env: process.env, dataDir })
+    ?? readWorkflowProcessRelayContext({ env: process.env, dataDir });
   if (!context) return false;
   if (!runId || rest.length > 0) {
     console.error(`❌ 隔离会话中的 workflow ${sub} 只接受一个 runId，不接受其它参数。`);

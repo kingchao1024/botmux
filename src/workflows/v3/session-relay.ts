@@ -100,6 +100,9 @@ export function authorizeV3SessionRunMutationRequest(input: {
   /** Parsed JSON request body (untrusted). */
   raw: unknown;
   trustedHost: boolean;
+  /** The daemon proved the loopback client belongs to this exact live CLI
+   * turn. This narrower fallback is accepted for human authoring only. */
+  currentTurnProcessAttested?: boolean;
   /** undefined when the claimed sessionId has no live session on this daemon. */
   session: V3SessionRelaySessionView | undefined;
   selfLarkAppId: string | undefined;
@@ -134,6 +137,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
   if (!body) return { ok: false, status: 400, error: 'bad_json' };
   const sessionId = body.sessionId;
   if (!nonEmpty(sessionId)) return { ok: false, status: 400, error: 'missing_session_id' };
+  const authoring = isV3SessionRunAuthoringMutation(input.mutation);
 
   const claimedAttempt = typeof body.originDispatchAttempt === 'number'
     && Number.isSafeInteger(body.originDispatchAttempt)
@@ -141,7 +145,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
     ? body.originDispatchAttempt
     : undefined;
   const verified = authorizeSessionScopedIpc({
-    trustedHost: input.trustedHost,
+    trustedHost: input.trustedHost || (authoring && input.currentTurnProcessAttested === true),
     sessionExists: !!input.session,
     receiverSession: !!input.session?.receiver,
     // A meeting receiver must not drive workflow runs: its side effects belong
@@ -174,7 +178,6 @@ export function authorizeV3SessionRunMutationRequest(input: {
   }
 
   const liveTurnId = current.liveOrigin?.turnId;
-  const authoring = isV3SessionRunAuthoringMutation(input.mutation);
   const scheduledTurn = !!liveTurnId && !!parseScheduledTurnId(liveTurnId);
   const actorKind = scheduledTurn ? 'scheduled' : (current.senderKind ?? 'unknown');
   if (authoring && !isHumanWorkflowAuthoringActor(actorKind)) {

@@ -34,6 +34,41 @@ export interface WorkflowSessionRelayContext {
   ipcPortFallback?: number;
 }
 
+export interface WorkflowProcessRelayContext {
+  sessionId: string;
+  larkAppId?: string;
+  ipcPortFallback: number;
+}
+
+/**
+ * Fall back to daemon-side process attestation when an outer execution sandbox
+ * hides the Botmux process marker without being a Botmux-managed sandbox.  In
+ * that shape no capability file exists, but the daemon can still prove that
+ * the loopback client belongs to the exact live CLI turn.
+ */
+export function readWorkflowProcessRelayContext(options: {
+  env: NodeJS.ProcessEnv;
+  dataDir: string;
+  startPid?: number;
+  /** Test seam. */
+  findMarker?: typeof findAncestorSessionContext;
+}): WorkflowProcessRelayContext | null {
+  const sessionId = options.env.BOTMUX_SESSION_ID?.trim();
+  if (!sessionId) return null;
+  const findMarker = options.findMarker ?? findAncestorSessionContext;
+  if (findMarker(options.dataDir, options.startPid ?? process.ppid, sessionId)?.sessionId) {
+    return null;
+  }
+  const portRaw = Number(options.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!Number.isSafeInteger(portRaw) || portRaw <= 0 || portRaw > 65_535) return null;
+  const larkAppId = options.env.BOTMUX_LARK_APP_ID?.trim();
+  return {
+    sessionId,
+    ...(larkAppId ? { larkAppId } : {}),
+    ipcPortFallback: portRaw,
+  };
+}
+
 /**
  * Detect an isolated session and load its per-turn capability.
  *
@@ -93,7 +128,7 @@ export function readWorkflowSessionRelayContext(options: {
  * capability aperture and fail-closes inside the handler.
  */
 export async function postWorkflowSessionRunMutation(input: {
-  context: WorkflowSessionRelayContext;
+  context: WorkflowSessionRelayContext | WorkflowProcessRelayContext;
   runId: string;
   mutation: V3SessionRunMutation;
   body?: Record<string, unknown>;
@@ -112,12 +147,16 @@ export async function postWorkflowSessionRunMutation(input: {
   const requestBody = JSON.stringify({
     ...(input.body ?? {}),
     sessionId: input.context.sessionId,
-    originCapability: input.context.capability,
-    ...(input.context.originChannelId
+    ...('capability' in input.context && input.context.capability
+      ? { originCapability: input.context.capability }
+      : {}),
+    ...('originChannelId' in input.context && input.context.originChannelId
       ? { originChannelId: input.context.originChannelId }
       : {}),
-    ...(input.context.turnId ? { originTurnId: input.context.turnId } : {}),
-    ...(input.context.dispatchAttempt !== undefined
+    ...('turnId' in input.context && input.context.turnId
+      ? { originTurnId: input.context.turnId }
+      : {}),
+    ...('dispatchAttempt' in input.context && input.context.dispatchAttempt !== undefined
       ? { originDispatchAttempt: input.context.dispatchAttempt }
       : {}),
   });

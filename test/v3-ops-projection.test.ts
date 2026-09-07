@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync, readFile
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { appendEvent } from '../src/workflows/v3/journal.js';
+import { birthRun } from '../src/workflows/v3/grill-state.js';
 import {
   projectRun,
   projectRunById,
@@ -136,15 +137,19 @@ describe('v3 ops-projection — projectRunById 安全 + listRuns', () => {
     expect(isValidRunId('')).toBe(false);
   });
 
-  it('listRuns 列出带 journal 的 run，名字倒序', () => {
+  it('listRuns 列出 authoring 和 runtime run，名字倒序', () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-proj-'));
     try {
       buildRun(base, 'a-260602-0800');
       buildRun(base, 'b-260602-0900');
-      mkdirSync(join(base, 'no-journal-260602-0000'), { recursive: true }); // 无 journal，应忽略
+      birthRun({ goal: 'draft', baseDir: base, runId: 'c-260602-1000' });
+      mkdirSync(join(base, 'no-state-260602-0000'), { recursive: true });
       const runs = listRuns(base);
-      expect(runs.map((r) => r.runId)).toEqual(['b-260602-0900', 'a-260602-0800']);
-      expect(runs[0].nodeCount).toBe(2);
+      expect(runs.map((r) => r.runId)).toEqual([
+        'c-260602-1000', 'b-260602-0900', 'a-260602-0800',
+      ]);
+      expect(runs[0]).toMatchObject({ runStatus: 'grilling', nodeCount: 0 });
+      expect(runs[1].nodeCount).toBe(2);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

@@ -258,6 +258,36 @@ describe('v3 session relay authorization', () => {
       .toEqual({ ok: false, status: 403, error: 'session_identity_incomplete' });
   });
 
+  it('accepts process attestation only for human authoring mutations', () => {
+    writeGrill('grill-bound', BINDING);
+    expect(authorize({
+      runId: 'grill-bound',
+      mutation: 'spec-finalize',
+      raw: { sessionId: 'sess-1' },
+      currentTurnProcessAttested: true,
+    }).ok).toBe(true);
+
+    writeEnvelope('bound-ok', BINDING);
+    expect(authorize({
+      mutation: 'start',
+      raw: { sessionId: 'sess-1' },
+      currentTurnProcessAttested: true,
+    })).toEqual({ ok: false, status: 403, error: 'origin_unproven' });
+  });
+
+  it('still rejects non-human authoring after process attestation', () => {
+    writeGrill('grill-bound', BINDING);
+    expect(authorize({
+      runId: 'grill-bound',
+      mutation: 'spec-finalize',
+      raw: { sessionId: 'sess-1' },
+      currentTurnProcessAttested: true,
+      session: sessionView({ senderKind: 'bot' }),
+    })).toEqual({
+      ok: false, status: 403, error: 'workflow_authoring_requires_human_turn',
+    });
+  });
+
   it('rejects a run bound to a different chat tuple, with the mismatch detail', () => {
     writeEnvelope('bound-ok', BINDING);
     const decision = authorize({ session: sessionView({ chatId: 'oc_other' }) });

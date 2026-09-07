@@ -431,6 +431,10 @@ import {
   V3_SESSION_RUN_MUTATION_ROUTE_PREFIX,
 } from './workflows/v3/session-relay.js';
 import { isV3SessionRunAuthoringMutation } from './workflows/v3/authoring-authority.js';
+import {
+  resolveDaemonCurrentActor,
+  resolveLoopbackPeerProcesses,
+} from './core/current-actor-attestation.js';
 import { defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.js';
 import { readRunEnvelope } from './workflows/v3/run-envelope.js';
 import {
@@ -6269,11 +6273,31 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
       const ds = typeof claimedSessionId === 'string'
         ? findActiveBySessionId(claimedSessionId)
         : undefined;
+      let currentTurnProcessAttested = false;
+      if (ds
+        && typeof claimedSessionId === 'string'
+        && isV3SessionRunAuthoringMutation(sessionRelayMutation)
+        && raw && typeof raw === 'object' && !Array.isArray(raw)
+        && typeof (raw as Record<string, unknown>).originCapability !== 'string') {
+        const peer = resolveLoopbackPeerProcesses({
+          remoteAddress: req.socket.remoteAddress,
+          remotePort: req.socket.remotePort,
+          localPort: req.socket.localPort,
+        });
+        if (peer.ok) {
+          currentTurnProcessAttested = (await resolveDaemonCurrentActor({
+            sessionId: claimedSessionId,
+            peer: peer.peer,
+            findSession: findActiveBySessionId,
+          })).ok;
+        }
+      }
       const decision = authorizeV3SessionRunMutationRequest({
         runId: params.runId,
         mutation: sessionRelayMutation,
         raw,
         trustedHost: isTrustedHostIpcRequest(req),
+        currentTurnProcessAttested,
         session: ds
           ? {
               receiver: !!ds.session.vcMeetingReceiver,
