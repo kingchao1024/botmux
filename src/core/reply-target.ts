@@ -263,7 +263,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; senderIsBot?: boolean; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
 ): void {
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
@@ -284,9 +284,11 @@ export function beginReplyTargetTurn(
     ...(ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
       : {}),
-    ...(ds.session.quoteTargetSenderIsBot !== undefined
-      ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
-      : {}),
+    ...(Object.prototype.hasOwnProperty.call(opts ?? {}, 'senderIsBot')
+      ? (opts?.senderIsBot !== undefined ? { replyTargetSenderIsBot: opts.senderIsBot } : {})
+      : ds.session.quoteTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
+        : {}),
     // Chat-scope only: distinguishes "answered flat AT TOP LEVEL" from
     // "answered flat but the inbound was already inside a topic" (a native
     // topic seed). Thread-scope turns route off session.rootMessageId and
@@ -321,6 +323,7 @@ export function beginReplyTargetTurn(
     updatedAt: nowIso,
     ...(isChatScope ? { quoteOnly: opts?.quoteOnly, substitute: opts?.substitute } : {}),
     ...(opts?.senderOpenId ? { senderOpenId: opts.senderOpenId } : {}),
+    ...(opts?.senderIsBot !== undefined ? { replyTargetSenderIsBot: opts.senderIsBot } : {}),
     ...(opts?.participants?.length ? { participants: dedupeParticipants(opts.participants) } : {}),
     ...(opts?.participantsIncomplete ? { participantsIncomplete: true } : {}),
   };

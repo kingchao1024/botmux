@@ -11133,6 +11133,11 @@ function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string |
   return pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
 }
 
+function currentGatewaySenderKind(ds: DaemonSession, turnId: string): 'human' | 'bot' | undefined {
+  const senderIsBot = frozenReplyContextForTurn(ds, turnId).replyTargetSenderIsBot;
+  return senderIsBot === true ? 'bot' : senderIsBot === false ? 'human' : undefined;
+}
+
 function currentTurnProcessIdentities(
   ds: DaemonSession,
   turnId: string | undefined,
@@ -13672,6 +13677,9 @@ function setupWorkerHandlers(
             : {}),
           ...((msg.turnId && currentGatewayCallerOpenId(ds, msg.turnId))
             ? { callerOpenId: currentGatewayCallerOpenId(ds, msg.turnId) }
+            : {}),
+          ...((msg.turnId && currentGatewaySenderKind(ds, msg.turnId))
+            ? { senderKind: currentGatewaySenderKind(ds, msg.turnId) }
             : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }

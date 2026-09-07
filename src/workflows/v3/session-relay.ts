@@ -17,12 +17,12 @@ import { authorizeSessionScopedIpc } from '../../core/daemon-ipc-session-auth.js
 import {
   parseWorkflowDaemonMutationBody,
 } from './daemon-ipc-body.js';
-import type { WorkflowDaemonMutation } from './daemon-ipc-client.js';
 import {
   authorizeV3RunMutationForCurrentTuple,
   V3DaemonCommandAuthorityError,
 } from './cli-daemon-command-authority.js';
 import { isValidRunId } from './ops-projection.js';
+import { readGrillState } from './grill-state.js';
 import {
   authorizeScheduledTurn,
   parseScheduledTurnId,
@@ -31,9 +31,22 @@ import {
 
 export const V3_SESSION_RUN_MUTATION_ROUTE_PREFIX = '/api/v3/session-runs';
 
-export const V3_SESSION_RUN_MUTATIONS = ['start', 'cancel', 'retry', 'grant'] as const;
+export const V3_SESSION_RUN_AUTHORING_MUTATIONS = [
+  'spec-finalize', 'approve-spec', 'architect', 'approve-dag',
+] as const;
+export const V3_SESSION_RUN_MUTATIONS = [
+  'start', 'cancel', 'retry', 'grant',
+  ...V3_SESSION_RUN_AUTHORING_MUTATIONS,
+] as const;
+export type V3SessionRunMutation = typeof V3_SESSION_RUN_MUTATIONS[number];
+export type V3SessionRunAuthoringMutation = typeof V3_SESSION_RUN_AUTHORING_MUTATIONS[number];
+export function isV3SessionRunAuthoringMutation(
+  value: string,
+): value is V3SessionRunAuthoringMutation {
+  return (V3_SESSION_RUN_AUTHORING_MUTATIONS as readonly string[]).includes(value);
+}
 
-export function isV3SessionRunMutation(value: string): value is WorkflowDaemonMutation {
+export function isV3SessionRunMutation(value: string): value is V3SessionRunMutation {
   return (V3_SESSION_RUN_MUTATIONS as readonly string[]).includes(value);
 }
 
@@ -42,6 +55,7 @@ export interface V3SessionRelaySessionView {
   receiver: boolean;
   liveOrigin?: { capability: string; turnId?: string; dispatchAttempt?: number };
   callerOpenId?: string;
+  senderKind?: 'human' | 'bot';
   chatId?: string;
   larkAppId?: string;
   /** The session's CURRENT inbound turn pointer — advances the moment the next
@@ -69,11 +83,15 @@ function nonEmpty(value: unknown): value is string {
 
 /** Mutation payload keys the relay forwards; everything else is dropped so a
  * sandboxed caller cannot smuggle fields past the shared body parser. */
-const MUTATION_BODY_KEYS: Record<WorkflowDaemonMutation, readonly string[]> = {
+const MUTATION_BODY_KEYS: Record<V3SessionRunMutation, readonly string[]> = {
   start: [],
   cancel: ['reason'],
   retry: ['nodeId'],
   grant: ['loopId'],
+  'spec-finalize': [],
+  'approve-spec': [],
+  architect: [],
+  'approve-dag': [],
 };
 
 /**
@@ -161,6 +179,10 @@ export function authorizeV3SessionRunMutationRequest(input: {
   }
 
   const liveTurnId = current.liveOrigin?.turnId;
+  const authoring = isV3SessionRunAuthoringMutation(input.mutation);
+  if (authoring && current.senderKind !== 'human') {
+    return { ok: false, status: 403, error: 'workflow_authoring_requires_human_turn' };
+  }
 
   // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
   // inbound message exists, so the session row carries no
@@ -172,6 +194,9 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // creator, never anything the request chooses.
   let callerOpenId: string;
   if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
+    if (authoring) {
+      return { ok: false, status: 403, error: 'workflow_authoring_requires_human_turn' };
+    }
     if (!input.sessionDataDir) {
       return {
         ok: false, status: 403, error: 'schedule_turn_unauthorized',
@@ -243,6 +268,15 @@ export function authorizeV3SessionRunMutationRequest(input: {
       detail: `run 归属 ${authority.larkAppId}`,
     };
   }
+  if (authoring) {
+    const grill = readGrillState(authority.runDir);
+    if (grill?.chatBinding?.sessionId !== sessionId) {
+      return {
+        ok: false, status: 403, error: 'run_binding_mismatch',
+        detail: `当前 session 与 run ${input.runId} 的 chatBinding 不匹配：sessionId`,
+      };
+    }
+  }
 
   // Re-validate the payload with the exact same parser the signed-envelope
   // route uses, from an allowlisted subset only.
@@ -250,7 +284,15 @@ export function authorizeV3SessionRunMutationRequest(input: {
   for (const key of MUTATION_BODY_KEYS[input.mutation]) {
     if (body[key] !== undefined) subset[key] = body[key];
   }
-  const parsed = parseWorkflowDaemonMutationBody(input.mutation, JSON.stringify(subset));
+  if (!['start', 'cancel', 'retry', 'grant'].includes(input.mutation)) {
+    return Object.keys(subset).length === 0
+      ? { ok: true, body: {}, runDir: authority.runDir, larkAppId: authority.larkAppId }
+      : { ok: false, status: 400, error: 'bad_body' };
+  }
+  const parsed = parseWorkflowDaemonMutationBody(
+    input.mutation as 'start' | 'cancel' | 'retry' | 'grant',
+    JSON.stringify(subset),
+  );
   if (!parsed.ok) return { ok: false, status: 400, error: parsed.error };
 
   return {

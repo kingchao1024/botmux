@@ -745,7 +745,7 @@ export function resolveArchitectBotSnapshot(
   return snapshot;
 }
 
-async function runArchitectCli(runId: string, baseDir: string, rest: string[]): Promise<ArchitectOutcome> {
+export async function runArchitectCli(runId: string, baseDir: string, rest: string[]): Promise<ArchitectOutcome> {
   const bots = loadBotConfigs();
   const secretById = new Map(bots.map((b) => [b.larkAppId, b.larkAppSecret]));
   // The authoritative constructor rejects disableCliBypass=true: architect and

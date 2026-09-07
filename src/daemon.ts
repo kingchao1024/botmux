@@ -427,10 +427,19 @@ import { botToSnapshot } from './workflows/v3/bot-resolve.js';
 import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js';
 import {
   authorizeV3SessionRunMutationRequest,
+  isV3SessionRunAuthoringMutation,
   V3_SESSION_RUN_MUTATIONS,
   V3_SESSION_RUN_MUTATION_ROUTE_PREFIX,
 } from './workflows/v3/session-relay.js';
 import { defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.js';
+import { readRunEnvelope } from './workflows/v3/run-envelope.js';
+import {
+  authorizeAdHocRun,
+  hostApproveDag,
+  hostApproveSpec,
+  hostSpecFinalize,
+  runArchitectCli,
+} from './workflows/v3/host.js';
 import { persistV3StartIntent } from './workflows/v3/start-intent.js';
 import {
   createWorkflowDaemonIpcNonceStore,
@@ -6272,6 +6281,9 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
               ...(ds.session.lastCallerOpenId
                 ? { callerOpenId: ds.session.lastCallerOpenId }
                 : {}),
+              ...(ds.managedTurnOrigin?.senderKind
+                ? { senderKind: ds.managedTurnOrigin.senderKind }
+                : {}),
               ...(ds.chatId ? { chatId: ds.chatId } : {}),
               ...(ds.larkAppId ? { larkAppId: ds.larkAppId } : {}),
               // Current-turn pointers for the generation join: the authorizer
@@ -6313,12 +6325,47 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           ...(decision.detail ? { detail: decision.detail } : {}),
         });
       }
-      const executor = v3RunMutationExecutors[sessionRelayMutation];
+      if (isV3SessionRunAuthoringMutation(sessionRelayMutation)) {
+        if (!isWorkflowFeatureEnabled()) {
+          return jsonRes(res, 409, { ok: false, error: 'workflow_disabled' });
+        }
+        try {
+          if (sessionRelayMutation === 'spec-finalize') {
+            const out = hostSpecFinalize(decision.runDir);
+            return out.ok
+              ? jsonRes(res, 200, { ok: true, runId: params.runId, status: out.state!.status, specJsonPath: out.state!.specJsonPath })
+              : jsonRes(res, 409, { ok: false, error: 'spec_invalid', problems: out.problems });
+          }
+          if (sessionRelayMutation === 'approve-spec') {
+            const state = hostApproveSpec(decision.runDir);
+            return jsonRes(res, 200, { ok: true, runId: params.runId, status: state.status });
+          }
+          if (sessionRelayMutation === 'architect') {
+            const out = await runArchitectCli(params.runId, v3DefaultBaseDir(), []);
+            return out.ok
+              ? jsonRes(res, 200, { ok: true, runId: params.runId, status: out.state.status, dagPath: out.state.dagPath, notesPath: out.state.notesPath })
+              : jsonRes(res, 409, { ok: false, error: 'architect_failed', problems: out.problems });
+          }
+          const before = readRunEnvelope(decision.runDir, params.runId);
+          const bots = before.kind === 'missing' ? loadBotConfigs() : [];
+          const authorized = authorizeAdHocRun(decision.runDir, bots);
+          const { state } = hostApproveDag(decision.runDir);
+          return jsonRes(res, 200, { ok: true, runId: params.runId, status: state.status, dagPath: authorized.dagPath });
+        } catch (error) {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'workflow_host_command_failed',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      const runtimeMutation = sessionRelayMutation as WorkflowDaemonMutation;
+      const executor = v3RunMutationExecutors[runtimeMutation];
       if (!executor || !selfV3LarkAppId || !selfV3BootInstanceId) {
         return jsonRes(res, 503, { ok: false, error: 'workflow_ipc_identity_unavailable' });
       }
       return executor(
-        (status, payload) => jsonRes(res, status, payload),
+        (status: number, payload: unknown) => jsonRes(res, status, payload),
         { runId: params.runId },
         decision.body as never,
         { larkAppId: selfV3LarkAppId, bootInstanceId: selfV3BootInstanceId },
@@ -17715,7 +17762,7 @@ async function startInitialPassthroughSession(args: {
     sessionStore.updateSession(ds.session);
   }
   const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId });
+  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { senderOpenId, senderIsBot: resolvedSenderIsBotTriState, participants: initialWindow.participants, participantsIncomplete: initialWindow.incomplete, inThread: !!parsed.threadId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -18718,7 +18765,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Turn key is the reply anchor (== messageId outside session-group births) so
   // the per-turn reply context and currentReplyTarget.turnId line up with the
   // worker's turn id — current-turn provenance requires that equality.
-  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBotSender), participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -20146,7 +20193,7 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot), participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
@@ -20610,7 +20657,7 @@ async function handleThreadReplyAdmitted(
       : 'thread';
     const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const autoCreateWindow = buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt);
-    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
+    beginReplyTargetTurn(newDs, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: senderOId, senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot), participants: autoCreateWindow.participants, participantsIncomplete: autoCreateWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId });
     sessionStore.updateSession(newDs.session);
     const registration = await claimNewDaemonSession(activeSessions, newDs);
     if (!registration.accepted) {

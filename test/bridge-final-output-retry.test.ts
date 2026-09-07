@@ -3051,6 +3051,36 @@ describe('Worker turn_terminal routing', () => {
     expect(ds.managedTurnOrigin).toBeUndefined();
   });
 
+  it('binds managed turn origin to the daemon-frozen sender kind for that exact turn', () => {
+    const ds = makeDs();
+    ds.session.turnReplyContexts = {
+      'turn-human': {
+        target: { mode: 'thread', rootMessageId: 'om_root' },
+        replyTargetSenderIsBot: false,
+      },
+    };
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'human-capability',
+      turnId: 'turn-human',
+    } satisfies Extract<WorkerToDaemon, { type: 'managed_turn_origin' }>);
+
+    expect(ds.managedTurnOrigin).toEqual({
+      capability: 'human-capability',
+      turnId: 'turn-human',
+      senderKind: 'human',
+    });
+  });
+
   it('ignores stale-worker CLI exit authority changes after replacement', async () => {
     const ds = makeDs();
     const oldWorker = ds.worker as any;

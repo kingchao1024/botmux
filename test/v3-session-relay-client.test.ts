@@ -191,6 +191,21 @@ describe('postWorkflowSessionRunMutation', () => {
     });
   });
 
+  it('posts a bounded grill mutation through the same session capability route', async () => {
+    const fetchImpl = fetchOk();
+    await postWorkflowSessionRunMutation({
+      context,
+      runId: 'run-1',
+      mutation: 'spec-finalize',
+      fetchImpl,
+    });
+    const [url, init] = fetchImpl.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(url).toBe('http://127.0.0.1:4310/api/v3/session-runs/run-1/spec-finalize');
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      sessionId: 'sess-1', originCapability: CAPABILITY, originTurnId: 'turn-7',
+    });
+  });
+
   it('omits absent turn fields and encodes the runId', async () => {
     const fetchImpl = fetchOk();
     await postWorkflowSessionRunMutation({

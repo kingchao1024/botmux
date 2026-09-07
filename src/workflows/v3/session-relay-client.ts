@@ -17,7 +17,8 @@ import {
   readManagedOriginCapability,
 } from '../../core/managed-origin-capability.js';
 import { findAncestorSessionContext } from '../../core/session-marker.js';
-import type { WorkflowDaemonMutation, WorkflowDaemonMutationResponse } from './daemon-ipc-client.js';
+import type { WorkflowDaemonMutationResponse } from './daemon-ipc-client.js';
+import type { V3SessionRunMutation } from './session-relay.js';
 import { WorkflowDaemonMutationTransportError } from './daemon-ipc-client.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from './session-relay.js';
 import { loopbackFetchImpl } from '../../core/loopback-fetch.js';
@@ -94,7 +95,7 @@ export function readWorkflowSessionRelayContext(options: {
 export async function postWorkflowSessionRunMutation(input: {
   context: WorkflowSessionRelayContext;
   runId: string;
-  mutation: WorkflowDaemonMutation;
+  mutation: V3SessionRunMutation;
   body?: Record<string, unknown>;
   /** Resolve the owning daemon's ipcPort from discovery (host-visible only). */
   resolveIpcPort?: (larkAppId: string | undefined) => number | undefined;
