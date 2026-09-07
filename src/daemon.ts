@@ -373,6 +373,7 @@ import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js'
 import {
   parseWorkflowGrillTrigger,
   buildWorkflowGrillPrompt,
+  birthWorkflowGrillRun,
   isLegacyTemplateCommand,
   LEGACY_TEMPLATE_RETIRED_MESSAGE,
   WORKFLOW_USAGE,
@@ -18202,6 +18203,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // untrusted context.
   const codexAppVisibleText = content;
   let workflowGrillPrompt: string | undefined;
+  let workflowOwnerOpenId: string | undefined;
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
     if (!isWorkflowFeatureEnabled()) {
@@ -18215,6 +18217,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       await sessionReply(anchor, WORKFLOW_USAGE, 'text', larkAppId);
       return;
     }
+    if (!senderOpenId) {
+      await sessionReply(anchor, 'workflow run 创建失败：sender identity unavailable', 'text', larkAppId);
+      return;
+    }
+    workflowOwnerOpenId = senderOpenId;
     workflowGrillPrompt = buildWorkflowGrillPrompt(newTopicGrill.goal);
     content = workflowGrillPrompt;
     // 保留原 cmdContent（"/workflow new …"）供 title/日志；/workflow 非注册命令，
@@ -18497,8 +18504,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     : '';
   // 话题 hint 同样前置到 codex-app 结构化 sidecar lane（与 quote hint 一致双 lane
   // 下发），否则 codex-app（clean input）bot 走 sidecar 时会静默丢掉该 hint。
-  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
-  const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
+  let codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
+  let promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
@@ -18738,6 +18745,43 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     return;
   }
+  const prepareNewTopicWorkflowRun = async (): Promise<boolean> => {
+    if (newTopicGrill?.kind !== 'goal') return true;
+    if (!workflowOwnerOpenId) {
+      activeSessions.delete(registration.key);
+      sessionStore.closeSession(ds.session.sessionId);
+      return false;
+    }
+    try {
+      const run = birthWorkflowGrillRun({
+        goal: newTopicGrill.goal, larkAppId, chatId, chatType,
+        ...(scope === 'thread' ? { rootMessageId: anchor } : {}),
+        sessionId: ds.session.sessionId, ownerOpenId: workflowOwnerOpenId, messageId: parsed.messageId,
+        isSessionClosed: sessionId => {
+          const owned = sessionStore.getOwnedSession(sessionId);
+          if (!owned || owned.larkAppId !== larkAppId) return false;
+          try {
+            const fresh = sessionStore.getSessionFresh(sessionId);
+            return fresh?.larkAppId === larkAppId && fresh.status === 'closed';
+          } catch {
+            return false;
+          }
+        },
+      });
+      workflowGrillPrompt = buildWorkflowGrillPrompt(newTopicGrill.goal, run);
+      content = workflowGrillPrompt;
+      codexAppMessageContext = topicThreadContext + codexAppQuoteContext + workflowGrillPrompt;
+      promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + workflowGrillPrompt;
+      ds.pendingPrompt = promptContent;
+      ds.pendingCodexAppMessageContext = codexAppMessageContext;
+      return true;
+    } catch (error) {
+      activeSessions.delete(registration.key);
+      sessionStore.closeSession(ds.session.sessionId);
+      await sessionReply(anchor, `workflow run 创建失败：${error instanceof Error ? error.message : String(error)}`, 'text', larkAppId);
+      return false;
+    }
+  };
   if (ds.pendingRepo) {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
@@ -18759,6 +18803,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // messages buffered during creation). detach → return immediately.
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (!await prepareNewTopicWorkflowRun()) return;
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
@@ -18769,6 +18814,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (!await prepareNewTopicWorkflowRun()) return;
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
       ds,
@@ -18794,6 +18840,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Show repo selection card
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+  if (!await prepareNewTopicWorkflowRun()) return;
   let projects = prefetchedRepoProjects ?? [];
   if (!prefetchedRepoProjects) {
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
@@ -19677,6 +19724,7 @@ async function handleThreadReplyAdmitted(
   // 转发逻辑，让现有/新建的 agent 接管。v3 Workflow 动词已在上方处理，
   // `/template` 只保留退役提示。
   const threadGrill = parseWorkflowGrillTrigger(cmdContent);
+  let pendingThreadWorkflowGoal: string | undefined;
   if (threadGrill) {
     if (!isWorkflowFeatureEnabled()) {
       await sessionReply(anchor, WORKFLOW_DISABLED_MESSAGE, 'text', larkAppId);
@@ -19689,6 +19737,7 @@ async function handleThreadReplyAdmitted(
       await sessionReply(anchor, WORKFLOW_USAGE, 'text', larkAppId);
       return;
     }
+    pendingThreadWorkflowGoal = threadGrill.goal;
     const workflowPrompt = buildWorkflowGrillPrompt(threadGrill.goal);
     // Legacy/non-clean paths still need daemon-owned VC lifecycle context.
     // For clean Codex App, keep that trusted context in the application lane
@@ -20044,7 +20093,7 @@ async function handleThreadReplyAdmitted(
   // keep the Lark-authored bytes visible and move the rewritten instruction
   // into hidden untrusted context. Simple quote/bot prefixes use only the
   // prefix as context, avoiding a duplicate copy of the user text.
-  const codexAppMessageContext = rewrittenCodexAppMessageContext
+  let codexAppMessageContext = rewrittenCodexAppMessageContext
     ?? initialCodexAppMessageContext;
   const codexAppApplicationContext = initialCodexAppApplicationContext;
 
@@ -20102,6 +20151,35 @@ async function handleThreadReplyAdmitted(
       ds.session.lastCallerOpenId = callerOpenId;
     }
     sessionStore.updateSession(ds.session);
+    if (pendingThreadWorkflowGoal) {
+      if (!threadSenderOpenId) {
+        await sessionReply(anchor, 'workflow run 创建失败：sender identity unavailable', 'text', larkAppId);
+        return;
+      }
+      try {
+        const run = birthWorkflowGrillRun({
+          goal: pendingThreadWorkflowGoal, larkAppId, chatId: ds.chatId, chatType: ds.chatType,
+          ...(ds.scope === 'thread' ? { rootMessageId: anchor } : {}),
+          sessionId: ds.session.sessionId, ownerOpenId: threadSenderOpenId, messageId: parsed.messageId,
+          isSessionClosed: sessionId => {
+            const owned = sessionStore.getOwnedSession(sessionId);
+            if (!owned || owned.larkAppId !== larkAppId) return false;
+            try {
+              const fresh = sessionStore.getSessionFresh(sessionId);
+              return fresh?.larkAppId === larkAppId && fresh.status === 'closed';
+            } catch {
+              return false;
+            }
+          },
+        });
+        const workflowPrompt = buildWorkflowGrillPrompt(pendingThreadWorkflowGoal, run);
+        promptContent = initialCodexAppMessageContext + initialCodexAppApplicationContext + workflowPrompt;
+        codexAppMessageContext = initialCodexAppMessageContext + workflowPrompt;
+      } catch (error) {
+        await sessionReply(anchor, `workflow run 创建失败：${error instanceof Error ? error.message : String(error)}`, 'text', larkAppId);
+        return;
+      }
+    }
   }
 
   // The first owner may have failed while this handler was awaiting resource
@@ -20558,6 +20636,43 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
+    const prepareAutoCreatedWorkflowRun = async (): Promise<boolean> => {
+      if (!pendingThreadWorkflowGoal) return true;
+      if (!senderOId) {
+        activeSessions.delete(registration.key);
+        sessionStore.closeSession(newDs.session.sessionId);
+        await sessionReply(anchor, 'workflow run 创建失败：sender identity unavailable', 'text', larkAppId);
+        return false;
+      }
+      try {
+        const run = birthWorkflowGrillRun({
+          goal: pendingThreadWorkflowGoal, larkAppId, chatId: autoCreateChatId, chatType: autoCreateChatType,
+          ...(scope === 'thread' ? { rootMessageId: anchor } : {}),
+          sessionId: newDs.session.sessionId, ownerOpenId: senderOId,
+          messageId: parsed.messageId,
+          isSessionClosed: sessionId => {
+            const owned = sessionStore.getOwnedSession(sessionId);
+            if (!owned || owned.larkAppId !== larkAppId) return false;
+            try {
+              const fresh = sessionStore.getSessionFresh(sessionId);
+              return fresh?.larkAppId === larkAppId && fresh.status === 'closed';
+            } catch {
+              return false;
+            }
+          },
+        });
+        const workflowPrompt = buildWorkflowGrillPrompt(pendingThreadWorkflowGoal, run);
+        promptContent = initialCodexAppMessageContext + initialCodexAppApplicationContext + workflowPrompt;
+        newDs.pendingPrompt = promptContent;
+        newDs.pendingCodexAppMessageContext = initialCodexAppMessageContext + workflowPrompt;
+        return true;
+      } catch (error) {
+        activeSessions.delete(registration.key);
+        sessionStore.closeSession(newDs.session.sessionId);
+        await sessionReply(anchor, `workflow run 创建失败：${error instanceof Error ? error.message : String(error)}`, 'text', larkAppId);
+        return false;
+      }
+    };
     if (newDs.pendingRepo) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',
@@ -20575,6 +20690,7 @@ async function handleThreadReplyAdmitted(
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      if (!await prepareAutoCreatedWorkflowRun()) return;
       markIngressAdmitted(ctx);
       newDs.initialStartPending = false; // pendingRepo/worktree now owns buffering
       startAutoWorktreePending(newDs, { anchor, baseDir: pinnedWorkingDir, title: parsed.content.substring(0, 50), prompt: promptContent, operatorOpenId: ownerOpenId });
@@ -20585,6 +20701,7 @@ async function handleThreadReplyAdmitted(
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      if (!await prepareAutoCreatedWorkflowRun()) return;
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -20602,6 +20719,7 @@ async function handleThreadReplyAdmitted(
 
     // Show repo selection card (same as handleNewTopic)
     if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+    if (!await prepareAutoCreatedWorkflowRun()) return;
     const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
     let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
     if (scanDirs2.length > 0) {
