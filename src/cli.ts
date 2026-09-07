@@ -201,11 +201,11 @@ import {
   postWorkflowSessionRunMutation,
   readWorkflowSessionRelayContext,
 } from './workflows/v3/session-relay-client.js';
+import type { V3SessionRunMutation } from './workflows/v3/session-relay.js';
 import {
   isV3SessionRunAuthoringMutation,
   type V3SessionRunAuthoringMutation,
-  type V3SessionRunMutation,
-} from './workflows/v3/session-relay.js';
+} from './workflows/v3/authoring-authority.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';

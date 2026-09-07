@@ -9,6 +9,10 @@ import {
 const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 const dashboardSource = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 const sessionRelaySource = readFileSync(new URL('../src/workflows/v3/session-relay.ts', import.meta.url), 'utf8');
+const authoringAuthoritySource = readFileSync(
+  new URL('../src/workflows/v3/authoring-authority.ts', import.meta.url),
+  'utf8',
+);
 
 function sourceBetween(source: string, begin: string, end: string): string {
   const start = source.indexOf(begin);
@@ -37,9 +41,9 @@ describe('Workflow v3 daemon IPC wiring', () => {
 
   it('keeps grill relay verbs session-scoped and excludes run birth', () => {
     for (const mutation of ['spec-finalize', 'approve-spec', 'architect', 'approve-dag']) {
-      expect(sessionRelaySource).toContain(`'${mutation}'`);
+      expect(authoringAuthoritySource).toContain(`'${mutation}'`);
     }
-    expect(sessionRelaySource).toContain("'spec-finalize', 'approve-spec', 'architect', 'approve-dag'");
+    expect(authoringAuthoritySource).toContain("'spec-finalize', 'approve-spec', 'architect', 'approve-dag'");
     expect(daemonSource).not.toContain("sessionRelayMutation === 'new'");
   });
 

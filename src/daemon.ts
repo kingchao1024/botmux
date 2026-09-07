@@ -427,10 +427,10 @@ import { botToSnapshot } from './workflows/v3/bot-resolve.js';
 import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js';
 import {
   authorizeV3SessionRunMutationRequest,
-  isV3SessionRunAuthoringMutation,
   V3_SESSION_RUN_MUTATIONS,
   V3_SESSION_RUN_MUTATION_ROUTE_PREFIX,
 } from './workflows/v3/session-relay.js';
+import { isV3SessionRunAuthoringMutation } from './workflows/v3/authoring-authority.js';
 import { defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.js';
 import { readRunEnvelope } from './workflows/v3/run-envelope.js';
 import {
@@ -17567,7 +17567,7 @@ function deliverPassthroughToExistingSession(
     messageId: string;
     replyRootId?: string;
     senderOpenId?: string;
-    senderIsBot: boolean;
+    senderIsBot?: boolean;
     substitute: boolean;
     /** The inbound message carried a Lark thread_id (see
      *  FrozenSessionReplyContext.inThread). */
@@ -19919,7 +19919,7 @@ async function handleThreadReplyAdmitted(
           messageId: parsed.messageId,
           replyRootId,
           senderOpenId: threadSenderOpenId,
-          senderIsBot: isForeignBot,
+          senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot),
           substitute: !!substituteTrigger,
           inThread: !!parsed.threadId,
           onDelivered: () => markIngressAdmitted(ctx),

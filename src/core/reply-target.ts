@@ -276,6 +276,9 @@ export function beginReplyTargetTurn(
     quoteOnly: opts?.quoteOnly,
   });
   const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
+  const frozenSenderKind = opts && Object.prototype.hasOwnProperty.call(opts, 'senderIsBot')
+    ? opts.senderIsBot
+    : ds.session.quoteTargetSenderIsBot;
   // Re-insertion keeps the newest turn at the end for deterministic bounding.
   delete exactContexts[turnId];
   exactContexts[turnId] = {
@@ -284,11 +287,9 @@ export function beginReplyTargetTurn(
     ...(ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
       : {}),
-    ...(Object.prototype.hasOwnProperty.call(opts ?? {}, 'senderIsBot')
-      ? (opts?.senderIsBot !== undefined ? { replyTargetSenderIsBot: opts.senderIsBot } : {})
-      : ds.session.quoteTargetSenderIsBot !== undefined
-        ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
-        : {}),
+    ...(frozenSenderKind !== undefined
+      ? { replyTargetSenderIsBot: frozenSenderKind }
+      : {}),
     // Chat-scope only: distinguishes "answered flat AT TOP LEVEL" from
     // "answered flat but the inbound was already inside a topic" (a native
     // topic seed). Thread-scope turns route off session.rootMessageId and

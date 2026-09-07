@@ -24,6 +24,11 @@ import {
 import { isValidRunId } from './ops-projection.js';
 import { readGrillState } from './grill-state.js';
 import {
+  isHumanWorkflowAuthoringActor,
+  isV3SessionRunAuthoringMutation,
+  V3_SESSION_RUN_AUTHORING_MUTATIONS,
+} from './authoring-authority.js';
+import {
   authorizeScheduledTurn,
   parseScheduledTurnId,
   scheduledTurnAuthErrorMessage,
@@ -31,21 +36,11 @@ import {
 
 export const V3_SESSION_RUN_MUTATION_ROUTE_PREFIX = '/api/v3/session-runs';
 
-export const V3_SESSION_RUN_AUTHORING_MUTATIONS = [
-  'spec-finalize', 'approve-spec', 'architect', 'approve-dag',
-] as const;
 export const V3_SESSION_RUN_MUTATIONS = [
   'start', 'cancel', 'retry', 'grant',
   ...V3_SESSION_RUN_AUTHORING_MUTATIONS,
 ] as const;
 export type V3SessionRunMutation = typeof V3_SESSION_RUN_MUTATIONS[number];
-export type V3SessionRunAuthoringMutation = typeof V3_SESSION_RUN_AUTHORING_MUTATIONS[number];
-export function isV3SessionRunAuthoringMutation(
-  value: string,
-): value is V3SessionRunAuthoringMutation {
-  return (V3_SESSION_RUN_AUTHORING_MUTATIONS as readonly string[]).includes(value);
-}
-
 export function isV3SessionRunMutation(value: string): value is V3SessionRunMutation {
   return (V3_SESSION_RUN_MUTATIONS as readonly string[]).includes(value);
 }
@@ -180,7 +175,9 @@ export function authorizeV3SessionRunMutationRequest(input: {
 
   const liveTurnId = current.liveOrigin?.turnId;
   const authoring = isV3SessionRunAuthoringMutation(input.mutation);
-  if (authoring && current.senderKind !== 'human') {
+  const scheduledTurn = !!liveTurnId && !!parseScheduledTurnId(liveTurnId);
+  const actorKind = scheduledTurn ? 'scheduled' : (current.senderKind ?? 'unknown');
+  if (authoring && !isHumanWorkflowAuthoringActor(actorKind)) {
     return { ok: false, status: 403, error: 'workflow_authoring_requires_human_turn' };
   }
 
@@ -193,10 +190,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // scheduled-turn-provenance). The tuple's callerOpenId is the task's
   // creator, never anything the request chooses.
   let callerOpenId: string;
-  if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
-    if (authoring) {
-      return { ok: false, status: 403, error: 'workflow_authoring_requires_human_turn' };
-    }
+  if (scheduledTurn) {
     if (!input.sessionDataDir) {
       return {
         ok: false, status: 403, error: 'schedule_turn_unauthorized',

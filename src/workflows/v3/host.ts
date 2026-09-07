@@ -55,6 +55,12 @@ import {
   type V3AdHocRunEnvelope,
 } from './run-envelope.js';
 import { V3_SUPPORTED_CLIS, isV3SupportedCli, type BotSnapshot } from './contract.js';
+import {
+  isHumanWorkflowAuthoringActor,
+  type WorkflowAuthoringActorKind,
+} from './authoring-authority.js';
+
+type WorkflowHostCaller = RunChatBinding & { actorKind?: WorkflowAuthoringActorKind };
 
 // ─── Core operations (dep-injected, pure of CLI / process concerns) ─────────
 
@@ -81,7 +87,7 @@ export function hostNew(opts: {
 export function chatBindingFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   startPid: number = process.ppid,
-): RunChatBinding | undefined {
+): WorkflowHostCaller | undefined {
   if (env.SESSION_DATA_DIR) {
     const provenance = resolveCurrentTurnProvenance({
       dataDir: env.SESSION_DATA_DIR,
@@ -96,6 +102,7 @@ export function chatBindingFromEnv(
         ...(provenance.rootMessageId ? { rootMessageId: provenance.rootMessageId } : {}),
         sessionId: provenance.sessionId,
         ownerOpenId: provenance.callerOpenId,
+        actorKind: provenance.actorKind,
       };
     }
   } else if (env.BOTMUX_SESSION_ID) {
@@ -132,7 +139,7 @@ export function chatBindingFromEnv(
  */
 export function assertWorkflowHostCaller(
   runDir: string,
-  current: RunChatBinding | undefined,
+  current: WorkflowHostCaller | undefined,
 ): void {
   const state = mustRead(runDir);
   const target = state.chatBinding;
@@ -156,13 +163,17 @@ export function assertWorkflowHostCaller(
   if (!current?.ownerOpenId) {
     throw new HostGuardError(`run ${state.runId} 绑定了 chat caller，当前命令缺少本轮调用者认证`);
   }
+  if (!isHumanWorkflowAuthoringActor(current.actorKind ?? 'unknown')) {
+    throw new HostGuardError(`run ${state.runId} 的 authoring 仅允许当前真人消息触发`);
+  }
   if (
     current.ownerOpenId !== target.ownerOpenId
     || current.larkAppId !== target.larkAppId
     || current.chatId !== target.chatId
+    || current.sessionId !== target.sessionId
   ) {
     throw new HostGuardError(
-      `当前 caller/chat/bot 与 run ${state.runId} 的 grill.chatBinding 不匹配`,
+      `当前 caller/chat/bot/session 与 run ${state.runId} 的 grill.chatBinding 不匹配`,
     );
   }
 }
@@ -616,7 +627,7 @@ function runDirFor(runId: string, baseDir: string): string {
 export interface WorkflowHostCommandDeps {
   loadBots?: () => BotConfig[];
   /** Test/dev seam; production resolves fresh current-turn provenance. */
-  resolveChatBinding?: () => RunChatBinding | undefined;
+  resolveChatBinding?: () => WorkflowHostCaller | undefined;
 }
 
 export async function cmdWorkflowHost(
@@ -639,7 +650,19 @@ export async function cmdWorkflowHost(
       // grill 经 daemon worker 出生时，env 带话题上下文 → 落 chatBinding，供后续
       // daemon humanGate 发审批卡用（CLI/dev 出生无 env → undefined，不影响）。
       const chatBinding = (deps.resolveChatBinding ?? chatBindingFromEnv)();
-      const { runId, runDir, state } = hostNew({ goal, baseDir, chatBinding });
+      if (chatBinding?.ownerOpenId
+        && !isHumanWorkflowAuthoringActor(chatBinding.actorKind ?? 'unknown')) {
+        throw new HostGuardError('workflow authoring 仅允许当前真人消息触发');
+      }
+      const persistedBinding = chatBinding ? {
+        larkAppId: chatBinding.larkAppId,
+        chatId: chatBinding.chatId,
+        ...(chatBinding.chatType ? { chatType: chatBinding.chatType } : {}),
+        ...(chatBinding.rootMessageId ? { rootMessageId: chatBinding.rootMessageId } : {}),
+        ...(chatBinding.sessionId ? { sessionId: chatBinding.sessionId } : {}),
+        ...(chatBinding.ownerOpenId ? { ownerOpenId: chatBinding.ownerOpenId } : {}),
+      } : undefined;
+      const { runId, runDir, state } = hostNew({ goal, baseDir, chatBinding: persistedBinding });
       console.log(JSON.stringify({
         runId, runDir, status: state.status, specPath: state.specPath,
         chatBound: !!chatBinding,
