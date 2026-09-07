@@ -19,6 +19,12 @@ import { isLocalDevInstallAt, botmuxVersionAt, botmuxInstallRoot } from './insta
 import { detectGlobalInstallManager } from './global-install.js';
 import { parseVersion } from '../core/update-check.js';
 
+type GitDescribe = (
+  file: string,
+  args: string[],
+  options: { cwd: string; encoding: BufferEncoding; timeout: number; stdio: ['ignore', 'pipe', 'ignore'] },
+) => string;
+
 /** Minimum Node major (mirrors package.json `engines.node`). */
 export const MIN_NODE_MAJOR = 22;
 
@@ -71,6 +77,29 @@ export function resolveCurrentVersionAt(rootDir: string): string {
 /** The version to show for the running install (its own package root). */
 export function resolveCurrentVersion(): string {
   return resolveCurrentVersionAt(botmuxInstallRoot());
+}
+
+/** Source checkout identifier for display; update comparisons keep using the release baseline. */
+export function resolveCurrentVersionLabelAt(
+  rootDir: string,
+  execFile: GitDescribe = execFileSync as unknown as GitDescribe,
+): string {
+  const raw = botmuxVersionAt(rootDir);
+  if (raw !== '0.0.0') return raw;
+  try {
+    return execFile('git', ['describe', '--tags', '--always', '--long', '--dirty'], {
+      cwd: rootDir,
+      encoding: 'utf-8',
+      timeout: 3_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim().replace(/^v/i, '') || raw;
+  } catch {
+    return raw;
+  }
+}
+
+export function resolveCurrentVersionLabel(): string {
+  return resolveCurrentVersionLabelAt(botmuxInstallRoot());
 }
 
 export type InstallKind =

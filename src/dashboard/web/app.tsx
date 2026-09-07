@@ -56,6 +56,7 @@ type TopbarStatusSummary = {
 };
 type BotmuxUpdateStatus = {
   current: string;
+  currentLabel?: string;
   latest: string | null;
   versionLookupOk: boolean;
   behind: boolean;
@@ -781,7 +782,7 @@ function TopbarVersionControl(props: {
   const RING_C = 2 * Math.PI * RING_R;
   const ringDashoffset = RING_C * (1 - Math.max(2, Math.round(progress)) / 100);
   const command = status.updateCommand ?? 'botmux update';
-  const currentVersion = `v${status.current}`;
+  const currentVersion = `v${status.currentLabel ?? status.current}`;
   const latestVersion = status.latest ? `v${status.latest}` : '';
   const unavailableReason = status.localDevInstall
     ? t('update.localDev')

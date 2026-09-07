@@ -179,7 +179,7 @@ import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
-import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
+import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt, resolveCurrentVersionLabel, resolveCurrentVersionLabelAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
   fetchReleasesSince,
@@ -1831,6 +1831,13 @@ function currentInstalledVersion(): string {
   if (!lastSuccessfulUpdatePlan) return resolveCurrentVersion();
   const version = botmuxVersionAt(lastSuccessfulUpdatePlan.activePackageRoot);
   return version === '0.0.0' ? resolveCurrentVersion() : version;
+}
+
+function currentInstalledVersionLabel(): string {
+  if (!lastSuccessfulUpdatePlan) return resolveCurrentVersionLabel();
+  const root = lastSuccessfulUpdatePlan.activePackageRoot;
+  const version = botmuxVersionAt(root);
+  return version === '0.0.0' ? resolveCurrentVersionLabelAt(root) : version;
 }
 
 /**
@@ -4339,6 +4346,7 @@ const server = createServer(async (req, res) => {
     // `authed` guards on the two mutations are defense-in-depth for host actions.
     if (req.method === 'GET' && url.pathname === '/api/update/status') {
       const current = currentInstalledVersion();
+      const currentLabel = currentInstalledVersionLabel();
       // Display/classification only — deliberately NOT a plan root. It feeds
       // `currentUpdateStrategy` (which handles the compiled binary's "/" correctly)
       // and the manager label shown when nothing else resolves. Named distinctly from
@@ -4393,6 +4401,7 @@ const server = createServer(async (req, res) => {
       const localDev = isLocalDevInstall();
       return jsonRes(res, 200, {
         current,
+        currentLabel,
         latest,
         versionLookupOk: latestResult.lookupOk,
         behind: !!latest && isNewerVersion(latest, current),

@@ -110,6 +110,7 @@ interface CliRuntimeUpdateStatus {
 }
 interface UpdateStatus {
   current: string;
+  currentLabel?: string;
   latest: string | null;
   behind: boolean;
   cliBehind: boolean;
@@ -1825,7 +1826,7 @@ function UpdateCard(props: {
     inner = (
       <>
         <p className="update-version">
-          <span>{tr('update.current')}: <strong>v{s.current}</strong></span>{' '}
+          <span>{tr('update.current')}: <strong>v{s.currentLabel ?? s.current}</strong></span>{' '}
           <UpdateBadge status={s} />
         </p>
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}

@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { checkNode, analyzeInstalls, type InstallProbeDeps } from '../src/utils/install-diagnostics.js';
+import { describe, expect, it, vi } from 'vitest';
+import { checkNode, analyzeInstalls, resolveCurrentVersionLabelAt, type InstallProbeDeps } from '../src/utils/install-diagnostics.js';
 
 describe('checkNode', () => {
   it('ok at/above the required major', () => {
@@ -9,6 +9,13 @@ describe('checkNode', () => {
   it('not ok below the required major', () => {
     expect(checkNode('v20.11.0', 22).ok).toBe(false);
     expect(checkNode('garbage', 22)).toEqual({ version: 'garbage', major: 0, required: 22, ok: false });
+  });
+});
+
+describe('resolveCurrentVersionLabelAt', () => {
+  it('shows the release base with branch revision and dirty state', () => {
+    const execFile = vi.fn(() => 'v3.19.3-8-gbe577a01-dirty\n');
+    expect(resolveCurrentVersionLabelAt('/tmp/botmux-source', execFile)).toBe('3.19.3-8-gbe577a01-dirty');
   });
 });
 
