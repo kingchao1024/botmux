@@ -42,6 +42,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // （25→reasonix、26→opencode2、27→dsh）。
   '28': 'mojo',
   '29': 'ebsd',
+  '30': 'mimocode',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -61,6 +62,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
+  'mimocode': 'MiMoCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',

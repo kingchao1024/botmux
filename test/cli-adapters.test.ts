@@ -35,6 +35,7 @@ import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
@@ -113,7 +114,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'mimocode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -329,6 +330,38 @@ describe('claude-code buildArgs', () => {
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('sonnet');
     expect(adapter.modelChoices).toContain('opus');
+  });
+});
+
+describe('mimocode adapter', () => {
+  const adapter = createMiMoCodeAdapter('/usr/bin/mimo');
+
+  it('uses the MiMoCode executable and isolated state roots', () => {
+    expect(adapter.id).toBe('mimocode');
+    expect(adapter.resolvedBin).toBe('/usr/bin/mimo');
+    expect(adapter.authPaths).toEqual([
+      '~/.config/mimocode',
+      '~/.local/share/mimocode',
+      '~/.local/state/mimocode',
+      '~/.cache/mimocode',
+    ]);
+    expect(adapter.skillsDir).toBe('~/.config/mimocode/skills');
+  });
+
+  it('reuses the OpenCode-compatible prompt and model argument shape', () => {
+    expect(adapter.buildArgs({
+      sessionId: 'ses_test',
+      resume: false,
+      initialPrompt: 'hello MiMoCode',
+      model: 'xiaomi/mimo-v2.5-pro',
+    })).toEqual([
+      '--model', 'xiaomi/mimo-v2.5-pro',
+      '--prompt', 'hello MiMoCode',
+    ]);
+    expect(adapter.buildResumeCommand?.({
+      sessionId: 'botmux-session',
+      cliSessionId: 'ses_native',
+    })).toBe('mimo -s ses_native');
   });
 });
 
