@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { promisify } from 'node:util';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -21,6 +23,15 @@ import { delay } from '../../utils/timing.js';
 
 const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z-]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
+const MODEL_ID_RE = /^[^\s/]+(?:\/[^\s]+)+$/;
+
+function parseModelList(stdout: string): string[] {
+  return [...new Set(stdout
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+—.*$/, '').trim())
+    .filter((line) => MODEL_ID_RE.test(line)))];
+}
 
 /** 判断是否 OpenCode 原生会话 id（`ses_…`）。opencode2 复用同一套 id 规则。 */
 export function isOpenCodeSessionId(value: string | undefined): value is string {
@@ -320,6 +331,7 @@ export interface OpenCodeLikeAdapterOptions {
   skillsDir: string;
   hookConfigPath: string;
   modelChoices: readonly string[];
+  modelListArgs: readonly string[];
 }
 
 export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runtime: OpenCodeLikeAdapterOptions): CliAdapter {
@@ -469,6 +481,20 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
       format: 'opencode-plugin',
     },
     asksViaHook: true,
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, runtime.modelListArgs, {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseModelList(String(stdout));
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
     modelChoices: [...runtime.modelChoices],
@@ -483,6 +509,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     dbPath: opencodeDbPath,
     skillsDir: '~/.config/opencode/skills',
     hookConfigPath: '~/.config/opencode/plugin/botmux-ask.js',
+    modelListArgs: ['models'],
     modelChoices: [
       'anthropic/claude-sonnet-4',
       'anthropic/claude-opus-4',
