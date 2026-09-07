@@ -34,7 +34,7 @@ import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
-import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
@@ -362,6 +362,42 @@ describe('mimocode adapter', () => {
       sessionId: 'botmux-session',
       cliSessionId: 'ses_native',
     })).toBe('mimo -s ses_native');
+  });
+
+  it('accepts MiMoCode native session ids and follows XDG roots', () => {
+    expect(isOpenCodeSessionId('ses_-ffe5f83a176a5ffexg2lnkhTF')).toBe(true);
+
+    const previous = {
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+    };
+    const root = mkdtempSync(join(tmpdir(), 'mimocode-xdg-'));
+    try {
+      process.env.XDG_CONFIG_HOME = join(root, 'config');
+      process.env.XDG_DATA_HOME = join(root, 'data');
+      process.env.XDG_STATE_HOME = join(root, 'state');
+      process.env.XDG_CACHE_HOME = join(root, 'cache');
+      const configured = createMiMoCodeAdapter('/usr/bin/mimo');
+      expect(configured.authPaths).toEqual([
+        join(root, 'config', 'mimocode'),
+        join(root, 'data', 'mimocode'),
+        join(root, 'state', 'mimocode'),
+        join(root, 'cache', 'mimocode'),
+      ]);
+      expect(configured.skillsDir).toBe(join(root, 'config', 'mimocode', 'skills'));
+      expect(configured.hookInstall?.configPath).toBe(join(root, 'config', 'mimocode', 'plugin', 'botmux-ask.js'));
+      expect(configured.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'ses_-ffe5f83a176a5ffexg2lnkhTF' })).toEqual([
+        '--session', 'ses_-ffe5f83a176a5ffexg2lnkhTF',
+      ]);
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

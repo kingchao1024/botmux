@@ -19,7 +19,7 @@ import { delay } from '../../utils/timing.js';
  *   - 兜底：botmux 每条 prompt 都嵌 `<session_id>` 块，直接在 part 表按文本反查。
  */
 
-const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z]+$/;
+const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z-]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
 
 /** 判断是否 OpenCode 原生会话 id（`ses_…`）。opencode2 复用同一套 id 规则。 */
