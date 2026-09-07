@@ -144,6 +144,23 @@ describe('v3 ops-projection — projectRunById 安全 + listRuns', () => {
       buildRun(base, 'b-260602-0900');
       birthRun({ goal: 'draft', baseDir: base, runId: 'c-260602-1000' });
       mkdirSync(join(base, 'no-state-260602-0000'), { recursive: true });
+      for (const [runId, invalid] of [
+        ['partial-260602-0001', { runId: 'partial-260602-0001', status: 'grilling' }],
+        ['bad-status-260602-0002', {
+          schemaVersion: 1, runId: 'bad-status-260602-0002', goal: 'bad', status: 'bogus',
+          createdAt: '2026-09-07T00:00:00.000Z', updatedAt: '2026-09-07T00:00:00.000Z',
+          specPath: '/tmp/spec.md', specJsonPath: '/tmp/spec.json',
+        }],
+        ['bad-schema-260602-0003', {
+          schemaVersion: 2, runId: 'bad-schema-260602-0003', goal: 'bad', status: 'grilling',
+          createdAt: '2026-09-07T00:00:00.000Z', updatedAt: '2026-09-07T00:00:00.000Z',
+          specPath: '/tmp/spec.md', specJsonPath: '/tmp/spec.json',
+        }],
+      ] as const) {
+        const dir = join(base, runId);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'grill.state.json'), JSON.stringify(invalid));
+      }
       const runs = listRuns(base);
       expect(runs.map((r) => r.runId)).toEqual([
         'c-260602-1000', 'b-260602-0900', 'a-260602-0800',

@@ -17,7 +17,12 @@ import { join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { readJournal } from './journal.js';
 import { materialize, type V3RunStatus } from './state.js';
-import { readGrillState, type GrillStatus } from './grill-state.js';
+import {
+  GRILL_STATE_SCHEMA_VERSION,
+  readGrillState,
+  type GrillState,
+  type GrillStatus,
+} from './grill-state.js';
 import type { V3NodeStatus } from './orchestrator.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
@@ -404,6 +409,26 @@ export interface RunSummary {
   nodeCount: number;
 }
 
+const GRILL_STATUSES: ReadonlySet<GrillStatus> = new Set([
+  'grilling',
+  'spec_ready',
+  'spec_approved',
+  'architect_running',
+  'dag_ready',
+  'dag_approved',
+]);
+
+function isListableGrillState(value: GrillState | undefined, runId: string): value is GrillState {
+  return value?.schemaVersion === GRILL_STATE_SCHEMA_VERSION
+    && value.runId === runId
+    && typeof value.goal === 'string'
+    && GRILL_STATUSES.has(value.status)
+    && typeof value.createdAt === 'string'
+    && typeof value.updatedAt === 'string'
+    && typeof value.specPath === 'string'
+    && typeof value.specJsonPath === 'string';
+}
+
 /** List runs under `runsDir` (authoring state or runtime journal), newest-first by
  *  name (runIds carry a `<slug>-<yymmdd-hhmm>` stamp so name sort ≈ time sort). */
 export function listRuns(runsDir: string): RunSummary[] {
@@ -414,7 +439,7 @@ export function listRuns(runsDir: string): RunSummary[] {
     const runDir = join(runsDir, entry.name);
     if (!existsSync(join(runDir, 'journal.ndjson'))) {
       const grill = readGrillState(runDir);
-      if (!grill || grill.runId !== entry.name) continue;
+      if (!isListableGrillState(grill, entry.name)) continue;
     }
     const view = projectRun(entry.name, runDir);
     out.push({ runId: view.runId, runStatus: view.runStatus, nodeCount: view.nodes.length });
