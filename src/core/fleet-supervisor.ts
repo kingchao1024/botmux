@@ -157,6 +157,9 @@ interface StartupAdmissionRetry {
 
 export class FleetSupervisor {
   private readonly children = new Map<string, ChildProcess>();
+  /** External callers await this exec-boundary acknowledgement so a failed
+   * plugin spawn is not reported as a successful service start. */
+  private readonly spawnReady = new WeakMap<ChildProcess, Promise<void>>();
   /** Per-name generation the live child was spawned with — guards stale exits. */
   private readonly liveGeneration = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -309,6 +312,31 @@ export class FleetSupervisor {
       undefined,
       allowRosterRevisionAdvance,
     );
+  }
+
+  /** Replace an external definition only after its prior child has stopped. */
+  async upsertExternal(spec: FleetBotSpec): Promise<void> {
+    if (!spec.external) throw new Error('fleet: external spec required');
+    const known = this.knownSpecs.get(spec.name);
+    if (known && JSON.stringify(known.external) !== JSON.stringify(spec.external)) {
+      await this.stopOneBot(spec.name);
+    }
+    this.startOneBot(spec);
+    const child = this.children.get(spec.name);
+    if (!child) throw new Error(`fleet: failed to start ${spec.name}`);
+    await this.spawnReady.get(child);
+  }
+
+  async removeExternal(name: string): Promise<void> {
+    const spec = this.knownSpecs.get(name);
+    if (spec && !spec.external) throw new Error(`fleet: not an external member: ${name}`);
+    await this.stopOneBot(name);
+    this.knownSpecs.delete(name);
+    this.liveGeneration.delete(name);
+    mutateFleetState(this.opts.statePath, current => {
+      current.procs = current.procs.filter(proc => proc.name !== name);
+      return current;
+    });
   }
 
   /** Stop ONE bot without touching the rest — the live side of `botmux stop-bot`.
@@ -620,6 +648,14 @@ export class FleetSupervisor {
       }
     }
     if (!child) return;
+    const ready = new Promise<void>((resolve, reject) => {
+      const onSpawn = (): void => { child.removeListener('error', onError); resolve(); };
+      const onError = (error: Error): void => { child.removeListener('spawn', onSpawn); reject(error); };
+      child.once('spawn', onSpawn);
+      child.once('error', onError);
+    });
+    void ready.catch(() => {});
+    this.spawnReady.set(child, ready);
     const now = new Date().toISOString();
 
     // Persist the new generation + pid atomically, bumping generation on restart.

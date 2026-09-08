@@ -772,6 +772,23 @@ process.on('SIGTERM', () => process.exit(90)); setInterval(() => {}, 1000);
     await sup.stopAll();
   });
 
+  it('upserts and removes an external member with spawn acknowledgement', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-upsert', appId: '', botIndex: -1,
+      external: { command: process.execPath, args: ['-e', "process.on('SIGTERM',()=>process.exit(0)); setInterval(()=>{},1000)"] },
+    };
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    await expect(sup.upsertExternal(svc)).resolves.toBeUndefined();
+    expect(readFleetState(statePath)?.procs).toEqual([expect.objectContaining({ name: svc.name, status: 'online' })]);
+    const pid = readFleetState(statePath)?.procs[0]?.pid;
+    killLater(pid);
+    await expect(sup.removeExternal(svc.name)).resolves.toBeUndefined();
+    expect(readFleetState(statePath)?.procs).toEqual([]);
+    await sup.stopAll();
+  });
+
   it('scrubs session-scoped env before handing it to an external member', async () => {
     // The load-bearing security spec. An external command inherits whatever we
     // give it and never scrubs itself, so these keys must be gone BEFORE exec.
