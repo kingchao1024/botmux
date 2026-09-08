@@ -789,6 +789,22 @@ process.on('SIGTERM', () => process.exit(90)); setInterval(() => {}, 1000);
     await sup.stopAll();
   });
 
+  it('refuses to replace a managed daemon with an external member', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([bots[0]]);
+    expect(await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online')).toBe(true);
+    const pid = readFleetState(statePath)?.procs[0]?.pid;
+    killLater(pid);
+    await expect(sup.upsertExternal({
+      name: bots[0].name, appId: '', botIndex: -1,
+      external: { command: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'] },
+    })).rejects.toThrow(`fleet: cannot replace managed member: ${bots[0].name}`);
+    expect(readFleetState(statePath)?.procs[0]).toEqual(expect.objectContaining({ pid, status: 'online' }));
+    await sup.stopAll();
+  });
+
   it('scrubs session-scoped env before handing it to an external member', async () => {
     // The load-bearing security spec. An external command inherits whatever we
     // give it and never scrubs itself, so these keys must be gone BEFORE exec.
@@ -885,6 +901,20 @@ process.on('SIGTERM', () => process.exit(90)); setInterval(() => {}, 1000);
     // And the restart tally really moved (not just a coincidental double spawn).
     expect(await waitFor(() => (readFleetState(statePath)?.procs[0]?.restarts ?? 0) >= 1)).toBe(true);
     killLater(readFleetState(statePath)?.procs[0]?.pid);
+    await sup.stopAll();
+  });
+
+  it('does not restart an external member with autorestart disabled', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const svc: FleetBotSpec = {
+      name: 'botmux-plugin-no-restart', appId: '', botIndex: -1,
+      external: { command: process.execPath, args: ['-e', 'process.exit(1)'], autorestart: false },
+    };
+    const sup = new FleetSupervisor({ statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, log: () => {} });
+    sup.start([svc]);
+    expect(await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'stopped')).toBe(true);
+    expect(readFleetState(statePath)?.procs[0]).toEqual(expect.objectContaining({ restarts: 0, pid: 0 }));
     await sup.stopAll();
   });
 

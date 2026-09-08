@@ -95,6 +95,10 @@ export interface FleetBotSpec {
      *  fleet-state so a later reconcile can detect "running from a stale config"
      *  and restart it. See FleetProcState.configHash. */
     configHash?: string;
+    /** Whether an external member is restarted after a natural exit. */
+    autorestart?: boolean;
+    /** Per-member SIGTERM grace period before force-stop. */
+    killTimeoutMs?: number;
   };
 }
 
@@ -318,6 +322,7 @@ export class FleetSupervisor {
   async upsertExternal(spec: FleetBotSpec): Promise<void> {
     if (!spec.external) throw new Error('fleet: external spec required');
     const known = this.knownSpecs.get(spec.name);
+    if (known && !known.external) throw new Error(`fleet: cannot replace managed member: ${spec.name}`);
     if (known && JSON.stringify(known.external) !== JSON.stringify(spec.external)) {
       await this.stopOneBot(spec.name);
     }
@@ -826,6 +831,10 @@ export class FleetSupervisor {
     }
 
     const current = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
+    if (spec.external?.autorestart === false) {
+      this.markStopped(spec.name, exit, 'stopped');
+      return;
+    }
     // An external member does not get the 90-is-graceful sentinel: it is not our
     // code and may use 90 as an ordinary failure code, in which case honouring it
     // would silently retire the service instead of restarting it (see
@@ -911,13 +920,21 @@ export class FleetSupervisor {
   }
 
   private stopOne(name: string, child: ChildProcess): Promise<void> {
-    return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    return new Promise((resolve, reject) => {
       let done = false;
-      const finish = () => { if (done) return; done = true; clearTimeout(killTimer); resolve(); };
-      const killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, this.killTimeoutMs);
+      const finish = () => { if (done) return; done = true; clearTimeout(killTimer); clearTimeout(deadline); resolve(); };
+      const timeout = this.knownSpecs.get(name)?.external?.killTimeoutMs ?? this.killTimeoutMs;
+      const killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, timeout);
       killTimer.unref?.();
+      const deadline = setTimeout(() => {
+        if (done) return;
+        done = true;
+        child.removeListener('exit', finish);
+        reject(new Error(`fleet: stop not confirmed for ${name}`));
+      }, timeout + 5_000);
       child.once('exit', finish);
-      try { child.kill('SIGTERM'); } catch { finish(); }
+      try { child.kill('SIGTERM'); } catch { /* wait for exit or deadline */ }
     });
   }
 }
