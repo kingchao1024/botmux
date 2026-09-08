@@ -1062,10 +1062,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     net: ctx.net !== false,
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    finalReadOnlyPaths: [
-      ...serviceCredentialReadOnlyPaths,
-      ...(ctx.mandatoryReadOnlyPaths ?? []),
-    ].filter(path => !isBelowAny(sealedDenyRoots, path)),
+    finalReadOnlyPaths: finalReadOnlyPaths.filter(path => !isBelowAny(sealedDenyRoots, path)),
     finalDenyPaths: sealedDenyRoots,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
