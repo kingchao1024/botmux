@@ -22,6 +22,7 @@ export function createMiMoCodeAdapter(pathOverride?: string) {
     skillsDir: `${mimocodeConfigPath()}/skills`,
     hookConfigPath: `${mimocodeConfigPath()}/plugin/botmux-ask.js`,
     modelListArgs: ['models'],
+    startupArgs: ['--trust'],
     modelChoices: [
       'xiaomi/mimo-v2.5-pro',
       'xiaomi/mimo-v2.5-pro-ultraspeed',

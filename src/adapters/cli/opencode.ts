@@ -360,6 +360,7 @@ export interface OpenCodeLikeAdapterOptions {
   hookConfigPath: string;
   modelChoices: readonly string[];
   modelListArgs: readonly string[];
+  startupArgs?: readonly string[];
 }
 
 export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runtime: OpenCodeLikeAdapterOptions): CliAdapter {
@@ -378,7 +379,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model }) {
-      const args: string[] = [];
+      const args: string[] = [...(runtime.startupArgs ?? [])];
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }

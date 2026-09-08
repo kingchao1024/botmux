@@ -355,6 +355,7 @@ describe('mimocode adapter', () => {
       initialPrompt: 'hello MiMoCode',
       model: 'xiaomi/mimo-v2.5-pro',
     })).toEqual([
+      '--trust',
       '--model', 'xiaomi/mimo-v2.5-pro',
       '--prompt', 'hello MiMoCode',
     ]);
@@ -389,6 +390,7 @@ describe('mimocode adapter', () => {
       expect(configured.skillsDir).toBe(join(root, 'config', 'mimocode', 'skills'));
       expect(configured.hookInstall?.configPath).toBe(join(root, 'config', 'mimocode', 'plugin', 'botmux-ask.js'));
       expect(configured.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'ses_-ffe5f83a176a5ffexg2lnkhTF' })).toEqual([
+        '--trust',
         '--session', 'ses_-ffe5f83a176a5ffexg2lnkhTF',
       ]);
     } finally {
