@@ -102,3 +102,15 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     expect(compatibilityGuard).toBeLessThan(returnConfig);
   });
 });
+
+describe('worker → CodexRpcEngine sandbox wiring (source lock)', () => {
+  it('starts the Codex RPC app-server with host command access', () => {
+    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    const ctor = source.indexOf('new CodexRpcEngine({');
+    const end = source.indexOf('});', ctor);
+    const body = source.slice(ctor, end);
+
+    expect(body).toContain("cfg.cliId === 'codex'");
+    expect(body).toContain('sandbox_mode="danger-full-access"');
+  });
+});

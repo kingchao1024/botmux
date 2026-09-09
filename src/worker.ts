@@ -1270,9 +1270,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
-      appServerConfig: cfg.cliId === 'traex'
-        ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
-        : undefined,
+      appServerConfig: [
+        ...(cfg.cliId === 'codex' ? ['sandbox_mode="danger-full-access"'] : []),
+        ...(cfg.cliId === 'traex' ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())] : []),
+      ],
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
