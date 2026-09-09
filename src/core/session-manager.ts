@@ -56,6 +56,7 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -92,6 +93,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
+import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -936,6 +938,45 @@ function renderRoleContextBlock(
   return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
 }
 
+export function renderProjectGroupModeBlock(
+  larkAppId: string | undefined,
+  chatId: string | undefined,
+  dataDir = config.session.dataDir,
+): string {
+  if (!larkAppId || !chatId) return '';
+  try {
+    const mode = readGroupCollaborationMode(dataDir, chatId);
+    if (mode?.mode !== 'project' || mode.coordinatorAppId !== larkAppId) return '';
+    const workers = (mode.workerAppIds ?? []).map(xmlEscape).join(',');
+    return [
+      `<project_group_mode chat_id="${xmlEscape(chatId)}" coordinator_app_id="${xmlEscape(larkAppId)}" worker_app_ids="${workers}">`,
+      'This ordinary group is the project control plane. Derive and confirm project-specific goals in the conversation; do not treat Dashboard configuration as project content.',
+      'This coordinator protocol is system-owned, chat-scoped, injected on every turn, and independent of custom &lt;role&gt; content; custom roles cannot disable project-state maintenance.',
+      'Use `botmux project init/update/status/close/resume` for the durable project state and pinned progress card.',
+      'At the start of every substantive project turn, read the durable state with `botmux project status`. If no project exists, derive or confirm a provisional title and goal, then use `botmux project init`; discussion is a valid project phase, so do not wait for a fully specified goal.',
+      'When the goal, phase, current focus, plan or remaining work, blockers, or milestones materially changes, immediately persist it with `botmux project update`; ordinary chat prose is not a substitute. `botmux dispatch` and `botmux report` synchronize workstream lifecycle automatically, so do not duplicate those fields unless the project summary also changed.',
+      'Before a substantive progress or completion reply, verify that durable state matches the reported facts. If a project state command fails, surface the failure instead of silently continuing.',
+      'Use `botmux project close/resume` for explicit lifecycle transitions; the pinned progress card is the durable projection of this state.',
+      'Dispatch bounded subtasks only to the configured worker app ids with `botmux dispatch`; every new subtask must use a specific title of at most 24 characters (never generic "子任务/子项目"). Workers execute inside their subtopics and return progress with `botmux report`.',
+      '</project_group_mode>',
+    ].join('\n');
+  } catch (error) {
+    logger.warn(`[project-mode:${chatId}] prompt context unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return '';
+  }
+}
+
+function renderApplicationRoleBlock(
+  larkAppId: string | undefined,
+  chatId: string | undefined,
+  opts?: { followUp?: boolean },
+): string {
+  return [
+    renderRoleContextBlock(larkAppId, chatId, opts),
+    renderProjectGroupModeBlock(larkAppId, chatId),
+  ].filter(Boolean).join('\n\n');
+}
+
 export function ensureSessionWhiteboard(ds: DaemonSession): void {
   if (!whiteboardEnabled()) return;
   // Whiteboard is an optional, best-effort context enhancement. A failure here
@@ -1203,7 +1244,7 @@ function buildNewTopicBlocks(
     ].join('\n');
   }
 
-  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1389,7 +1430,7 @@ export function buildNewTopicCliInput(
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
     return { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
   }
-  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1472,7 +1513,7 @@ function buildFollowUpBlocks(
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
-  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1693,7 +1734,7 @@ export function buildFollowUpCliInput(
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
     return { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
   }
-  const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
+  const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
@@ -3356,32 +3397,6 @@ export function resolveScheduledTaskExecutionPosition(
   if (task.executionPosition === 'top-level') return 'top-level';
   if (task.deliver === 'new-topic') return 'new-topic';
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
-}
-
-/**
- * Identity a scheduled turn runs as: the task's creator, as captured at
- * creation time. The turn itself is authenticated by the daemon-minted
- * `schedule:<taskId>:<uuid>` turn id (see scheduled-turn-provenance) — this
- * only decides WHICH identity that authenticated turn carries.
- *
- * Returns undefined when the task has no creator union_id (legacy tasks,
- * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
- * fail-closed story: with no identity on the turn, identity-bound tools refuse
- * to run instead of falling back to the bot's own access, while everything that
- * does not need a user identity keeps working.
- */
-function trustedCallerForScheduledTask(
-  task: ScheduledTask,
-  larkAppId: string,
-): CliTurnPayload['trustedCaller'] | undefined {
-  if (!task.ownerUnionId) return undefined;
-  return {
-    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
-    requestUserUnionId: task.ownerUnionId,
-    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
-    source: 'schedule_creator',
-    taskId: task.id,
-  };
 }
 
 async function buildScheduledTargetNotice(params: {
