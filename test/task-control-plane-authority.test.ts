@@ -58,4 +58,19 @@ describe('DaemonTaskControlAuthority', () => {
       })).toBeUndefined();
     }
   });
+
+  it('binds an opaque write grant to every execution fact and expiry', () => {
+    const authority = verifier();
+    const grant = authority.issueVerifiedWriteExecutionGrant({
+      grantRef: 'grant:write-1', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', candidate: '3928820',
+      action: 'git.commit', attempt: 2, operatorId: 'acceptor-1', issuedAt: '2026-09-05T00:00:00.000Z', expiresAt: '2026-09-05T01:00:00.000Z',
+    });
+    const exact = { grant, projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', candidate: '3928820', action: 'git.commit', attempt: 2, operatorId: 'acceptor-1', now: '2026-09-05T00:30:00.000Z' };
+    expect(authority.verifyWriteExecutionGrant(exact)).toMatchObject({ grantRef: 'grant:write-1' });
+    for (const changed of [
+      { projectId: 'other-project' }, { phaseId: 'other-phase' }, { taskGuid: 'other-task' }, { candidate: 'other-candidate' },
+      { action: 'deploy' }, { attempt: 3 }, { operatorId: 'other-operator' }, { now: '2026-09-05T01:00:00.000Z' },
+    ]) expect(authority.verifyWriteExecutionGrant({ ...exact, ...changed })).toBeUndefined();
+    expect(authority.verifyWriteExecutionGrant({ ...exact, grant: { ...exact } })).toBeUndefined();
+  });
 });

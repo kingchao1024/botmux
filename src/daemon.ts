@@ -90,20 +90,23 @@ import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { DaemonTaskControlBridge } from './services/task-control-plane-daemon-bridge.js';
-import { DaemonTaskControlIntegration } from './services/task-control-plane-daemon-integration.js';
+import { DaemonTaskControlIntegration, DaemonTaskControlShadowCollector } from './services/task-control-plane-daemon-integration.js';
 import { DaemonTaskControlAuthority } from './services/task-control-plane-authority.js';
 import { createV3TaskControlApprovalSource } from './services/task-control-plane-v3-approval.js';
+import { TaskControlMappingTrust, createTaskControlProductionMappingVerifier, parseKeyIdSet } from './services/task-control-plane-mapping-trust.js';
+import { resolveTaskControlMappingRegistration } from './services/task-control-plane-mapping-source.js';
 import {
   createTaskControlRouteHandlers,
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
   TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE,
   TASK_CONTROL_FREEZE_ROUTE,
+  TASK_CONTROL_WRITE_EXECUTION_ROUTE,
   TASK_CONTROL_MAPPING_REGISTER_ROUTE,
   TASK_CONTROL_REVIEWER_INGRESS_ROUTE,
   TASK_CONTROL_REVIEWER_SOURCE_ROUTE,
   TASK_CONTROL_REVIEWER_VERDICT_ROUTE,
 } from './services/task-control-plane-route-authority.js';
-import { startTaskControlPlaneRuntime, taskControlPlaneFlags, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
+import { productionTaskControlPlaneConfig, scopedTaskControlPlaneConfig, startTaskControlPlaneRuntime, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -528,12 +531,25 @@ const taskControlRouteHandlers = createTaskControlRouteHandlers({
   hostSecret: () => {
     try { return loadDaemonIpcSecret(); } catch { return undefined; }
   },
+  previousHostSecret: () => process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+  reviewerAllowedKeyIds: () => parseKeyIdSet(process.env.TASK_CONTROL_PLANE_ALLOWED_KEY_IDS),
+  reviewerRevokedKeyIds: () => parseKeyIdSet(process.env.TASK_CONTROL_PLANE_REVOKED_KEY_IDS),
   readMessageDetail: getMessageDetail,
   readDocumentRevision: async (larkAppId, docToken) => {
     const response = await larkGet(getBotClient(larkAppId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`);
     const revision = Number(response?.data?.document?.revision_id);
     return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined;
   },
+  resolveMappingRegistration: (larkAppId, input) => resolveTaskControlMappingRegistration({
+    readTaskComment: (appId, commentId) => larkGet(getBotClient(appId), `/open-apis/task/v2/comments/${encodeURIComponent(commentId)}`),
+    readTask: (appId, taskGuid) => larkGet(getBotClient(appId), `/open-apis/task/v2/tasks/${encodeURIComponent(taskGuid)}`),
+    readTopic: getMessageDetail,
+    readDocumentRevision: async (appId, docToken) => {
+      const response = await larkGet(getBotClient(appId), `/open-apis/docx/v1/documents/${encodeURIComponent(docToken)}`);
+      const revision = Number(response?.data?.document?.revision_id);
+      return Number.isSafeInteger(revision) && revision > 0 ? revision : undefined;
+    },
+  }, larkAppId, input),
   resolveReviewerSource: async (reviewerLarkAppId, body) => {
     const target = findOnlineDaemon(reviewerLarkAppId);
     if (!target) return undefined;
@@ -6226,6 +6242,7 @@ ipcRoute('POST', TASK_CONTROL_MAPPING_REGISTER_ROUTE, taskControlRouteHandlers.m
 // or report output. The lifecycle also checks the disabled flag so even a valid
 // host request cannot turn a default-off daemon into an enforcing daemon.
 ipcRoute('POST', TASK_CONTROL_FREEZE_ROUTE, taskControlRouteHandlers.freeze);
+ipcRoute('POST', TASK_CONTROL_WRITE_EXECUTION_ROUTE, taskControlRouteHandlers.writeExecution);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, taskControlRouteHandlers.designatedReviewer);
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE, taskControlRouteHandlers.designatedReviewerResolve);
 ipcRoute('POST', TASK_CONTROL_REVIEWER_SOURCE_ROUTE, taskControlRouteHandlers.reviewerSource);
@@ -22334,7 +22351,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // P2-6 stays opt-in: default false means this isolated ledger has no effect on
   // legacy dispatch/report/session paths.  Its authentication adapter is owned
   // here (not exposed to callers), and bootstrap failure returns a no-op handle.
-  const taskControlFlags = taskControlPlaneFlags();
+  const hostSecret = (() => { try { return loadDaemonIpcSecret(); } catch { return undefined; } })();
+  const previousHostSecret = process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET;
+  const productionConfig = productionTaskControlPlaneConfig({ larkAppId: cfg.larkAppId });
+  const productionRequested = process.env.TASK_CONTROL_PLANE_PRODUCTION !== undefined;
+  const taskControlConfig = productionRequested
+    ? productionConfig
+    : scopedTaskControlPlaneConfig(cfg.larkAppId);
+  const taskControlFlags = taskControlConfig.flags;
+  if (taskControlConfig.disabledReason && taskControlConfig.disabledReason !== 'target_app_mismatch') {
+    logger.warn(`[task-control] scope disabled: ${taskControlConfig.disabledReason}`);
+  }
   taskControlIntegration = undefined;
   if (!taskControlFlags.ledgerEnabled) {
     // Do not create keys, databases, timers or files while the feature is off.
@@ -22345,32 +22372,54 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
   } else {
     try {
-      const taskControlBridge = new DaemonTaskControlBridge({
+      const production = productionRequested && productionConfig.flags.ledgerEnabled;
+      const shadowTaskGuid = !production
+        ? (taskControlConfig as ReturnType<typeof scopedTaskControlPlaneConfig>).shadowTaskGuid
+        : undefined;
+      if (!production && !shadowTaskGuid) throw new Error('task_control_shadow_target_unavailable');
+      if (production && !hostSecret) throw new Error('task_control_host_secret_unavailable');
+      let shadowCollector: DaemonTaskControlShadowCollector | undefined;
+      let productionIntegration: DaemonTaskControlIntegration | undefined;
+      const taskControlBridge = production ? new DaemonTaskControlBridge({
         approvals: createV3TaskControlApprovalSource({ baseDir: v3DefaultBaseDir() }),
         larkAppId: cfg.larkAppId,
-      });
-      let integration: DaemonTaskControlIntegration | undefined;
+        productionMapping: createTaskControlProductionMappingVerifier({
+          trust: new TaskControlMappingTrust({ hostSecret: hostSecret!, previousHostSecret, larkAppId: cfg.larkAppId }),
+          allowedKeyIds: productionConfig.allowedKeyIds,
+          revokedKeyIds: productionConfig.revokedKeyIds,
+        }),
+      }) : undefined;
       taskControlPlane = await startTaskControlPlaneRuntime({
-        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags, authority: taskControlBridge.authority, logger, deferStart: true,
-        // The integration itself owns no remote writes. Shadow polls only stable
-        // task/comment/topic/doc references; the outbox can only verify a typed
-        // destination or degrade for subsequent active reconciliation.
-        deliver: row => integration?.deliver(row) ?? Promise.resolve({ kind: 'degraded', error: 'integration_unavailable' }),
-        collect: () => integration?.collectAll() ?? Promise.resolve(),
+        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags,
+        authority: taskControlBridge?.authority ?? new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
+        logger, deferStart: true,
+        deliver: production ? row => productionIntegration?.deliver(row) ?? Promise.resolve({ kind: 'retry' as const, error: 'integration_unavailable' }) : undefined,
+        collect: () => shadowCollector?.collectAll() ?? productionIntegration?.collectAll() ?? Promise.resolve(),
       });
       const taskControlStore = taskControlPlane.getStore();
       if (!taskControlStore) throw new Error('task_control_store_unavailable');
-      integration = new DaemonTaskControlIntegration({
-        dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore,
-        bridge: taskControlBridge, logger,
-        isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
-          const live = findActiveBySessionId(sessionId);
-          return !!live && live.worker !== null
-            && live.workerGeneration === workerGeneration
-            && live.session.workerGeneration === workerGeneration;
-        },
-      });
-      taskControlIntegration = integration;
+      if (production) {
+        productionIntegration = new DaemonTaskControlIntegration({
+          dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore,
+          bridge: taskControlBridge!, logger,
+          mappingTrust: new TaskControlMappingTrust({ hostSecret: hostSecret!, previousHostSecret, larkAppId: cfg.larkAppId }),
+          receiptAllowedKeyIds: productionConfig.allowedKeyIds,
+          receiptRevokedKeyIds: productionConfig.revokedKeyIds,
+          controlledWriteback: taskControlFlags.pumpEnabled,
+          isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
+            const live = findActiveBySessionId(sessionId);
+            return !!live && live.worker !== null
+              && live.workerGeneration === workerGeneration
+              && live.session.workerGeneration === workerGeneration;
+          },
+        });
+        taskControlIntegration = productionIntegration;
+      } else {
+        shadowCollector = new DaemonTaskControlShadowCollector({
+          larkAppId: cfg.larkAppId, taskGuid: shadowTaskGuid!, lifecycle: taskControlPlane, logger,
+        });
+        taskControlIntegration = undefined;
+      }
       // No recovery claim may run before its daemon-owned delivery/collector
       // adapters exist. This prevents a restored outbox row being degraded as
       // `integration_unavailable` during bootstrap.

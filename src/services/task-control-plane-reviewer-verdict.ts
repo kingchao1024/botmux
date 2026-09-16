@@ -110,8 +110,8 @@ function keyContext(domain: string, appId: string): string {
   return `${domain}\0${appId}`;
 }
 
-function stableKeyId(prefix: string, domain: string, appId: string): string {
-  return `${prefix}:${createHash('sha256').update(keyContext(domain, appId), 'utf8').digest('hex')}`;
+function stableKeyId(prefix: string, key: Buffer): string {
+  return `${prefix}:${createHash('sha256').update(key).digest('hex')}`;
 }
 
 function sourceTimestamp(value: unknown): string | undefined {
@@ -195,12 +195,12 @@ export function reviewerCapabilityHash(capability: string): string {
 
 /** Stable controller/reviewer rendezvous id for one review round. It is derived
  * only from controller-bound dispatch scope and the selected reviewer app. */
-export function reviewerDesignationRef(dispatchRoot: string, reviewerBotAppId: string, reviewRound: number): string {
+export function reviewerDesignationRef(dispatchRoot: string, reviewerBotAppId: string, reviewRound: number, generation: string | number = 1): string {
   if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot) || !validAppId(reviewerBotAppId)
-    || !Number.isSafeInteger(reviewRound) || reviewRound < 1) {
+    || !Number.isSafeInteger(reviewRound) || reviewRound < 1 || (typeof generation !== 'number' && !nonBlank(generation)) || (typeof generation === 'number' && (!Number.isSafeInteger(generation) || generation < 1))) {
     throw new Error('task_control_reviewer_designation_ref_invalid');
   }
-  return `dr_${createHash('sha256').update(`${REVIEWER_VERDICT_TRUST_DOMAIN}\0${dispatchRoot}\0${reviewerBotAppId}\0${reviewRound}`).digest('hex').slice(0, 48)}`;
+  return `dr_${createHash('sha256').update(`${REVIEWER_VERDICT_TRUST_DOMAIN}\0${dispatchRoot}\0${reviewerBotAppId}\0${reviewRound}\0${String(generation)}`).digest('hex').slice(0, 48)}`;
 }
 
 export function reviewerVerdictSourceVersionHash(source: ReviewerVerdictMessageSource | ReviewerVerdictCommentSource): string {
@@ -306,6 +306,8 @@ function validDesignationShape(record: Omit<DesignatedReviewerMapping, 'signatur
 export class DaemonReviewerVerdictProvider {
   constructor(private readonly input: { key: Buffer | string; keyId: string; now?: () => number }) {}
 
+  get keyId(): string { return this.input.keyId; }
+
   issueDesignatedReviewer(input: Omit<DesignatedReviewerMapping, 'schemaVersion' | 'designatedReviewerRef' | 'keyId' | 'signature' | 'issuedAt'> & { designatedReviewerRef?: string; issuedAt?: string }): DesignatedReviewerMapping {
     const issuedAt = input.issuedAt ?? new Date(this.input.now?.() ?? Date.now()).toISOString();
     const ref = input.designatedReviewerRef ?? `dr_${randomBytes(20).toString('hex')}`;
@@ -370,13 +372,13 @@ export function deriveDaemonReviewerVerdictProvider(input: {
   const context = keyContext(REVIEWER_VERDICT_TRUST_DOMAIN, input.reviewerBotAppId);
   const key = createHmac('sha256', input.hostSecret).update(context, 'utf8').digest();
   return new DaemonReviewerVerdictProvider({
-    key, keyId: reviewerVerdictKeyId(input.reviewerBotAppId), now: input.now,
+    key, keyId: reviewerVerdictKeyId(input.reviewerBotAppId, input.hostSecret), now: input.now,
   });
 }
 
-/** Public, non-secret stable selector for the one reviewer-domain trust root. */
-export function reviewerVerdictKeyId(reviewerBotAppId: string): string {
-  return stableKeyId('rv1', REVIEWER_VERDICT_TRUST_DOMAIN, reviewerBotAppId);
+/** Stable selector for one app-scoped reviewer root generation. */
+export function reviewerVerdictKeyId(reviewerBotAppId: string, hostSecret: string): string {
+  return stableKeyId('rv1', createHmac('sha256', hostSecret).update(keyContext(REVIEWER_VERDICT_TRUST_DOMAIN, reviewerBotAppId), 'utf8').digest());
 }
 
 /** The controller signs designations with its own app-scoped root. This is a
@@ -393,7 +395,7 @@ export function deriveDaemonDesignatedReviewerProvider(input: {
   const context = keyContext(DESIGNATED_REVIEWER_TRUST_DOMAIN, input.controllerBotAppId);
   const key = createHmac('sha256', input.hostSecret).update(context, 'utf8').digest();
   return new DaemonReviewerVerdictProvider({
-    key, keyId: stableKeyId('dr1', DESIGNATED_REVIEWER_TRUST_DOMAIN, input.controllerBotAppId), now: input.now,
+    key, keyId: stableKeyId('dr1', key), now: input.now,
   });
 }
 
@@ -402,31 +404,48 @@ export function deriveDaemonDesignatedReviewerProvider(input: {
  * from a requester-supplied key id or verifier callback. */
 export function createDaemonReviewerVerdictVerifier(input: {
   hostSecret: string;
+  previousHostSecret?: string;
   controllerBotAppId: string;
   now?: () => number;
+  allowedKeyIds?: readonly string[];
+  revokedKeyIds?: readonly string[];
 }): {
   providerForApp(reviewerBotAppId: string): DaemonReviewerVerdictProvider | undefined;
   verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean;
   verifyVerdict(value: ReviewerVerdictV1): boolean;
 } {
-  const providers = new Map<string, DaemonReviewerVerdictProvider>();
+  const providers = new Map<string, DaemonReviewerVerdictProvider[]>();
+  const permitted = (keyId: string): boolean => !input.revokedKeyIds?.includes(keyId)
+    && (input.allowedKeyIds === undefined || input.allowedKeyIds.includes(keyId));
   const providerForApp = (reviewerBotAppId: string): DaemonReviewerVerdictProvider | undefined => {
     if (!validAppId(reviewerBotAppId)) return undefined;
     let provider = providers.get(reviewerBotAppId);
     if (!provider) {
-      provider = deriveDaemonReviewerVerdictProvider({
-        hostSecret: input.hostSecret, reviewerBotAppId, now: input.now,
-      });
+      provider = [deriveDaemonReviewerVerdictProvider({ hostSecret: input.hostSecret, reviewerBotAppId, now: input.now })];
+      if (input.previousHostSecret && input.previousHostSecret !== input.hostSecret) {
+        provider.push(deriveDaemonReviewerVerdictProvider({ hostSecret: input.previousHostSecret, reviewerBotAppId, now: input.now }));
+      }
       providers.set(reviewerBotAppId, provider);
     }
-    return provider;
+    return provider.find(candidate => permitted(candidate.keyId));
+  };
+  const verifyDesignation = (value: DesignatedReviewerMapping): boolean => {
+    if (value.controllerBotAppId !== input.controllerBotAppId || !permitted(value.keyId)) return false;
+    const candidates = [deriveDaemonDesignatedReviewerProvider({ hostSecret: input.hostSecret, controllerBotAppId: input.controllerBotAppId, now: input.now })];
+    if (input.previousHostSecret && input.previousHostSecret !== input.hostSecret) candidates.push(deriveDaemonDesignatedReviewerProvider({ hostSecret: input.previousHostSecret, controllerBotAppId: input.controllerBotAppId, now: input.now }));
+    return candidates.some(candidate => candidate.verifyDesignatedReviewer(value));
   };
   return {
     providerForApp,
-    verifyDesignatedReviewer: value => value.controllerBotAppId === input.controllerBotAppId
-      && deriveDaemonDesignatedReviewerProvider({
-        hostSecret: input.hostSecret, controllerBotAppId: input.controllerBotAppId, now: input.now,
-      }).verifyDesignatedReviewer(value),
-    verifyVerdict: value => providerForApp(value.reviewerBotAppId)?.verifyVerdict(value) === true,
+    verifyDesignatedReviewer: verifyDesignation,
+    verifyVerdict: value => {
+      if (!permitted(value.keyId) || !validAppId(value.reviewerBotAppId)) return false;
+      const candidates = providers.get(value.reviewerBotAppId) ?? [
+        deriveDaemonReviewerVerdictProvider({ hostSecret: input.hostSecret, reviewerBotAppId: value.reviewerBotAppId, now: input.now }),
+        ...(input.previousHostSecret && input.previousHostSecret !== input.hostSecret ? [deriveDaemonReviewerVerdictProvider({ hostSecret: input.previousHostSecret, reviewerBotAppId: value.reviewerBotAppId, now: input.now })] : []),
+      ];
+      providers.set(value.reviewerBotAppId, candidates);
+      return candidates.some(candidate => candidate.verifyVerdict(value));
+    },
   };
 }

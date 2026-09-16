@@ -598,6 +598,7 @@ interface TrustedHostGateMaterial {
   options: string[];
   approveOptions: string[];
   approvers: string[];
+  writeExecution?: import('./dag.js').V3WriteExecutionBinding;
   hostApproval: { attemptId: string; approvalDigest: string; inputHash: string };
 }
 
@@ -672,6 +673,7 @@ function waitMatchesTrustedHostGate(wait: GateWait, trusted: TrustedHostGateMate
     JSON.stringify(wait.options) === JSON.stringify(trusted.options) &&
     JSON.stringify(wait.approveOptions) === JSON.stringify(trusted.approveOptions) &&
     JSON.stringify(wait.approvers) === JSON.stringify(trusted.approvers) &&
+    JSON.stringify(wait.writeExecution) === JSON.stringify(trusted.writeExecution) &&
     JSON.stringify(wait.hostApproval) === JSON.stringify(trusted.hostApproval);
 }
 
@@ -998,6 +1000,9 @@ export function resolveV3GateClick(
       return { kind: 'stale-run', reason: 'no-wait' };
     }
   }
+  if (JSON.stringify(wait.writeExecution) !== JSON.stringify(dagNode?.humanGate?.writeExecution)) {
+    return { kind: 'stale-run', reason: 'no-wait' };
+  }
   if (!canResolveGateWait(wait, input.by)) return { kind: 'unauthorized' };
   const resolution = selectedResolution(wait, input.selected);
   if (!resolution) return { kind: 'stale-run', reason: 'no-wait' };
@@ -1040,6 +1045,7 @@ export function resolveV3GateClick(
     ...(trustedHost
       ? { hostApproval: trustedHost.hostApproval }
       : resolvedWait.hostApproval ? { hostApproval: resolvedWait.hostApproval } : {}),
+    ...(resolvedWait.writeExecution ? { writeExecution: resolvedWait.writeExecution } : {}),
   });
   return { kind: 'resolved', resolution };
 }
@@ -1915,6 +1921,7 @@ function reconcileOneRun(
         ...(trustedHostGate
           ? { hostApproval: trustedHostGate.hostApproval }
           : wait.hostApproval ? { hostApproval: wait.hostApproval } : {}),
+        ...(wait.writeExecution ? { writeExecution: wait.writeExecution } : {}),
       });
     } else {
       // resolved wait but node still gateWaiting → journal lost gateResolved → heal.
@@ -1930,6 +1937,7 @@ function reconcileOneRun(
         ...(trustedHostGate
           ? { hostApproval: trustedHostGate.hostApproval }
           : wait.hostApproval ? { hostApproval: wait.hostApproval } : {}),
+        ...(wait.writeExecution ? { writeExecution: wait.writeExecution } : {}),
       });
       resume = true;
     }

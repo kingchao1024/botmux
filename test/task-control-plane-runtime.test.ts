@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { taskControlPlaneDatabasePath, taskControlPlaneFlags } from '../src/services/task-control-plane-runtime.js';
+import { productionTaskControlPlaneConfig, scopedTaskControlPlaneConfig, taskControlPlaneDatabasePath, taskControlPlaneFlags } from '../src/services/task-control-plane-runtime.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 function collectChild(child: ReturnType<typeof spawnTsEvalWithRepoImports>): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -31,6 +31,109 @@ describe('task control plane runtime', () => {
     expect(existsSync(taskControlPlaneDatabasePath(dataDir))).toBe(false);
     await lifecycle.close();
     rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('enables only one exact read-only app+task Shadow scope and otherwise fails closed', () => {
+    const appId = 'cli_aac926f0eb795bc1';
+    const taskGuid = '2cd616e9-910b-47e1-a081-349b4808ee5a';
+    const enabled = {
+      TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
+      TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true',
+      TASK_CONTROL_PLANE_PUMP_ENABLED: 'false',
+      TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
+      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: appId,
+      TASK_CONTROL_PLANE_TARGET_TASK_GUID: taskGuid,
+    };
+    expect(scopedTaskControlPlaneConfig(appId, enabled)).toEqual({
+      flags: { ledgerEnabled: true, shadowEnabled: true, pumpEnabled: false, freezeEnforcement: false },
+      shadowTaskGuid: taskGuid,
+    });
+    const off = { ledgerEnabled: false, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false };
+    expect(scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', enabled)).toEqual({ flags: off, disabledReason: 'target_app_mismatch' });
+    expect(scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', {
+      ...enabled,
+      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: 'cli_bbbbbbbbbbbbbbbb',
+      TASK_CONTROL_PLANE_TARGET_TASK_GUID: '11111111-1111-1111-1111-111111111111',
+    })).toEqual({ flags: off, disabledReason: 'target_scope_unauthorized' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TARGET_TASK_GUID: '' }))
+      .toEqual({ flags: off, disabledReason: 'target_scope_required' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_TARGET_TASK_GUID: `${taskGuid},other` }))
+      .toEqual({ flags: off, disabledReason: 'target_scope_invalid' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'true' }))
+      .toEqual({ flags: off, disabledReason: 'scoped_shadow_read_only_required' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'true' }))
+      .toEqual({ flags: off, disabledReason: 'scoped_shadow_read_only_required' });
+    expect(scopedTaskControlPlaneConfig(appId, { ...enabled, TASK_CONTROL_PLANE_PUMP_ENABLED: 'tru' }))
+      .toEqual({ flags: off, disabledReason: 'flag_value_invalid' });
+    expect(scopedTaskControlPlaneConfig(appId, { TASK_CONTROL_PLANE_LEDGER_ENABLED: '1' }))
+      .toEqual({ flags: off, disabledReason: 'flag_value_invalid' });
+    expect(scopedTaskControlPlaneConfig(appId, {
+      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: appId, TASK_CONTROL_PLANE_TARGET_TASK_GUID: taskGuid,
+    })).toEqual({ flags: off });
+  });
+
+  it('requires explicit production mode and validates only explicit key allow/revoke JSON', () => {
+    const appId = 'cli_aac926f0eb795bc1';
+    const base = { TASK_CONTROL_PLANE_PRODUCTION: 'true', TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true', TASK_CONTROL_PLANE_PUMP_ENABLED: 'true' };
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: base })).toMatchObject({ flags: { ledgerEnabled: true, pumpEnabled: true } });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_ALLOWED_KEY_IDS: 'not-json' } }))
+      .toMatchObject({ disabledReason: 'production_key_set_invalid' });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_PRODUCTION: 'false' } }))
+      .toMatchObject({ disabledReason: 'production_mode_required' });
+    expect(productionTaskControlPlaneConfig({ larkAppId: appId, env: { ...base, TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true' } }))
+      .toMatchObject({ disabledReason: 'production_ledger_required' });
+  });
+
+  it('boots, activates, and closes an isolated production-flag lifecycle without widening the scope', async () => {
+    const appId = 'cli_aac926f0eb795bc1';
+    const config = productionTaskControlPlaneConfig({ larkAppId: appId, env: {
+      TASK_CONTROL_PLANE_PRODUCTION: 'true', TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
+      TASK_CONTROL_PLANE_PUMP_ENABLED: 'true', TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
+    } });
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-production-runtime-'));
+    const warnings: string[] = [];
+    let deliveries = 0;
+    try {
+      const runtime = await import('../src/services/task-control-plane-runtime.js');
+      const authority = new (await import('../src/services/task-control-plane-authority.js')).DaemonTaskControlAuthority({ resolvePrincipal: () => undefined });
+      const lifecycle = await runtime.startTaskControlPlaneRuntime({
+        dataDir, larkAppId: appId, flags: config.flags, authority, deferStart: true, intervalMs: 5,
+        logger: { warn: value => warnings.push(value) }, deliver: async () => { deliveries++; return { kind: 'retry' }; },
+      });
+      expect(lifecycle.enabled).toBe(true);
+      expect(existsSync(taskControlPlaneDatabasePath(dataDir))).toBe(true);
+      expect(deliveries).toBe(0);
+      lifecycle.activate();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      await lifecycle.close();
+      expect(warnings).toEqual([]);
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it('does not create SQLite for a non-target app even when the scoped Shadow flags are enabled', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-task-control-scope-off-'));
+    const config = scopedTaskControlPlaneConfig('cli_bbbbbbbbbbbbbbbb', {
+      TASK_CONTROL_PLANE_LEDGER_ENABLED: 'true',
+      TASK_CONTROL_PLANE_SHADOW_ENABLED: 'true',
+      TASK_CONTROL_PLANE_PUMP_ENABLED: 'false',
+      TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT: 'false',
+      TASK_CONTROL_PLANE_TARGET_LARK_APP_ID: 'cli_aac926f0eb795bc1',
+      TASK_CONTROL_PLANE_TARGET_TASK_GUID: '2cd616e9-910b-47e1-a081-349b4808ee5a',
+    });
+    try {
+      const lifecycle = await (await import('../src/services/task-control-plane-runtime.js')).startTaskControlPlaneRuntime({
+        dataDir, flags: config.flags,
+        authority: new (await import('../src/services/task-control-plane-authority.js')).DaemonTaskControlAuthority({
+          resolvePrincipal: () => undefined,
+        }),
+        logger: { warn: () => {} },
+      });
+      expect(lifecycle.enabled).toBe(false);
+      expect(existsSync(taskControlPlaneDatabasePath(dataDir))).toBe(false);
+      await lifecycle.close();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('opens, recovers and closes the enabled SQLite lifecycle in an isolated runtime', async () => {

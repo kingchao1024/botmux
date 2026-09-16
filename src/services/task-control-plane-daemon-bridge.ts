@@ -4,8 +4,10 @@ import {
   type TaskControlAuthentication,
   DaemonTaskControlAuthority,
   type VerifiedTaskControlGateResolution,
+  type VerifiedWriteExecutionGrant,
 } from './task-control-plane-authority.js';
 import type { TaskControlEventObservation } from './task-control-plane-events.js';
+import { taskControlMappingFacts, type TaskControlMappingProof } from './task-control-plane-mapping-trust.js';
 
 export interface DaemonTaskControlMapping {
   controllerId: string;
@@ -19,9 +21,14 @@ export interface DaemonTaskControlMapping {
   acceptorId: string;
   /** The controller-owned registration reference, never a task title or body. */
   registrationRef: string;
+  registrationVersion?: string;
+  phaseRegistrationRefs?: Record<string, string>;
   /** Exact durable v3 humanGate that may authorize phase freeze. */
   approvalGate: TaskControlApprovalGateBinding;
   docToken?: string;
+  docRevision?: number;
+  /** Controller-issued, app/purpose-scoped proof; never sourced from worker payload. */
+  mappingProof?: TaskControlMappingProof;
 }
 
 export interface TaskControlApprovalGateBinding {
@@ -40,6 +47,11 @@ export type DaemonTaskControlMappingRegistration = Omit<DaemonTaskControlMapping
   approvalGate: TaskControlApprovalGateRegistration;
 };
 
+export interface TaskControlProductionMappingVerifier {
+  readonly minimumTaskCount: number;
+  verifyMapping(proof: TaskControlMappingProof | undefined, facts: Record<string, unknown>): boolean;
+}
+
 export interface DaemonTaskControlApprovalSource {
   validateBinding(input: { larkAppId: string; gate: TaskControlApprovalGateRegistration }): boolean;
   get(input: {
@@ -48,6 +60,11 @@ export interface DaemonTaskControlApprovalSource {
     gate: TaskControlApprovalGateBinding;
   }): Omit<VerifiedTaskControlGateResolution,
     'approvalRef' | 'projectId' | 'phaseId' | 'taskSetSnapshot' | 'acceptorId'> | undefined;
+  /** Durable human authorization for one exact write; absent means fail closed. */
+  getWriteExecution?(input: {
+    grantRef: string; larkAppId: string; projectId: string; phaseId: string; taskGuid: string; candidate: string; action: string; attempt: number; operatorId: string;
+    gate: TaskControlApprovalGateBinding;
+  }): Pick<VerifiedWriteExecutionGrant, 'issuedAt' | 'expiresAt'> | undefined;
 }
 
 export type TaskControlBridgeEvent = Omit<TaskControlEventObservation, 'authentication' | 'projectId' | 'phaseId' | 'taskGuid' | 'topicRootId'> & {
@@ -80,6 +97,7 @@ export class DaemonTaskControlBridge {
   constructor(private readonly input: {
     approvals: DaemonTaskControlApprovalSource;
     larkAppId: string;
+    productionMapping?: TaskControlProductionMappingVerifier;
     now?: () => number;
   }) {
     this.authority = new DaemonTaskControlAuthority({
@@ -92,9 +110,12 @@ export class DaemonTaskControlBridge {
     return this.registerMapping(record.dispatchRoot, {
       controllerId: record.controllerId, projectId: record.projectId, phaseId: record.phaseId, phaseTaskGuids: record.phaseTaskGuids,
       taskGuid: record.taskGuid, topicRootId: record.topicRootId, ownerId: record.ownerId,
-      reviewerId: record.reviewerId, acceptorId: record.acceptorId, registrationRef: record.registrationRef,
+      reviewerId: record.reviewerId, acceptorId: record.acceptorId, registrationRef: record.registrationRef, ...(record.registrationVersion ? { registrationVersion: record.registrationVersion } : {}),
+      ...(record.phaseRegistrationRefs ? { phaseRegistrationRefs: record.phaseRegistrationRefs } : {}),
       approvalGate: record.approvalGate,
       ...(record.docToken ? { docToken: record.docToken } : {}),
+      ...(record.docRevision ? { docRevision: record.docRevision } : {}),
+      ...(record.mappingProof ? { mappingProof: record.mappingProof } : {}),
     }, record.controllerId);
   }
 
@@ -112,6 +133,7 @@ export class DaemonTaskControlBridge {
       || mapping.ownerId === mapping.acceptorId
       || !Array.isArray(mapping.phaseTaskGuids)
       || !mapping.phaseTaskGuids.every(taskGuid => !!nonBlank(taskGuid))
+      || new Set(mapping.phaseTaskGuids).size !== mapping.phaseTaskGuids.length
       || !mapping.phaseTaskGuids.includes(mapping.taskGuid)
       || !Array.isArray(mapping.approvalGate?.approverPolicy)
       || !mapping.approvalGate.approverPolicy.every(approver => !!nonBlank(approver))
@@ -124,6 +146,14 @@ export class DaemonTaskControlBridge {
           operatorId: mapping.approvalGate.operatorId, approverPolicy: mapping.approvalGate.approverPolicy,
         },
       })) return false;
+    const production = this.input.productionMapping;
+    if (production && (mapping.phaseTaskGuids.length < production.minimumTaskCount
+      || !production.verifyMapping(mapping.mappingProof, taskControlMappingFacts({
+        dispatchRoot: root, projectId: mapping.projectId, phaseId: mapping.phaseId, phaseTaskGuids: mapping.phaseTaskGuids,
+        taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId,
+        acceptorId: mapping.acceptorId, registrationRef: mapping.registrationRef, registrationVersion: mapping.registrationVersion, controllerId: controller,
+        ...(mapping.phaseRegistrationRefs ? { phaseRegistrationRefs: mapping.phaseRegistrationRefs } : {}), approvalGate: mapping.approvalGate, docToken: mapping.docToken, docRevision: mapping.docRevision,
+      })))) return false;
     const prior = this.mappings.get(root);
     if (prior && JSON.stringify(prior) !== JSON.stringify(mapping)) return false;
     this.mappings.set(root, {
@@ -215,6 +245,25 @@ export class DaemonTaskControlBridge {
     return this.authority.issueVerifiedGateApproval({
       ...source, approvalRef: ref, projectId: mapping.projectId, phaseId: mapping.phaseId,
       taskSetSnapshot: mapping.phaseTaskGuids, acceptorId: mapping.acceptorId,
+    });
+  }
+
+  /** Explicit daemon-only write authority; no dispatch brief or report text is parsed. */
+  issueWriteExecutionGrant(input: Omit<VerifiedWriteExecutionGrant, 'issuedAt' | 'expiresAt'> & { dispatchRoot: string }): unknown | undefined {
+    const mapping = this.mappings.get(input.dispatchRoot);
+    if (!mapping || mapping.projectId !== input.projectId || mapping.phaseId !== input.phaseId || mapping.taskGuid !== input.taskGuid
+      || mapping.acceptorId !== input.operatorId || !nonBlank(input.candidate) || !nonBlank(input.action)
+      || !Number.isSafeInteger(input.attempt) || input.attempt < 1) return undefined;
+    const source = this.input.approvals.getWriteExecution?.({
+      grantRef: input.grantRef, larkAppId: this.input.larkAppId, projectId: input.projectId, phaseId: input.phaseId, taskGuid: input.taskGuid,
+      candidate: input.candidate, action: input.action, attempt: input.attempt, operatorId: input.operatorId,
+      gate: mapping.approvalGate,
+    });
+    if (!source) return undefined;
+    return this.authority.issueVerifiedWriteExecutionGrant({
+      grantRef: input.grantRef, projectId: input.projectId, phaseId: input.phaseId, taskGuid: input.taskGuid,
+      candidate: input.candidate, action: input.action, attempt: input.attempt, operatorId: input.operatorId,
+      issuedAt: source.issuedAt, expiresAt: source.expiresAt,
     });
   }
 

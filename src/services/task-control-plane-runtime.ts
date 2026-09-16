@@ -8,12 +8,27 @@ import {
   type TaskControlEvent,
 } from './task-control-plane-store.js';
 import { DaemonTaskControlAuthority, type TaskControlAuthentication } from './task-control-plane-authority.js';
+import { parseKeyIdSet } from './task-control-plane-mapping-trust.js';
 
 export interface TaskControlPlaneFlags {
   ledgerEnabled: boolean;
   shadowEnabled: boolean;
   pumpEnabled: boolean;
   freezeEnforcement: boolean;
+}
+
+export interface ScopedTaskControlPlaneConfig {
+  flags: TaskControlPlaneFlags;
+  /** Present only for the one exact app+task read-only Shadow canary. */
+  shadowTaskGuid?: string;
+  disabledReason?: string;
+}
+
+export interface ProductionTaskControlPlaneConfig {
+  flags: TaskControlPlaneFlags;
+  allowedKeyIds?: readonly string[];
+  revokedKeyIds?: readonly string[];
+  disabledReason?: string;
 }
 
 export interface TaskControlPlaneLogger {
@@ -25,6 +40,8 @@ export interface TaskControlPlaneDeliveryResult {
   error?: string;
   /** Exact provider receipt for this event/destination; required for delivered. */
   receiptRef?: string;
+  /** Durable controlled fallback queued before the primary row is degraded. */
+  fallbackDestinationId?: string;
 }
 
 export interface TaskControlPlaneLifecycle {
@@ -87,6 +104,77 @@ export function taskControlPlaneFlags(env: NodeJS.ProcessEnv = process.env): Tas
     pumpEnabled: enabled('TASK_CONTROL_PLANE_PUMP_ENABLED'),
     freezeEnforcement: enabled('TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT'),
   };
+}
+
+const LARK_APP_ID_PATTERN = /^cli_[A-Za-z0-9]{16,64}$/;
+const TASK_GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SCOPED_SHADOW_LARK_APP_ID = 'cli_aac926f0eb795bc1';
+const SCOPED_SHADOW_TASK_GUID = '2cd616e9-910b-47e1-a081-349b4808ee5a';
+
+/**
+ * Production daemon gate for the first real Shadow canary. Any enabled flag
+ * requires one exact app+task scope and the read-only ledger+shadow flag set.
+ * Missing, malformed, cross-app or write-capable configurations fail closed.
+ */
+export function scopedTaskControlPlaneConfig(
+  selfLarkAppId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ScopedTaskControlPlaneConfig {
+  const flags = taskControlPlaneFlags(env);
+  const disabled = (): TaskControlPlaneFlags => ({ ...DEFAULT_FLAGS });
+  const flagNames = [
+    'TASK_CONTROL_PLANE_LEDGER_ENABLED',
+    'TASK_CONTROL_PLANE_SHADOW_ENABLED',
+    'TASK_CONTROL_PLANE_PUMP_ENABLED',
+    'TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT',
+  ];
+  if (flagNames.some(name => env[name] !== undefined && !/^(true|false)$/i.test(env[name]!.trim()))) {
+    return { flags: disabled(), disabledReason: 'flag_value_invalid' };
+  }
+  if (!Object.values(flags).some(Boolean)) return { flags: disabled() };
+
+  const targetLarkAppId = env.TASK_CONTROL_PLANE_TARGET_LARK_APP_ID?.trim();
+  const targetTaskGuid = env.TASK_CONTROL_PLANE_TARGET_TASK_GUID?.trim();
+  if (!targetLarkAppId || !targetTaskGuid) {
+    return { flags: disabled(), disabledReason: 'target_scope_required' };
+  }
+  if (!LARK_APP_ID_PATTERN.test(targetLarkAppId) || !TASK_GUID_PATTERN.test(targetTaskGuid)) {
+    return { flags: disabled(), disabledReason: 'target_scope_invalid' };
+  }
+  if (targetLarkAppId !== SCOPED_SHADOW_LARK_APP_ID || targetTaskGuid !== SCOPED_SHADOW_TASK_GUID) {
+    return { flags: disabled(), disabledReason: 'target_scope_unauthorized' };
+  }
+  if (targetLarkAppId !== selfLarkAppId) {
+    return { flags: disabled(), disabledReason: 'target_app_mismatch' };
+  }
+  if (!flags.ledgerEnabled || !flags.shadowEnabled || flags.pumpEnabled || flags.freezeEnforcement) {
+    return { flags: disabled(), disabledReason: 'scoped_shadow_read_only_required' };
+  }
+  return { flags, shadowTaskGuid: targetTaskGuid };
+}
+
+/**
+ * Production is opt-in. Mapping facts arrive only through the authenticated
+ * controller route and are then signed/persisted by the daemon; no comma-list
+ * environment value becomes a control-plane fact.
+ */
+export function productionTaskControlPlaneConfig(input: {
+  larkAppId: string;
+  env?: NodeJS.ProcessEnv;
+}): ProductionTaskControlPlaneConfig {
+  const env = input.env ?? process.env;
+  const flags = taskControlPlaneFlags(env);
+  const disabled = (disabledReason: string): ProductionTaskControlPlaneConfig => ({ flags: { ...DEFAULT_FLAGS }, disabledReason });
+  const flagNames = ['TASK_CONTROL_PLANE_LEDGER_ENABLED', 'TASK_CONTROL_PLANE_SHADOW_ENABLED', 'TASK_CONTROL_PLANE_PUMP_ENABLED', 'TASK_CONTROL_PLANE_FREEZE_ENFORCEMENT'];
+  if (flagNames.some(name => env[name] !== undefined && !/^(true|false)$/i.test(env[name]!.trim()))) return disabled('flag_value_invalid');
+  if (!Object.values(flags).some(Boolean)) return { flags: { ...DEFAULT_FLAGS } };
+  if (env.TASK_CONTROL_PLANE_PRODUCTION !== 'true') return disabled('production_mode_required');
+  if (!flags.ledgerEnabled || flags.shadowEnabled) return disabled('production_ledger_required');
+  const allowedKeyIds = parseKeyIdSet(env.TASK_CONTROL_PLANE_ALLOWED_KEY_IDS);
+  const revokedKeyIds = parseKeyIdSet(env.TASK_CONTROL_PLANE_REVOKED_KEY_IDS);
+  if ((env.TASK_CONTROL_PLANE_ALLOWED_KEY_IDS !== undefined && !allowedKeyIds)
+    || (env.TASK_CONTROL_PLANE_REVOKED_KEY_IDS !== undefined && !revokedKeyIds)) return disabled('production_key_set_invalid');
+  return { flags, allowedKeyIds, revokedKeyIds };
 }
 
 function validateFlags(flags: TaskControlPlaneFlags, hasDelivery: boolean, hasCollector: boolean): void {
@@ -265,6 +353,13 @@ class ActiveTaskControlPlaneLifecycle implements TaskControlPlaneLifecycle {
               });
             }
           } else if (result.kind === 'degraded' || row.attempts >= this.options.maxAttempts) {
+            if (result.fallbackDestinationId) {
+              this.store.degradeOutboxWithFallback({
+                eventId: row.eventId, sourceDestinationId: row.destinationId, fallbackDestinationId: result.fallbackDestinationId,
+                claimToken: token, error: result.error ?? 'delivery_retry_exhausted', now: this.options.now(),
+              });
+              continue;
+            }
             this.store.settleOutboxDegraded(row.outboxId, token, { error: result.error ?? 'delivery_retry_exhausted' });
           } else {
             this.store.rescheduleOutbox(row.outboxId, token, {
@@ -340,7 +435,9 @@ export async function startTaskControlPlaneRuntime(options: TaskControlPlaneRunt
       staleClaimMs: options.staleClaimMs ?? 60_000,
       maxAttempts: options.maxAttempts ?? 5,
       deliver: flags.pumpEnabled ? options.deliver : undefined,
-      collect: flags.shadowEnabled ? options.collect : undefined,
+      // Production reuses the same bounded read-only collector; a supplied
+      // collector never writes an external object by itself.
+      collect: options.collect,
       freezeEnabled: flags.freezeEnforcement,
       intervalMs: options.intervalMs,
     });

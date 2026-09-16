@@ -83,14 +83,31 @@ describe('ReviewerVerdict provider journal', () => {
       docToken: 'doc-1', docRevision: 1, expiresAt: '2099-09-05T00:00:00.000Z',
     });
     const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, controllerBotAppId: 'controller-app' });
-    expect(verdictA.keyId).toBe(reviewerVerdictKeyId('reviewer-app-a'));
+    expect(verdictA.keyId).toBe(reviewerVerdictKeyId('reviewer-app-a', hostSecret));
     expect(verdictA.keyId).toMatch(/^rv1:[a-f0-9]{64}$/);
     expect(verifier.verifyDesignatedReviewer(designation)).toBe(true);
     expect(verifier.verifyVerdict(verdictA)).toBe(true);
     expect(reviewerB.verifyVerdict(verdictA)).toBe(false);
     expect(reviewerA.verifyDesignatedReviewer(designation)).toBe(false);
-    expect(verifier.verifyVerdict({ ...verdictA, keyId: reviewerVerdictKeyId('reviewer-app-b') })).toBe(false);
+    expect(verifier.verifyVerdict({ ...verdictA, keyId: reviewerVerdictKeyId('reviewer-app-b', hostSecret) })).toBe(false);
     expect(verifier.verifyVerdict({ ...verdictA, keyId: '' })).toBe(false);
+  });
+
+  it('verifies only current or explicit previous reviewer roots and honors revoke', () => {
+    const old = deriveDaemonReviewerVerdictProvider({ hostSecret: 'old-reviewer-root', reviewerBotAppId: 'reviewer-app', now: () => now });
+    const controller = deriveDaemonDesignatedReviewerProvider({ hostSecret: 'old-reviewer-root', controllerBotAppId: 'controller-app', now: () => now });
+    const designation = controller.issueDesignatedReviewer({
+      designatedReviewerRef: reviewerDesignationRef('om_root', 'reviewer-app', 1), projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', controllerId: 'controller-app', controllerBotAppId: 'controller-app', effectiveAt: '2026-09-05T00:00:00.000Z', expiresAt: '2099-09-05T00:00:00.000Z',
+    });
+    const verdict = old.issueVerdict({
+      verdictId: 'old-root-verdict', projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root', taskSetSnapshot: ['task-1'], reviewRound: 1, designatedReviewerRef: designation.designatedReviewerRef, reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-app', sessionId: 'session-1', workerGeneration: 1, capability: 'cap', sourceMessageId: 'om_review', sourceVersionHash: `sha256:${'a'.repeat(64)}`, kind: 'verdict', verdict: 'pass', conditionIds: [], resolvedConditionEvidence: {}, docToken: 'doc-1', docRevision: 1, expiresAt: '2099-09-05T00:00:00.000Z',
+    });
+    const overlap = createDaemonReviewerVerdictVerifier({ hostSecret: 'new-reviewer-root', previousHostSecret: 'old-reviewer-root', controllerBotAppId: 'controller-app' });
+    expect(overlap.verifyVerdict(verdict)).toBe(true);
+    expect(overlap.verifyDesignatedReviewer(designation)).toBe(true);
+    const revoked = createDaemonReviewerVerdictVerifier({ hostSecret: 'new-reviewer-root', previousHostSecret: 'old-reviewer-root', controllerBotAppId: 'controller-app', revokedKeyIds: [verdict.keyId, designation.keyId] });
+    expect(revoked.verifyVerdict(verdict)).toBe(false);
+    expect(revoked.verifyDesignatedReviewer(designation)).toBe(false);
   });
 
   it('requires a current exact message id, topic root, sender and created time; body is irrelevant', () => {

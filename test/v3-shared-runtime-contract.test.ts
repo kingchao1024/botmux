@@ -130,4 +130,54 @@ describe('v3 shared runtime contract', () => {
       { kind: 'dispatchGate', nodeId: 'deploy', instanceId: 'deploy#001' },
     ]);
   });
+
+  it('accepts only an exact operator-bound write-execution gate', () => {
+    const writeExecution = {
+      grantRef: 'grant:write-1',
+      projectId: 'project-1',
+      phaseId: 'phase-1',
+      taskGuid: 'task-1',
+      candidate: 'candidate-c8',
+      action: 'git.commit',
+      attempt: 2,
+      operatorId: 'acceptor-1',
+    };
+    const valid = validateDag({
+      runId: 'write-gate',
+      nodes: [goal('authorize', {
+        humanGate: { prompt: 'Approve?', approvers: ['acceptor-1'], writeExecution },
+      })],
+    });
+    expect(valid.nodes[0]!.humanGate?.writeExecution).toEqual(writeExecution);
+    expect(normalizeGateWaitInput(valid.nodes[0]!.humanGate!).prompt).toContain(JSON.stringify(writeExecution, null, 2));
+
+    expect(() => validateDag({
+      runId: 'write-gate-wrong-operator',
+      nodes: [goal('authorize', {
+        humanGate: { prompt: 'Approve?', approvers: ['other'], writeExecution },
+      })],
+    })).toThrow(/approvers must be exactly/);
+    expect(() => validateDag({
+      runId: 'write-gate-extra-field',
+      nodes: [goal('authorize', {
+        humanGate: { prompt: 'Approve?', approvers: ['acceptor-1'], writeExecution: { ...writeExecution, extra: true } },
+      })],
+    })).toThrow(/must contain exactly/);
+    expect(() => validateDag({
+      runId: 'write-host-gate',
+      nodes: [{
+        id: 'send',
+        type: 'host',
+        executor: 'feishu-send',
+        input: {
+          larkAppId: { $ref: 'context.larkAppId' },
+          chatId: { $ref: 'context.chatId' },
+          content: 'hello',
+        },
+        depends: [],
+        inputs: [],
+        humanGate: { prompt: 'Approve?', approvers: ['acceptor-1'], writeExecution },
+      }],
+    })).toThrow(/must not authorize both/);
+  });
 });
