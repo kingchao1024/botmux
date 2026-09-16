@@ -23573,7 +23573,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         desc.lastHeartbeat = Date.now();
         assertTargetStable();
         writeDaemonDescriptor(desc, { publish: true });
-      }));
+      }), { caller: 'daemon', operation: 'startup-admission' });
   } catch (error) {
     // A failed startup must not leave a fresh discoverable descriptor whose IPC
     // readiness promise can never resolve, and it must withdraw only THIS

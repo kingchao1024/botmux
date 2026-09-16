@@ -2573,7 +2573,7 @@ async function startConfiguredFleet(
         }
         console.log(`\n✅ fleet 已在运行 (supervisor pid ${launched.supervisorPid}, ${launched.botCount} 个机器人)`);
       }
-    }, { maxWaitMs: 5_000 });
+    }, { maxWaitMs: 5_000, caller: 'cli', operation: 'fleet-start' });
     if (!launched || !launchPlan) throw new Error('[start] fleet launch plan was not captured');
     if (launched.action !== 'already-running' && !options.bootHookStart) {
       const { waitFleetReady } = await import('./core/fleet-runtime.js');
@@ -2764,7 +2764,7 @@ async function cmdRestart(): Promise<void> {
           }
           launched = r.start;
         },
-        { maxWaitMs: 5_000 },
+        { maxWaitMs: 5_000, caller: 'cli', operation: 'fleet-restart' },
       );
       if (!launchPlan || !launched) throw new Error('[restart] fleet launch plan was not handed off');
       const health = await waitFleetReady(
@@ -2936,7 +2936,7 @@ async function ensureBotDaemonStarted(
             rosterRevision: plan.rosterRevision,
           } : null;
         },
-        { maxWaitMs: 5_000 },
+        { maxWaitMs: 5_000, caller: 'cli', operation: 'bot-start' },
       );
       if (!botSpec) {
         return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };

@@ -58,5 +58,5 @@ export async function rmwBotEntry<T>(
     }
     await writeRawConfigAtomic(targetPath, raw);
     return { ok: true, result: out as T };
-  });
+  }, { caller: 'config-store', operation: 'bot-entry-rmw' });
 }

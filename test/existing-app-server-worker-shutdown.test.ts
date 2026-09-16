@@ -5,7 +5,7 @@ const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8'
 
 describe('existing App Server shared-adopt worker shutdown', () => {
   it('preserves only the BotMux remote TUI when its parent daemon exits', () => {
-    const start = source.indexOf('function shutdownWorkerForParentExit(');
+    const start = source.indexOf('async function shutdownWorkerForParentExitImpl(');
     expect(start).toBeGreaterThanOrEqual(0);
     const body = source.slice(start, source.indexOf("\nprocess.on('SIGTERM'", start));
 
@@ -22,5 +22,14 @@ describe('existing App Server shared-adopt worker shutdown', () => {
     expect(source).toContain("process.on('SIGTERM', () => shutdownWorkerForParentExit('SIGTERM'));");
     expect(source).toContain("shutdownWorkerForParentExit('IPC disconnect')");
     expect(source).toContain("shutdownWorkerForParentExit('parent watchdog')");
+  });
+
+  it('waits for only Botmux-owned RPC app-servers before ordinary parent-exit teardown', () => {
+    const start = source.indexOf('async function shutdownWorkerForParentExitImpl(');
+    const body = source.slice(start, source.indexOf("\nprocess.on('SIGTERM'", start));
+
+    expect(body).toContain('await codexRpcEngine?.stopAndWait();');
+    expect(body.indexOf('await codexRpcEngine?.stopAndWait();'))
+      .toBeLessThan(body.indexOf('killCli();'));
   });
 });

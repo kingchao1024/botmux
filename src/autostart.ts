@@ -317,6 +317,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# The supervisor/worker protocol owns RPC teardown; do not let systemd's
+# cgroup fallback kill persistent tmux sessions during a restart.
+KillMode=process
+TimeoutStopSec=20s
 WorkingDirectory=${opts.configDir}
 Environment=PATH=${autostartPath(opts.environmentPath, 'linux')}
 Environment=${AUTOSTART_UNIT_ENV}=1

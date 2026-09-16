@@ -5,28 +5,88 @@
  * - 文件权限 0o600 (只有用户自己能读), secret 不外泄给同机器人其它用户
  */
 import { writeFileSync, renameSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
-import { FileLockTimeoutError, withFileLock, withFileLockSync, type FileLockOptions } from '../utils/file-lock.js';
-import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
+import {
+  FileLockTimeoutError,
+  withFileLock,
+  withFileLockSync,
+  type FileLockOptions,
+} from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
+import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
 import {
   assertCanonicalBotsConfigTargetStable,
   resolveCanonicalBotsConfigTarget,
 } from '../core/config-dir.js';
 
-export type BotsJsonLockCaller = 'bots-store' | 'cli' | 'config-store' | 'daemon' | 'dashboard' | 'device-isolation' | 'sandbox-migration';
-export type BotsJsonLockOperation = 'atomic-write' | 'bot-entry-rmw' | 'bot-start' | 'fleet-restart' | 'fleet-start' | 'legacy-config-migration' | 'plugin-binding' | 'startup-admission' | 'vc-agent-profile';
-export interface BotsJsonLockOptions extends FileLockOptions { caller?: BotsJsonLockCaller; operation?: BotsJsonLockOperation }
-const LOCK_CALLERS = new Set<BotsJsonLockCaller>(['bots-store', 'cli', 'config-store', 'daemon', 'dashboard', 'device-isolation', 'sandbox-migration']);
-const LOCK_OPERATIONS = new Set<BotsJsonLockOperation>(['atomic-write', 'bot-entry-rmw', 'bot-start', 'fleet-restart', 'fleet-start', 'legacy-config-migration', 'plugin-binding', 'startup-admission', 'vc-agent-profile']);
+export type BotsJsonLockCaller =
+  | 'bots-store'
+  | 'cli'
+  | 'config-store'
+  | 'daemon'
+  | 'dashboard'
+  | 'device-isolation'
+  | 'sandbox-migration';
 
-function logOwnedBotsJsonLockTimeout(error: unknown, targetPath: string, options: BotsJsonLockOptions, startedAt: number): void {
+export type BotsJsonLockOperation =
+  | 'atomic-write'
+  | 'bot-entry-rmw'
+  | 'bot-start'
+  | 'fleet-restart'
+  | 'fleet-start'
+  | 'legacy-config-migration'
+  | 'plugin-binding'
+  | 'startup-admission'
+  | 'vc-agent-profile';
+
+export interface BotsJsonLockOptions extends FileLockOptions {
+  /** Fixed component name for timeout observability; invalid values are redacted. */
+  caller?: BotsJsonLockCaller;
+  /** Fixed operation name for timeout observability; invalid values are redacted. */
+  operation?: BotsJsonLockOperation;
+}
+
+const LOCK_CALLERS = new Set<BotsJsonLockCaller>([
+  'bots-store',
+  'cli',
+  'config-store',
+  'daemon',
+  'dashboard',
+  'device-isolation',
+  'sandbox-migration',
+]);
+
+const LOCK_OPERATIONS = new Set<BotsJsonLockOperation>([
+  'atomic-write',
+  'bot-entry-rmw',
+  'bot-start',
+  'fleet-restart',
+  'fleet-start',
+  'legacy-config-migration',
+  'plugin-binding',
+  'startup-admission',
+  'vc-agent-profile',
+]);
+
+function observableLockLabel(
+  value: string | undefined,
+  allowed: ReadonlySet<string>,
+): string {
+  if (value === undefined) return 'unspecified';
+  return allowed.has(value) ? value : 'invalid';
+}
+
+function logOwnedBotsJsonLockTimeout(
+  error: unknown,
+  targetPath: string,
+  options: BotsJsonLockOptions,
+  startedAt: number,
+): void {
   if (!(error instanceof FileLockTimeoutError) || error.lockPath !== targetPath + '.lock') return;
-  const label = (value: string | undefined, allowed: ReadonlySet<string>): string =>
-    value === undefined ? 'unspecified' : allowed.has(value) ? value : 'invalid';
+
   logger.warn('[bots-lock] timeout', {
     lock: 'bots.json.lock',
-    caller: label(options.caller, LOCK_CALLERS),
-    operation: label(options.operation, LOCK_OPERATIONS),
+    caller: observableLockLabel(options.caller, LOCK_CALLERS),
+    operation: observableLockLabel(options.operation, LOCK_OPERATIONS),
     waitedMs: Math.max(0, Date.now() - startedAt),
     holderPid: error.holderPid ?? null,
     lockAgeMs: Number.isFinite(error.lockAgeMs) ? Math.round(error.lockAgeMs) : null,
@@ -44,12 +104,13 @@ export function withBotsJsonLockSync<T>(
   options: BotsJsonLockOptions = {},
 ): T {
   const target = resolveCanonicalBotsConfigTarget(botsJsonPath, { allowMissing: true });
+  const assertTargetStable = (): void => assertCanonicalBotsConfigTargetStable(target);
   const startedAt = Date.now();
   try {
     return withFileLockSync(target.targetPath, () => {
-      assertCanonicalBotsConfigTargetStable(target);
+      assertTargetStable();
       const result = fn(target.targetPath);
-      if (target.requestedWasSymlink) assertCanonicalBotsConfigTargetStable(target);
+      if (target.requestedWasSymlink) assertTargetStable();
       return result;
     }, options);
   } catch (error) {
@@ -87,19 +148,18 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
   try {
     withFileLockSync(target.targetPath, () => {
       assertCanonicalBotsConfigTargetStable(target);
-      // Clone/onboarding callers pass the exact generation they intend to save.
       assertQuotaFallbackGraphAcyclic(bots);
-    // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
-    const tmp = target.targetPath + '.tmp';
-    writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
-    try {
-      if (target.requestedWasSymlink) assertCanonicalBotsConfigTargetStable(target);
-      renameSync(tmp, target.targetPath);
-      if (target.requestedWasSymlink) assertCanonicalBotsConfigTargetStable(target);
-    } catch (error) {
-      try { unlinkSync(tmp); } catch { /* best effort */ }
-      throw error;
-    }
+      // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
+      const tmp = target.targetPath + '.tmp';
+      writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
+      try {
+        if (target.requestedWasSymlink) assertCanonicalBotsConfigTargetStable(target);
+        renameSync(tmp, target.targetPath);
+        if (target.requestedWasSymlink) assertCanonicalBotsConfigTargetStable(target);
+      } catch (error) {
+        try { unlinkSync(tmp); } catch { /* best effort */ }
+        throw error;
+      }
     });
   } catch (error) {
     logOwnedBotsJsonLockTimeout(error, target.targetPath, options, startedAt);

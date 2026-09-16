@@ -389,7 +389,7 @@ export async function activateDeviceCredentialIsolation(
         }
       }
       throw lastError;
-    }, { homeDir }));
+    }, { homeDir }), { caller: 'device-isolation', operation: 'startup-admission' });
 }
 
 async function runDeviceCredentialIsolationActivationAttempt(

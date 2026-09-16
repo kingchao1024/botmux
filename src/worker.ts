@@ -1276,6 +1276,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         ...(cfg.cliId === 'codex' ? ['sandbox_mode="danger-full-access"'] : []),
         ...(cfg.cliId === 'traex' ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())] : []),
       ],
+      bypassHookTrust: cfg.cliId === 'traex'
+        && cfg.disableCliBypass !== true
+        && config.bypassCodexHookTrust,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
@@ -20573,6 +20576,10 @@ process.on('message', async (raw: unknown) => {
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
+      // destroySession() can synchronously trigger the remote viewer's onExit,
+      // which clears the global engine reference. Keep this exact managed engine
+      // so local close still awaits its detached app-server group afterwards.
+      const closeRpcEngine = codexRpcEngine;
       // Local close destroys persistent owned sessions. Remote backends never
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
@@ -20581,6 +20588,16 @@ process.on('message', async (raw: unknown) => {
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
+      }
+      try {
+        // A managed RPC app-server is detached from the tmux viewer. Do not let
+        // this local close exit the worker until its bounded group barrier proves
+        // the app-server is gone; otherwise stop()'s unref timer dies with us.
+        await closeRpcEngine?.stopAndWait();
+      } catch (error) {
+        log(`Local close RPC teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+        return;
       }
       stopOwnedSessionScope('close');
       killCli();
@@ -20915,7 +20932,17 @@ function cleanup(): void {
  * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
  * retain the historical killCli shutdown path.
  */
+let parentExitShutdown: Promise<void> | null = null;
+
 function shutdownWorkerForParentExit(reason: string): void {
+  if (parentExitShutdown) return;
+  parentExitShutdown = shutdownWorkerForParentExitImpl(reason).catch((error) => {
+    log(`Parent-exit RPC teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  });
+}
+
+async function shutdownWorkerForParentExitImpl(reason: string): Promise<void> {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
@@ -20923,6 +20950,11 @@ function shutdownWorkerForParentExit(reason: string): void {
     process.exit(0);
     return;
   }
+  // App-server children are detached so a worker can manage their whole process
+  // group. Do not call process.exit() until the bounded RPC stop barrier has
+  // reaped that group; otherwise stop()'s unref'd SIGKILL timer dies with this
+  // worker and systemd eventually has to clean up the orphan.
+  await codexRpcEngine?.stopAndWait();
   killCli();
   cleanup();
   process.exit(0);

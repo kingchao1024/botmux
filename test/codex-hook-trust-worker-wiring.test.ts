@@ -6,7 +6,8 @@ import { describe, expect, it } from 'vitest';
  * Source-lock for the Codex hook-trust bypass + RPC-viewer wiring.
  *
  * The behavioral half (does the flag appear for the 4 toggle×restricted combos;
- * does the --remote viewer stay flag-free) is covered by the adapter matrix in
+ * does the TraeX --remote viewer receive it before its subcommand) is covered by
+ * the adapter matrix in
  * cli-adapters.test.ts. But that only proves "buildArgs behaves when handed the
  * right opts" — it can't catch the worker handing it the WRONG opts. That is
  * exactly the class of bug the a0fa71010 sandbox refactor introduced: it silently
