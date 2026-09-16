@@ -2,13 +2,14 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { PersistentBackendTarget } from '../src/adapters/backend/types.js';
 import {
+  awaitAskReceiptAuthorityBootstrapInventory,
   buildDeviceIsolationInventory,
-  commitDeviceIsolationActivation,
+  commitDeviceIsolationActivation as commitDeviceIsolationActivationRaw,
   mergePersistedDeviceIsolationSessions,
-  prepareDeviceIsolationActivation,
-  releaseDeviceIsolationActivation,
+  prepareDeviceIsolationActivation as prepareDeviceIsolationActivationRaw,
+  releaseDeviceIsolationActivation as releaseDeviceIsolationActivationRaw,
   resetDeviceIsolationDaemonForTest,
-  setDeviceIsolationDaemonDependenciesForTest,
+  setDeviceIsolationDaemonDependenciesForTest as setDeviceIsolationDaemonDependenciesForTestRaw,
   setDeviceIsolationDaemonIdentity,
   type DeviceIsolationRuntimeSession,
 } from '../src/core/device-isolation-daemon.js';
@@ -16,10 +17,34 @@ import {
   currentDeviceIsolationFreezeLease,
   resetDeviceIsolationActivationForTest,
 } from '../src/core/device-isolation-activation.js';
+import { ASK_RECEIPT_AUTHORITY_VERSION } from '../src/platform/device-isolation.js';
 
 const NONCE = 'n'.repeat(43);
+const ROSTER_REVISION = 'a'.repeat(64);
+const BOTS_CONFIG_PATH = '/tmp/botmux-device-isolation-bots.json';
 const ENABLED_AT = '2026-07-22T00:00:00.000Z';
 const NOW = Date.parse(ENABLED_AT);
+
+function setDeviceIsolationDaemonDependenciesForTest(
+  overrides: Parameters<typeof setDeviceIsolationDaemonDependenciesForTestRaw>[0],
+): void {
+  setDeviceIsolationDaemonDependenciesForTestRaw(overrides && {
+    readRosterRevision: () => ROSTER_REVISION,
+    ...overrides,
+  });
+}
+
+function prepareDeviceIsolationActivation(body: Record<string, unknown>) {
+  return prepareDeviceIsolationActivationRaw({ rosterRevision: ROSTER_REVISION, ...body });
+}
+
+function commitDeviceIsolationActivation(body: Record<string, unknown>) {
+  return commitDeviceIsolationActivationRaw({ rosterRevision: ROSTER_REVISION, ...body });
+}
+
+function releaseDeviceIsolationActivation(body: Record<string, unknown>) {
+  return releaseDeviceIsolationActivationRaw({ rosterRevision: ROSTER_REVISION, ...body });
+}
 
 function digest(raw: string): string {
   return createHash('sha256').update(raw, 'utf8').digest('hex');
@@ -35,6 +60,17 @@ function activeMarker(): string {
     state: 'active',
     enabledAt: ENABLED_AT,
     activatedAt: '2026-07-22T00:01:00.000Z',
+    askReceiptAuthorityVersion: ASK_RECEIPT_AUTHORITY_VERSION,
+    askReceiptAuthorityProof: {
+      activationEpoch: 'a'.repeat(43),
+      protocolVersion: 1,
+      participants: [{
+        larkAppId: 'cli_test',
+        bootInstanceId: 'boot-test',
+        pid: process.pid,
+        procStart: 'daemon-start',
+      }],
+    },
   }, null, 2)}\n`;
 }
 
@@ -58,7 +94,17 @@ function ownedPtySession(): DeviceIsolationRuntimeSession {
 beforeEach(() => {
   resetDeviceIsolationActivationForTest();
   resetDeviceIsolationDaemonForTest();
-  setDeviceIsolationDaemonIdentity({ larkAppId: 'cli_test', bootInstanceId: 'boot-test' });
+  setDeviceIsolationDaemonIdentity({
+    larkAppId: 'cli_test',
+    bootInstanceId: 'boot-test',
+    botsConfigPath: BOTS_CONFIG_PATH,
+    rosterRevision: ROSTER_REVISION,
+  });
+  setDeviceIsolationDaemonDependenciesForTest({
+    readRosterRevision: configPath => configPath === BOTS_CONFIG_PATH
+      ? ROSTER_REVISION
+      : 'invalid',
+  });
 });
 
 afterEach(() => {
@@ -67,6 +113,114 @@ afterEach(() => {
 });
 
 describe('device-isolation daemon transaction', () => {
+  it('rejects roster drift before prepare without acquiring a freeze', () => {
+    setDeviceIsolationDaemonDependenciesForTest({
+      readRosterRevision: () => 'b'.repeat(64),
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      dataDir: () => '/tmp/data',
+      listSessions: () => [],
+    });
+
+    expect(prepareDeviceIsolationActivationRaw({
+      activationVersion: 1, nonce: NONCE, rosterRevision: ROSTER_REVISION,
+    })).toEqual({
+      status: 409, body: { ok: false, error: 'roster_revision_mismatch' },
+    });
+    expect(currentDeviceIsolationFreezeLease(NOW)).toBeNull();
+  });
+
+  it('keeps a prepared transaction frozen when the roster drifts before commit', async () => {
+    let revision = ROSTER_REVISION;
+    const marker = pendingMarker();
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => NOW,
+      readRosterRevision: () => revision,
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      dataDir: () => '/tmp/data',
+      listSessions: () => [],
+      processExists: () => false,
+      readMarker: () => marker,
+    });
+    const prepared = prepareDeviceIsolationActivation({ activationVersion: 1, nonce: NONCE });
+    revision = 'b'.repeat(64);
+
+    expect(await commitDeviceIsolationActivation({
+      activationVersion: 1, nonce: NONCE,
+      leaseId: prepared.body.leaseId, markerSha256: digest(marker),
+    })).toEqual({
+      status: 409, body: { ok: false, error: 'roster_revision_mismatch' },
+    });
+    expect(currentDeviceIsolationFreezeLease(NOW)).not.toBeNull();
+  });
+
+  it('rejects an idempotent prepare when its request revision differs from the transaction', () => {
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => NOW,
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      dataDir: () => '/tmp/data',
+      listSessions: () => [],
+      processExists: () => false,
+    });
+    const first = prepareDeviceIsolationActivation({ activationVersion: 1, nonce: NONCE });
+    expect(first.status).toBe(200);
+
+    expect(prepareDeviceIsolationActivationRaw({
+      activationVersion: 1, nonce: NONCE, rosterRevision: 'b'.repeat(64),
+    })).toEqual({
+      status: 409, body: { ok: false, error: 'roster_revision_mismatch' },
+    });
+    expect(currentDeviceIsolationFreezeLease(NOW)?.leaseId).toBe(first.body.leaseId);
+  });
+
+  it('does not release a committed R1 transaction after the roster becomes R2', async () => {
+    let revision = ROSTER_REVISION;
+    let marker = pendingMarker();
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => NOW,
+      readRosterRevision: () => revision,
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      dataDir: () => '/tmp/data',
+      listSessions: () => [],
+      processExists: () => false,
+      readMarker: () => marker,
+    });
+    const prepared = prepareDeviceIsolationActivation({ activationVersion: 1, nonce: NONCE });
+    expect((await commitDeviceIsolationActivation({
+      activationVersion: 1, nonce: NONCE,
+      leaseId: prepared.body.leaseId, markerSha256: digest(marker),
+    })).status).toBe(200);
+    marker = activeMarker();
+    revision = 'b'.repeat(64);
+
+    expect(releaseDeviceIsolationActivation({
+      activationVersion: 1, nonce: NONCE,
+      leaseId: prepared.body.leaseId, markerSha256: digest(marker),
+    })).toEqual({
+      status: 409, body: { ok: false, error: 'roster_revision_mismatch' },
+    });
+    expect(currentDeviceIsolationFreezeLease(NOW)).not.toBeNull();
+  });
+
+  it('rejects request/transaction revision mismatches without releasing the transaction', () => {
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => NOW,
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      dataDir: () => '/tmp/data',
+      listSessions: () => [],
+      processExists: () => false,
+    });
+    const prepared = prepareDeviceIsolationActivation({ activationVersion: 1, nonce: NONCE });
+    const leaseId = prepared.body.leaseId as string;
+
+    expect(releaseDeviceIsolationActivationRaw({
+      activationVersion: 1, nonce: NONCE, rosterRevision: 'b'.repeat(64),
+      leaseId, abort: true,
+    })).toEqual({
+      status: 409, body: { ok: false, error: 'roster_revision_mismatch' },
+    });
+    expect(currentDeviceIsolationFreezeLease(NOW)?.leaseId).toBe(leaseId);
+  });
+
   it('includes unregistered durable store rows and fails closed on exact ZMX/Herdr targets', () => {
     const zmxTarget = {
       backendType: 'zmx' as const,
@@ -254,6 +408,7 @@ describe('device-isolation daemon transaction', () => {
     const merged = mergePersistedDeviceIsolationSessions([runtime], [{
       sessionId: runtime.sessionId,
       status: 'active',
+      pid: 9999,
       backendType: 'zmx',
       persistentBackendTarget: {
         backendType: 'zmx',
@@ -262,11 +417,44 @@ describe('device-isolation daemon transaction', () => {
     } as any]);
 
     expect(merged).toHaveLength(1);
-    expect(merged[0]).toBe(runtime);
+    expect(merged[0]).toMatchObject(runtime);
+    expect(merged[0]?.unregisteredPid).toBe(9999);
     expect(merged[0]?.persistentBackendTarget).toEqual({
       backendType: 'zmx',
       sessionName: 'bmx-runtime',
     });
+  });
+
+  it('preserves a persisted PTY pid behind a workerless runtime row until death is proven', () => {
+    const runtime: DeviceIsolationRuntimeSession = {
+      sessionId: 'restored-pty',
+      adopted: false,
+      frozenBackend: 'pty',
+      workerPresent: false,
+    };
+    const merged = mergePersistedDeviceIsolationSessions([runtime], [{
+      sessionId: runtime.sessionId,
+      status: 'active',
+      backendType: 'pty',
+      pid: 4242,
+    } as any]);
+    expect(merged).toEqual([expect.objectContaining({ unregisteredPid: 4242 })]);
+
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => merged,
+      processExists: pid => pid === 4242,
+    });
+    expect(buildDeviceIsolationInventory().blockers).toEqual([
+      { sessionId: 'restored-pty', blocker: 'process_identity_unavailable' },
+    ]);
+
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => merged,
+      processExists: () => false,
+    });
+    expect(buildDeviceIsolationInventory().entries).toEqual([
+      expect.objectContaining({ sessionId: 'restored-pty', disposition: 'quiescent' }),
+    ]);
   });
 
   it('freezes, quiesces exact local identities, accepts ACTIVE release hash, then unfreezes', async () => {
@@ -304,11 +492,13 @@ describe('device-isolation daemon transaction', () => {
     expect(prepared.body).toMatchObject({
       ok: true,
       activationVersion: 1,
+      receiptAuthorityVersion: ASK_RECEIPT_AUTHORITY_VERSION,
       nonce: NONCE,
       phase: 'prepared',
       daemon: {
         larkAppId: 'cli_test',
         bootInstanceId: 'boot-test',
+        rosterRevision: 'a'.repeat(64),
         pid: process.pid,
         procStart: 'daemon-start',
       },
@@ -695,5 +885,104 @@ describe('device-isolation daemon transaction', () => {
       leaseId,
       markerSha256: digest(marker),
     })).body.error).toBe('inventory_changed');
+  });
+
+  it('waits a bounded startup barrier for restored local sessions to attest isolated', async () => {
+    let reads = 0;
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => NOW + (reads * 25),
+      listSessions: () => {
+        reads += 1;
+        return reads >= 2
+          ? [{
+            sessionId: 'restored-owned',
+            adopted: false,
+            frozenBackend: 'pty',
+            workerPresent: true,
+            workerGeneration: 1,
+            worker: { pid: 3101, procStart: 'worker-start' },
+            attestation: {
+              backendType: 'pty',
+              credentialIsolated: true,
+              cli: { pid: 3102, procStart: 'cli-start' },
+              workerGeneration: 1,
+            },
+          }]
+          : [{
+            sessionId: 'restored-owned',
+            adopted: false,
+            frozenBackend: 'pty',
+            workerPresent: true,
+            workerGeneration: 1,
+            worker: { pid: 3101, procStart: 'worker-start' },
+            attestation: {
+              backendType: 'pty',
+              credentialIsolated: false,
+              cli: { pid: 3102, procStart: 'cli-start' },
+              workerGeneration: 1,
+            },
+          }];
+      },
+      processStart: pid => new Map([
+        [3101, 'worker-start'],
+        [3102, 'cli-start'],
+      ]).get(pid),
+      processExists: () => true,
+      sleep: async () => {},
+    });
+
+    const inventory = await awaitAskReceiptAuthorityBootstrapInventory({
+      timeoutMs: 100,
+      pollIntervalMs: 10,
+    });
+
+    expect(inventory.blockers).toEqual([]);
+    expect(inventory.entries).toEqual([
+      expect.objectContaining({
+        sessionId: 'restored-owned',
+        disposition: 'owned_local',
+        credentialIsolated: true,
+      }),
+    ]);
+  });
+
+  it('returns the last blocked inventory when the startup barrier times out', async () => {
+    let now = NOW;
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => now,
+      listSessions: () => [{
+        sessionId: 'restored-owned',
+        adopted: false,
+        frozenBackend: 'pty',
+        workerPresent: true,
+        workerGeneration: 1,
+        worker: { pid: 3201, procStart: 'worker-start' },
+        attestation: {
+          backendType: 'pty',
+          credentialIsolated: false,
+          cli: { pid: 3202, procStart: 'cli-start' },
+          workerGeneration: 1,
+        },
+      }],
+      processStart: pid => new Map([
+        [3201, 'worker-start'],
+        [3202, 'cli-start'],
+      ]).get(pid),
+      processExists: () => true,
+      sleep: async ms => { now += ms; },
+    });
+
+    const inventory = await awaitAskReceiptAuthorityBootstrapInventory({
+      timeoutMs: 60,
+      pollIntervalMs: 20,
+    });
+
+    expect(inventory.entries).toEqual([
+      expect.objectContaining({
+        sessionId: 'restored-owned',
+        disposition: 'owned_local',
+        credentialIsolated: false,
+      }),
+    ]);
   });
 });

@@ -122,7 +122,12 @@ export function buildCredentialOnlySandboxArgs(input: {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
     args.push('--ro-bind', normalized, normalized);
   }
-  for (const directory of hideDirectories.sort()) args.push('--tmpfs', directory);
+  // Authority directory masks must be unreadable with respect to host data and
+  // unwritable inside the sandbox. A bare tmpfs hides host contents but leaves
+  // a writable replacement namespace, so seal each mask immediately.
+  for (const directory of hideDirectories.sort()) {
+    args.push('--tmpfs', directory, '--remount-ro', directory);
+  }
   for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
   args.push(
     '--unshare-user',

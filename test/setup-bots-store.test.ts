@@ -4,10 +4,24 @@
  * Run: pnpm vitest run test/setup-bots-store.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeBotsJsonAtomic, readBotsJsonOrEmpty } from '../src/setup/bots-store.js';
+import {
+  readBotsJsonOrEmpty,
+  withBotsJsonLock,
+  withBotsJsonLockSync,
+  writeBotsJsonAtomic,
+} from '../src/setup/bots-store.js';
 
 let tmpDir: string;
 let botsPath: string;
@@ -75,6 +89,44 @@ describe('writeBotsJsonAtomic', () => {
       { larkAppId: 'cli_b', quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' } },
     ])).toThrow('cli_a -> cli_b -> cli_a');
     expect(readFileSync(botsPath, 'utf8')).toBe(before);
+  });
+
+  it.runIf(process.platform !== 'win32')('fails closed if a symlink registry retargets while its canonical target is locked', () => {
+    const first = join(tmpDir, 'first.json');
+    const second = join(tmpDir, 'second.json');
+    const alias = join(tmpDir, 'fleet.json');
+    writeFileSync(first, '[{"larkAppId":"first"}]\n', { mode: 0o600 });
+    writeFileSync(second, '[{"larkAppId":"second"}]\n', { mode: 0o600 });
+    symlinkSync(first, alias);
+
+    expect(() => withBotsJsonLockSync(alias, (targetPath) => {
+      expect(targetPath).toBe(first);
+      unlinkSync(alias);
+      symlinkSync(second, alias);
+      writeFileSync(targetPath, '[{"larkAppId":"old-target-only"}]\n', { mode: 0o600 });
+    })).toThrow(/target changed during operation/);
+
+    expect(JSON.parse(readFileSync(second, 'utf8'))[0].larkAppId).toBe('second');
+    expect(JSON.parse(readFileSync(first, 'utf8'))[0].larkAppId).toBe('old-target-only');
+  });
+
+  it.runIf(process.platform !== 'win32')('exposes an in-lock alias stability check before irreversible work', async () => {
+    const first = join(tmpDir, 'first.json');
+    const second = join(tmpDir, 'second.json');
+    const alias = join(tmpDir, 'fleet.json');
+    writeFileSync(first, '[]\n', { mode: 0o600 });
+    writeFileSync(second, '[]\n', { mode: 0o600 });
+    symlinkSync(first, alias);
+    let published = false;
+
+    await expect(withBotsJsonLock(alias, async (_targetPath, assertTargetStable) => {
+      unlinkSync(alias);
+      symlinkSync(second, alias);
+      assertTargetStable();
+      published = true;
+    })).rejects.toThrow(/target changed during operation/);
+
+    expect(published).toBe(false);
   });
 });
 

@@ -23,7 +23,12 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
-import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
+import {
+  resolveBotmuxConfigDir,
+  resolveBotsConfigFile,
+  resolveCanonicalBotsConfigTarget,
+  type BotsConfigProvenance,
+} from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
@@ -2876,8 +2881,8 @@ function resolveBotConfigPath(): string {
   //    non-default HOME. See core/config-dir.ts for the full rationale.
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
-    const resolved = resolve(botsConfigPath);
-    if (!existsSync(resolved)) {
+    const requested = resolve(botsConfigPath);
+    if (!existsSync(requested)) {
       // FAIL CLOSED, and deliberately so. For a daemon-spawned CLI child this
       // path is the registry the daemon actually parsed (pinned by spawnCli), so
       // "it is gone now" must NOT degrade into "resolve my own HOME's default
@@ -2886,23 +2891,25 @@ function resolveBotConfigPath(): string {
       // this bot against another fleet's secret and routing. Losing the file is
       // an operator-visible fault; changing registries behind their back is worse.
       throw new Error(
-        `BOTS_CONFIG file not found: ${resolved}`
+        `BOTS_CONFIG file not found: ${requested}`
         + ` — refusing to fall back to a different registry.`
         + ` (For a botmux-spawned CLI this is the exact bots.json the daemon loaded;`
         + ` if it was moved or unmounted, restore it or restart the daemon.)`,
       );
     }
-    loadedConfigPath = resolved;
+    const resolved = resolveCanonicalBotsConfigTarget(requested);
+    loadedConfigPath = resolved.targetPath;
     loadedConfigProvenance = 'loaded';
-    return resolved;
+    return resolved.targetPath;
   }
 
   // 2. <config dir>/bots.json (i.e. os.homedir()/.botmux/bots.json)
   const defaultPath = resolveBotsConfigFile();
   if (existsSync(defaultPath)) {
-    loadedConfigPath = defaultPath;
+    const resolved = resolveCanonicalBotsConfigTarget(defaultPath);
+    loadedConfigPath = resolved.targetPath;
     loadedConfigProvenance = 'loaded';
-    return defaultPath;
+    return resolved.targetPath;
   }
 
   throw new Error(

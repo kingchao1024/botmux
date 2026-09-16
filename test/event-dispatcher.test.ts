@@ -163,6 +163,16 @@ import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { resolve } from 'node:path';
+import { generateKeyPairSync } from 'node:crypto';
+import { createAskAnswerProvenanceAuthority, createAskReceiptSigner } from '../src/daemon/ask-receipt-authority.js';
+import {
+  _resetForTest as resetAskBrokerForTest,
+  registerAsk,
+  setAskReceiptRedeemer,
+  setCanTalkChecker,
+  setCardDispatcher,
+} from '../src/core/ask-broker.js';
+import { ASK_SELECT_ACTION, handleAskCardActionWithOutcome } from '../src/im/lark/ask-card.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -7229,6 +7239,7 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
   beforeEach(() => {
+    resetAskBrokerForTest();
     capturedHandlers = {};
     __resetAnchorQueues();
     __resetEventClaimsForTest();
@@ -7237,6 +7248,414 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     setupBotState();
     handlers = makeHandlers();
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('mints a one-shot Ask provenance capability only on the registered WS callback path', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'dispatcher-test',
+    });
+    const claimed = new Set<string>();
+    const authority = createAskAnswerProvenanceAuthority({
+      signer,
+      daemonBootId: 'boot-test',
+      claimEvent: async (appId, eventId) => {
+        const key = `${appId}:${eventId}`;
+        if (claimed.has(key)) return { ok: false, reason: 'duplicate' };
+        claimed.add(key);
+        return { ok: true, recovered: false };
+      },
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    setAskReceiptRedeemer(authority.redeemer);
+    setCanTalkChecker((_app, _chat, openId) => openId === USER_OPEN_ID);
+    let ask: import('../src/core/ask-types.js').PendingAsk | undefined;
+    setCardDispatcher({ async send(value) { ask = value; return { messageId: 'om-ask-card' }; } });
+    const pendingResult = registerAsk({
+      larkAppId: MY_APP_ID, sessionId: 'session-1', chatId: 'oc-chat', rootMessageId: 'om-root',
+      questions: [{ prompt: 'Proceed?', multiSelect: false, options: [
+        { key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' },
+      ] }],
+      timeoutMs: 60_000,
+    });
+    await Promise.resolve(); await Promise.resolve();
+    handlers.handleCardAction.mockImplementation((data, _appId, token) => handleAskCardActionWithOutcome(data, token));
+    const issue = vi.fn(authority.issue);
+    const complete = vi.fn(async (token: unknown) => {
+      const result = await authority.complete(token);
+      if (result.ok) claimed.add(`${MY_APP_ID}:evt-real-dispatch`);
+      return result;
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', {
+      issue,
+      wasRedeemed: authority.wasRedeemed,
+      complete,
+      revoke: authority.redeemer.revoke,
+    });
+    const event = {
+      event_id: 'evt-real-dispatch', operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: ask!.askId, nonce: ask!.nonce, key: 'yes' } },
+    };
+    await capturedHandlers['card.action.trigger'](event);
+    const result = await pendingResult;
+    expect(result.kind === 'answered' ? result.receipt?.payload : undefined).toMatchObject({
+      larkAppId: MY_APP_ID, actor: { identity: USER_OPEN_ID },
+      platformEventId: 'evt-real-dispatch', cardMessageId: 'om-ask-card', selected: 'yes',
+    });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    expect([...claimed]).toEqual([`${MY_APP_ID}:evt-real-dispatch`]);
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    const replay = await capturedHandlers['card.action.trigger']({ ...event });
+    expect(replay).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
+    expect(issue).toHaveBeenCalledTimes(2);
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    resetAskBrokerForTest();
+  });
+
+  it('rejects an Ask callback before the handler when its durable claim fails', async () => {
+    const issuer = {
+      issue: vi.fn(async () => ({ kind: 'rejected', reason: 'storage_error' } as const)),
+      wasRedeemed: vi.fn(() => false),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-claim-storage-failed',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes' } },
+    });
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } });
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+    expect(issuer.complete).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed Ask callback before durable claim and handler dispatch', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'dispatcher-malformed-shape',
+    });
+    const claimEvent = vi.fn(async () => ({ ok: true, recovered: false } as const));
+    const completeEvent = vi.fn(async () => ({ ok: true, recovered: false } as const));
+    const authority = createAskAnswerProvenanceAuthority({
+      signer,
+      daemonBootId: 'boot-malformed-shape',
+      claimEvent,
+      completeEvent,
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', {
+      issue: authority.issue,
+      wasRedeemed: authority.wasRedeemed,
+      complete: authority.complete,
+      revoke: authority.redeemer.revoke,
+    });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-malformed-ask-shape',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: {
+        action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes', question_index: '0',
+      } },
+    });
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } });
+    expect(claimEvent).not.toHaveBeenCalled();
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+    expect(completeEvent).not.toHaveBeenCalled();
+  });
+
+  it('uses one immutable callback snapshot across deferred claim and handler dispatch', async () => {
+    let releaseClaim!: () => void;
+    const claimGate = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    let notifyClaimStarted!: () => void;
+    const claimStarted = new Promise<void>((resolve) => { notifyClaimStarted = resolve; });
+    let issuedData: any;
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'dispatcher-snapshot',
+    });
+    const authority = createAskAnswerProvenanceAuthority({
+      signer,
+      daemonBootId: 'boot-snapshot',
+      claimEvent: async () => {
+        notifyClaimStarted();
+        await claimGate;
+        return { ok: true, recovered: false };
+      },
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    const issuer = {
+      issue: vi.fn(async (_appId: string, data: unknown) => {
+        issuedData = data;
+        return authority.issue(_appId, data);
+      }),
+      wasRedeemed: authority.wasRedeemed,
+      complete: authority.complete,
+      revoke: authority.redeemer.revoke,
+    };
+    setAskReceiptRedeemer(authority.redeemer);
+    setCanTalkChecker((_app, _chat, openId) => openId === USER_OPEN_ID);
+    let ask: import('../src/core/ask-types.js').PendingAsk | undefined;
+    setCardDispatcher({ async send(value) { ask = value; return { messageId: 'om-ask-card' }; } });
+    const pendingResult = registerAsk({
+      larkAppId: MY_APP_ID, sessionId: 'session-snapshot', chatId: 'oc-chat', rootMessageId: 'om-root',
+      questions: [{ prompt: 'Pick one', multiSelect: false, options: [
+        { key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' },
+      ] }],
+      timeoutMs: 60_000,
+    });
+    await Promise.resolve(); await Promise.resolve();
+    const originalAskId = ask!.askId;
+    const originalNonce = ask!.nonce;
+    handlers.handleCardAction.mockImplementation((data, _appId, token) =>
+      handleAskCardActionWithOutcome(data, token));
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+    const original = {
+      event_id: 'evt-submit-snapshot', operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: {
+        value: {
+          action: 'ask_submit', ask_id: ask!.askId, nonce: ask!.nonce,
+          confirm_empty: 'true',
+        },
+        form_value: { q0: ['0::yes'] },
+      },
+    };
+
+    const call = capturedHandlers['card.action.trigger'](original);
+    await claimStarted;
+    original.action.value.ask_id = 'ask-mutated';
+    original.action.value.confirm_empty = undefined as unknown as 'true';
+    original.action.form_value.q0[0] = '0::no';
+    releaseClaim();
+    await call;
+    const result = await pendingResult;
+
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    const handledData = handlers.handleCardAction.mock.calls[0]![0];
+    expect(handledData).toBe(issuedData);
+    expect(handledData.action.value).toMatchObject({
+      ask_id: originalAskId, nonce: originalNonce, confirm_empty: 'true',
+    });
+    expect(handledData.action.form_value).toEqual({ q0: ['0::yes'] });
+    expect(Object.isFrozen(handledData)).toBe(true);
+    expect(Object.isFrozen(handledData.action)).toBe(true);
+    expect(Object.isFrozen(handledData.action.value)).toBe(true);
+    expect(Object.isFrozen(handledData.action.form_value)).toBe(true);
+    expect(Object.isFrozen(handledData.action.form_value.q0)).toBe(true);
+    expect(result).toMatchObject({ kind: 'answered', answers: [['yes']] });
+    expect(result.kind === 'answered' ? result.receipt?.payload : undefined).toMatchObject({
+      askId: originalAskId,
+      answers: [['yes']],
+      platformEventId: 'evt-submit-snapshot',
+    });
+  });
+
+  it('falls back to ordinary unsigned ask handling when the receipt authority is unavailable', async () => {
+    setCanTalkChecker((_app, _chat, openId) => openId === USER_OPEN_ID);
+    let ask: import('../src/core/ask-types.js').PendingAsk | undefined;
+    setCardDispatcher({ async send(value) { ask = value; return { messageId: 'om-ask-card' }; } });
+    const pendingResult = registerAsk({
+      larkAppId: MY_APP_ID,
+      sessionId: 'session-no-authority',
+      chatId: 'oc-chat',
+      rootMessageId: 'om-root',
+      questions: [{ prompt: 'Proceed without receipt signer?', multiSelect: false, options: [
+        { key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' },
+      ] }],
+      timeoutMs: 60_000,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    handlers.handleCardAction.mockImplementation((data, _appId, token) => handleAskCardActionWithOutcome(data, token));
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', undefined);
+
+    const event = {
+      event_id: 'evt-no-authority',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: ask!.askId, nonce: ask!.nonce, key: 'yes' } },
+    };
+
+    const first = await capturedHandlers['card.action.trigger'](event);
+    const result = await pendingResult;
+    const replay = await capturedHandlers['card.action.trigger']({ ...event });
+
+    expect(first).toMatchObject({ card: { data: { header: { title: { content: expect.stringContaining('已结束') } } } } });
+    expect(result).toMatchObject({ kind: 'answered', answers: [['yes']], by: USER_OPEN_ID });
+    expect(result.kind === 'answered' ? result.receipt : undefined).toBeUndefined();
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    expect(replay).toEqual({ toast: { type: 'info', content: '操作已收到，请勿重复点击' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    resetAskBrokerForTest();
+  });
+
+  it('treats key-init-unavailable as ordinary unsigned ask handling when no authority is wired', async () => {
+    setCanTalkChecker((_app, _chat, openId) => openId === USER_OPEN_ID);
+    let ask: import('../src/core/ask-types.js').PendingAsk | undefined;
+    setCardDispatcher({ async send(value) { ask = value; return { messageId: 'om-ask-card' }; } });
+    const pendingResult = registerAsk({
+      larkAppId: MY_APP_ID,
+      sessionId: 'session-key-init-unavailable',
+      chatId: 'oc-chat',
+      rootMessageId: 'om-root',
+      questions: [{ prompt: 'Proceed without initialized key?', multiSelect: false, options: [
+        { key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' },
+      ] }],
+      timeoutMs: 60_000,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    handlers.handleCardAction.mockImplementation((data, _appId, token) => handleAskCardActionWithOutcome(data, token));
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu');
+
+    await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-key-init-unavailable',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: ask!.askId, nonce: ask!.nonce, key: 'yes' } },
+    });
+    const result = await pendingResult;
+
+    expect(result).toMatchObject({ kind: 'answered', answers: [['yes']], by: USER_OPEN_ID });
+    expect(result.kind === 'answered' ? result.receipt : undefined).toBeUndefined();
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    resetAskBrokerForTest();
+  });
+
+  it('rejects a malformed Ask callback before handler dispatch even when authority is unavailable', async () => {
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', undefined);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-malformed-ask-no-authority',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: {
+        action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes', question_index: '0',
+      } },
+    });
+
+    expect(result).toEqual({ toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' } });
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+  });
+
+  it('keeps the total Ask ACK path bounded when the durable claim is slow', async () => {
+    vi.useFakeTimers();
+    const issuer = {
+      issue: vi.fn(() => new Promise<never>(() => {})),
+      wasRedeemed: vi.fn(() => false),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+    const call = capturedHandlers['card.action.trigger']({
+      event_id: 'evt-slow-claim',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes' } },
+    });
+
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(call).resolves.toEqual({
+      toast: { type: 'error', content: '无法安全确认此次操作，请稍后重试' },
+    });
+    expect(handlers.handleCardAction).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('completes only a successfully redeemed Ask callback claim', async () => {
+    const redeemed = Object.freeze({});
+    const unused = Object.freeze({});
+    const issuer = {
+      issue: vi.fn()
+        .mockResolvedValueOnce({ kind: 'issued', token: redeemed })
+        .mockResolvedValueOnce({ kind: 'issued', token: unused }),
+      wasRedeemed: vi.fn((token: unknown) => token === redeemed),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    handlers.handleCardAction
+      .mockResolvedValueOnce({
+        kind: 'botmux.ask-card-action-outcome.v1', mutationApplied: true,
+        response: { toast: { type: 'info', content: 'done' } },
+      })
+      .mockResolvedValueOnce({
+        kind: 'botmux.ask-card-action-outcome.v1', mutationApplied: false,
+        response: { toast: { type: 'warning', content: 'stale' } },
+      });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+    const event = (eventId: string) => ({
+      event_id: eventId,
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes' } },
+    });
+
+    await capturedHandlers['card.action.trigger'](event('evt-redeemed'));
+    await capturedHandlers['card.action.trigger'](event('evt-unused'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(issuer.complete).toHaveBeenCalledTimes(1);
+    expect(issuer.complete).toHaveBeenCalledWith(redeemed);
+    expect(issuer.revoke).toHaveBeenCalledWith(redeemed);
+    expect(issuer.revoke).toHaveBeenCalledWith(unused);
+  });
+
+  it('does not complete an Ask claim when the handler reports no mutation', async () => {
+    const token = Object.freeze({});
+    const issuer = {
+      issue: vi.fn(async () => ({ kind: 'issued', token } as const)),
+      wasRedeemed: vi.fn(() => true),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    handlers.handleCardAction.mockResolvedValue({
+      kind: 'botmux.ask-card-action-outcome.v1', mutationApplied: false,
+      response: { toast: { type: 'warning', content: 'invalid answer' } },
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+
+    await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-handler-rejected',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes' } },
+    });
+    await Promise.resolve();
+
+    expect(issuer.complete).not.toHaveBeenCalled();
+    expect(issuer.revoke).toHaveBeenCalledWith(token);
+  });
+
+  it('does not complete a redeemed claim when the Ask handler rejects', async () => {
+    const token = Object.freeze({});
+    const issuer = {
+      issue: vi.fn(async () => ({ kind: 'issued', token } as const)),
+      wasRedeemed: vi.fn(() => true),
+      complete: vi.fn(async () => ({ ok: true })),
+      revoke: vi.fn(),
+    };
+    handlers.handleCardAction.mockRejectedValue(new Error('settlement failed'));
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', issuer);
+
+    await capturedHandlers['card.action.trigger']({
+      event_id: 'evt-handler-rejected',
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om-ask-card' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: 'ask-1', nonce: 'nonce-1', key: 'yes' } },
+    });
+    await Promise.resolve();
+
+    expect(issuer.complete).not.toHaveBeenCalled();
+    expect(issuer.revoke).toHaveBeenCalledWith(token);
   });
 
   it('uses empty ACK plus message.patch for a fast deferred complex-card update', async () => {

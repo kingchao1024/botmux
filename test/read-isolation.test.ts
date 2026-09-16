@@ -8,6 +8,10 @@ import {
   deviceCredentialIsolationMarkerPath,
   isCredentialIsolationReservedBasename,
   buildCredentialIsolationRules,
+  askReceiptHostAuthorityPaths,
+  askAuthorityActivationPaths,
+  detectAskAuthorityPresence,
+  buildSeatbeltProfile,
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   evaluatePersistentPaneMigration,
@@ -28,6 +32,7 @@ import {
   shouldRedirectCliData,
 } from '../src/adapters/cli/read-isolation.js';
 import { managedOriginAttestationDirectory, managedOriginCapabilityDirectory } from '../src/core/managed-origin-capability.js';
+import { buildCredentialOnlySandboxArgs } from '../src/adapters/backend/sandbox.js';
 
 describe('CLI data redirect gate', () => {
   const base = { supportsReadIsolation: true, sessionDataDir: '/srv/botmux/data' };
@@ -160,19 +165,103 @@ describe('evaluateReadIsolationGate (fail-closed, single decision point)', () =>
   });
 });
 
-describe('mandatory device credential isolation', () => {
-  it('activates once either the enrollment marker or a device credential exists', () => {
-    expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: false })).toBe(false);
-    expect(credentialIsolationRequired({ markerExists: true, deviceCredentialExists: false })).toBe(true);
-    expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: true })).toBe(true);
+describe('mandatory host credential isolation', () => {
+  it('detects a default callback ledger even when the configured data root moved', () => {
+    const ctx = {
+      homeDir: '/home/agent',
+      botmuxHome: '/srv/botmux-runtime',
+      defaultBotmuxHome: '/home/agent/.botmux',
+      sessionDataDir: '/srv/botmux-runtime/data',
+    };
+    expect(askAuthorityActivationPaths(ctx)).toEqual({
+      signingKeys: [
+        '/home/agent/.botmux/ask-receipt-authority/signing-key.json',
+        '/srv/botmux-runtime/ask-receipt-authority/signing-key.json',
+      ],
+      callbackLedgers: [
+        '/home/agent/.botmux/data/dedup/ask-card-events',
+        '/srv/botmux-runtime/data/dedup/ask-card-events',
+      ],
+      askStores: [
+        '/home/agent/.botmux/data/asks',
+        '/srv/botmux-runtime/data/asks',
+      ],
+    });
+    const presence = detectAskAuthorityPresence(
+      ctx,
+      path => path === '/home/agent/.botmux/data/dedup/ask-card-events',
+    );
+    expect(presence).toEqual({
+      askReceiptSigningKeyExists: false,
+      askCardEventLedgerExists: true,
+      askPersistStoreExists: false,
+    });
+    expect(evaluateCredentialOnlyIsolationGate({
+      markerExists: false,
+      deviceCredentialExists: false,
+      ...presence,
+      remoteBackend: false,
+      platform: 'linux',
+      mechanismAvailable: true,
+      fullIsolationCoversCredentials: false,
+    })).toEqual({ required: true, mode: 'bwrap' });
+  });
+
+  it('activates once any host credential or Ask authority exists', () => {
+    expect(credentialIsolationRequired({
+      markerExists: false, deviceCredentialExists: false, askReceiptSigningKeyExists: false,
+    })).toBe(false);
+    expect(credentialIsolationRequired({
+      markerExists: false, deviceCredentialExists: false, askReceiptSigningKeyExists: false,
+      askCardEventLedgerExists: true,
+    })).toBe(true);
+    expect(credentialIsolationRequired({
+      markerExists: false, deviceCredentialExists: false, askReceiptSigningKeyExists: false,
+      askPersistStoreExists: true,
+    })).toBe(true);
+    expect(credentialIsolationRequired({
+      markerExists: true, deviceCredentialExists: false, askReceiptSigningKeyExists: false,
+    })).toBe(true);
+    expect(credentialIsolationRequired({
+      markerExists: false, deviceCredentialExists: true, askReceiptSigningKeyExists: false,
+    })).toBe(true);
     expect(deviceCredentialIsolationMarkerPath('/home/agent/'))
       .toBe('/home/agent/.botmux/.device-credential-isolation');
+  });
+
+  it('activates for an Ask signing key alone and selects the platform confinement', () => {
+    expect(credentialIsolationRequired({
+      markerExists: false, deviceCredentialExists: false, askReceiptSigningKeyExists: true,
+    })).toBe(true);
+    const base = {
+      markerExists: false,
+      deviceCredentialExists: false,
+      askReceiptSigningKeyExists: true,
+      remoteBackend: false,
+      mechanismAvailable: true,
+      fullIsolationCoversCredentials: false,
+    };
+    expect(evaluateCredentialOnlyIsolationGate({ ...base, platform: 'darwin' }))
+      .toEqual({ required: true, mode: 'seatbelt' });
+    expect(evaluateCredentialOnlyIsolationGate({ ...base, platform: 'linux' }))
+      .toEqual({ required: true, mode: 'bwrap' });
+    expect(evaluateCredentialOnlyIsolationGate({
+      ...base, platform: 'linux', fullIsolationCoversCredentials: true,
+    })).toEqual({ required: true, mode: 'covered' });
+    expect(evaluateCredentialOnlyIsolationGate({
+      ...base, platform: 'linux', remoteBackend: true,
+    })).toEqual({ required: true, mode: 'remote-bypass' });
+    expect(evaluateCredentialOnlyIsolationGate({
+      ...base, platform: 'linux', mechanismAvailable: false,
+    })).toMatchObject({ required: true, mode: 'blocked' });
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(11);
   });
 
   it('fails closed when required confinement is unavailable', () => {
     expect(evaluateCredentialOnlyIsolationGate({
       markerExists: true,
       deviceCredentialExists: false,
+      askReceiptSigningKeyExists: false,
       remoteBackend: false,
       platform: 'linux',
       mechanismAvailable: false,
@@ -181,6 +270,7 @@ describe('mandatory device credential isolation', () => {
     expect(evaluateCredentialOnlyIsolationGate({
       markerExists: true,
       deviceCredentialExists: false,
+      askReceiptSigningKeyExists: false,
       remoteBackend: false,
       platform: 'linux',
       mechanismAvailable: true,
@@ -188,15 +278,26 @@ describe('mandatory device credential isolation', () => {
     })).toEqual({ required: true, mode: 'covered' });
   });
 
-  it('denies dedicated, legacy, marker, backup, and atomic sidecar paths', () => {
+  it('denies device and Ask signing authority under default and configured roots', () => {
     const rules = buildCredentialIsolationRules({
       homeDir: '/home/agent',
       botmuxHome: '/srv/botmux-runtime',
+      sessionDataDir: '/srv/botmux-runtime/data',
     });
     expect(rules.roots).toEqual(['/home/agent/.botmux', '/srv/botmux-runtime']);
     expect(rules.denyPaths).toContain('/home/agent/.botmux/device-auth');
     expect(rules.denyPaths).toContain('/srv/botmux-runtime/platform.json');
     expect(rules.denyPaths).toContain('/home/agent/.botmux/.device-credential-isolation');
+    expect(rules.askReceiptAuthorityPaths).toEqual([
+      '/home/agent/.botmux/ask-receipt-authority',
+      '/srv/botmux-runtime/ask-receipt-authority',
+      '/home/agent/.botmux/data/dedup/ask-card-events',
+      '/srv/botmux-runtime/data/dedup/ask-card-events',
+      '/home/agent/.botmux/data/asks',
+      '/srv/botmux-runtime/data/asks',
+    ]);
+    expect(rules.denyPaths).toEqual(expect.arrayContaining(rules.askReceiptAuthorityPaths));
+    expect(rules.denyWritePaths).toEqual(expect.arrayContaining(rules.askReceiptAuthorityPaths));
     for (const name of [
       'device-auth',
       'device.json',
@@ -220,6 +321,59 @@ describe('mandatory device credential isolation', () => {
     expect(strippedWorkerSource).toContain('canonical(profileDir)');
     expect(capabilityDir).toMatch(/^\/tmp\/botmux-data\/read-isolation\/origin-[a-f0-9]{64}$/);
     expect(attestationDir).toMatch(/^\/tmp\/botmux-data\/read-isolation\/attest-[a-f0-9]{64}$/);
+  });
+
+  it('emits final Darwin denies and Linux directory masks for both Ask authorities', () => {
+    const rules = buildCredentialIsolationRules({
+      homeDir: '/home/agent',
+      botmuxHome: '/srv/botmux-runtime',
+      sessionDataDir: '/srv/botmux-runtime/data',
+    });
+    const authority = '/home/agent/.botmux/ask-receipt-authority';
+    const key = `${authority}/signing-key.json`;
+    const profile = buildSeatbeltProfile(
+      rules.denyPaths,
+      [key],
+      rules.askReceiptAuthorityPaths,
+      [],
+      rules.denyRegexes,
+      undefined,
+      {
+        denyWritePaths: rules.denyWritePaths,
+        denyWriteRegexes: rules.denyWriteRegexes,
+        denyWriteLiterals: rules.denyWriteLiterals,
+      },
+    );
+    expect(profile.lastIndexOf(`(deny file-read* (subpath "${authority}"))`))
+      .toBeGreaterThan(profile.indexOf(`(allow file-read* (subpath "${key}"))`));
+    expect(profile).toContain(`(deny file-write* (subpath "${authority}"))`);
+
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: rules.askReceiptAuthorityPaths,
+      hideFiles: [],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+    for (const path of rules.askReceiptAuthorityPaths) {
+      const at = args.indexOf(path);
+      expect(args[at - 1]).toBe('--tmpfs');
+      expect(args.slice(at + 1, at + 3)).toEqual(['--remount-ro', path]);
+    }
+    expect(args).not.toContain(key);
+  });
+
+  it('dedupes default/configured Ask authorities when the runtime uses default paths', () => {
+    expect(askReceiptHostAuthorityPaths({
+      homeDir: '/home/agent',
+      botmuxHome: '/home/agent/.botmux',
+      defaultBotmuxHome: '/home/agent/.botmux',
+      sessionDataDir: '/home/agent/.botmux/data',
+    })).toEqual([
+      '/home/agent/.botmux/ask-receipt-authority',
+      '/home/agent/.botmux/data/dedup/ask-card-events',
+      '/home/agent/.botmux/data/asks',
+    ]);
   });
 });
 
@@ -1062,8 +1216,16 @@ describe('worker capability carve-out ordering', () => {
     expect(credentialWrapperAt).toBeLessThan(spawnAt);
     expect(strippedSource).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(strippedSource).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(strippedSource).toContain('requiredCapabilities: appliedIsolationCapabilities');
-    expect(strippedSource).toContain('exactCapabilities: true');
+    expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
+    expect(source).toContain('isCredentialIsolationReservedBasename(name)');
+    expect(source).toContain('} = detectAskAuthorityPresence({');
+    expect(source).toContain('}, hostEntryExistsNoFollow);');
+    expect(source).toContain('askReceiptSigningKeyExists,');
+    expect(source).toContain('const askAuthorityPaths = askReceiptHostAuthorityPaths({');
+    expect(source).toContain('hideDirectories.add(realpathSync(authorityDirectory))');
+    expect(source).toContain('rules.askReceiptAuthorityPaths.map(canonical)');
+    expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
+    expect(source).toContain('exactCapabilities: true');
   });
 });
 

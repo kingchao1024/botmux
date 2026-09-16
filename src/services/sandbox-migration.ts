@@ -14,7 +14,7 @@
 import { promises as fsp, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { withFileLock } from '../utils/file-lock.js';
+import { withBotsJsonLock } from '../setup/bots-store.js';
 import { writeRawConfigAtomic } from './config-store.js';
 import { migrateLegacySandboxFields } from '../adapters/cli/fs-policy.js';
 import { logger } from '../utils/logger.js';
@@ -38,9 +38,9 @@ export function resolveBotsConfigPath(): string | null {
  */
 export async function migrateSandboxConfigOnDisk(path: string): Promise<{ migrated: string[] }> {
   try {
-    return await withFileLock(path, async () => {
+    return await withBotsJsonLock(path, async (targetPath) => {
       let raw: unknown;
-      try { raw = JSON.parse(await fsp.readFile(path, 'utf-8')); } catch { return { migrated: [] }; }
+      try { raw = JSON.parse(await fsp.readFile(targetPath, 'utf-8')); } catch { return { migrated: [] }; }
       if (!Array.isArray(raw)) return { migrated: [] };
       const migrated: string[] = [];
       for (const entry of raw) {
@@ -52,12 +52,12 @@ export async function migrateSandboxConfigOnDisk(path: string): Promise<{ migrat
         migrated.push(typeof entry.larkAppId === 'string' ? entry.larkAppId : '<unknown>');
       }
       if (!migrated.length) return { migrated };
-      const bak = `${path}.bak-sandbox-v1`;
+      const bak = `${targetPath}.bak-sandbox-v1`;
       if (!existsSync(bak)) {
         await fsp.copyFile(path, bak);
         await fsp.chmod(bak, 0o600);
       }
-      await writeRawConfigAtomic(path, raw);
+      await writeRawConfigAtomic(targetPath, raw);
       logger.info(`[sandbox-migration] migrated legacy sandbox fields for ${migrated.length} bot(s): ${migrated.join(', ')} (backup: ${bak})`);
       return { migrated };
     });

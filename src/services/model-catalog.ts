@@ -33,16 +33,38 @@ export interface DetectModelsOptions {
   readonly adapterFactory?: (cliId: CliId) => CliAdapter;
 }
 
+export interface StaticModelChoicesOptions {
+  /** Adapter factory seam used by tests to prove the fast path stays shell-free. */
+  readonly adapterFactory?: (cliId: CliId) => CliAdapter;
+}
+
+/**
+ * These adapters intentionally expose no static model picker, but constructing
+ * them resolves their executable through login/interactive shells. Doing that
+ * while enumerating every Dashboard option adds roughly three seconds per
+ * missing CLI and blocks the whole Bot defaults page for no useful result.
+ */
+const MODELLESS_EAGER_RESOLUTION_CLIS = new Set<CliId>([
+  'seed',
+  'relay',
+  'pi',
+  'oh-my-pi',
+]);
+
 // ─── 静态候选 ────────────────────────────────────────────────────────────────
 
 /**
  * 按 CLI 选择键取静态模型候选（shell-free，同步，绝不抛异常）。
  * key 来自 CLI_SELECT_OPTIONS（普通 cliId 或 'ttadk-x-claude' 这类网关键）。
  *  - ttadk 网关项：ttadkAcceptsModel(wrapperCli) 为真 → [...TTADK_MODEL_SUGGESTIONS]，否则 []
+ *  - 明确无静态候选且构造会解析 shell 的 CLI：直接返回 []
  *  - 其它：createCliAdapterSync(cliId).modelChoices ?? []（构造失败/无候选 → []）
  *  - 未知 key → []
  */
-export function staticModelChoices(key: string): readonly string[] {
+export function staticModelChoices(
+  key: string,
+  opts: StaticModelChoicesOptions = {},
+): readonly string[] {
   try {
     const opt = lookupCliSelection(key);
     if (!opt) return [];
@@ -51,7 +73,8 @@ export function staticModelChoices(key: string): readonly string[] {
     if (isTtadkWrapper(opt.wrapperCli)) {
       return ttadkAcceptsModel(opt.wrapperCli) ? [...TTADK_MODEL_SUGGESTIONS] : [];
     }
-    const adapter = createCliAdapterSync(opt.cliId);
+    if (MODELLESS_EAGER_RESOLUTION_CLIS.has(opt.cliId)) return [];
+    const adapter = (opts.adapterFactory ?? createCliAdapterSync)(opt.cliId);
     return adapter.modelChoices ? [...adapter.modelChoices] : [];
   } catch {
     return [];

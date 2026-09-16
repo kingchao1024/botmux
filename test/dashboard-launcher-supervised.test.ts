@@ -113,7 +113,8 @@ describe('dashboard launcher — source pins', () => {
 
   it('cmdRestart health-gates on fleet MEMBERS so a down dashboard fails the restart', () => {
     const cli = read('cli.ts');
-    expect(cli).toContain('fleetMemberNames');
+    expect(cli).toContain('waitFleetReady');
+    expect(cli).toContain('probeDashboardReadyWithin');
   });
 
   it('reports quota fallback cycles before restart and keeps the recoverable fleet path', () => {

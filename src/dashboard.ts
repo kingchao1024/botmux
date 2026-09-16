@@ -293,6 +293,7 @@ import {
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, rmwBotEntry, writeRawConfigAtomic } from './services/config-store.js';
+import { withBotsJsonLock } from './setup/bots-store.js';
 import {
   emitCodexNotifierOutboxItem,
   installCodexNotifierHook,
@@ -1568,8 +1569,8 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
   let changed = false;
   try {
     const path = requireConfigPath();
-    await withFileLock(path, async () => {
-      const raw = await readRawConfig(path);
+    await withBotsJsonLock(path, async (targetPath) => {
+      const raw = await readRawConfig(targetPath);
       const idx = findEntryIndex(raw, targetAppId);
       if (idx < 0) throw new Error('bot_not_in_config');
       const entry = raw[idx] as Record<string, unknown>;
@@ -1579,7 +1580,7 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
       compactVcMeetingAgentEntry(entry, next);
       // 落盘前整份校验，和 daemon bootstrap 保持对称，避免 Dashboard 写出非法 registry。
       parseBotConfigsFromText(JSON.stringify(raw));
-      await writeRawConfigAtomic(path, raw);
+      await writeRawConfigAtomic(targetPath, raw);
       changed = true;
     });
   } catch (err: any) {
@@ -2501,8 +2502,8 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
   try { loadBotConfigs(); } catch { return false; }
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-  return withFileLock(path, async () => {
-    const raw = await readRawConfig(path);
+  return withBotsJsonLock(path, async (targetPath) => {
+    const raw = await readRawConfig(targetPath);
     const index = findEntryIndex(raw, larkAppId);
     if (index < 0) return false;
     const entry = raw[index];
@@ -2516,7 +2517,7 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
     const next = updateBotPluginOverride(current, pluginId, enabled);
     if (next.length > 0) entry.plugins = next;
     else delete entry.plugins;
-    await writeRawConfigAtomic(path, raw);
+    await writeRawConfigAtomic(targetPath, raw);
     return true;
   });
 }

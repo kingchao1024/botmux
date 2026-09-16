@@ -61,7 +61,7 @@ import {
   refreshAutostart,
 } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
-import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
+import { withBotsJsonLock, writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import {
   applyBotConfigEdits,
@@ -167,7 +167,15 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
-import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import {
+  callDashboard,
+  probeDashboardReadiness,
+  type DashboardEndpoint,
+  type DashboardResult,
+} from './cli/dashboard-endpoint.js';
+import { resolveBotsConfigFile } from './core/config-dir.js';
+import type { FleetLaunchPlan } from './core/fleet-launch-plan.js';
+import type { StartFleetResult } from './core/fleet-runtime.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
 import { isRemoteAccessEnabled } from './global-config.js';
@@ -317,8 +325,10 @@ import {
 } from './core/plugins/dependencies.js';
 import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
 import {
+  cleanupStaleDaemonDescriptorFiles,
   findOnlineDaemon,
   listOnlineDaemons as listOnlineDaemonsIn,
+  parseDaemonIpcPort,
   resolveDaemonIpcPort,
   type OnlineDaemonInfo,
 } from './utils/daemon-discovery.js';
@@ -389,16 +399,16 @@ function ensureConfigDir(): void {
   }
 }
 
-function loadBotsJson(): any[] {
+function loadBotsJson(configPath: string = BOTS_JSON_FILE): any[] {
   // NOTE: this stays FATAL on a read error, deliberately. Several callers treat
   // an empty list as "nothing references this" and go on to delete things
   // (plugin dematerialize / uninstall dependency check) — degrading the read to
   // [] would turn a denied read into silent destructive action. Anything that
   // must survive an unreadable bots.json has to opt out explicitly, the way
   // allBotAppIds() and currentBotIsApiOnly() do.
-  if (existsSync(BOTS_JSON_FILE)) {
+  if (existsSync(configPath)) {
     try {
-      return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE);
+      return parseBotConfigsJson(readFileSync(configPath, 'utf-8'), configPath);
     } catch (err: any) {
       console.error(`❌ ${err?.message ?? String(err)}`);
       process.exit(1);
@@ -541,8 +551,12 @@ async function cmdServe(args: string[]): Promise<void> {
   });
 }
 
+function lifecycleBotsConfigPath(): string {
+  return resolveBotsConfigFile({ env: process.env });
+}
+
 function hasConfig(): boolean {
-  return existsSync(BOTS_JSON_FILE) || existsSync(ENV_FILE);
+  return existsSync(lifecycleBotsConfigPath()) || existsSync(ENV_FILE);
 }
 
 function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
@@ -2481,15 +2495,17 @@ async function cmdStart(): Promise<void> {
   ensureConfigDir();
   await ensureSystemDependencies();
 
-  const botsForCheck = await preflightConfiguredBotCredentials();
-  // The boot hook marks itself so purely presentational waiting can be skipped
-  // there (see startConfiguredFleet).
-  await startConfiguredFleet(botsForCheck, { bootHookStart });
+  const preflight = await preflightConfiguredBotCredentials();
+  // A systemd boot hook must return before the oneshot deadline, so it skips
+  // both the bounded true-readiness gate and the later dashboard-link hint.
+  // The detached supervisor and daemon admission remain fail-closed themselves.
+  await startConfiguredFleet(preflight, { bootHookStart });
 }
 
 /** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
 async function preflightConfiguredBotCredentials() {
-  const botsForCheck = loadBotsJson();
+  const configPath = lifecycleBotsConfigPath();
+  const botsForCheck = loadBotsJson(configPath);
   const blockedBotIds = preflightQuotaFallbackTopology(botsForCheck, 'start');
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
@@ -2518,18 +2534,19 @@ async function preflightConfiguredBotCredentials() {
       process.exit(1);
     }
   }
-  return botsForCheck;
+  return { bots: botsForCheck, configPath };
 }
 
 async function startConfiguredFleet(
-  botsForCheck: ReturnType<typeof loadBotsJson>,
+  preflight: Awaited<ReturnType<typeof preflightConfiguredBotCredentials>>,
   options: { bootHookStart?: boolean } = {},
 ): Promise<void> {
-
+  let launched: StartFleetResult | undefined;
+  let launchPlan: FleetLaunchPlan | undefined;
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
-    await withFileLock(BOTS_JSON_FILE, async () => {
-      const lockedBots = loadBotsJson();
-      if (JSON.stringify(lockedBots) !== JSON.stringify(botsForCheck)) {
+    await withBotsJsonLock(preflight.configPath, async (lockedConfigPath, assertTargetStable) => {
+      const lockedBots = loadBotsJson(lockedConfigPath);
+      if (JSON.stringify(lockedBots) !== JSON.stringify(preflight.bots)) {
         throw new Error('[start] bots.json changed during credential preflight; retry with the new configuration');
       }
       preflightNodeSanity();
@@ -2546,22 +2563,39 @@ async function startConfiguredFleet(
       // live supervisor already owns the fleet is a safe no-op — no pm2-style
       // "refuse partial live fleet" dance needed; the running supervisor keeps
       // the fleet reconciled itself.
-      const { startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
-      const result = startFleetViaSupervisor();
-      if (result.action === 'already-running') {
+      const { captureFleetLaunchPlan, startFleetViaSupervisor } = await import('./core/fleet-runtime.js');
+      launchPlan = captureFleetLaunchPlan(preflight.configPath, lockedConfigPath);
+      assertTargetStable();
+      launched = startFleetViaSupervisor(launchPlan);
+      if (launched.action === 'already-running') {
         if (process.env.BOTMUX_COMPANION_SECRET_FILE || process.env.BOTMUX_COMPANION_BOT_APP_ID) {
           throw new Error('fleet is already running; use `botmux restart` to apply companion options');
         }
-        console.log(`\n✅ fleet 已在运行 (supervisor pid ${result.supervisorPid}, ${result.botCount} 个机器人)`);
+        console.log(`\n✅ fleet 已在运行 (supervisor pid ${launched.supervisorPid}, ${launched.botCount} 个机器人)`);
       }
     }, { maxWaitMs: 5_000 });
+    if (!launched || !launchPlan) throw new Error('[start] fleet launch plan was not captured');
+    if (launched.action !== 'already-running' && !options.bootHookStart) {
+      const { waitFleetReady } = await import('./core/fleet-runtime.js');
+      const health = await waitFleetReady(
+        launchPlan,
+        { pid: launched.supervisorPid, processStartIdentity: launched.supervisorProcessStartIdentity },
+        pm2StartVerifyTimeoutMs(launchPlan.bots.length + 1),
+        { dashboardReady: probeDashboardReadyWithin },
+      );
+      if (!health.healthy) {
+        throw new Error(
+          `[start] fleet 未在超时时间内就绪 (${health.online}/${health.expected})；`
+          + `未就绪: ${health.pending.join(', ')}${health.error ? `；${health.error}` : ''}`,
+        );
+      }
+    }
   }, { maxWaitMs: 5_000 });
   await reconcilePluginServicesForCli(undefined, {
     autoOnly: true,
   });
-  const bots = loadBotsJson();
-  const blockedCount = new Set(findQuotaFallbackCycles(bots).flat()).size;
-  const count = Math.max(0, bots.length - blockedCount);
+  const blockedCount = Math.max(0, preflight.bots.length - (launchPlan?.bots.length ?? 0));
+  const count = launchPlan?.bots.length ?? 0;
   console.log(count === 0
     ? '\n✅ Dashboard 已启动 (0 个 Bot daemon)'
     : `\n✅ daemon 已启动${count > 1 ? ` (${count} 个机器人, 每个独立进程)` : ''}`);
@@ -2599,15 +2633,7 @@ async function startConfiguredFleet(
  */
 function cleanupStaleDaemonDescriptors(): void {
   const regDir = join(resolveDataDir(), 'dashboard-daemons');
-  if (!existsSync(regDir)) return;
-  for (const f of readdirSync(regDir)) {
-    if (!f.endsWith('.json')) continue;
-    const fp = join(regDir, f);
-    try {
-      const stat = statSync(fp);
-      if (Date.now() - stat.mtimeMs > 5 * 60_000) unlinkSync(fp);
-    } catch { /* ignore */ }
-  }
+  cleanupStaleDaemonDescriptorFiles(regDir);
 }
 
 /** Block the current thread for `ms`. Safe here: the restart CLI is a one-shot
@@ -2703,64 +2729,74 @@ async function cmdRestart(): Promise<void> {
     cleanupLegacyPm2('restart'); // reap any pre-migration pm2 God still holding botmux procs
     if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
     cleanupStaleDaemonDescriptors();
+    const requestedConfigPath = lifecycleBotsConfigPath();
+    const { captureFleetLaunchPlan, restartFleet, waitFleetReady } = await import('./core/fleet-runtime.js');
+    const restartAttemptId = randomBytes(16).toString('hex');
+    let restartIntentPrepared = false;
+    try {
+      const now = Date.now();
+      writeRestartAttemptIntentTo(
+        restartIntentDir,
+        stagedRestartIntent ?? { kind: 'manual', at: new Date(now).toISOString() },
+        now,
+        restartAttemptId,
+      );
+      restartIntentPrepared = true;
+    } catch { /* breadcrumb is best-effort */ }
 
-    await withFileLock(BOTS_JSON_FILE, async () => {
-      const restartBots = loadBotsJson();
-      // Recompute the skip set source against the locked config generation;
-      // resolveFleetMembers applies the same projection in the new supervisor.
-      preflightQuotaFallbackTopology(restartBots, 'restart', false);
-      const restartAttemptId = randomBytes(16).toString('hex');
-      let restartIntentPrepared = false;
-      try {
-        const now = Date.now();
-        writeRestartAttemptIntentTo(
-          restartIntentDir,
-          stagedRestartIntent ?? { kind: 'manual', at: new Date(now).toISOString() },
-          now,
-          restartAttemptId,
+    try {
+      let launchPlan: FleetLaunchPlan | undefined;
+      let launched: StartFleetResult | undefined;
+      // Capture and hand off one immutable, secret-free plan while the canonical
+      // config target stays locked. Release immediately after supervisor spawn:
+      // daemon startup admission needs this same lock, so readiness must be after.
+      await withBotsJsonLock(
+        requestedConfigPath,
+        async (lockedConfigPath, assertTargetStable) => {
+          preflightQuotaFallbackTopology(loadBotsJson(lockedConfigPath), 'restart', false);
+          launchPlan = captureFleetLaunchPlan(requestedConfigPath, lockedConfigPath);
+          assertTargetStable();
+          const r = restartFleet(launchPlan, { refreshPersistedEnv, readFailureFallback });
+          if (r.action === 'stop-timeout') {
+            throw new Error(
+              `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
+            );
+          }
+          launched = r.start;
+        },
+        { maxWaitMs: 5_000 },
+      );
+      if (!launchPlan || !launched) throw new Error('[restart] fleet launch plan was not handed off');
+      const health = await waitFleetReady(
+        launchPlan,
+        { pid: launched.supervisorPid, processStartIdentity: launched.supervisorProcessStartIdentity },
+        pm2StartVerifyTimeoutMs(launchPlan.bots.length + 1),
+        { dashboardReady: probeDashboardReadyWithin },
+      );
+      if (!health.healthy) {
+        throw new Error(
+          `[restart] fleet 未在超时时间内全部就绪 (${health.online}/${health.expected})；`
+          + `未就绪: ${health.pending.join(', ')}${health.error ? `；${health.error}` : ''}。`
+          + `用 \`botmux status\` / \`botmux logs\` 排查。`,
         );
-        restartIntentPrepared = true;
-      } catch { /* breadcrumb is best-effort */ }
+      }
+    } catch (err) {
+      try { removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId); } catch { /* best-effort */ }
+      throw err;
+    }
 
-      // Stop the live supervisor (graceful, then killed if it overruns) and
-      // start a fresh one, which re-reads bots.json and (re)spawns every bot.
-      const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
-      let health: ReturnType<typeof waitFleetOnline>;
+    if (restartIntentPrepared) {
+      let committed = false;
       try {
-        const r = restartFleet({ refreshPersistedEnv, readFailureFallback });
-        if (r.stop.action === 'timeout') {
-          throw new Error(
-            `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
-          );
-        }
-        // Health-gate on every supervised member (bot daemons + dashboard), so a
-        // restart that leaves the dashboard down is reported unhealthy, not "ok".
-        const names = fleetMemberNames();
-        health = waitFleetOnline(names, pm2StartVerifyTimeoutMs(names.length));
-        if (!health.healthy) {
-          throw new Error(
-            `[restart] fleet 未在超时时间内全部上线 (${health.online}/${health.expected})；`
-            + `未上线: ${health.pending.join(', ')}。用 \`botmux status\` / \`botmux logs\` 排查。`,
-          );
-        }
-      } catch (err) {
-        try { removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId); } catch { /* best-effort */ }
-        throw err;
-      }
-
-      if (restartIntentPrepared) {
-        let committed = false;
+        committed = commitRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+      } catch { /* best-effort after verified healthy fleet */ }
+      if (!committed) {
         try {
-          committed = commitRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
-        } catch { /* best-effort after verified healthy fleet */ }
-        if (!committed) {
-          try {
-            removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
-          } catch { /* best-effort */ }
-          console.warn('⚠️  daemon 已完整启动，但重启摘要凭据未能提交；本次不会发送重启摘要。');
-        }
+          removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+        } catch { /* best-effort */ }
+        console.warn('⚠️  daemon 已完整启动，但重启摘要凭据未能提交；本次不会发送重启摘要。');
       }
-    }, { maxWaitMs: 5_000 });
+    }
 
     await reconcilePluginServicesForCli(undefined, { autoOnly: true });
     if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
@@ -2773,8 +2809,8 @@ async function cmdRestart(): Promise<void> {
   // asks the dashboard for a link. Holding the lock across it would block every
   // other fleet mutation (`start`, `stop`, `start-bot`, plugin reconcile) for that
   // whole time, and those callers give up after 5s with a lock timeout. The
-  // restart itself, its health gate, the plugin reconcile and the autostart sync
-  // all stay inside.
+  // restart itself, its true-readiness gate, the plugin reconcile and the
+  // autostart sync all stay inside.
   await printDashboardHintWithRetry();
 }
 
@@ -2849,7 +2885,8 @@ async function ensureBotDaemonStarted(
   try {
     return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       cleanupLegacyPm2(); // reap a pre-migration pm2 God if one is still around
-      const bots = loadBotsJson();
+      const requestedConfigPath = lifecycleBotsConfigPath();
+      const bots = loadBotsJson(requestedConfigPath);
       const index = bots.findIndex(b => b?.larkAppId === appId);
       if (index < 0) {
         return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
@@ -2884,9 +2921,28 @@ async function ensureBotDaemonStarted(
         return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
       }
 
-      const { startBotViaSupervisor } = await import('./core/fleet-runtime.js');
-      const r = startBotViaSupervisor(
-        appId,
+      const { captureFleetLaunchPlan, startBotSpecViaSupervisor } = await import('./core/fleet-runtime.js');
+      // Enqueue from a short canonical config-lock snapshot. The supervisor
+      // authenticates this revision; the descriptor wait happens only after the
+      // lock is released so daemon startup can acquire it.
+      const botSpec = await withBotsJsonLock(
+        requestedConfigPath,
+        async lockedConfigPath => {
+          const plan = captureFleetLaunchPlan(requestedConfigPath, lockedConfigPath);
+          const spec = plan.bots.find(candidate => candidate.appId === appId);
+          return spec ? {
+            ...spec,
+            botsConfigPath: plan.requestedConfigPath,
+            rosterRevision: plan.rosterRevision,
+          } : null;
+        },
+        { maxWaitMs: 5_000 },
+      );
+      if (!botSpec) {
+        return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+      }
+      const r = startBotSpecViaSupervisor(
+        botSpec,
         () => randomBytes(8).toString('hex'),
         () => new Date().toISOString(),
       );
@@ -3357,6 +3413,17 @@ async function callDashboardEndpoint(
     path,
     rescanWhenUnreachable: opts.rescanWhenUnreachable,
     requestTimeoutMs: opts.requestTimeoutMs,
+  });
+}
+
+/** Exact authenticated dashboard readiness, bounded by the caller's one deadline. */
+async function probeDashboardReadyWithin(remainingMs: number): Promise<boolean> {
+  if (remainingMs <= 0) return false;
+  return probeDashboardReadiness({
+    configDir: CONFIG_DIR,
+    defaultPort: 7891,
+    envPort: process.env.BOTMUX_DASHBOARD_PORT,
+    timeoutMs: Math.min(2_000, remainingMs),
   });
 }
 
@@ -5602,12 +5669,23 @@ type DaemonDescriptorLite = OnlineDaemonInfo;
  *  copy of the descriptor parse and the 90s staleness cutoff. These two
  *  wrappers only pin it to THIS process's resolved data dir, so the liveness
  *  probe and the session store always read the same directory. */
+function cliDaemonDiscoveryOptions(): string | { registryDir: string; cleanupStale: false } {
+  const dataDir = resolveDataDir();
+  const sessionScoped = !!process.env.BOTMUX_SESSION_ID?.trim();
+  return sessionScoped
+    ? {
+        registryDir: join(dataDir, 'dashboard-daemons'),
+        cleanupStale: false,
+      }
+    : dataDir;
+}
+
 function listOnlineDaemons(): DaemonDescriptorLite[] {
-  return listOnlineDaemonsIn(resolveDataDir());
+  return listOnlineDaemonsIn(cliDaemonDiscoveryOptions());
 }
 
 function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
-  if (larkAppId) return findOnlineDaemon(larkAppId, resolveDataDir());
+  if (larkAppId) return findOnlineDaemon(larkAppId, cliDaemonDiscoveryOptions());
   return listOnlineDaemons()[0] ?? null;
 }
 
@@ -6208,8 +6286,11 @@ async function cmdTermLink(rest: string[]): Promise<void> {
     }
   }
 
-  const daemon = findDaemon(session.larkAppId);
-  if (!daemon) {
+  const currentSessionPort = process.env.BOTMUX_SESSION_ID === session.sessionId
+    ? parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT)
+    : undefined;
+  const daemonPort = currentSessionPort ?? findDaemon(session.larkAppId)?.ipcPort;
+  if (!daemonPort) {
     console.error('❌ 未找到在线 daemon。请确认 daemon 正在运行：botmux status');
     process.exit(1);
   }
@@ -6217,12 +6298,12 @@ async function cmdTermLink(rest: string[]): Promise<void> {
   let res: Response;
   try {
     res = await fetchDaemonIpc(
-      daemon.ipcPort,
+      daemonPort,
       `/api/sessions/${encodeURIComponent(session.sessionId)}/write-link-card`,
       { method: 'POST' },
     );
   } catch (err: any) {
-    console.error(`❌ 无法连接到 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
+    console.error(`❌ 无法连接到 daemon (port=${daemonPort}): ${err?.message ?? err}`);
     process.exit(1);
   }
 
@@ -6413,6 +6494,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
+  ask receipt verify <file|-> [--public-key <key|file>] [--key-id <id>] [--json]
+                                       离线校验 botmux.ask-receipt.v1 Ed25519 回执
   skill list                           列出本会话可用的技能（用户自定义 + botmux 内置）及其描述
   skill show <name>                    读取某技能的完整 SKILL.md 说明（prompt 注入模式下按需拉取内置技能全文）
 
@@ -10821,6 +10904,116 @@ async function assertProjectDispatchPolicy(input: {
   throw new Error(`${body.error ?? `HTTP ${response.status}`}${disallowed}`);
 }
 
+const REVIEWER_VERDICT_COMMAND_USAGE = [
+  '用法: botmux reviewer-verdict submit --source-message-id <om_message> --verdict-id <id>',
+  '       --verdict <pass|fail|conditional> --doc-token <token> --doc-revision <positive-int> --review-round <positive-int>',
+  '       [--condition-id <id> ...] [--condition-evidence <id>=<ref>@<ISO-8601> ...]',
+].join('\n');
+
+function reviewerVerdictInteger(args: string[], flag: string): number | undefined {
+  const raw = argValue(args, flag);
+  if (!raw || !/^[1-9][0-9]*$/.test(raw)) return undefined;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function reviewerConditionEvidence(args: string[]): Record<string, { evidenceRef: string; observedAt: string }> | undefined {
+  const values = argValues(args, '--condition-evidence');
+  const out: Record<string, { evidenceRef: string; observedAt: string }> = {};
+  for (const value of values) {
+    const separator = value.indexOf('=');
+    const at = value.lastIndexOf('@');
+    if (separator <= 0 || at <= separator + 1 || at === value.length - 1) return undefined;
+    const conditionId = value.slice(0, separator).trim();
+    const evidenceRef = value.slice(separator + 1, at).trim();
+    const observedAt = value.slice(at + 1).trim();
+    if (!conditionId || !evidenceRef || !Number.isFinite(Date.parse(observedAt)) || out[conditionId]) return undefined;
+    out[conditionId] = { evidenceRef, observedAt: new Date(Date.parse(observedAt)).toISOString() };
+  }
+  return out;
+}
+
+/** The single reviewer-worker action: it contributes only typed review fields.
+ * Session, generation, turn capability, reviewer app and controller target all
+ * remain daemon-derived on the existing narrow ingress route. */
+async function cmdReviewerVerdict(rest: string[]): Promise<void> {
+  if (rest[0] !== 'submit' || rest.includes('--help') || rest.includes('-h')) {
+    console.error(REVIEWER_VERDICT_COMMAND_USAGE);
+    process.exit(rest[0] === 'submit' ? 0 : 2);
+  }
+  const args = rest.slice(1);
+  const unknown = unknownFlags(args, {
+    valueFlags: [
+      '--source-message-id', '--verdict-id', '--verdict', '--doc-token', '--doc-revision', '--review-round',
+      '--condition-id', '--condition-evidence',
+    ],
+  });
+  if (unknown.length > 0) {
+    console.error(`botmux reviewer-verdict: 未知参数: ${unknown.join(', ')}`);
+    process.exit(2);
+  }
+  const sourceMessageId = argValue(args, '--source-message-id');
+  const verdictId = argValue(args, '--verdict-id');
+  const verdict = argValue(args, '--verdict');
+  const docToken = argValue(args, '--doc-token');
+  const docRevision = reviewerVerdictInteger(args, '--doc-revision');
+  const reviewRound = reviewerVerdictInteger(args, '--review-round');
+  const conditionIds = argValues(args, '--condition-id');
+  const resolvedConditionEvidence = reviewerConditionEvidence(args);
+  if (!sourceMessageId || !verdictId || !docToken || !docRevision || !reviewRound
+    || (verdict !== 'pass' && verdict !== 'fail' && verdict !== 'conditional')
+    || !resolvedConditionEvidence
+    || new Set(conditionIds).size !== conditionIds.length
+    || conditionIds.some(conditionId => !conditionId.trim())
+    || (verdict === 'conditional') !== (conditionIds.length > 0)
+    || Object.keys(resolvedConditionEvidence).some(conditionId => !conditionIds.includes(conditionId))) {
+    console.error(REVIEWER_VERDICT_COMMAND_USAGE);
+    process.exit(2);
+  }
+  const session = findAncestorSessionContext();
+  if (!session?.sessionId || !session.turnId) {
+    console.error('botmux reviewer-verdict: 当前 reviewer worker 缺少受信 session/turn 上下文');
+    process.exit(2);
+  }
+  let discoveredPort: number | undefined;
+  try { discoveredPort = findDaemon(process.env.BOTMUX_LARK_APP_ID)?.ipcPort; } catch { /* isolated worker uses injected port */ }
+  const ipcPort = resolveDaemonIpcPort(discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('botmux reviewer-verdict: 当前 daemon 不在线');
+    process.exit(1);
+  }
+  const claim = readManagedOriginCapability(
+    resolveDataDir(), session.sessionId, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  );
+  if (!claim?.capability) {
+    console.error('botmux reviewer-verdict: 当前 reviewer worker capability 不可用');
+    process.exit(2);
+  }
+  const body = {
+    originCapability: claim.capability, originTurnId: session.turnId,
+    sourceMessageId, verdictId, verdict, docToken, docRevision, reviewRound, conditionIds, resolvedConditionEvidence,
+  };
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* capability path below */ }
+  }
+  try {
+    const init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } satisfies RequestInit;
+    const response = hostSecret
+      ? await fetchDaemonIpc(ipcPort, '/api/task-control/reviewer-verdicts/submit', init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${ipcPort}/api/task-control/reviewer-verdicts/submit`, init);
+    const result = await response.json().catch(() => ({})) as { ok?: unknown; error?: unknown; verdictId?: unknown };
+    if (response.status !== 201 || result.ok !== true || result.verdictId !== verdictId) {
+      console.error(`botmux reviewer-verdict: ${typeof result.error === 'string' ? result.error : `daemon HTTP ${response.status}`}`);
+      process.exit(1);
+    }
+    process.stdout.write(`${JSON.stringify({ ok: true, verdictId })}\n`);
+  } catch {
+    console.error('botmux reviewer-verdict: 无法连接当前 daemon');
+    process.exit(1);
+  }
+}
+
 async function cmdDispatch(rest: string[]): Promise<void> {
   const parsedArgs = parseDispatchArgs(rest);
   if (!parsedArgs.ok) {
@@ -12162,7 +12355,10 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
  *     runHook 会重连重试。确定性 4xx（bad body / capability 拒绝 / unsupported)
  *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
-async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
+async function postAsk(
+  body: Record<string, unknown>,
+  path = '/api/asks',
+): Promise<import('./core/ask-types.js').AskResult> {
   type AskResult = import('./core/ask-types.js').AskResult;
   type AskError = Error & { exitCode: number; retryable: boolean };
   const mkErr = (message: string, retryable: boolean): AskError =>
@@ -12202,8 +12398,8 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
     }
     res = hostSecret
-      ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
+      ? await fetchDaemonIpc(daemon.ipcPort, path, init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, init);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -12230,6 +12426,18 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
 }
 
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
+  // Receipt verification is a standalone, read-only operation: it must work
+  // outside a Botmux session and does not contact or authenticate to a daemon.
+  if (sub === 'receipt') {
+    const { runAskReceiptCommand } = await import('./core/ask-receipt-command.js');
+    const stdin = rest[1] === '-' ? readStdinUtf8() : '';
+    const verified = runAskReceiptCommand(rest, stdin);
+    if (verified.stdout) process.stdout.write(verified.stdout);
+    if (verified.stderr) process.stderr.write(verified.stderr);
+    process.exitCode = verified.code;
+    return;
+  }
+
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
   // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
   // approvals belong in humanGate / decision nodes so the choice is part of
@@ -12256,37 +12464,55 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
+  const {
+    findMissingAskEnv,
+    parseAskOptions,
+    parseAskTimeoutSeconds,
+    parseS1ControllerAskArgs,
+    AskArgsError,
+  } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
-
-  const missing = findMissingAskEnv(process.env);
-  if (missing) {
-    console.error(
-      `botmux ask: 缺少必需环境变量 ${missing}。` +
-        ` 请在 botmux daemon spawn 的 CLI 会话内运行。`,
-    );
-    process.exit(2);
-  }
 
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
   const useJson = rest.includes('--json');
   const multiSelect = rest.includes('--multi');
-  const positionalArgs = positionals(rest, ['--json', '--multi']);
+  const positionalArgs = positionals(rest, [
+    '--json',
+    '--multi',
+    '--s1-controller',
+    '--recover-only',
+  ]);
 
   let options;
   let timeoutMs;
+  let s1Controller;
   try {
     options = parseAskOptions(optionsRaw);
-    timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
+    s1Controller = parseS1ControllerAskArgs(rest, { json: useJson });
+    timeoutMs = s1Controller
+      ? s1Controller.expiresAtMs - s1Controller.notBeforeMs
+      : parseAskTimeoutSeconds(timeoutRaw);
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
       process.exit(2);
     }
     throw err;
+  }
+
+  const missing = findMissingAskEnv(process.env, {
+    s1Controller: !!s1Controller,
+    s1Phase: s1Controller?.phase,
+  });
+  if (missing) {
+    console.error(
+      `botmux ask: 缺少必需环境变量 ${missing}。` +
+        ` 请在 botmux daemon spawn 的 CLI 会话内运行。`,
+    );
+    process.exit(2);
   }
 
   const prompt = positionalArgs.join(' ').trim();
@@ -12298,38 +12524,69 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   }
 
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
-  const askSessionId = process.env.BOTMUX_SESSION_ID!;
-  const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
+  const askQuestions = multiSelect
+    ? [{ prompt, options, multiSelect: true }]
+    : undefined;
+  const ordinarySessionId = process.env.BOTMUX_SESSION_ID!;
+  const liveAskOrigin = s1Controller ? null : resolveSessionContext(resolveDataDir(), ordinarySessionId);
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
-  const askOriginCapability = readManagedOriginCapability(
-    resolveDataDir(),
-    askSessionId,
-    askRelayDir,
-    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-  )?.capability;
-  const body = {
-    sessionId: askSessionId,
-    chatId: process.env.BOTMUX_CHAT_ID!,
-    larkAppId,
-    rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
-    ...(multiSelect
-      ? { questions: [{ prompt, options, multiSelect: true }] }
-      : { options, prompt }),
-    timeoutMs,
-    // Explicit `botmux ask buttons` has no reconnecting claimant (the CLI exits
-    // on daemon restart), so mark it non-hook: the broker won't persist/handoff
-    // it and can never confuse it with a hook ask's card (codex P1-4/P1-3).
-    originKind: 'explicit',
-    ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
-    ...(liveAskOrigin?.dispatchAttempt !== undefined
-      ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
-      : {}),
-    ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
-  };
+  const askOriginCapability = s1Controller
+    ? undefined
+    : readManagedOriginCapability(
+        resolveDataDir(),
+        ordinarySessionId,
+        askRelayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      )?.capability;
+  const s1ExecutionCapability = s1Controller?.phase === 'execution'
+    ? readManagedOriginCapability(
+        resolveDataDir(),
+        process.env.BOTMUX_SESSION_ID,
+        askRelayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      )?.capability
+    : undefined;
+  const body = s1Controller
+    ? {
+        phase: s1Controller.phase,
+        larkAppId,
+        chatId: s1Controller.chatId,
+        ...(s1Controller.phase === 'execution'
+          ? {
+              sessionId: process.env.BOTMUX_SESSION_ID!,
+              rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID!,
+              ...(s1ExecutionCapability ? { originCapability: s1ExecutionCapability } : {}),
+            }
+          : {}),
+        questions: askQuestions ?? [{ prompt, options, multiSelect: false }],
+        timeoutMs,
+        requestId: s1Controller.requestId,
+        notBeforeMs: s1Controller.notBeforeMs,
+        expiresAtMs: s1Controller.expiresAtMs,
+      }
+    : {
+        sessionId: ordinarySessionId,
+        chatId: process.env.BOTMUX_CHAT_ID!,
+        larkAppId,
+        rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
+        ...(askQuestions
+          ? { questions: askQuestions }
+          : { options, prompt }),
+        timeoutMs,
+        ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
+        ...(liveAskOrigin?.dispatchAttempt !== undefined
+          ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
+          : {}),
+        ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
+      };
+
+  const askPath = s1Controller
+    ? (s1Controller.recoverOnly ? '/api/asks/s1-controller/recover' : '/api/asks/s1-controller')
+    : '/api/asks';
 
   let result;
   try {
-    result = await postAsk(body);
+    result = await postAsk(body, askPath);
   } catch (err) {
     const code = (err as any).exitCode ?? 3;
     console.error((err as Error).message);
@@ -12350,6 +12607,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
       timedOut: result.kind === 'timedOut',
+      receipt: result.kind === 'answered' ? (result.receipt ?? null) : null,
     };
     process.stdout.write(JSON.stringify(out) + '\n');
   } else if (result.kind === 'answered') {
@@ -12523,12 +12781,15 @@ export async function runHook(
   // （settings.json 里的 86400s），让 broker 不会 *早于* hook 进程本身超时；
   // 既避免"人回复慢→picker 卡死"，又保留一个有限的进程级兜底（永不超时会让一次
   // CLI turn 无限阻塞，是更糟的失败）。
-  const DEFAULT_TIMEOUT_MS = 86_400_000; // 24h — 对齐 hook 安装侧 timeout:86400s
+  const { ASK_MAX_TIMEOUT_MS } = await import('./core/ask-limits.js');
+  const DEFAULT_TIMEOUT_MS = ASK_MAX_TIMEOUT_MS; // 24h — 对齐 hook 安装侧 timeout:86400s
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   const timeoutEnv = env.BOTMUX_ASK_TIMEOUT_MS;
   if (timeoutEnv) {
-    const parsed_timeout = parseInt(timeoutEnv, 10);
-    if (Number.isInteger(parsed_timeout) && parsed_timeout > 0) {
+    const parsed_timeout = Number(timeoutEnv);
+    if (Number.isSafeInteger(parsed_timeout)
+        && parsed_timeout >= 1_000
+        && parsed_timeout <= ASK_MAX_TIMEOUT_MS) {
       timeoutMs = parsed_timeout;
     }
   }
@@ -12536,7 +12797,8 @@ export async function runHook(
   // Per-invocation identity: generated ONCE here (outside the retry loop) and
   // reused across every reconnect POST, so a re-POST after a daemon restart
   // re-attaches to the same restored ask instead of posting a duplicate card.
-  // originKind='hook' namespaces it away from an explicit `botmux ask buttons`.
+  // The daemon derives originKind='hook' from the authenticated /api/asks/hook
+  // route; the request body is intentionally not an authority for that field.
   const requestId = randomUUID();
 
   const body: Record<string, unknown> = {
@@ -12547,7 +12809,6 @@ export async function runHook(
     questions: parsed.questions,
     timeoutMs,
     requestId,
-    originKind: 'hook',
   };
 
   // Post the ask, RETRYING across a daemon restart. The daemon holds pending
@@ -12630,7 +12891,12 @@ async function cmdHook(cliId: string): Promise<void> {
   }
 
   const env = process.env as Record<string, string | undefined>;
-  const result = await runHook(payload, env, postAsk, cliId);
+  const result = await runHook(
+    payload,
+    env,
+    body => postAsk(body, '/api/asks/hook'),
+    cliId,
+  );
   if (result.stdout) {
     console.log(result.stdout);
   }
@@ -14827,6 +15093,7 @@ switch (command) {
   }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
   case 'preview': await cmdPreview(process.argv.slice(3)); break;
+  case 'reviewer-verdict': await cmdReviewerVerdict(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]

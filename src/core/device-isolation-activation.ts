@@ -18,6 +18,7 @@ export interface DeviceIsolationFreezeLease {
   activationVersion: typeof DEVICE_ISOLATION_ACTIVATION_VERSION;
   leaseId: string;
   nonce: string;
+  rosterRevision?: string;
   inventoryGeneration: string;
   acquiredAt: number;
   expiresAt: number;
@@ -59,6 +60,7 @@ export type AcquireDeviceIsolationFreezeResult =
 
 export function acquireDeviceIsolationFreeze(input: {
   nonce: string;
+  rosterRevision?: string;
   inventoryGeneration: string;
   now?: number;
   leaseMs?: number;
@@ -78,6 +80,7 @@ export function acquireDeviceIsolationFreeze(input: {
     activationVersion: DEVICE_ISOLATION_ACTIVATION_VERSION,
     leaseId: (input.leaseIdFactory ?? randomUUID)(),
     nonce: input.nonce,
+    ...(input.rosterRevision ? { rosterRevision: input.rosterRevision } : {}),
     inventoryGeneration: input.inventoryGeneration,
     acquiredAt: now,
     expiresAt: now + leaseMs,
@@ -91,10 +94,15 @@ export function acquireDeviceIsolationFreeze(input: {
 export function requireDeviceIsolationFreeze(input: {
   nonce: string;
   leaseId: string;
+  rosterRevision?: string;
   now?: number;
 }): DeviceIsolationFreezeLease | null {
   const current = currentDeviceIsolationFreezeLease(input.now);
-  if (!current || current.nonce !== input.nonce || current.leaseId !== input.leaseId) {
+  if (!current
+      || current.nonce !== input.nonce
+      || current.leaseId !== input.leaseId
+      || (input.rosterRevision !== undefined
+        && current.rosterRevision !== input.rosterRevision)) {
     return null;
   }
   return current;
@@ -108,6 +116,7 @@ export function requireDeviceIsolationFreeze(input: {
 export function bindDeviceIsolationFreezeInventoryGeneration(input: {
   nonce: string;
   leaseId: string;
+  rosterRevision?: string;
   inventoryGeneration: string;
   now?: number;
 }): DeviceIsolationFreezeLease | null {
@@ -119,6 +128,7 @@ export function bindDeviceIsolationFreezeInventoryGeneration(input: {
 export function releaseDeviceIsolationFreeze(input: {
   nonce: string;
   leaseId: string;
+  rosterRevision?: string;
   now?: number;
 }): boolean {
   if (!requireDeviceIsolationFreeze(input)) return false;
