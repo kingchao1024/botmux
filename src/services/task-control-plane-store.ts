@@ -2182,16 +2182,25 @@ export class TaskControlPlaneStore {
         return { kind: 'duplicate', mapping: existingMapping };
       }
       // One phase opening is shared by every signed task mapping in its exact
-      // frozen task set. Using a per-task registration ref here turned a real
-      // two-task phase into a second invalid phase.opened transition.
-      const phaseRef = `phase:${projectId}:${phaseId}:${taskSetHash(phaseTaskGuids)}:${acceptorId}`;
-      const phaseResult = this.appendEventLocked({
-        eventId: stableId('evt_phase', phaseRef), eventType: 'phase.opened', projectId, phaseId,
-        actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: phaseRef,
-        occurredAt: mapping.createdAt, sourceRef: phaseRef,
-        payload: { taskGuids: phaseTaskGuids, designatedAcceptorId: acceptorId },
-      });
-      if (phaseResult.kind === 'conflict') throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
+      // frozen task set. A new task-set hash must not create a second phase.
+      const opened = this.listEvents({ projectId, phaseId })
+        .find(event => event.eventType === 'phase.opened' && !event.taskGuid);
+      if (opened) {
+        const openedTaskGuids = exactTaskSetSnapshot(opened.payload.taskGuids, 'phase.opened.taskGuids');
+        const openedAcceptorId = nonEmpty(opened.payload.designatedAcceptorId, 'phase.opened.designatedAcceptorId');
+        if (JSON.stringify(openedTaskGuids) !== JSON.stringify(phaseTaskGuids) || openedAcceptorId !== acceptorId) {
+          throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
+        }
+      } else {
+        const phaseRef = `phase:${projectId}:${phaseId}:${taskSetHash(phaseTaskGuids)}:${acceptorId}`;
+        const phaseResult = this.appendEventLocked({
+          eventId: stableId('evt_phase', phaseRef), eventType: 'phase.opened', projectId, phaseId,
+          actorId: principal.actorId, actorRole: principal.actorRole, idempotencyKey: phaseRef,
+          occurredAt: mapping.createdAt, sourceRef: phaseRef,
+          payload: { taskGuids: phaseTaskGuids, designatedAcceptorId: acceptorId },
+        });
+        if (phaseResult.kind === 'conflict') throw new Error(`task_control_mapping_phase_conflict:${dispatchRoot}`);
+      }
       const mappingRef = `mapping:${registrationRef}`;
       const mappingResult = this.appendEventLocked({
         eventId: stableId('evt_mapping', mappingRef), eventType: 'mapping.registered', projectId, phaseId, taskGuid, topicRootId,

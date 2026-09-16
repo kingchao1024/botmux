@@ -7,7 +7,7 @@ import {
   type DaemonTaskControlMappingRegistration,
 } from './task-control-plane-daemon-bridge.js';
 import { TaskControlEventAdapters, taskControlEventIdempotencyKey } from './task-control-plane-events.js';
-import type { TaskControlPlaneDeliveryResult, TaskControlPlaneLifecycle } from './task-control-plane-runtime.js';
+import { matchesTaskControlPlaneCanaryMapping, type TaskControlPlaneCanaryScope, type TaskControlPlaneDeliveryResult, type TaskControlPlaneLifecycle } from './task-control-plane-runtime.js';
 import { TaskControlPlaneStore, type DeliveryOutboxRow, type ReviewerVerdictHead } from './task-control-plane-store.js';
 import type {
   DesignatedReviewerMapping,
@@ -115,6 +115,8 @@ export class DaemonTaskControlIntegration {
       controlledWriteback?: boolean;
       /** Narrow test seam; production defaults to the existing Lark client. */
       deliveryClient?: TaskControlDeliveryClient;
+      /** Legacy fixed-canary restriction retained for its existing rollout tests. */
+      canary?: TaskControlPlaneCanaryScope;
     },
   ) {
     this.adapters = new TaskControlEventAdapters(input.lifecycle);
@@ -128,6 +130,7 @@ export class DaemonTaskControlIntegration {
 
   private restoreMappings(): void {
     for (const mapping of this.input.store.listTrustedMappings()) {
+      if (!this.mappingInScope(mapping)) continue;
       if (!this.input.bridge.restoreMapping(mapping)) {
         this.input.logger.warn('[task-control] ignored invalid persisted mapping reference');
       }
@@ -139,6 +142,7 @@ export class DaemonTaskControlIntegration {
     mapping: DaemonTaskControlMappingRegistration,
     controllerId: string,
   ): boolean {
+    if (this.input.canary && (this.input.canary.role !== 'controller' || !this.mappingInScope(mapping))) return false;
     const prior = this.input.bridge.mapping(dispatchRoot);
     if (prior) {
       return JSON.stringify({
@@ -188,7 +192,21 @@ export class DaemonTaskControlIntegration {
 
   /** Read-only bridge accessors keep daemon routes out of bridge internals. */
   mapping(dispatchRoot: string): DaemonTaskControlMapping | undefined {
-    return this.input.bridge.mapping(dispatchRoot);
+    const mapping = this.input.bridge.mapping(dispatchRoot);
+    return mapping && this.mappingInScope(mapping) ? mapping : undefined;
+  }
+
+  canaryRole(): TaskControlPlaneCanaryScope['role'] | undefined {
+    return this.input.canary?.role;
+  }
+
+  canaryScope(): TaskControlPlaneCanaryScope | undefined {
+    return this.input.canary;
+  }
+
+  issueAcceptorAuthentication(dispatchRoot: string) {
+    if (this.input.canary?.role && this.input.canary.role !== 'controller') return undefined;
+    return this.mapping(dispatchRoot) ? this.input.bridge.issueAuthentication(dispatchRoot, 'acceptor') : undefined;
   }
 
   issueAuthentication(
@@ -204,6 +222,7 @@ export class DaemonTaskControlIntegration {
 
   /** Controller-owned freeze request; readiness is recomputed by the store. */
   requestFreeze(dispatchRoot: string, requestId = `legacy:${dispatchRoot}`): boolean {
+    if (this.input.canary?.role && this.input.canary.role !== 'controller') return false;
     const mapping = this.input.bridge.mapping(dispatchRoot);
     const authentication = this.input.bridge.issueAuthentication(dispatchRoot, 'controller');
     if (!mapping || !authentication) return false;
@@ -366,6 +385,7 @@ export class DaemonTaskControlIntegration {
   }
 
   dispatchRequested(dispatchRoot: string, sourceSessionId: string, occurredAt: string): void {
+    if (!this.canPerformControllerLifecycle()) return;
     const event = this.input.bridge.event({
       dispatchRoot, principal: 'controller',
       eventId: `tcp-dispatch:${dispatchRoot}`,
@@ -392,6 +412,9 @@ export class DaemonTaskControlIntegration {
   consumeWriteExecutionGrant(input: {
     dispatchRoot: string; grantRef: string; candidate: string; action: string; attempt: number; operatorId: string; now?: string;
   }): { ok: true } | { ok: false; reason: string } {
+    if (this.input.canary?.role && this.input.canary.role !== 'controller') {
+      return { ok: false, reason: 'write_execution_role_unproven' };
+    }
     const mapping = this.input.bridge.mapping(input.dispatchRoot);
     if (!mapping || mapping.acceptorId !== input.operatorId) return { ok: false, reason: 'write_execution_mapping_unproven' };
     const grant = this.input.bridge.issueWriteExecutionGrant({
@@ -411,10 +434,12 @@ export class DaemonTaskControlIntegration {
   }
 
   workerAccepted(dispatchRoot: string, sourceRef: string, occurredAt?: string): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     this.appendMapped('task.accepted', dispatchRoot, 'worker', sourceRef, occurredAt);
   }
 
   workerExecutionStarted(dispatchRoot: string, sourceRef: string, occurredAt?: string): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     this.appendMapped('task.execution_started', dispatchRoot, 'worker', sourceRef, occurredAt);
     // The lifecycle hook is intentionally asynchronous. Wait for its durable
     // event before producing rework so accepted/executing order stays intact.
@@ -439,6 +464,7 @@ export class DaemonTaskControlIntegration {
   }
 
   firstSubmitted(dispatchRoot: string, sourceRef: string, input: { docToken: string; docRevision: number; evidenceRef: string }): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     this.appendMapped('task.first_submitted', dispatchRoot, 'worker', sourceRef, undefined, input);
   }
 
@@ -523,6 +549,7 @@ export class DaemonTaskControlIntegration {
   delivered(dispatchRoot: string, sourceRef: string, input: {
     docToken: string; docRevision: number; destinationId: string; receiptRef: string; evidenceRef: string;
   }): void {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     const controlledDestination = this.input.controlledWriteback
       ? `task-comment:${this.input.bridge.mapping(dispatchRoot)?.taskGuid ?? ''}`
       : input.destinationId;
@@ -569,6 +596,7 @@ export class DaemonTaskControlIntegration {
   }
 
   doneMarked(dispatchRoot: string, sourceRef: string, evidenceRef?: string): void {
+    if (!this.canPerformControllerLifecycle()) return;
     this.appendMapped('task.done_marked', dispatchRoot, 'controller', sourceRef, undefined, evidenceRef ? { evidenceRef } : {});
   }
 
@@ -592,6 +620,7 @@ export class DaemonTaskControlIntegration {
     sourceRef: string,
     input: { sessionId: string; workerGeneration: number; destinationId: string; receiptRef: string; docToken?: string },
   ): Promise<void> {
+    if (!this.canAdvanceWorkerLifecycle()) return;
     if (!this.receiptOwnerStillLive(input)) {
       this.deliveryReceiptUnknown(sourceRef, input, 'receipt_worker_generation_unproven');
       return;
@@ -636,6 +665,14 @@ export class DaemonTaskControlIntegration {
     return this.input.isLiveReceiptOwner?.(input) === true;
   }
 
+  private canAdvanceWorkerLifecycle(): boolean {
+    return !this.input.canary || this.input.canary.role === 'worker';
+  }
+
+  private canPerformControllerLifecycle(): boolean {
+    return !this.input.canary || this.input.canary.role === 'controller';
+  }
+
   /** A stale provider receipt is retained only as reference-only UNKNOWN. */
   deliveryReceiptUnknown(
     sourceRef: string,
@@ -655,6 +692,7 @@ export class DaemonTaskControlIntegration {
   }
 
   reportFallbackUnknown(sourceRef: string, errorClass: string): void {
+    if (this.input.canary) return;
     this.input.lifecycle.enqueueUnknownObservation({
       eventId: `tcp-unknown-report:${sourceRef}`, attemptedEventType: 'task.delivery_fallback_verified', sourceRef,
       idempotencyKey: `tcp-unknown-report:${sourceRef}`,
@@ -1008,7 +1046,7 @@ export class DaemonTaskControlIntegration {
 
   private async collectReferences(kind: TaskControlCollectionKind, _cursor?: string) {
     const records: Array<{ kind: TaskControlCollectionKind; sourceRef: string; eventId: string; idempotencyKey: string; occurredAt?: string }> = [];
-    for (const { dispatchRoot, mapping } of this.input.bridge.listMappings().slice(0, MAX_REFERENCE_POLL)) {
+    for (const { dispatchRoot, mapping } of this.input.bridge.listMappings().filter(({ mapping }) => this.mappingInScope(mapping)).slice(0, MAX_REFERENCE_POLL)) {
       try {
         if (kind === 'topic') {
           await getMessageDetail(this.input.larkAppId, dispatchRoot, { userCardContent: false });
@@ -1051,6 +1089,10 @@ export class DaemonTaskControlIntegration {
       eventId: `tcp-unknown-task.done_marked:${sourceRef}`, attemptedEventType: 'task.done_marked', sourceRef,
       idempotencyKey: `tcp-unknown-task.done_marked:${sourceRef}`, payload: { reason: 'task_done_reread_unproven', referenceOnly: true },
     }); }
+  }
+
+  private mappingInScope(mapping: Pick<DaemonTaskControlMapping, 'projectId' | 'phaseId' | 'phaseTaskGuids' | 'taskGuid' | 'docToken'>): boolean {
+    return !this.input.canary || matchesTaskControlPlaneCanaryMapping(this.input.canary, mapping);
   }
 }
 

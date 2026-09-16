@@ -73,6 +73,14 @@ export interface GrillState {
   problems?: string[];
   /** 飞书话题绑定（daemon 发 humanGate 审批卡用）；CLI/dev 出生时无. */
   chatBinding?: RunChatBinding;
+  /** Audit trail for a pre-execution ingress retry that moved an otherwise
+   * untouched run from one confirmed-closed session to its replacement. */
+  ingressRebindings?: Array<{
+    previousSessionId: string;
+    newSessionId: string;
+    reboundAt: string;
+    reason: 'previous_session_closed_before_execution';
+  }>;
 }
 
 /**
