@@ -79,7 +79,7 @@ import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/g
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
-import { snapshotAskCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
+import { hasExactAskCallbackValueKeys, hasOnlyLarkCardActionKeys, snapshotLarkCardActionCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
 import type { AskCardActionOutcome } from './ask-card.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
@@ -1086,13 +1086,13 @@ function validateAskCallbackShape(data: unknown): boolean {
   if (!nonEmptyString(valueRecord.ask_id) || !nonEmptyString(valueRecord.nonce)) return false;
 
   if (action === 'ask_select') {
-    return exactKeys(actionRecord, ['value'])
-      && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
+    return hasOnlyLarkCardActionKeys(actionRecord, false)
+      && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
       && nonEmptyString(valueRecord.key);
   }
   if (action === 'ask_toggle') {
-    return exactKeys(actionRecord, ['value'])
-      && exactKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
+    return hasOnlyLarkCardActionKeys(actionRecord, false)
+      && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
       && nonEmptyString(valueRecord.key)
       && safeQuestionIndex(valueRecord.question_index);
   }
@@ -1101,8 +1101,8 @@ function validateAskCallbackShape(data: unknown): boolean {
     : ['action', 'ask_id', 'nonce'];
   const formValueOwn = Object.prototype.hasOwnProperty.call(actionRecord, 'form_value');
   const formValue = actionRecord.form_value;
-  return exactKeys(actionRecord, formValueOwn ? ['value', 'form_value'] : ['value'])
-    && exactKeys(valueRecord, expectedValueKeys)
+  return hasOnlyLarkCardActionKeys(actionRecord, formValueOwn)
+    && hasExactAskCallbackValueKeys(valueRecord, expectedValueKeys)
     && (valueRecord.confirm_empty === undefined
       || valueRecord.confirm_empty === true
       || valueRecord.confirm_empty === 'true')
@@ -1127,7 +1127,7 @@ async function handleCardActionAckSafe(
 ): Promise<any> {
   let callbackData: any;
   try {
-    callbackData = snapshotAskCallbackData(data);
+    callbackData = snapshotLarkCardActionCallbackData(data);
     if (!isPlainRecord(callbackData)) throw new Error('card callback root must be an object');
   } catch {
     logger.warn('[card-action] malformed callback rejected before handler');

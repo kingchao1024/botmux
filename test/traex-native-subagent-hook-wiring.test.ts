@@ -68,6 +68,10 @@ function readLaunches(path: string): LaunchRecord[] {
   });
 }
 
+function isAppServerLaunch(record: LaunchRecord): boolean {
+  return record.argv.includes('app-server');
+}
+
 async function waitFor(
   harness: WorkerHarness,
   predicate: () => boolean,
@@ -107,6 +111,8 @@ function makeHarness(options: {
   resume?: boolean;
   cliSessionId?: string;
   codexRpcInput?: boolean;
+  disableCliBypass?: boolean;
+  bypassCodexHookTrust?: boolean;
 }): WorkerHarness {
   const root = mkdtempSync(join(tmpdir(), 'botmux-traex-launch-'));
   tempDirs.add(root);
@@ -115,6 +121,13 @@ function makeHarness(options: {
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(join(root, '.trae'), { recursive: true });
   mkdirSync(join(workingDir, '.trae'), { recursive: true });
+  if (options.bypassCodexHookTrust !== undefined) {
+    const botmuxDir = join(root, '.botmux');
+    mkdirSync(botmuxDir, { recursive: true });
+    writeFileSync(join(botmuxDir, 'config.json'), JSON.stringify({
+      dashboard: { bypassCodexHookTrust: options.bypassCodexHookTrust },
+    }));
+  }
   const globalHooksPath = join(root, '.trae', 'hooks.json');
   const projectHooksPath = join(workingDir, '.trae', 'hooks.json');
   const globalHooksBefore = '{"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[]}]}}\n';
@@ -128,6 +141,7 @@ function makeHarness(options: {
 import { appendFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 const argv = process.argv.slice(2);
+const commandArgv = argv[0] === '--dangerously-bypass-hook-trust' ? argv.slice(1) : argv;
 const keys = [
   'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID', 'BOTMUX_SESSION_SCOPE',
@@ -136,11 +150,11 @@ const keys = [
 ];
 const env = Object.fromEntries(keys.map(key => [key, process.env[key] ?? null]));
 appendFileSync(process.env.LAUNCH_CAPTURE_PATH, JSON.stringify({ argv, env }) + '\\n');
-if (argv[0] === '--version') {
+if (commandArgv[0] === '--version') {
   process.stdout.write('fake cli 1.0.0\\n');
   process.exit(0);
 }
-if (argv[0] === 'app-server') {
+if (commandArgv[0] === 'app-server') {
   await import(pathToFileURL(process.env.RPC_FIXTURE_PATH).href);
 } else {
   process.stdout.write('\\n› \\n');
@@ -200,6 +214,7 @@ if (argv[0] === 'app-server') {
     resume: options.resume,
     cliSessionId: options.cliSessionId,
     codexRpcInput: options.codexRpcInput,
+    disableCliBypass: options.disableCliBypass,
     ...(options.codexRpcInput
       ? {
           cliRuntime: {
@@ -309,7 +324,7 @@ describe('TRAE native subagent hook worker launches', () => {
       harness,
       () => {
         const launches = readLaunches(harness.capturePath);
-        return launches.some(record => record.argv[0] === 'app-server')
+        return launches.some(isAppServerLaunch)
           && launches.some(record => record.argv[0] === '--remote')
           && harness.messages.some(message => message.type === 'ready');
       },
@@ -317,11 +332,13 @@ describe('TRAE native subagent hook worker launches', () => {
       20_000,
     );
     const launches = readLaunches(harness.capturePath);
-    const appServer = launches.find(record => record.argv[0] === 'app-server');
+    const appServer = launches.find(isAppServerLaunch);
     const viewer = launches.find(record => record.argv[0] === '--remote');
     expect(appServer).toBeDefined();
     expect(viewer).toBeDefined();
     expectSingleNativeHook(appServer!);
+    expect(appServer!.argv[0]).toBe('--dangerously-bypass-hook-trust');
+    expect(appServer!.argv[1]).toBe('app-server');
     expect(appServer!.argv).toContain('default_mode_request_user_input');
     expect(hookOverrides(viewer!.argv)).toEqual([]);
     expect(viewer!.argv).toEqual([
@@ -331,6 +348,58 @@ describe('TRAE native subagent hook worker launches', () => {
     expectAuthenticatedSessionEnv(appServer!, harness.sessionId);
     expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
     expect(appServer!.env.BOTMUX_SESSION_SCOPE).toBe('thread');
+    expectHookFilesUnchanged(harness);
+  }, 25_000);
+
+  it.skipIf(!tmuxAvailable)('keeps the Trae RPC app-server interactive when the global hook-trust toggle is off', async () => {
+    const harness = makeHarness({
+      cliId: 'traex',
+      backendType: 'tmux',
+      codexRpcInput: true,
+      bypassCodexHookTrust: false,
+    });
+    await waitFor(
+      harness,
+      () => {
+        const launches = readLaunches(harness.capturePath);
+        return launches.some(isAppServerLaunch)
+          && launches.some(record => record.argv[0] === '--remote')
+          && harness.messages.some(message => message.type === 'ready');
+      },
+      'Trae app-server and remote viewer launches',
+      20_000,
+    );
+    const launches = readLaunches(harness.capturePath);
+    const appServer = launches.find(isAppServerLaunch);
+    const viewer = launches.find(record => record.argv[0] === '--remote');
+    expect(appServer).toBeDefined();
+    expect(viewer).toBeDefined();
+    expect(appServer!.argv[0]).toBe('app-server');
+    expect(appServer!.argv).not.toContain('--dangerously-bypass-hook-trust');
+    expect(viewer!.argv).not.toContain('--dangerously-bypass-hook-trust');
+    expectSingleNativeHook(appServer!);
+    expect(hookOverrides(viewer!.argv)).toEqual([]);
+    expectAuthenticatedSessionEnv(appServer!, harness.sessionId);
+    expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
+    expectHookFilesUnchanged(harness);
+  }, 25_000);
+
+  it.skipIf(!tmuxAvailable)('falls back to a non-bypassed TUI when the bot disables CLI bypasses', async () => {
+    const harness = makeHarness({
+      cliId: 'traex',
+      backendType: 'tmux',
+      codexRpcInput: true,
+      disableCliBypass: true,
+    });
+    await waitFor(harness, () => (
+      harness.messages.some(message => message.type === 'ready')
+      && nonProbeLaunches(harness).length === 1
+    ), 'restricted Trae TUI fallback');
+    const launches = nonProbeLaunches(harness);
+    expect(launches).toHaveLength(1);
+    expect(launches.some(isAppServerLaunch)).toBe(false);
+    expect(launches[0]!.argv).not.toContain('--dangerously-bypass-hook-trust');
+    expectAuthenticatedSessionEnv(launches[0]!, harness.sessionId);
     expectHookFilesUnchanged(harness);
   }, 25_000);
 

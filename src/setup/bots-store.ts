@@ -5,12 +5,33 @@
  * - 文件权限 0o600 (只有用户自己能读), secret 不外泄给同机器人其它用户
  */
 import { writeFileSync, renameSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
-import { withFileLock, withFileLockSync, type FileLockOptions } from '../utils/file-lock.js';
+import { FileLockTimeoutError, withFileLock, withFileLockSync, type FileLockOptions } from '../utils/file-lock.js';
 import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
+import { logger } from '../utils/logger.js';
 import {
   assertCanonicalBotsConfigTargetStable,
   resolveCanonicalBotsConfigTarget,
 } from '../core/config-dir.js';
+
+export type BotsJsonLockCaller = 'bots-store' | 'cli' | 'config-store' | 'daemon' | 'dashboard' | 'device-isolation' | 'sandbox-migration';
+export type BotsJsonLockOperation = 'atomic-write' | 'bot-entry-rmw' | 'bot-start' | 'fleet-restart' | 'fleet-start' | 'legacy-config-migration' | 'plugin-binding' | 'startup-admission' | 'vc-agent-profile';
+export interface BotsJsonLockOptions extends FileLockOptions { caller?: BotsJsonLockCaller; operation?: BotsJsonLockOperation }
+const LOCK_CALLERS = new Set<BotsJsonLockCaller>(['bots-store', 'cli', 'config-store', 'daemon', 'dashboard', 'device-isolation', 'sandbox-migration']);
+const LOCK_OPERATIONS = new Set<BotsJsonLockOperation>(['atomic-write', 'bot-entry-rmw', 'bot-start', 'fleet-restart', 'fleet-start', 'legacy-config-migration', 'plugin-binding', 'startup-admission', 'vc-agent-profile']);
+
+function logOwnedBotsJsonLockTimeout(error: unknown, targetPath: string, options: BotsJsonLockOptions, startedAt: number): void {
+  if (!(error instanceof FileLockTimeoutError) || error.lockPath !== targetPath + '.lock') return;
+  const label = (value: string | undefined, allowed: ReadonlySet<string>): string =>
+    value === undefined ? 'unspecified' : allowed.has(value) ? value : 'invalid';
+  logger.warn('[bots-lock] timeout', {
+    lock: 'bots.json.lock',
+    caller: label(options.caller, LOCK_CALLERS),
+    operation: label(options.operation, LOCK_OPERATIONS),
+    waitedMs: Math.max(0, Date.now() - startedAt),
+    holderPid: error.holderPid ?? null,
+    lockAgeMs: Number.isFinite(error.lockAgeMs) ? Math.round(error.lockAgeMs) : null,
+  });
+}
 
 /**
  * Serialize an operation with every supported bots.json writer. When nesting
@@ -20,30 +41,40 @@ import {
 export function withBotsJsonLockSync<T>(
   botsJsonPath: string,
   fn: (targetPath: string) => T,
-  options: FileLockOptions = {},
+  options: BotsJsonLockOptions = {},
 ): T {
   const target = resolveCanonicalBotsConfigTarget(botsJsonPath, { allowMissing: true });
-  return withFileLockSync(target.targetPath, () => {
-    assertCanonicalBotsConfigTargetStable(target);
-    const result = fn(target.targetPath);
-    if (target.requestedWasSymlink) assertCanonicalBotsConfigTargetStable(target);
-    return result;
-  }, options);
+  const startedAt = Date.now();
+  try {
+    return withFileLockSync(target.targetPath, () => {
+      assertCanonicalBotsConfigTargetStable(target);
+      const result = fn(target.targetPath);
+      if (target.requestedWasSymlink) assertCanonicalBotsConfigTargetStable(target);
+      return result;
+    }, options);
+  } catch (error) {
+    logOwnedBotsJsonLockTimeout(error, target.targetPath, options, startedAt);
+    throw error;
+  }
 }
 
 export function withBotsJsonLock<T>(
   botsJsonPath: string,
   fn: (targetPath: string, assertTargetStable: () => void) => Promise<T>,
-  options: FileLockOptions = {},
+  options: BotsJsonLockOptions = {},
 ): Promise<T> {
   const target = resolveCanonicalBotsConfigTarget(botsJsonPath, { allowMissing: true });
   const assertTargetStable = (): void => assertCanonicalBotsConfigTargetStable(target);
+  const startedAt = Date.now();
   return withFileLock(target.targetPath, async () => {
     assertTargetStable();
     const result = await fn(target.targetPath, assertTargetStable);
     if (target.requestedWasSymlink) assertTargetStable();
     return result;
-  }, options);
+  }, options).catch(error => {
+    logOwnedBotsJsonLockTimeout(error, target.targetPath, options, startedAt);
+    throw error;
+  });
 }
 
 export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
@@ -51,10 +82,13 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
   // post-start verification/rollback, so the ecosystem and its expected names
   // can never be built from different bots.json generations.
   const target = resolveCanonicalBotsConfigTarget(botsJsonPath, { allowMissing: true });
-  withFileLockSync(target.targetPath, () => {
-    assertCanonicalBotsConfigTargetStable(target);
-    // Clone/onboarding callers pass the exact generation they intend to save.
-    assertQuotaFallbackGraphAcyclic(bots);
+  const options: BotsJsonLockOptions = { caller: 'bots-store', operation: 'atomic-write' };
+  const startedAt = Date.now();
+  try {
+    withFileLockSync(target.targetPath, () => {
+      assertCanonicalBotsConfigTargetStable(target);
+      // Clone/onboarding callers pass the exact generation they intend to save.
+      assertQuotaFallbackGraphAcyclic(bots);
     // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
     const tmp = target.targetPath + '.tmp';
     writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
@@ -66,7 +100,11 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
       try { unlinkSync(tmp); } catch { /* best effort */ }
       throw error;
     }
-  });
+    });
+  } catch (error) {
+    logOwnedBotsJsonLockTimeout(error, target.targetPath, options, startedAt);
+    throw error;
+  }
 }
 
 export function readBotsJsonOrEmpty(botsJsonPath: string): any[] {

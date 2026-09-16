@@ -1014,7 +1014,8 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
-   *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
+   *  Codex-family managed TUI and TraeX RPC app-server launches. Default ON
+   *  (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
   codexNotifier: {
     enabled: boolean;
@@ -1582,7 +1583,7 @@ async function preflightVcMeetingBot(appId: string): Promise<{ ok: true } | { ok
       parseBotConfigsFromText(JSON.stringify(raw));
       await writeRawConfigAtomic(targetPath, raw);
       changed = true;
-    });
+    }, { caller: 'dashboard', operation: 'vc-agent-profile' });
   } catch (err: any) {
     return { ok: false, error: `vcMeetingBot_preflight_config_write_failed: ${err?.message ?? err}` };
   }
@@ -2519,7 +2520,7 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
     else delete entry.plugins;
     await writeRawConfigAtomic(targetPath, raw);
     return true;
-  });
+  }, { caller: 'dashboard', operation: 'plugin-binding' });
 }
 
 function pluginJson(res: ServerResponse, status: number, body: unknown): true {

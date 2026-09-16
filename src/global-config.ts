@@ -294,11 +294,12 @@ export interface DashboardGlobalConfig {
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
-   *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
+   *  to trust") for Codex-family managed launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
    *  and every botmux upgrade rewrites the hook script → its hash changes → the
    *  gate re-fires; a botmux-managed pane has no human to press `t`, so the first
-   *  turn wedges. When enabled, the adapter passes `--dangerously-bypass-hook-trust`.
+   *  turn wedges. When enabled, managed TUI launches and the TraeX RPC app-server
+   *  pass `--dangerously-bypass-hook-trust`.
    *  Default ON (ABSENT ⇒ ON — only an explicit `false` disables): a headless
    *  fleet needs it to not wedge. This is a SEPARATE knob from the approval/sandbox
    *  bypass: the flag trusts ALL hook sources codex sees (user/project/plugin), not

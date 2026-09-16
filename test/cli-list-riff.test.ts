@@ -43,6 +43,7 @@ interface StoredSession {
   cliId?: string;
   backendType?: 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff';
   persistentBackendTarget?: unknown;
+  pid?: number;
 }
 
 afterEach(() => {
@@ -80,6 +81,7 @@ function runList(
   dataDir: string,
   homeDir: string,
   args: string[] = ['--plain'],
+  extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = {
@@ -90,6 +92,7 @@ function runList(
       // POSIX). SESSION_DATA_DIR still wins for the session store regardless.
       HOME: homeDir,
       USERPROFILE: homeDir,
+      ...extraEnv,
     };
     const child = spawnTsScript(
       CLI_PATH,
@@ -178,5 +181,27 @@ describe('botmux list — active Riff session', () => {
       expect(stored[s.sessionId]).toBeDefined();
       expect(stored[s.sessionId].status).toBe('active');
     }
+  });
+
+  it('does not prune or report host-pid sessions as stopped from an isolated session', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-isolated-data-'));
+    const homeDir = mkdtempSync(join(tmpdir(), 'botmux-list-isolated-home-'));
+    tempDirs.push(dataDir, homeDir);
+    const hostSession = makeSession('host0001-0000-0000-0000-000000000001', {
+      title: 'host-visible-only',
+      cliId: undefined,
+      pid: 999_999,
+    });
+    writeSessions(dataDir, [hostSession]);
+
+    const result = await runList(dataDir, homeDir, ['--plain'], {
+      BOTMUX_SESSION_ID: 'sandbox-current-session',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('host-visible-only');
+    expect(result.stdout).toContain('unknown');
+    expect(result.stdout).not.toContain('stopped');
+    expect(readSessions(dataDir)[hostSession.sessionId]?.status).toBe('active');
   });
 });

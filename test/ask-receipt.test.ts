@@ -1,4 +1,5 @@
 import { generateKeyPairSync } from 'node:crypto';
+import * as Lark from '@larksuiteoapi/node-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -6,6 +7,7 @@ import {
   askQuestionDigest,
   askReceiptJti,
   snapshotAskCallbackData,
+  snapshotLarkCardActionCallbackData,
   verifyAskReceipt,
 } from '../src/core/ask-receipt.js';
 import { createAskAnswerProvenanceAuthority, createAskReceiptSigner } from '../src/daemon/ask-receipt-authority.js';
@@ -298,6 +300,36 @@ describe('signed Ask receipt', () => {
     expect(Object.isFrozen(snapshot.action.form_value.q0)).toBe(true);
     expect(snapshotAskCallbackData(snapshot)).toBe(snapshot);
     expect(snapshotAskCallbackData(structuredClone(snapshot))).not.toBe(snapshot);
+  });
+
+  it('accepts only the SDK card-action event marker at the callback root', async () => {
+    const dispatcher = new Lark.EventDispatcher({});
+    let snapshot: any;
+    dispatcher.register({
+      'card.action.trigger': (data: unknown) => {
+        snapshot = snapshotLarkCardActionCallbackData(data);
+      },
+    });
+    await dispatcher.invoke({
+      schema: '2.0',
+      header: { event_type: 'card.action.trigger', event_id: 'evt-sdk-card' },
+      event: {
+        operator: { open_id: 'ou-reviewer' },
+        context: { open_message_id: 'om-card' },
+        action: { value: { action: 'close', session_id: 'session-1' } },
+      },
+    }, { needCheck: false });
+    expect(Object.getOwnPropertySymbols(snapshot)).toHaveLength(0);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+  });
+
+  it('keeps non-SDK and nested callback symbols fail-closed', () => {
+    const external = { action: { value: { action: 'close' } } };
+    Object.defineProperty(external, Symbol('external'), { value: 'card.action.trigger', enumerable: true });
+    expect(() => snapshotLarkCardActionCallbackData(external)).toThrow('symbol properties');
+    const nested = { action: { value: { action: 'close' } } };
+    Object.defineProperty(nested.action, Symbol('event-type'), { value: 'card.action.trigger', enumerable: true });
+    expect(() => snapshotLarkCardActionCallbackData(nested)).toThrow('symbol properties');
   });
 
   it('keeps getter-backed callback data fail-closed', async () => {

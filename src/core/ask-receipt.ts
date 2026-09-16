@@ -200,10 +200,24 @@ interface SnapshotBudget {
 export function snapshotAskCallbackData(
   value: unknown,
 ): unknown {
+  return snapshotCallbackData(value, false);
+}
+
+/** Accept exactly the root metadata marker added by Lark's EventDispatcher. */
+export function snapshotLarkCardActionCallbackData(value: unknown): unknown {
+  return snapshotCallbackData(value, true);
+}
+
+function snapshotCallbackData(
+  value: unknown,
+  allowLarkEventTypeAtRoot: boolean,
+): unknown {
   if (value !== null && typeof value === 'object' && askCallbackSnapshots.has(value)) {
     return value;
   }
-  const snapshot = snapshotAskCallbackDataUnbranded(value, 0, { values: 0, stringBytes: 0 });
+  const snapshot = snapshotAskCallbackDataUnbranded(
+    value, 0, { values: 0, stringBytes: 0 }, allowLarkEventTypeAtRoot,
+  );
   if (!snapshot || typeof snapshot !== 'object') return snapshot;
   askCallbackSnapshots.add(snapshot);
   return snapshot;
@@ -213,6 +227,7 @@ function snapshotAskCallbackDataUnbranded(
   value: unknown,
   depth: number,
   budget: SnapshotBudget,
+  allowLarkEventTypeAtRoot = false,
 ): unknown {
   if (++budget.values > MAX_CALLBACK_SNAPSHOT_VALUES) {
     throw new Error('Ask callback exceeds snapshot bounds');
@@ -233,9 +248,23 @@ function snapshotAskCallbackDataUnbranded(
   const prototype = Object.getPrototypeOf(value);
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = Reflect.ownKeys(descriptors);
-  if (keys.some((key) => typeof key === 'symbol')) {
+  const symbolKeys = keys.filter((key): key is symbol => typeof key === 'symbol');
+  const larkEventType = symbolKeys.length === 1
+    ? Object.getOwnPropertyDescriptor(value, symbolKeys[0])
+    : undefined;
+  const hasOnlyExpectedLarkEventType = depth === 0
+    && allowLarkEventTypeAtRoot
+    && symbolKeys.length === 1
+    && Symbol.keyFor(symbolKeys[0]) === undefined
+    && symbolKeys[0].description === 'event-type'
+    && !!larkEventType
+    && 'value' in larkEventType
+    && larkEventType.enumerable === true
+    && larkEventType.value === 'card.action.trigger';
+  if (symbolKeys.length > 0 && !hasOnlyExpectedLarkEventType) {
     throw new Error('Ask callback must not contain symbol properties');
   }
+  const stringKeys = keys.filter((key): key is string => typeof key === 'string');
 
   if (Array.isArray(value)) {
     if (prototype !== Array.prototype) throw new Error('Ask callback arrays must be plain');
@@ -244,7 +273,7 @@ function snapshotAskCallbackDataUnbranded(
       throw new Error('Ask callback array length is invalid');
     }
     const out: unknown[] = [];
-    for (const key of keys as string[]) {
+    for (const key of stringKeys) {
       if (key === 'length') continue;
       const index = Number(key);
       const descriptor = descriptors[key]!;
@@ -262,7 +291,7 @@ function snapshotAskCallbackDataUnbranded(
   }
   if (prototype !== Object.prototype) throw new Error('Ask callback objects must be plain');
   const out: Record<string, unknown> = {};
-  for (const key of keys as string[]) {
+  for (const key of stringKeys) {
     const descriptor = descriptors[key]!;
     if ('get' in descriptor || descriptor.enumerable !== true) {
       throw new Error('Ask callback objects must contain only enumerable data properties');
@@ -409,6 +438,40 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
   return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+const LARK_CARD_ACTION_METADATA_KEYS = ['tag', 'name', 'option', 'timezone'] as const;
+export const BOTMUX_ASK_CALLBACK_MARKER_KEY = '__bm_cb';
+export const BOTMUX_ASK_CALLBACK_MARKER_VERSION = 1;
+
+/** Validate the documented Lark transport metadata around action.value. */
+export function hasOnlyLarkCardActionKeys(
+  action: Record<string, unknown>,
+  includeFormValue: boolean,
+): boolean {
+  const required = includeFormValue ? ['value', 'form_value'] : ['value'];
+  const allowed = new Set([...required, ...LARK_CARD_ACTION_METADATA_KEYS]);
+  if (!required.every(key => Object.prototype.hasOwnProperty.call(action, key))
+      || Object.keys(action).some(key => !allowed.has(key))) {
+    return false;
+  }
+  return LARK_CARD_ACTION_METADATA_KEYS.every(key =>
+    action[key] === undefined || action[key] === null || typeof action[key] === 'string',
+  );
+}
+
+/** Allow the egress ownership marker that Botmux itself stamps onto every
+ * callback button while keeping all other callback value keys exact. */
+export function hasExactAskCallbackValueKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const marker = value[BOTMUX_ASK_CALLBACK_MARKER_KEY];
+  const expectedKeys = marker === undefined
+    ? expected
+    : [...expected, BOTMUX_ASK_CALLBACK_MARKER_KEY];
+  return exactKeys(value, expectedKeys)
+    && (marker === undefined || marker === BOTMUX_ASK_CALLBACK_MARKER_VERSION);
 }
 
 function nonEmptyString(value: unknown): value is string {
