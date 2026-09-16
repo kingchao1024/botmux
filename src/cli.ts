@@ -336,6 +336,7 @@ import {
   listOnlineDaemons as listOnlineDaemonsIn,
   parseDaemonIpcPort,
   resolveDaemonIpcPort,
+  type DaemonDiscoveryOptions,
   type OnlineDaemonInfo,
 } from './utils/daemon-discovery.js';
 import {
@@ -3210,13 +3211,21 @@ async function cmdStatus(): Promise<void> {
   warnIfLegacyBotmuxAlive();
   const { readFleetStatus } = await import('./core/fleet-runtime.js');
   const status = readFleetStatus();
+  const isolatedSession = !!process.env.BOTMUX_SESSION_ID?.trim();
+  const visibleDaemons = isolatedSession ? listOnlineDaemons(true) : [];
+  const visibleDaemonGenerations = new Set(visibleDaemons.map(daemon =>
+    `${daemon.larkAppId}\0${daemon.pid ?? 0}`,
+  ));
   if (!status.supervisorAlive && status.rows.length === 0) {
     console.log('daemon 未在运行。（用 `botmux start` 启动）');
     return;
   }
-  const sup = status.supervisorAlive
-    ? `supervisor 在线 (pid ${status.supervisorPid}${status.supervisorStartedAt ? `, 自 ${status.supervisorStartedAt}` : ''})`
-    : 'supervisor 未在运行（下方为上次记录的状态）';
+  let sup = 'supervisor 未在运行（下方为上次记录的状态）';
+  if (status.supervisorAlive) {
+    sup = `supervisor 在线 (pid ${status.supervisorPid}${status.supervisorStartedAt ? `, 自 ${status.supervisorStartedAt}` : ''})`;
+  } else if (isolatedSession && visibleDaemons.length > 0) {
+    sup = `supervisor 在隔离会话内不可验证（${visibleDaemons.length} 个 daemon 描述符在线）`;
+  }
   console.log(sup);
   if (status.rows.length === 0) {
     console.log('  （无已配置机器人）');
@@ -3229,7 +3238,14 @@ async function cmdStatus(): Promise<void> {
   for (const r of status.rows) {
     // A row recorded 'online' whose pid is actually dead is shown as such so
     // status never lies while the supervisor is between reconcile ticks.
-    const shown = r.status === 'online' && !r.alive ? 'dead?' : r.status;
+    let shown: string = r.status;
+    if (r.status === 'online' && !r.alive) {
+      if (!isolatedSession) {
+        shown = 'dead?';
+      } else {
+        shown = visibleDaemonGenerations.has(`${r.appId}\0${r.pid}`) ? 'online' : 'unknown';
+      }
+    }
     const pidCol = r.pid > 0 ? String(r.pid) : '-';
     const exitCol = r.lastExitCode === null ? '-' : String(r.lastExitCode);
     console.log(`  ${r.name.padEnd(nameW)}  ${pidCol.padStart(7)}  ${shown.padEnd(9)}  ${String(r.restarts).padStart(4)}  ${exitCol}`);
@@ -4274,11 +4290,20 @@ function sessionDisplayPid(s: SessionData): number | undefined {
 }
 
 function isSessionAliveForList(s: SessionData): boolean {
+  if (process.env.BOTMUX_SESSION_ID === s.sessionId) return true;
   const pid = sessionDisplayPid(s);
   return !!(pid && isProcessAlive(pid));
 }
 
 function sessionStatusLabel(s: SessionData): string {
+  const isolatedSession = !!process.env.BOTMUX_SESSION_ID?.trim();
+  if (process.env.BOTMUX_SESSION_ID === s.sessionId) {
+    return isAdoptedSession(s) ? 'adopt' : 'online';
+  }
+  if (isolatedSession) {
+    if (isColdResumeDormant(s) || (!s.pid && isRealManagedSession(s))) return 'dormant';
+    return s.pid ? 'unknown' : 'idle';
+  }
   if (isAdoptedSession(s)) {
     const pid = adoptedCliPid(s);
     if (pid) return isProcessAlive(pid) ? 'adopt' : 'stopped';
@@ -4986,6 +5011,7 @@ function cmdManagedZmxAttach(args: string[]): void {
 async function cmdList(): Promise<void> {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
+  const isolatedSession = !!process.env.BOTMUX_SESSION_ID?.trim();
   // One immutable control-plane snapshot per invocation. In particular, ZMX's
   // full-list probe walks every per-session daemon, so running it once per row
   // would make a large session list quadratic and amplify socket timeouts.
@@ -5004,6 +5030,12 @@ async function cmdList(): Promise<void> {
   const prunedScratch: SessionData[] = [];
   const live: SessionData[] = [];
   for (const s of active) {
+    // A session sandbox cannot see host PIDs. `list` must never interpret that
+    // namespace boundary as proof of death or prune rows from the host store.
+    if (isolatedSession) {
+      live.push(s);
+      continue;
+    }
     if (isAdoptedSession(s)) {
       const pid = adoptedCliPid(s);
       if (pid && isProcessAlive(pid)) {
@@ -5675,24 +5707,33 @@ type DaemonDescriptorLite = OnlineDaemonInfo;
  *  copy of the descriptor parse and the 90s staleness cutoff. These two
  *  wrappers only pin it to THIS process's resolved data dir, so the liveness
  *  probe and the session store always read the same directory. */
-function cliDaemonDiscoveryOptions(): string | { registryDir: string; cleanupStale: false } {
+function cliDaemonDiscoveryOptions(opaqueProcessVisibility = false): string | DaemonDiscoveryOptions {
   const dataDir = resolveDataDir();
   const sessionScoped = !!process.env.BOTMUX_SESSION_ID?.trim();
   return sessionScoped
     ? {
         registryDir: join(dataDir, 'dashboard-daemons'),
         cleanupStale: false,
+        ...(opaqueProcessVisibility ? { processVisibility: 'opaque' as const } : {}),
       }
     : dataDir;
 }
 
-function listOnlineDaemons(): DaemonDescriptorLite[] {
-  return listOnlineDaemonsIn(cliDaemonDiscoveryOptions());
+function listOnlineDaemons(opaqueProcessVisibility = false): DaemonDescriptorLite[] {
+  return listOnlineDaemonsIn(cliDaemonDiscoveryOptions(opaqueProcessVisibility));
 }
 
-function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
-  if (larkAppId) return findOnlineDaemon(larkAppId, cliDaemonDiscoveryOptions());
-  return listOnlineDaemons()[0] ?? null;
+function findDaemon(
+  larkAppId?: string,
+  opaqueProcessVisibility = false,
+): DaemonDescriptorLite | null {
+  if (larkAppId) {
+    return findOnlineDaemon(
+      larkAppId,
+      cliDaemonDiscoveryOptions(opaqueProcessVisibility),
+    );
+  }
+  return listOnlineDaemons(opaqueProcessVisibility)[0] ?? null;
 }
 
 function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
@@ -12395,8 +12436,9 @@ async function postAsk(
     Object.assign(new Error(message), { exitCode: 3, retryable });
 
   const larkAppId = body.larkAppId as string;
-  const daemon = findDaemon(larkAppId);
-  if (!daemon) {
+  const daemon = findDaemon(larkAppId, true);
+  const ipcPort = resolveDaemonIpcPort(daemon?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
     // No daemon record → it's (re)starting or momentarily gone → retryable.
     throw mkErr(`botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`, true);
   }
@@ -12428,12 +12470,12 @@ async function postAsk(
       try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
     }
     res = hostSecret
-      ? await fetchDaemonIpc(daemon.ipcPort, path, init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${path}`, init);
+      ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
+      : await loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-    throw mkErr(`botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`, true);
+    throw mkErr(`botmux ask: 无法连接 daemon (port=${ipcPort}): ${msg}`, true);
   }
 
   if (!res.ok) {

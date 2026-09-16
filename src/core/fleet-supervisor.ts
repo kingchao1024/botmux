@@ -36,6 +36,7 @@ import { withDeviceCredentialIsolationActivationLockSync } from '../platform/dev
 import { readDeviceIsolationRosterSnapshot } from '../services/device-isolation-roster.js';
 import { FileLockTimeoutError } from '../utils/file-lock.js';
 import { botProcessName } from '../setup/bot-config-editor.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 
 export interface FleetBotSpec {
   /** botmux-<index> process name (or 'botmux-dashboard' for the dashboard). */
@@ -642,7 +643,7 @@ export class FleetSupervisor {
       try {
         child = spawnChild();
         attachProvisionalErrorGuard(child);
-        if (!child.pid) {
+        if (!child.pid && !spec.external) {
           terminalizeProvisionalSpawn(child, new Error(`spawn returned no pid for ${spec.name}`));
           child = undefined;
         }
@@ -684,8 +685,10 @@ export class FleetSupervisor {
         // "running and current". Only external members have one.
         if (spec.external?.configHash !== undefined) existing.configHash = spec.external.configHash;
         else delete existing.configHash;
+        if (spec.external && child.pid) existing.processStart = readDurableProcessIdentity(child.pid);
       } else {
         cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash) });
+        if (spec.external && child.pid) cur.procs[cur.procs.length - 1].processStart = readDurableProcessIdentity(child.pid);
       }
       return cur;
     }).procs.find((p) => p.name === spec.name)!.generation;

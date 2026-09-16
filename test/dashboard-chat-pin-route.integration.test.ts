@@ -9,6 +9,8 @@ import type { ChildProcess } from 'node:child_process';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { loadOrCreatePersistedToken } from '../src/dashboard/auth.js';
 import { loopbackFetch, type LoopbackFetchInit } from '../src/core/loopback-fetch.js';
+import { publishDaemonDescriptor } from '../src/utils/daemon-discovery.js';
+import { readSupervisorProcessStartIdentity } from '../src/core/process-start-identity.js';
 
 const DASHBOARD_ENTRY = resolve('src/index-dashboard.ts');
 
@@ -127,13 +129,13 @@ describe('dashboard real HTTP route · PUT /api/groups/:chatId/pin-streaming-car
     writeFileSync(join(botmuxDir, '.data-dir'), `${dataDir}\n`, { mode: 0o600 });
     writeFileSync(botsConfigPath, JSON.stringify([
       {
-        larkAppId: 'cli test-app',
+        larkAppId: 'cli_test-app',
         larkAppSecret: 'secret',
         botName: 'bot A',
         cliId: 'codex',
       },
       {
-        larkAppId: 'cli absent-app',
+        larkAppId: 'cli_absent-app',
         larkAppSecret: 'secret',
         botName: 'bot B',
         cliId: 'claude-code',
@@ -190,24 +192,31 @@ describe('dashboard real HTTP route · PUT /api/groups/:chatId/pin-streaming-car
     });
     const absentBotDaemonPort = await listen(absentBotDaemon);
 
-    writeFileSync(join(registryDir, 'cli test-app.json'), JSON.stringify({
-      larkAppId: 'cli test-app',
+    const processStartIdentity = readSupervisorProcessStartIdentity(process.pid)!;
+    publishDaemonDescriptor(registryDir, {
+      larkAppId: 'cli_test-app',
       botName: 'bot A',
       botIndex: 0,
       ipcPort: fakeDaemonPort,
       pid: process.pid,
+      bootInstanceId: 'A'.repeat(43),
+      processStartIdentity,
+      rosterRevision: 'a'.repeat(64),
       startedAt: Date.now(),
       lastHeartbeat: Date.now(),
-    }));
-    writeFileSync(join(registryDir, 'cli absent-app.json'), JSON.stringify({
-      larkAppId: 'cli absent-app',
+    });
+    publishDaemonDescriptor(registryDir, {
+      larkAppId: 'cli_absent-app',
       botName: 'bot B',
       botIndex: 1,
       ipcPort: absentBotDaemonPort,
       pid: process.pid,
+      bootInstanceId: 'B'.repeat(43),
+      processStartIdentity,
+      rosterRevision: 'a'.repeat(64),
       startedAt: Date.now(),
       lastHeartbeat: Date.now(),
-    }));
+    });
 
     dashboardChild = spawnTsScript(DASHBOARD_ENTRY, [], {
       cwd: resolve('.'),
@@ -257,21 +266,21 @@ describe('dashboard real HTTP route · PUT /api/groups/:chatId/pin-streaming-car
         name: 'group read 1',
       }],
     });
-    const presentBot = firstGroupsPayload.chats[0].memberBots.find(bot => bot.larkAppId === 'cli test-app');
+    const presentBot = firstGroupsPayload.chats[0].memberBots.find(bot => bot.larkAppId === 'cli_test-app');
     expect(presentBot).toMatchObject({
       inChat: true,
       pinStreamingCardMasterEnabled: true,
       pinStreamingCardChatEnabled: true,
       pinStreamingCardEffectiveEnabled: true,
     });
-    const absentBot = firstGroupsPayload.chats[0].memberBots.find(bot => bot.larkAppId === 'cli absent-app');
+    const absentBot = firstGroupsPayload.chats[0].memberBots.find(bot => bot.larkAppId === 'cli_absent-app');
     expect(absentBot).toMatchObject({ inChat: false });
     expect(absentBot).not.toHaveProperty('pinStreamingCardMasterEnabled');
     expect(absentBot).not.toHaveProperty('pinStreamingCardChatEnabled');
     expect(absentBot).not.toHaveProperty('pinStreamingCardEffectiveEnabled');
 
     const writeResponse = await requestLoopback(
-      `${base}/api/groups/${encodeURIComponent('oc topic/with slash')}/pin-streaming-card/${encodeURIComponent('cli test-app')}`,
+      `${base}/api/groups/${encodeURIComponent('oc topic/with slash')}/pin-streaming-card/${encodeURIComponent('cli_test-app')}`,
       {
         method: 'PUT',
         headers: {
@@ -314,7 +323,7 @@ describe('dashboard real HTTP route · PUT /api/groups/:chatId/pin-streaming-car
         name: 'group read 2',
       }],
     });
-    expect(secondGroupsPayload.chats[0].memberBots.find(bot => bot.larkAppId === 'cli test-app')).toMatchObject({
+    expect(secondGroupsPayload.chats[0].memberBots.find(bot => bot.larkAppId === 'cli_test-app')).toMatchObject({
       inChat: true,
       pinStreamingCardMasterEnabled: true,
       pinStreamingCardChatEnabled: false,

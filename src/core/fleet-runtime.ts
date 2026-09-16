@@ -242,7 +242,14 @@ export function resolveFleetBots(planValue?: FleetLaunchPlan): FleetBotSpec[] {
 }
 
 function quotaFallbackCycleIds(configPath: string): Set<string> {
-  const raw = JSON.parse(readFileSync(configPath, 'utf8')) as unknown;
+  let text: string;
+  try {
+    text = readFileSync(configPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Set();
+    throw error;
+  }
+  const raw = JSON.parse(text) as unknown;
   if (!Array.isArray(raw)) return new Set();
   return new Set(findQuotaFallbackCycles(raw).flat());
 }
