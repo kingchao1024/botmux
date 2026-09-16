@@ -10,6 +10,7 @@ import {
 import { WorkflowDaemonMutationTransportError } from '../src/workflows/v3/daemon-ipc-client.js';
 import {
   postWorkflowSessionRunMutation,
+  readWorkflowProcessRelayContext,
   readWorkflowSessionRelayContext,
   type WorkflowSessionRelayContext,
 } from '../src/workflows/v3/session-relay-client.js';
@@ -150,6 +151,36 @@ describe('readWorkflowSessionRelayContext', () => {
   });
 });
 
+describe('readWorkflowProcessRelayContext', () => {
+  it('detects an outer-sandboxed live CLI from its daemon routing env', () => {
+    expect(readWorkflowProcessRelayContext({
+      env: {
+        BOTMUX_SESSION_ID: 'sess-1',
+        BOTMUX_LARK_APP_ID: 'cli_owner',
+        BOTMUX_DAEMON_IPC_PORT: '4310',
+      },
+      dataDir: '/unused',
+      findMarker: () => null,
+    })).toEqual({
+      sessionId: 'sess-1',
+      larkAppId: 'cli_owner',
+      ipcPortFallback: 4310,
+    });
+  });
+
+  it('does not replace a visible host marker or accept an invalid port', () => {
+    const env = { BOTMUX_SESSION_ID: 'sess-1', BOTMUX_DAEMON_IPC_PORT: '4310' };
+    expect(readWorkflowProcessRelayContext({
+      env, dataDir: '/unused', findMarker: () => ({ sessionId: 'sess-1' }),
+    })).toBeNull();
+    expect(readWorkflowProcessRelayContext({
+      env: { ...env, BOTMUX_DAEMON_IPC_PORT: '0' },
+      dataDir: '/unused',
+      findMarker: () => null,
+    })).toBeNull();
+  });
+});
+
 describe('postWorkflowSessionRunMutation', () => {
   const context: WorkflowSessionRelayContext = {
     sessionId: 'sess-1',
@@ -191,6 +222,21 @@ describe('postWorkflowSessionRunMutation', () => {
     });
   });
 
+  it('posts a bounded grill mutation through the same session capability route', async () => {
+    const fetchImpl = fetchOk();
+    await postWorkflowSessionRunMutation({
+      context,
+      runId: 'run-1',
+      mutation: 'spec-finalize',
+      fetchImpl,
+    });
+    const [url, init] = fetchImpl.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(url).toBe('http://127.0.0.1:4310/api/v3/session-runs/run-1/spec-finalize');
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      sessionId: 'sess-1', originCapability: CAPABILITY, originTurnId: 'turn-7',
+    });
+  });
+
   it('omits absent turn fields and encodes the runId', async () => {
     const fetchImpl = fetchOk();
     await postWorkflowSessionRunMutation({
@@ -205,6 +251,18 @@ describe('postWorkflowSessionRunMutation', () => {
       sessionId: 'sess-1',
       originCapability: CAPABILITY,
     });
+  });
+
+  it('omits the capability for a process-attested authoring relay', async () => {
+    const fetchImpl = fetchOk();
+    await postWorkflowSessionRunMutation({
+      context: { sessionId: 'sess-1', ipcPortFallback: 4310 },
+      runId: 'run-1',
+      mutation: 'spec-finalize',
+      fetchImpl,
+    });
+    const [, init] = fetchImpl.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ sessionId: 'sess-1' });
   });
 
   it('prefers the protected capability port, falls back to discovery, then fails closed', async () => {

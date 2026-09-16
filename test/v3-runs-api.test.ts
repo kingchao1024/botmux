@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { Writable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appendEvent } from '../src/workflows/v3/journal.js';
+import { birthRun } from '../src/workflows/v3/grill-state.js';
 import { handleV3RunsApi } from '../src/dashboard/v3-runs-api.js';
 import type { V3RunsApiDeps } from '../src/dashboard/v3-runs-api.js';
 
@@ -127,6 +128,20 @@ describe('v3-runs-api', () => {
       expect(m.status).toBe(200);
       const body = m.json() as { runs: Array<{ runId: string }> };
       expect(body.runs.map((r) => r.runId)).toContain('r-260602-0907');
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('GET /api/v3/runs includes a newly-created authoring run before runtime starts', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-api-'));
+    try {
+      birthRun({ goal: 'draft', baseDir: base, runId: 'draft-260907-1400' });
+      const { req, url } = get('/api/v3/runs');
+      const m = mockRes();
+      await handleV3RunsApi(req, m.res, url, apiDeps(base), true);
+      expect(m.status).toBe(200);
+      expect(m.json()).toEqual({
+        runs: [{ runId: 'draft-260907-1400', runStatus: 'grilling', nodeCount: 0 }],
+      });
     } finally { rmSync(base, { recursive: true, force: true }); }
   });
 

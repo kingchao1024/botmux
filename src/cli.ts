@@ -219,8 +219,14 @@ import {
 } from './workflows/v3/daemon-ipc-client.js';
 import {
   postWorkflowSessionRunMutation,
+  readWorkflowProcessRelayContext,
   readWorkflowSessionRelayContext,
 } from './workflows/v3/session-relay-client.js';
+import type { V3SessionRunMutation } from './workflows/v3/session-relay.js';
+import {
+  isV3SessionRunAuthoringMutation,
+  type V3SessionRunAuthoringMutation,
+} from './workflows/v3/authoring-authority.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
@@ -5823,7 +5829,7 @@ function authorizeWorkflowDaemonCommand(runId: string, rest: string[]): string {
  */
 async function tryWorkflowSessionRelayMutation(
   runId: string,
-  mutation: WorkflowDaemonMutation,
+  mutation: V3SessionRunMutation,
   body?: Record<string, unknown>,
 ): Promise<WorkflowDaemonMutationResponse | null> {
   const context = readWorkflowSessionRelayContext({
@@ -5852,6 +5858,30 @@ async function tryWorkflowSessionRelayMutation(
     console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
+}
+
+async function cmdWorkflowAuthoringViaSessionRelay(
+  sub: V3SessionRunAuthoringMutation,
+  runId: string | undefined,
+  rest: string[],
+): Promise<boolean> {
+  const dataDir = resolveDataDir();
+  const context = readWorkflowSessionRelayContext({ env: process.env, dataDir })
+    ?? readWorkflowProcessRelayContext({ env: process.env, dataDir });
+  if (!context) return false;
+  if (!runId || rest.length > 0) {
+    console.error(`❌ 隔离会话中的 workflow ${sub} 只接受一个 runId，不接受其它参数。`);
+    process.exitCode = 1;
+    return true;
+  }
+  const response = await postWorkflowSessionRunMutation({ context, runId, mutation: sub });
+  if (!response.ok) {
+    console.error(`❌ ${sub} 失败 (HTTP ${response.status}): ${response.bodyRaw}`);
+    process.exitCode = 1;
+    return true;
+  }
+  console.log(response.bodyRaw);
+  return true;
 }
 
 /** `botmux workflow cancel <runId>` — authenticate the exact current caller
@@ -15213,6 +15243,13 @@ switch (command) {
   }
   case 'workflow': {
     const wfSub = process.argv[3] ?? '';
+    if (isV3SessionRunAuthoringMutation(wfSub)) {
+      if (await cmdWorkflowAuthoringViaSessionRelay(
+        wfSub,
+        process.argv[4],
+        process.argv.slice(5),
+      )) break;
+    }
     if (wfSub === 'cancel') {
       // Durable v3 run cancellation. The v2 runtime is retired.
       await cmdWorkflowCancelV3(process.argv[4], process.argv.slice(5));

@@ -8,6 +8,11 @@ import {
 
 const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 const dashboardSource = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+const sessionRelaySource = readFileSync(new URL('../src/workflows/v3/session-relay.ts', import.meta.url), 'utf8');
+const authoringAuthoritySource = readFileSync(
+  new URL('../src/workflows/v3/authoring-authority.ts', import.meta.url),
+  'utf8',
+);
 
 function sourceBetween(source: string, begin: string, end: string): string {
   const start = source.indexOf(begin);
@@ -32,6 +37,22 @@ describe('Workflow v3 daemon IPC wiring', () => {
         `ipcRoute\\(\\s*['\"]POST['\"]\\s*,\\s*['\"]\\/api\\/v3\\/runs\\/:runId\\/${mutation}['\"]`,
       ));
     }
+  });
+
+  it('keeps grill relay verbs session-scoped and excludes run birth', () => {
+    for (const mutation of ['spec-finalize', 'approve-spec', 'architect', 'approve-dag']) {
+      expect(authoringAuthoritySource).toContain(`'${mutation}'`);
+    }
+    expect(authoringAuthoritySource).toContain("'spec-finalize', 'approve-spec', 'architect', 'approve-dag'");
+    expect(daemonSource).not.toContain("sessionRelayMutation === 'new'");
+  });
+
+  it('uses the shared authoring set and rejects isolated CLI extra arguments', () => {
+    const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    expect(cliSource).toContain('isV3SessionRunAuthoringMutation(wfSub)');
+    expect(daemonSource).toContain('isV3SessionRunAuthoringMutation(sessionRelayMutation)');
+    expect(cliSource).toContain('if (!runId || rest.length > 0)');
+    expect(cliSource).toContain('只接受一个 runId，不接受其它参数');
   });
 
   it('dashboard v3 cancel proxy selects the full-envelope Workflow protocol', () => {

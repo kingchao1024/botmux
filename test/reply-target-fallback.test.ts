@@ -606,6 +606,19 @@ describe('collectTurnWindowParticipants — legacy pre-participants anchor', () 
 });
 
 describe('frozen reply context', () => {
+  it('freezes human, bot, and unknown sender kinds per turn', () => {
+    const ds = makeDs() as DaemonSession;
+    ds.session.quoteTargetSenderIsBot = false;
+
+    beginReplyTargetTurn(ds, undefined, 'turn-human', NOW, { senderIsBot: false });
+    beginReplyTargetTurn(ds, undefined, 'turn-bot', NOW, { senderIsBot: true });
+    beginReplyTargetTurn(ds, undefined, 'turn-unknown', NOW, { senderIsBot: undefined });
+
+    expect(frozenReplyContextForTurn(ds, 'turn-human').replyTargetSenderIsBot).toBe(false);
+    expect(frozenReplyContextForTurn(ds, 'turn-bot').replyTargetSenderIsBot).toBe(true);
+    expect(frozenReplyContextForTurn(ds, 'turn-unknown').replyTargetSenderIsBot).toBeUndefined();
+  });
+
   it('keeps turn A root, quote, and sender after mutable state advances to B', () => {
     const ds = makeDs() as DaemonSession;
     ds.session.quoteTargetId = 'om_a';

@@ -17,6 +17,12 @@ import { join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { readJournal } from './journal.js';
 import { materialize, type V3RunStatus } from './state.js';
+import {
+  GRILL_STATE_SCHEMA_VERSION,
+  readGrillState,
+  type GrillState,
+  type GrillStatus,
+} from './grill-state.js';
 import type { V3NodeStatus } from './orchestrator.js';
 
 /** Same allowlist shape as v0.2 ops-projection — validate BEFORE path-joining a
@@ -107,7 +113,7 @@ export interface RunNodeView {
 
 export interface RunView {
   runId: string;
-  runStatus: V3RunStatus;
+  runStatus: V3RunStatus | GrillStatus;
   failedNodeId?: string;
   blockedNodeId?: string;
   nodes: RunNodeView[];
@@ -181,13 +187,14 @@ function readDagNodes(runDir: string): DagNodeLite[] {
  */
 export function projectRun(runId: string, runDir: string): RunView {
   const journalPath = join(runDir, 'journal.ndjson');
+  const hasJournal = existsSync(journalPath);
   // readJournal is fail-loud on mid-file corruption (hardening #11) for the
   // RUNTIME paths, but projectRun is the read-only dashboard projection and is
   // contractually defensive (see above): degrade to a sparse view instead of
   // throwing, so one corrupt journal can't 500 the whole runs list or its own
   // detail page. The runtime (decision-making) callers still get the throw.
   let events: ReturnType<typeof readJournal> = [];
-  if (existsSync(journalPath)) {
+  if (hasJournal) {
     try {
       events = readJournal(journalPath);
     } catch {
@@ -195,6 +202,7 @@ export function projectRun(runId: string, runDir: string): RunView {
     }
   }
   const snap = materialize(events);
+  const grill = hasJournal ? undefined : readGrillState(runDir);
   const dagNodes = readDagNodes(runDir);
 
   const sessions = new Map<string, { sessionId: string; webPort?: number; ptyLogPath?: string }>();
@@ -293,7 +301,7 @@ export function projectRun(runId: string, runDir: string): RunView {
 
   return {
     runId,
-    runStatus: snap.runStatus,
+    runStatus: grill?.status ?? snap.runStatus,
     failedNodeId: snap.failedNodeId,
     blockedNodeId: snap.blockedNodeId,
     nodes,
@@ -397,19 +405,43 @@ export function ptyLogPathFor(runsDir: string, runId: string, nodeId: string): s
 
 export interface RunSummary {
   runId: string;
-  runStatus: V3RunStatus;
+  runStatus: V3RunStatus | GrillStatus;
   nodeCount: number;
 }
 
-/** List runs under `runsDir` (dirs that have a journal.ndjson), newest-first by
+const GRILL_STATUSES: ReadonlySet<GrillStatus> = new Set([
+  'grilling',
+  'spec_ready',
+  'spec_approved',
+  'architect_running',
+  'dag_ready',
+  'dag_approved',
+]);
+
+function isListableGrillState(value: GrillState | undefined, runId: string): value is GrillState {
+  return value?.schemaVersion === GRILL_STATE_SCHEMA_VERSION
+    && value.runId === runId
+    && typeof value.goal === 'string'
+    && GRILL_STATUSES.has(value.status)
+    && typeof value.createdAt === 'string'
+    && typeof value.updatedAt === 'string'
+    && typeof value.specPath === 'string'
+    && typeof value.specJsonPath === 'string';
+}
+
+/** List runs under `runsDir` (authoring state or runtime journal), newest-first by
  *  name (runIds carry a `<slug>-<yymmdd-hhmm>` stamp so name sort ≈ time sort). */
 export function listRuns(runsDir: string): RunSummary[] {
   if (!existsSync(runsDir)) return [];
   const out: RunSummary[] = [];
   for (const entry of readdirSync(runsDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
-    if (!existsSync(join(runsDir, entry.name, 'journal.ndjson'))) continue;
-    const view = projectRun(entry.name, join(runsDir, entry.name));
+    const runDir = join(runsDir, entry.name);
+    if (!existsSync(join(runDir, 'journal.ndjson'))) {
+      const grill = readGrillState(runDir);
+      if (!isListableGrillState(grill, entry.name)) continue;
+    }
+    const view = projectRun(entry.name, runDir);
     out.push({ runId: view.runId, runStatus: view.runStatus, nodeCount: view.nodes.length });
   }
   return out.sort((a, b) => b.runId.localeCompare(a.runId));

@@ -789,6 +789,7 @@ describe('host — 非 new 变更命令 caller 归属守卫', () => {
     rootMessageId: 'om_real',
     sessionId: 'sess-1',
     ownerOpenId: 'ou_caller_b',
+    actorKind: 'human' as const,
   };
 
   it('caller/chat/bot 全匹配才允许 finalize', async () => {
@@ -809,6 +810,7 @@ describe('host — 非 new 变更命令 caller 归属守卫', () => {
     ['caller', { ...boundCaller, ownerOpenId: 'ou_owner_a' }],
     ['chat', { ...boundCaller, chatId: 'oc_other' }],
     ['bot', { ...boundCaller, larkAppId: 'cli_other' }],
+    ['session', { ...boundCaller, sessionId: 'sess-other' }],
   ])('%s 不匹配时在写 spec.json 前 fail closed', async (_field, current) => {
     const b = base();
     try {
@@ -823,6 +825,26 @@ describe('host — 非 new 变更命令 caller 归属守卫', () => {
       rmSync(b, { recursive: true, force: true });
     }
   });
+
+  it.each(['bot', 'scheduled', 'unknown'] as const)(
+    '%s actor 不能通过 direct-host authoring',
+    async actorKind => {
+      const b = base();
+      try {
+        const { runDir, state } = hostNew({
+          goal: 'demo', baseDir: b, runId: 'r', chatBinding: boundCaller,
+        });
+        writeValidSpecMd(state.specPath, 'r');
+        await expect(cmdWorkflowHost('spec-finalize', ['r', '--base-dir', b], {
+          resolveChatBinding: () => ({ ...boundCaller, actorKind }),
+        })).rejects.toThrow(/仅允许当前真人消息触发/);
+        expect(readGrillState(runDir)?.status).toBe('grilling');
+        expect(existsSync(join(runDir, 'spec.json'))).toBe(false);
+      } finally {
+        rmSync(b, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('standalone dev 的 unbound run 继续可用', async () => {
     const b = base();
@@ -869,6 +891,7 @@ describe('host — chatBindingFromEnv（grill 出生落话题绑定）', () => {
           sessionId: 'sess-1', status: 'active', scope: 'thread',
           larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real',
           ownerOpenId: 'ou_owner_a', lastCallerOpenId: 'ou_caller_b', quoteTargetId: 'turn-current',
+          turnReplyContexts: { 'turn-current': { replyTargetSenderIsBot: false } },
         },
       });
 
@@ -882,6 +905,7 @@ describe('host — chatBindingFromEnv（grill 出生落话题绑定）', () => {
       } as NodeJS.ProcessEnv, process.pid)).toEqual({
         larkAppId: 'cli_real', chatId: 'oc_real', rootMessageId: 'om_real',
         sessionId: 'sess-1', ownerOpenId: 'ou_caller_b',
+        actorKind: 'human',
       });
     } finally {
       rmSync(dataDir, { recursive: true, force: true });

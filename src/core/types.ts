@@ -523,9 +523,12 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
-    /** Current human caller, carried over private worker IPC from the
+    /** Current caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;
+    /** Sender kind for this exact turn, derived from daemon-frozen routing
+     * context. Missing is unknown and cannot authorize human-only actions. */
+    senderKind?: 'human' | 'bot';
     /** Linux pid:starttime identities already present in the CLI subtree when
      * this turn authority was published. Actor callers may not traverse one of
      * these old descendants; the long-lived CLI root itself is the exception. */
