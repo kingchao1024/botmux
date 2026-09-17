@@ -61,20 +61,27 @@ const daemonEnv = {
 };
 let child;
 let output = '';
-function startDaemon() {
+async function startDaemon() {
   child = spawn(binary, ['__daemon'], { cwd: root, env: daemonEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   child.stdout.on('data', chunk => { output += String(chunk); });
   child.stderr.on('data', chunk => { output += String(chunk); });
+  await new Promise((resolveSpawn, rejectSpawn) => {
+    let spawned = false;
+    child.once('spawn', () => { spawned = true; resolveSpawn(); });
+    child.on('error', error => {
+      output += `${error instanceof Error ? error.message : String(error)}\n`;
+      if (!spawned) rejectSpawn(error);
+    });
+  });
 }
-startDaemon();
 
 async function cleanup() {
-  if (child.exitCode === null) { try { child.kill('SIGTERM'); } catch {} }
-  if (child.exitCode === null) await Promise.race([
+  if (child?.exitCode === null) { try { child.kill('SIGTERM'); } catch {} }
+  if (child?.exitCode === null) await Promise.race([
     new Promise(resolve => child.once('exit', resolve)),
     new Promise(resolve => setTimeout(resolve, 3_000)),
   ]);
-  if (child.exitCode === null) { try { child.kill('SIGKILL'); } catch {} }
+  if (child?.exitCode === null) { try { child.kill('SIGKILL'); } catch {} }
   try { rmSync(root, { recursive: true, force: true }); } catch {}
 }
 
@@ -109,6 +116,7 @@ function daemonHeaders(path) {
 }
 
 try {
+  await startDaemon();
   await waitForHealth('initial');
   if (production) {
     const { DatabaseSync } = await import('node:sqlite');
@@ -122,14 +130,13 @@ try {
     const routeResponse = await fetch(`http://127.0.0.1:${port}${route}`, { method: 'POST', headers: daemonHeaders(route), body: '{}' });
     if (routeResponse.status !== 400) throw new Error(`production task-control route unavailable:${routeResponse.status}`);
     await stopDaemon();
-    startDaemon();
+    await startDaemon();
     await waitForHealth('recovery');
   }
   console.log(`smoke: ✅ nonempty apiOnly ${production ? 'production-flag ' : ''}daemon reached __health`);
 } catch (error) {
   console.error(`smoke: FAIL [nonempty-daemon] ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+} finally {
   await cleanup();
-  process.exit(1);
 }
-await cleanup();
-process.exit(0);

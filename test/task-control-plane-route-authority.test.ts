@@ -38,6 +38,7 @@ let ipc: IpcServerHandle | undefined;
 let dataDir: string | undefined;
 
 type TestContext = {
+  now: number;
   registrationCalls: number;
   registrationResolveCalls: number;
   freezeCalls: number;
@@ -80,6 +81,7 @@ type TestContext = {
 
 let context: TestContext;
 const handlers = createTaskControlRouteHandlers({
+  now: () => context.now,
   dataDir: () => dataDir!,
   selfLarkAppId: () => context.selfAppId,
   integration: () => context.integrationEnabled ? context.realIntegrations?.get(context.selfAppId) ?? ({
@@ -238,6 +240,7 @@ async function server(): Promise<IpcServerHandle> {
 function reset(): void {
   dataDir = mkdtempSync(join(tmpdir(), 'task-control-route-'));
   context = {
+    now: Date.parse('2026-09-05T18:30:00.000Z'),
     registrationCalls: 0, registrationResolveCalls: 0, freezeCalls: 0, frozenWrites: 0, registrationAllowed: true, approval: undefined, freezeMode: 'disabled',
     designationCalls: 0, reviewedCalls: 0, unknowns: [], sourceSender: 'reviewer-open-id', sourceRoot: 'om_orch_root', sourceMessageId: 'om_review',
     documentRevision: 9, selfAppId: 'app-1', integrationEnabled: true, sourceReads: 0, designationRequests: 0, documentReads: 0, receiverDocumentReads: 0, seenVerdicts: new Map(),
@@ -744,6 +747,10 @@ describe('task-control mapping/freeze controlled IPC', () => {
     context.reviewerRoot = 'om_controller_a';
     expect((await post(TASK_CONTROL_REVIEWER_INGRESS_ROUTE, { ...first, verdict: 'fail' }, false)).status).toBe(409);
     expect(controllerA.lifecycle.getStore()!.listEvents({ taskGuid: 'task-1' }).filter(event => event.eventType === 'task.reviewed')).toHaveLength(1);
+    context.now = Date.parse('2026-09-06T18:00:00.001Z');
+    expect((await post(TASK_CONTROL_REVIEWER_INGRESS_ROUTE, { ...first, verdictId: 'expired-verdict' }, false)).status).toBe(409);
+    expect(controllerA.lifecycle.getStore()!.listEvents({ taskGuid: 'task-1' }).filter(event => event.eventType === 'task.reviewed')).toHaveLength(1);
+    context.now = Date.parse('2026-09-05T18:30:00.000Z');
     const injected = new DatabaseSync(controllerA.lifecycle.getStore()!.path);
     try {
       injected.exec(`CREATE TRIGGER reject_reviewer_action_append BEFORE INSERT ON control_events

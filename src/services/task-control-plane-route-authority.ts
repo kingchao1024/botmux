@@ -418,6 +418,7 @@ export function createTaskControlRouteHandlers(input: {
     dispatchRoot: string; reviewerBotAppId: string; reviewRound: number;
   }) => Promise<{ status: number; resolved?: ResolvedReviewerDesignation } | undefined>;
   forwardReviewerVerdict: (controllerLarkAppId: string, body: ForwardedReviewerVerdict) => Promise<{ status: number } | undefined>;
+  now?: () => number;
 }): {
   mapping(req: IncomingMessage, res: ServerResponse): Promise<void>;
   freeze(req: IncomingMessage, res: ServerResponse): Promise<void>;
@@ -652,7 +653,11 @@ export function createTaskControlRouteHandlers(input: {
       }
       const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       integration.setReviewerVerdictVerifier(verifier);
-      const prior = integration.currentDesignatedReviewer(dispatchRoot, reviewRound);
+      const prior = integration.currentDesignatedReviewer(
+        dispatchRoot,
+        reviewRound,
+        new Date(input.now?.() ?? Date.now()).toISOString(),
+      );
       if (supersedesDesignatedReviewerRef && prior?.designatedReviewerRef !== supersedesDesignatedReviewerRef) {
         jsonRes(res, 409, { ok: false, error: 'task_control_designated_reviewer_supersedes_unproven' });
         return;
@@ -895,7 +900,11 @@ export function createTaskControlRouteHandlers(input: {
       }
       const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       integration.setReviewerVerdictVerifier(verifier);
-      const designation = integration.currentDesignatedReviewer(dispatchRoot, reviewRound);
+      const designation = integration.currentDesignatedReviewer(
+        dispatchRoot,
+        reviewRound,
+        new Date(input.now?.() ?? Date.now()).toISOString(),
+      );
       if (!designation || designation.reviewerBotAppId !== reviewerBotAppId
         || !designation.designatedReviewerRef.startsWith('dr_')) {
         jsonRes(res, 409, { ok: false, error: 'task_control_designation_resolve_unproven' });
@@ -973,7 +982,8 @@ export function createTaskControlRouteHandlers(input: {
       mapping = currentMapping;
       const verifier = createDaemonReviewerVerdictVerifier({ hostSecret, previousHostSecret: input.previousHostSecret?.(), controllerBotAppId: selfAppId, allowedKeyIds: input.reviewerAllowedKeyIds?.(), revokedKeyIds: input.reviewerRevokedKeyIds?.() });
       integration.setReviewerVerdictVerifier(verifier);
-      const designated = integration.currentDesignatedReviewer(dispatchRoot, verdict.reviewRound);
+      const now = new Date(input.now?.() ?? Date.now()).toISOString();
+      const designated = integration.currentDesignatedReviewer(dispatchRoot, verdict.reviewRound, now);
       if (!mapping || !mapping.docToken || !designated
         || designated.designatedReviewerRef !== verdict.designatedReviewerRef
         || designated.reviewerId !== verdict.reviewerId
@@ -992,7 +1002,7 @@ export function createTaskControlRouteHandlers(input: {
       }
       const head = integration.submitVerifiedReviewerVerdict({
         dispatchRoot, verdict, attestation, verifier, expectedReviewerBotAppId: designated.reviewerBotAppId,
-        expectedReviewerId: designated.reviewerId, now: new Date().toISOString(),
+        expectedReviewerId: designated.reviewerId, now,
       });
       if (head.status !== 'active' && head.status !== 'revoked') {
         jsonRes(res, 409, { ok: false, error: head.reason ?? 'task_control_reviewer_verdict_unproven' });

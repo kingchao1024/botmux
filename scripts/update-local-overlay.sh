@@ -4,16 +4,29 @@ set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$repo_dir"
 
-if [[ $(git branch --show-current) != "local/s1-overlay" ]]; then
-  echo "error: run this from branch local/s1-overlay" >&2
-  exit 2
-fi
+current_branch=$(git branch --show-current)
+case "$current_branch" in
+  local/s1-overlay|integrate/all-local-branches-*) ;;
+  *)
+    echo "error: run this from an overlay integration branch" >&2
+    exit 2
+    ;;
+esac
 if [[ -n $(git status --porcelain) ]]; then
   echo "error: worktree is not clean" >&2
   exit 2
 fi
 if [[ ! -d node_modules ]]; then
   echo "error: node_modules is absent; prepare dependencies in the canonical checkout first" >&2
+  exit 2
+fi
+
+bun_version=$(node -p "const value=require('./package.json').packageManager || ''; const match=/^bun@(.+)$/.exec(value); if (!match) process.exit(2); match[1]") || {
+  echo "error: package.json packageManager must pin an exact Bun version" >&2
+  exit 2
+}
+if [[ ! $bun_version =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+  echo "error: package.json packageManager must pin an exact Bun version" >&2
   exit 2
 fi
 
@@ -24,7 +37,7 @@ GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-TRAE CLI}" \
 GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-noreply@bytedance.com}" \
   git rebase origin/master
 
-bun_cmd=(npx --yes bun@1.4.0)
+bun_cmd=(npx --yes "bun@$bun_version")
 "${bun_cmd[@]}" run test -- \
   test/api-only-mode-wiring.test.ts \
   test/ask-card.test.ts \
