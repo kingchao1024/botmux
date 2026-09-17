@@ -25,6 +25,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -258,6 +259,37 @@ describe('claude-code buildArgs', () => {
     for (const prompt of [systemPrompt, shellHints]) {
       expect(prompt).toContain('--response-kind final');
       expect(prompt).toContain('feedback buttons');
+    }
+  });
+
+  // 同一条对齐守卫，但针对受实验开关控制的 `--as` 提示：两条注入路径必须同时
+  // 出现、同时消失。只断言「开启时都有」会漏掉「关闭时只有一条路径漏了」，
+  // 所以两个方向都断言。开关默认关闭，见 isCrossPrincipalInterruptionEnabled。
+  it('keeps the cross-principal --as hint aligned across both injection paths, in both switch states', () => {
+    const originalXpi = process.env.BOTMUX_XPI_ENABLED;
+    try {
+      process.env.BOTMUX_XPI_ENABLED = 'true';
+      for (const prompt of [
+        buildBotmuxSystemPromptText({ locale: 'en' }),
+        buildBotmuxShellHints('en').join('\n'),
+      ]) {
+        expect(prompt).toContain('--as independent');
+        expect(prompt).toContain('--as suggestion');
+      }
+
+      process.env.BOTMUX_XPI_ENABLED = 'false';
+      for (const prompt of [
+        buildBotmuxSystemPromptText({ locale: 'en' }),
+        buildBotmuxShellHints('en').join('\n'),
+      ]) {
+        expect(prompt).not.toContain('--as independent');
+        expect(prompt).not.toContain('--as suggestion');
+        // 闸是外科式的：其余路由提示不受影响。
+        expect(prompt).toContain('--response-kind final');
+      }
+    } finally {
+      if (originalXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = originalXpi;
     }
   });
 
@@ -563,6 +595,7 @@ describe('codex buildArgs', () => {
 
   it('RPC mode: attaches to the app-server thread AND disables the startup update check', () => {
     const args = adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
       // even with BOTH bypass toggles on, the --remote viewer early-returns before
@@ -572,7 +605,9 @@ describe('codex buildArgs', () => {
     // pure --remote viewer: no paste-mode bypass flag, no stale resume path
     expect(args).toEqual([
       '--remote', 'ws://127.0.0.1:9931', 'resume', '--no-alt-screen',
-      '-c', 'check_for_update_on_startup=false', 'thread-abc',
+      '-c', 'check_for_update_on_startup=false',
+      '-c', 'notice.hide_rate_limit_model_nudge=true',
+      'thread-abc',
     ]);
     // the -c disable must land BEFORE the thread id (a resume-subcommand config)
     const cIdx = args.indexOf('-c');
@@ -596,6 +631,32 @@ describe('codex buildArgs', () => {
       '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
       '-c', 'check_for_update_on_startup=false', 'thread-xyz',
     ]);
+  });
+
+  it('traex native fork branches the source session instead of resuming it', () => {
+    const traex = createTraexAdapter('/bin/traecli');
+    const args = traex.buildArgs({
+      sessionId: 'botmux-child',
+      resume: true,
+      resumeSessionId: 'traex-parent',
+      forkSession: true,
+      workingDir: '/workspace',
+    });
+    expect(args[0]).toBe('fork');
+    expect(args.at(-1)).toBe('traex-parent');
+    expect(args).toContain('/workspace');
+  });
+
+  it('traex restarts a completed fork child with ordinary resume', () => {
+    const traex = createTraexAdapter('/bin/traecli');
+    const args = traex.buildArgs({
+      sessionId: 'botmux-child',
+      resume: true,
+      resumeSessionId: 'traex-child',
+      forkSession: false,
+    });
+    expect(args[0]).toBe('resume');
+    expect(args.at(-1)).toBe('traex-child');
   });
 
   it('does not inject a stale turn id into Codex shell environment policy', () => {
@@ -629,7 +690,7 @@ describe('codex buildArgs', () => {
   });
 
   it('passes the effective working directory as Codex agent root', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', bypassHookTrust: true });
+    const args = adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'sess-4', resume: false, workingDir: '/repo/root', bypassHookTrust: true });
     expect(args).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--dangerously-bypass-hook-trust',
@@ -638,19 +699,23 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
   });
 
   it('omits approval/sandbox bypass flag when disableCliBypass is true', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
+    const args = adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
     expect(args).toEqual([
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);
@@ -665,6 +730,42 @@ describe('codex buildArgs', () => {
     expect(args[idx - 1]).toBe('-c');
   });
 
+  it('suppresses the low-usage luna model nudge for plain TUI launches', () => {
+    // Codex 0.151+ shows a "Switch to <luna> for lower credit usage?" popup at
+    // >=90% primary usage; its default item switches models, and the paste
+    // path's submit Enter would confirm it (#1281). Process-level -c only.
+    const fresh = adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'sess-4', resume: false });
+    const idx = fresh.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(fresh[idx - 1]).toBe('-c');
+
+    // Must survive resume as well, placed before the resumed session id.
+    const resumed = adapter.buildArgs({
+      hideRateLimitModelNudge: true,
+      sessionId: 'sess-4',
+      resume: true,
+      resumeSessionId: 'codex-session-id',
+    });
+    const resumeIdx = resumed.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(resumeIdx).toBeGreaterThan(0);
+    expect(resumeIdx).toBeLessThan(resumed.indexOf('codex-session-id'));
+  });
+
+  it('also suppresses the luna nudge popup on the pure --remote RPC viewer', () => {
+    // The viewer injects no keys (turns go through app-server JSON-RPC), but it
+    // is itself a TUI that renders the modal; keep the pane free of it like the
+    // startup update picker, before the resumed thread id.
+    const args = adapter.buildArgs({
+      hideRateLimitModelNudge: true,
+      sessionId: 'sess-rpc', resume: true,
+      remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+    });
+    const idx = args.indexOf('notice.hide_rate_limit_model_nudge=true');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-c');
+    expect(idx).toBeLessThan(args.indexOf('thread-abc'));
+  });
+
   it('keeps the startup update override on resume before the Codex session id', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-4',
@@ -675,6 +776,27 @@ describe('codex buildArgs', () => {
     expect(args[0]).toBe('resume');
     expect(args[configIdx - 1]).toBe('-c');
     expect(configIdx).toBeLessThan(args.indexOf('codex-session-id'));
+  });
+
+  it('disables automatic recap for a quiet resume without adding a prompt', () => {
+    const normal = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing' });
+    const quiet = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing', quietResume: true });
+    expect(normal).not.toContain('tui.auto_recap=false');
+    expect(quiet).toEqual([...normal.slice(0, -1), '-c', 'tui.auto_recap=false', 'codex-existing']);
+    expect(adapter.buildArgs({ sessionId: 'sess-quiet', resume: false, quietResume: true })).not.toContain('tui.auto_recap=false');
+  });
+
+  it('keeps model-nudge suppression and quiet resume together when attaching the RPC viewer', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-quiet-rpc', resume: true, quietResume: true,
+      hideRateLimitModelNudge: true,
+      remoteWsUrl: 'ws://127.0.0.1:9933', remoteThreadId: 'thread-existing',
+    });
+    expect(args.slice(-5)).toEqual([
+      '-c', 'notice.hide_rate_limit_model_nudge=true',
+      '-c', 'tui.auto_recap=false',
+      'thread-existing',
+    ]);
   });
 
   it('passes configured model with --model', () => {
@@ -717,6 +839,13 @@ describe('codex-app buildArgs', () => {
     });
     expect(args).toContain('--thread-id');
     expect(args).toContain('thread-123');
+    expect(args).not.toContain('--strict-resume');
+  });
+
+  it('requires strict thread resume for a quiet maintenance restore without injecting a prompt', () => {
+    const normal = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123' });
+    const quiet = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123', quietResume: true });
+    expect(quiet).toEqual([...normal, '--strict-resume']);
   });
 
   it('canonicalizes a symlinked codex so --codex-bin matches the sandbox-authorized path', () => {
@@ -2426,6 +2555,52 @@ describe('busyPattern', () => {
     expect(createCliAdapterSync('relay').busyPattern!.source).toBe(busy!.source);
   });
 
+  it('claude-code busy footer matches through the SGR color codes tmux capture-pane -e emits at line starts', () => {
+    // Regression: the worker's viewport busy probe reads captureViewport() =
+    // `tmux capture-pane -e -p`, whose rows carry SGR/control codes. A live
+    // busy footer is literally (verbatim bytes from a busy pane):
+    //   \x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m
+    // The pattern anchors on `^\s*[⏵⏸]`, but the line STARTS with an ESC
+    // sequence, so the anchor never binds and the pre-idle veto never fires —
+    // the card flips green while Claude works. Assertions go through the REAL
+    // worker entry (busyProbeRegion, which strips ANSI before region/slice),
+    // so reverting the worker fix makes these fail.
+    const busy = createCliAdapterSync('claude-code').busyPattern!;
+    const ansiBusyFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · esc to interrupt · ← for agents\x1b[39m';
+    const ansiIdleFooter =
+      '\x1b[39m  \x1b[38;5;211m⏵⏵ bypass permissions on\x1b[38;5;246m (shift+tab to cycle) · ← for agents\x1b[39m';
+    // Raw ANSI rows do NOT match the bare pattern — that is the production
+    // bug; busyProbeRegion must repair them.
+    expect(busy.test(ansiBusyFooter)).toBe(false);
+    expect(busy.test(ansiIdleFooter)).toBe(false);
+    // Through the real viewport entry: busy resolves busy, idle stays idle.
+    expect(busy.test(busyProbeRegion(ansiBusyFooter))).toBe(true);
+    expect(busy.test(busyProbeRegion(ansiIdleFooter))).toBe(false);
+    // Multi-line region (tail slice + strip): colored prose above + colored
+    // busy footer at the bottom resolves busy; the same with the interrupt
+    // segment removed stays idle.
+    const region = (footer: string) => [
+      '\x1b[36m● docs say esc to interrupt works\x1b[39m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      '\x1b[1m❯\x1b[22m',
+      '\x1b[2m────────────────────────────────\x1b[22m',
+      footer,
+    ].join('\n');
+    expect(busy.test(busyProbeRegion(region(ansiBusyFooter)))).toBe(true);
+    expect(busy.test(busyProbeRegion(region(ansiIdleFooter)))).toBe(false);
+    // Control sequences tmux capture-pane can emit that a narrower stripper
+    // misses (Codex review): CSI with ':' subparameter, ST-terminated OSC 8
+    // hyperlink, and bare SO/SI charset-shift bytes at the line start. Each
+    // must be removed so the `^` anchor still binds; all must resolve busy.
+    const plainBusy = '⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents';
+    expect(busy.test(busyProbeRegion('\x1b[4:3m' + plainBusy))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x1b]8;;http://x\x1b\\' + plainBusy + '\x1b]8;;\x1b\\'))).toBe(true);
+    expect(busy.test(busyProbeRegion('\x0f' + plainBusy))).toBe(true);
+    // Cursor-forward (ESC[nC) renders as real gaps and is preserved as spaces.
+    expect(busy.test(busyProbeRegion('\x1b[5C' + plainBusy))).toBe(true);
+  });
+
   it('traex matches spinner-anchored working labels and standalone queue strings but not prose or idle composer', () => {
     // Regression: a static capacity-queue screen matches readyPattern's
     // `\d+% left` status-bar arm and survives the 2s quiescence window,
@@ -3066,6 +3241,8 @@ describe('native session rename capability', () => {
       .toBe('/rename 新的标题');
     expect(createTraexAdapter('/bin/traex').buildSessionRenameCommand?.('TraeX 标题'))
       .toBe('/rename TraeX 标题');
+    expect(createTraexAdapter('/bin/traex').buildSessionRenameCommand?.('排查问题 @希儿'))
+      .toBe('/rename 排查问题 ＠希儿');
     expect(createClaudeCodeAdapter('/bin/claude').buildSessionRenameCommand?.('new title'))
       .toBe('/rename new title');
     expect(createGrokAdapter('/usr/bin/grok').buildSessionRenameCommand?.('新标题'))

@@ -6,13 +6,13 @@
 import { existsSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
-import { expandHome } from './working-dir.js';
+import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -94,6 +94,12 @@ import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
+import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
+import {
+  reconcileXpiSharedCwdRecovery,
+  type XpiSharedCwdQuarantineNotice,
+  type XpiSharedCwdStartupNotice,
+} from './xpi-shared-cwd-admission.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -112,6 +118,7 @@ function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: s
 async function resumeRestoredPendingRepoSetup(
   ds: DaemonSession,
   activeSessions: Map<string, DaemonSession>,
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined,
 ): Promise<void> {
   const setup = ds.session.pendingRepoSetup;
   if (!setup || ds.session.queuedActivationPending || !ds.pendingRepo) return;
@@ -135,6 +142,12 @@ async function resumeRestoredPendingRepoSetup(
       operatorOpenId: ds.session.ownerOpenId,
       activeSessions,
       notify,
+      force: setup.force,
+      worktreePath: setup.worktreePath,
+      branch: setup.branch,
+      reuseExisting: setup.reuseExisting,
+      targetSubdir: setup.targetSubdir,
+      prepareTurn,
     }).catch((err) => {
       // Git/worktree recovery is deliberately detached. A failed publish or
       // build may not reject daemon startup or erase this durable setup owner.
@@ -284,6 +297,9 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+  // Includes legacy: migration pins the original runtime/home, not just pool IDs.
+  // Removing the pool changes new-session defaults; it does not unbind old rows.
+  if (ds.session.cliInstanceBinding) return null;
   if (ds.session.cliLaunchSnapshot?.state === 'resolved') return null;
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
@@ -2093,9 +2109,11 @@ export async function staggeredRecoveryFork(
 export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
-): Promise<void> {
+  options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
+): Promise<XpiSharedCwdStartupNotice[] | undefined> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
+    if (session.headless) return 2;
     if (session.adoptedFrom || session.cliId || session.cliLaunchSnapshot || session.lastCliInput || session.backendType) return 2;
     if (session.queued) return 1;
     return 0; // disposable daemon-command scratch
@@ -2104,7 +2122,7 @@ export async function restoreActiveSessions(
   // real CLI/adopt rows first, queued intent second, command scratches last.
   // Registration itself is CAS, so a fresh runtime occupant always wins over
   // every startup candidate regardless of this disk ordering.
-  const active = sessions
+  let active = sessions
     .filter(s => s.status === 'active')
     // Idempotency quarantine (at-most-once): a session the boot reconcile just
     // terminalized as `dispatch_unknown` (or dropped as a pre-dispatch reserved
@@ -2115,6 +2133,87 @@ export async function restoreActiveSessions(
     .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
 
+  // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
+  // before stale-pid sweeping, backend probes, registration, card recovery, or
+  // any worker fork. One stale legacy record quarantines only its session; an
+  // ambiguous authority quarantines only its explicit group. Every unrelated
+  // session continues through ordinary restore.
+  let xpiQuarantineNotices: XpiSharedCwdStartupNotice[] = [];
+  if (active.length > 0) {
+    const groups = new Map<string, Session[]>();
+    const standalone: Session[][] = [];
+    for (const session of active) {
+      const groupId = session.xpiSharedCwdAdmissionGroupId;
+      if (groupId) {
+        const members = groups.get(groupId) ?? [];
+        members.push(session);
+        groups.set(groupId, members);
+        continue;
+      }
+      const hasStandaloneRecoveryState = !!session.xpiSharedCwdQuarantine
+        || (session.crossPrincipalInterruptions?.length ?? 0) > 0
+        || !!session.xpiSharedCwdAdmissionCoordinatorSessionId
+        || !!session.xpiSharedCwdAdmissionLease
+        || (session.xpiSharedCwdQueuedTurns?.length ?? 0) > 0;
+      if (hasStandaloneRecoveryState) standalone.push([session]);
+    }
+    const partitions = [
+      ...[...groups.entries()].map(([key, members]) => ({ scope: 'group' as const, key, members })),
+      ...standalone.map(members => ({ scope: 'session' as const, key: members[0]!.sessionId, members })),
+    ];
+    const quarantinedSessionIds = new Set<string>();
+    for (const partition of partitions) {
+      try {
+        let result: ReturnType<typeof reconcileXpiSharedCwdRecovery> | undefined;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            ({ result } = sessionStore.mutateOwnedSessionsAtomically(
+              partition.members.map(session => session.sessionId),
+              fresh => reconcileXpiSharedCwdRecovery([...fresh.values()], Date.now()),
+              { nonblocking: true },
+            ));
+            break;
+          } catch (error) {
+            if (!(error instanceof sessionStore.SessionStoreBusyError) || attempt === 2) throw error;
+            await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+          }
+        }
+        if (!result) throw new Error('XPI shared-cwd recovery transaction returned no result');
+        xpiQuarantineNotices.push(...result.notices);
+        xpiQuarantineNotices.push(...result.dispatchUnknownNotices);
+        for (const sessionId of result.quarantinedSessionIds) quarantinedSessionIds.add(sessionId);
+        for (const notice of result.notices) {
+          logger.error(`[xpi-shared-cwd] recovery_quarantine ${JSON.stringify(notice)}`);
+        }
+      } catch (error) {
+        const detail = `XPI shared-cwd ${partition.scope} ${partition.key} recovery persistence failed: `
+          + `${error instanceof Error ? error.message : String(error)}`;
+        logger.error(`[xpi-shared-cwd] recovery_partition_failure ${JSON.stringify({
+          scope: partition.scope,
+          key: partition.key,
+          sessionIds: partition.members.map(session => session.sessionId),
+          detail,
+        })}`);
+        for (const session of partition.members) {
+          // The write lock is unavailable, so this marker cannot be durable in
+          // this attempt. listSessions() exposes the owned in-memory cache;
+          // stamping it still reserves the route for this daemon lifetime and
+          // prevents a replacement session beside an unverified old backing.
+          // The next boot retries the durable reconcile before opening ingress.
+          session.restoreQuarantinedAt ??= new Date().toISOString();
+          quarantinedSessionIds.add(session.sessionId);
+          xpiQuarantineNotices.push({
+            sessionId: session.sessionId,
+            scope: partition.scope,
+            reason: 'recovery_persistence_failure',
+            detail,
+          });
+        }
+      }
+    }
+    active = active.filter(session => !quarantinedSessionIds.has(session.sessionId));
+  }
+
   // Sweep dead CLI-pid markers regardless of whether we have sessions to restore:
   // the landmine files (recycled-PID misroute source) accumulate across every
   // daemon run, and a run with zero active sessions is still a fresh start that
@@ -2123,7 +2222,7 @@ export async function restoreActiveSessions(
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');
-    return;
+    return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
   }
 
   // Kill any stale CLI processes from previous daemon run
@@ -2551,7 +2650,7 @@ export async function restoreActiveSessions(
       announceSessionRow(ds);
       if (restoredPendingRepo) {
         try {
-          await resumeRestoredPendingRepoSetup(ds, activeSessions);
+          await resumeRestoredPendingRepoSetup(ds, activeSessions, options.prepareTurn);
         } catch (err) {
           // One unavailable scan/Lark send/worktree import must not abort the
           // entire daemon restore. Rebuild volatile buffers from the retained
@@ -2583,7 +2682,9 @@ export async function restoreActiveSessions(
       spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: sessionLastMessageAtMs(session),
-      hasHistory: session.cliLaunchSnapshot?.state === 'pending'
+      hasHistory: session.headless && !session.cliId && !session.lastCliInput && !session.backendType
+        ? false
+        : session.cliLaunchSnapshot?.state === 'pending'
         ? false
         : session.queuedActivationPending
           ? (session.queuedActivationResume ?? false)
@@ -2809,7 +2910,9 @@ export async function restoreActiveSessions(
   // pass has registered collision winners. A zero-delay overdue backoff must
   // not wake while a later row is still competing for the same route.
   for (const ds of restoredByThisInvocation) {
-    if (stillOwnsRestoreRegistration(ds)) ensureOrdinaryTurnRecoveryAttached(ds);
+    if (!stillOwnsRestoreRegistration(ds)) continue;
+    ensureOrdinaryTurnRecoveryAttached(ds);
+    ensureReadonlyTaskContinuationAttached(ds);
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -3000,6 +3103,7 @@ export async function restoreActiveSessions(
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
+  return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
 }
 
 /** Re-attaching to a pane that is already alive: the worker only has to reconnect. */
@@ -3814,7 +3918,7 @@ export async function executeScheduledTask(
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
-    const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
+    const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group', undefined, { source: 'schedule' });
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
@@ -4283,6 +4387,84 @@ export async function spawnDashboardSession(
   // in_progress：立即开跑或弹 /repo 卡片（没钉目录时）。userContent 已按角色包装好。
   logger.info(`[createSession] spawned session ${session.sessionId.substring(0, 8)} (bot=${larkAppId}, chat=${chatId}, role=${role}, pendingRepo=${!!ds.pendingRepo})`);
   return { ok: true, sessionId: session.sessionId };
+}
+
+export interface CreateHeadlessSessionArgs {
+  larkAppId: string;
+  title?: string;
+  workingDir?: string;
+  model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+}
+
+export async function createHeadlessSession(
+  activeSessions: Map<string, DaemonSession>,
+  refreshCliVersion: RefreshCliVersion | undefined,
+  args: CreateHeadlessSessionArgs,
+): Promise<{ ok: true; headlessId: string; sessionId: string } | { ok: false; error: string }> {
+  const { larkAppId } = args;
+  let bot: ReturnType<typeof getBot>;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
+  const rawWorkingDir = args.workingDir ?? effectiveDefaultWorkingDir(bot.config) ?? process.cwd();
+  const wd = validateWorkingDir(rawWorkingDir, localeForBot(larkAppId));
+  if (!wd.ok) return { ok: false, error: wd.error };
+  refreshCliVersion?.(bot.config);
+
+  const headlessId = newHeadlessId();
+  const chatId = headlessChatId(headlessId);
+  const title = args.title?.trim() || 'Headless session';
+  const key = sessionKey(chatId, larkAppId);
+  const registered = await withActiveSessionKeyLock(activeSessions, key, () => {
+    if (activeSessions.has(key)) return undefined;
+    const session = sessionStore.createSession(chatId, chatId, title, 'group');
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    session.larkAppId = larkAppId;
+    session.scope = 'chat';
+    session.headless = {
+      id: headlessId,
+      createdAt: nowIso,
+      source: 'cli',
+    };
+    session.lastMessageAt = nowIso;
+    session.workingDir = wd.resolvedPath;
+    if (args.reasoningEffort) session.reasoningEffort = args.reasoningEffort;
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(chatId);
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: wd.resolvedPath,
+      ownerOpenId: session.ownerOpenId,
+    };
+    if (args.model) ds.spawnModelOverride = args.model;
+    activeSessions.set(key, ds);
+    const record = createHeadlessRecord({
+      id: headlessId,
+      sessionId: session.sessionId,
+      larkAppId,
+      title,
+      workingDir: wd.resolvedPath,
+      model: args.model,
+      reasoningEffort: args.reasoningEffort,
+      now: new Date(now),
+    });
+    saveHeadlessSession(record);
+    dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+    return { sessionId: session.sessionId };
+  });
+  if (!registered) return { ok: false, error: 'session_exists' };
+  return { ok: true, headlessId, sessionId: registered.sessionId };
 }
 
 /** 激活一条 parked（待办池）会话：把暂存的 queuedPrompt 当首轮发给 CLI，清掉 queued

@@ -1,4 +1,5 @@
 import { createOpenCodeLikeAdapter } from './opencode.js';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import {
   mimocodeCachePath,
   mimocodeConfigPath,
@@ -23,10 +24,7 @@ export function createMiMoCodeAdapter(pathOverride?: string) {
     hookConfigPath: `${mimocodeConfigPath()}/plugin/botmux-ask.js`,
     modelListArgs: ['models'],
     startupArgs: ['--trust'],
-    modelChoices: [
-      'xiaomi/mimo-v2.5-pro',
-      'xiaomi/mimo-v2.5-pro-ultraspeed',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['mimocode'],
   });
 }
 

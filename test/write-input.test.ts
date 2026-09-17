@@ -1348,6 +1348,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
@@ -1359,6 +1360,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1368,6 +1371,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
@@ -1380,6 +1384,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1391,7 +1397,7 @@ describe('codex writeInput submission confirmation', () => {
     appendCodexHistory('<session_id>botmux-session</session_id>', 'new-codex-session');
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
@@ -1399,6 +1405,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       'new-codex-session',
     ]);
   });
@@ -1411,7 +1419,7 @@ describe('codex writeInput submission confirmation', () => {
       resetCodexHistory();
       appendCodexHistory('<session_id>custom-botmux-session</session_id>', 'custom-codex-session');
       const adapter = createCodexAdapter('/bin/codex');
-      expect(adapter.buildArgs({ sessionId: 'custom-botmux-session', resume: true })).toEqual([
+      expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'custom-botmux-session', resume: true })).toEqual([
         'resume',
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
@@ -1419,6 +1427,8 @@ describe('codex writeInput submission confirmation', () => {
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         '-c',
         'check_for_update_on_startup=false',
+        '-c',
+        'notice.hide_rate_limit_model_nudge=true',
         'custom-codex-session',
       ]);
 
@@ -1437,13 +1447,15 @@ describe('codex writeInput submission confirmation', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
     ]);
   });
 
@@ -1452,6 +1464,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       workingDir: '/repo/root',
@@ -1462,6 +1475,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       '-C',
       '/repo/root',
     ]);

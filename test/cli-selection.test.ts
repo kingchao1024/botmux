@@ -18,6 +18,7 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from '../src/setup/cli-selection.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
@@ -344,6 +345,19 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
   });
 
+  it('strips the luna-nudge override alongside the startup-update one (aiden x codex)', () => {
+    // aiden 1.8.38+ rejects passthrough -c outright; without whitelisting this
+    // botmux-injected value the launch would abort instead of merely losing it.
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      '--no-alt-screen',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
+  });
+
   it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
     const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
     expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
@@ -407,6 +421,16 @@ describe('buildWrappedLaunch', () => {
       'check_for_update_on_startup=false',
     ]);
     expect(out.args).toEqual(['codex', '--config', 'check_for_update_on_startup=false']);
+  });
+
+  it('rewrites the luna-nudge override to --config for cjadk codex', () => {
+    // Same -c → --config passthrough requirement as the startup-update override;
+    // cjadk's code subcommand claims -c as --command otherwise.
+    const out = buildWrappedLaunch('cjadk codex', [
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+    ]);
+    expect(out.args).toEqual(['codex', '--config', 'notice.hide_rate_limit_model_nudge=true']);
   });
 
   it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {
@@ -638,5 +662,58 @@ describe('decorateResumeForWrapper', () => {
   it('omits -m for ttadk CoCo resume (still adds --skip-check)', () => {
     expect(decorateResumeForWrapper('coco --resume ID', 'ttadk coco', { ttadkModel: 'glm-5.1' }))
       .toBe('ttadk coco --skip-check --resume ID');
+  });
+});
+
+describe('Codex model-nudge override through wrappers', () => {
+  const override = 'notice.hide_rate_limit_model_nudge=true';
+  it.each([
+    { wrapper: 'aiden x codex', flag: null },
+    { wrapper: 'cjadk codex', flag: '--config' },
+    { wrapper: 'ttadk codex', flag: '-c' },
+  ])('$wrapper handles the enabled override without breaking launch', ({ wrapper, flag }) => {
+    for (const resume of [false, true]) {
+      const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+        sessionId: 'session', resume, resumeSessionId: 'existing-thread',
+        hideRateLimitModelNudge: true,
+      });
+      expect(args).toContain(override);
+      const out = buildWrappedLaunch(wrapper, args);
+      if (flag === null) {
+        expect(out.args).not.toContain(override);
+        expect(out.args).not.toContain('-c');
+        expect(out.args).not.toContain('--config');
+      } else {
+        expect(out.args).toContain(override);
+        expect(out.args[out.args.indexOf(override) - 1]).toBe(flag);
+        if (flag === '--config') expect(out.args).not.toContain('-c');
+      }
+      expect(out.args).toContain('--no-alt-screen');
+      if (resume) expect(out.args).toContain('existing-thread');
+    }
+  });
+
+  it.each(['aiden x codex', 'cjadk codex', 'ttadk codex'])(
+    '%s leaves user-provided notice overrides untouched', (wrapper) => {
+      const userArgs = ['-c', 'notice.hide_rate_limit_model_nudge=false'];
+      expect(buildWrappedLaunch(wrapper, userArgs).args.slice(-2)).toEqual(userArgs);
+    },
+  );
+
+  it('ttadk coco preserves the model-nudge long config option across fresh and resume launches', () => {
+    for (const resume of [false, true]) {
+      for (const enabled of [false, true]) {
+        const args = createCocoAdapter('/usr/bin/coco').buildArgs({
+          sessionId: 'coco-session', resume, model: 'coco-model', hideRateLimitModelNudge: enabled,
+        });
+        const out = buildWrappedLaunch('ttadk coco', args);
+        expect(out.args).toEqual(['coco', '--skip-check', ...args]);
+        expect(out.args.includes('notice.hide_rate_limit_model_nudge=true')).toBe(enabled);
+        if (enabled) {
+          expect(out.args[out.args.indexOf('notice.hide_rate_limit_model_nudge=true') - 1]).toBe('--config');
+        }
+        expect(out.args).toContain('model.name=coco-model');
+      }
+    }
   });
 });

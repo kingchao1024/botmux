@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -358,7 +359,7 @@ export interface OpenCodeLikeAdapterOptions {
   dbPath: () => string;
   skillsDir: string;
   hookConfigPath: string;
-  modelChoices: readonly string[];
+  modelChoices: readonly string[] | undefined;
   modelListArgs: readonly string[];
   startupArgs?: readonly string[];
 }
@@ -543,7 +544,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     },
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
-    modelChoices: [...runtime.modelChoices],
+    modelChoices: runtime.modelChoices ? [...runtime.modelChoices] : undefined,
   };
 }
 
@@ -556,12 +557,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     skillsDir: '~/.config/opencode/skills',
     hookConfigPath: '~/.config/opencode/plugin/botmux-ask.js',
     modelListArgs: ['models'],
-    modelChoices: [
-      'anthropic/claude-sonnet-4',
-      'anthropic/claude-opus-4',
-      'openai/gpt-5',
-      'google/gemini-2.5-pro',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['opencode'],
   });
 }
 
