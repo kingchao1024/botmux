@@ -319,6 +319,13 @@ describe('agent raise-hand folded into botmux-send (--attention)', () => {
     // guards documented: not with --top-level/--chat-id/--into
     expect(send.content).toContain('--top-level');
   });
+
+  it('botmux-send prevents dispatch child topics from escaping into a new same-chat topic', () => {
+    const send = BUILTIN_SKILLS.find(s => s.name === 'botmux-send')!;
+    expect(send.content).toContain('dispatch 子话题');
+    expect(send.content).toContain('botmux report');
+    expect(send.content).toContain('botmux send --into <主话题根>');
+  });
 });
 
 describe('botmux-ask skill 条件兜底（hook 优先 + 非 hook CLI 保留）', () => {

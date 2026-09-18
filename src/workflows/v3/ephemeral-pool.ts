@@ -436,7 +436,7 @@ async function runNodeImpl(
           break;
         case 'claude_exit':
           void appendLine(stderrPath(req), `[worker] cli exit code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`);
-          finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit');
+          finish(event.code === 0 && event.signal == null ? 'ok' : 'fail', 'cli-exit');
           break;
       }
     });

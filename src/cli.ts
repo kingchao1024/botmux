@@ -45,7 +45,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, dispatchChildTopLevelEscape, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
   persistDispatchLifecycle as persistDispatchLifecycleRecord,
   type DispatchAcceptanceState,
@@ -10119,6 +10119,21 @@ async function cmdSend(rest: string[]): Promise<void> {
     const regPath = join(dataDir, 'orchestrate-dispatch.json');
     if (existsSync(regPath)) dispatchReg = JSON.parse(readFileSync(regPath, 'utf-8'));
   } catch { /* no/!corrupt registry → no guard */ }
+  const topLevelEscape = dispatchChildTopLevelEscape({
+    requestedTopLevel: sendTopLevel,
+    overrideChatId,
+    into: sendInto,
+    sessionChatId: s.chatId,
+    sessionRootMessageId: s.rootMessageId,
+    registry: dispatchReg,
+  });
+  if (topLevelEscape) {
+    console.error(
+      'botmux send refused: 当前会话属于已登记的协作子话题；--top-level 会在同群新开一个脱离项目上下文的话题。\n'
+      + `请用 botmux report 回报主控，或改用 --into ${topLevelEscape.orchestratorRootMessageId} 发回关联主话题。`
+    );
+    process.exit(2);
+  }
   const dispatchActiveSeeds = new Set<string>();
   let allSessions: SessionData[] = [];
   if (Object.keys(dispatchReg).length > 0) {
