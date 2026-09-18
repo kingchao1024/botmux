@@ -11,6 +11,7 @@ import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
+import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
 
 /** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
 export const ASK_SELECT_ACTION = 'ask_select';
@@ -68,6 +69,7 @@ export interface AskCardDispatcherDeps {
 /** 点击处理的可注入依赖。目前只有「未授权 → 弹授权卡」这一路（供单测替换）。 */
 export interface AskCardActionDeps {
   requestGrant?: typeof requestGrantForAskClicker;
+  larkAppId?: string;
 }
 
 export function createLarkAskCardDispatcher(
@@ -79,6 +81,13 @@ export function createLarkAskCardDispatcher(
 
   return {
     async send(ask) {
+      if (ask.replyCardTarget) {
+        try { return { messageId: await publishReplyCardAsk(ask) }; }
+        catch (err) {
+          const { retryable, detail } = classifyAskDispatchError(err);
+          throw new AskDispatchError(detail, retryable);
+        }
+      }
       const cardJson = buildAskCard(ask);
       // botmux 把 chat-scope session 的 routing anchor 也叫 rootMessageId,
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
@@ -104,6 +113,7 @@ export function createLarkAskCardDispatcher(
       }
     },
     async onSettle(ask, result) {
+      if (ask.replyCardTarget) { await publishReplyCardAsk(ask, result); return; }
       if (!ask.cardMessageId) return;
       try {
         await update(ask.larkAppId, ask.cardMessageId, buildAskCard(ask, result));
@@ -229,6 +239,13 @@ export async function handleAskCardActionWithOutcome(
   if (!askId || !nonce || !by) {
     return askCardActionOutcome(staleToast(locale), false);
   }
+  const pending = getAskSnapshot(askId);
+  if (deps.larkAppId && pending && pending.larkAppId !== deps.larkAppId) {
+    return askCardActionOutcome(staleToast(locale), false);
+  }
+  if (pending?.replyCardTarget && !replyCardAskCanAct(pending, data.context?.open_message_id ?? data.open_message_id)) {
+    return askCardActionOutcome(staleToast(locale), false);
+  }
 
   /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
    *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
@@ -268,7 +285,12 @@ export async function handleAskCardActionWithOutcome(
     if (outcome !== 'toggled') return askCardActionOutcome(outcomeResponse(outcome), false);
     const updated = getAskSnapshot(askId);
     if (!updated) return askCardActionOutcome(staleToast(locale), true);
-    return askCardActionOutcome(JSON.parse(buildAskCard(updated)) as Record<string, unknown>, true);
+    return askCardActionOutcome(
+      updated.replyCardTarget
+        ? inlineAskResponse(updated)
+        : JSON.parse(buildAskCard(updated)) as Record<string, unknown>,
+      true,
+    );
   }
 
   // 新 Submit 路径：优先从按钮累积态提交；兼容旧 form_value 回调。
@@ -349,6 +371,10 @@ export async function handleAskCardAction(
 function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string, unknown> | undefined {
   const ask = getAskSnapshot(askId);
   if (!ask) return staleToast(locale);
+  if (ask.replyCardTarget) return {
+    ...inlineAskResponse(ask, undefined, true),
+    toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
+  };
   return {
     card: {
       type: 'raw',
@@ -371,7 +397,12 @@ function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string,
 function settledCardResponse(askId: string, result: AskResult): Record<string, unknown> | undefined {
   const updated = getAskSnapshot(askId);
   if (!updated) return undefined;
+  if (updated.replyCardTarget) return inlineAskResponse(updated, result);
   return JSON.parse(buildAskCard(updated, result)) as Record<string, unknown>;
+}
+
+function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArmed = false): Record<string, unknown> {
+  return { afterAck: async () => { await publishReplyCardAsk(ask, result, confirmEmptyArmed, true); } };
 }
 
 /**
@@ -628,7 +659,8 @@ function templateForResult(result: AskResult): string {
   }
 }
 
-function approverSummary(_ask: PendingAsk, locale?: Locale): string {
+function approverSummary(ask: PendingAsk, locale?: Locale): string {
+  if (ask.answererOpenId) return `<at id=${ask.answererOpenId}></at>`;
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);

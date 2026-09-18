@@ -12,6 +12,36 @@ const QUIESCENCE_MS = 2_000;
 /** Spinner guard — don't declare idle if spinner seen within this window */
 const SPINNER_GUARD_MS = 3_000;
 
+/** Strip ANSI escape sequences from a screen/PTY text before running
+ *  line-anchored adapter patterns. Shared by the IdleDetector PTY stream path
+ *  and the worker's viewport busy probes: both must see IDENTICAL text, since
+ *  patterns (e.g. claude-code's footer regex) anchor on `^` and tmux
+ *  `capture-pane -e` emits SGR color codes at line starts that break the
+ *  anchor unless stripped first. Cursor-forward sequences (`ESC[nC`) are
+ *  expanded to spaces because they represent real horizontal gaps.
+ *
+ *  Covers what tmux capture-pane actually emits (verified against tmux 3.5a
+ *  grid output): CSI with `:` subparameters (e.g. `ESC[4:3m`), OSC hyperlinks
+ *  terminated by ST (`ESC \`) as well as BEL, charset designation (`ESC( B`),
+ *  and bare SO/SI charset-shift bytes (0x0e/0x0f). Leaving any of these at a
+ *  line start keeps a `^`-anchored pattern from binding. */
+export function stripAnsiScreenText(str: string): string {
+  return str
+    // Cursor-forward: ESC[nC moves the cursor right n columns, which renders
+    // as real horizontal whitespace on screen — preserve it as spaces.
+    .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
+    // CSI: ESC[ params(0x30–0x3F, includes ':' ';' '?') intermediates final.
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    // OSC: ESC] ... terminated by BEL (0x07) or ST (ESC \).
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
+    // Charset designation: ESC ( B / ESC ) 0 etc.
+    .replace(/\x1b[()][0-9A-B]/g, '')
+    // Remaining two-byte escape sequences.
+    .replace(/\x1b[ -/]*[@-~]/g, '')
+    // Bare SO/SI (G0/G1 charset shift) control bytes.
+    .replace(/[\x0e\x0f]/g, '');
+}
+
 export class IdleDetector {
   private outputTail = '';
   private lastSpinnerAt = 0;
@@ -28,6 +58,7 @@ export class IdleDetector {
   private readySeen = false;
   private startupPendingPattern: RegExp | undefined;
   private startupReadyPattern: RegExp | undefined;
+  private startupReadyFromHistory: CliAdapter['startupReadyFromHistory'];
   private startupTail = '';
   private startupPending = false;
   private startupComplete = false;
@@ -50,6 +81,7 @@ export class IdleDetector {
     this.readyPattern = cli.readyPattern;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
+    this.startupReadyFromHistory = cli.startupReadyFromHistory;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
@@ -268,6 +300,67 @@ export class IdleDetector {
     return this.startupPending && !this.startupComplete;
   }
 
+  /** Positive initialization evidence, retained across resync/turn resets. */
+  isStartupComplete(): boolean {
+    return this.startupComplete;
+  }
+
+  /**
+   * Startup-banner evidence read from an authoritative screen snapshot.
+   *
+   * feed() is the only other source of that evidence, and on a snapshot-based
+   * backend it cannot carry it: ZMX's screen source is `zmx history`, which
+   * returns the current screen instead of an append-only byte stream. Only a
+   * snapshot that extends the previous one is published as PTY data; an
+   * in-place repaint — exactly what `model: loading` → `model: <real>` is — is
+   * published as a screen resync, which deliberately never reaches feed(). The
+   * startup hold could therefore never be released on that backend and queued
+   * input was held for the lifetime of the session.
+   *
+   * Deliberately narrower than feed(): it touches ONLY the startup latch, never
+   * outputTail / readySeen / spinner / quiescence state, and it neither arms
+   * nor fires a timer. Initialization allows the worker's existing type-ahead
+   * path, but does not prove idle: readyPattern plus quiescence still gate that
+   * independently. It does lift a veto: a quiescence check that
+   * fed data had already armed, and that isStartupPending() was rejecting, can
+   * complete afterwards. That is the point of the hold, not a bypass of it —
+   * the evidence behind that check still came from feed().
+   *
+   * Unlike feed(), ready does NOT win unconditionally here. A snapshot carries
+   * spatial order, and history includes scrollback: an initialized banner left
+   * above the viewport by an earlier CLI generation must not release a hold
+   * that the live banner still reports as loading. The lower banner wins.
+   *
+   * Returns true only on the transition that completes startup (for logging).
+   */
+  observeStartupScreen(screen: string): boolean {
+    if (this.startupComplete || !this.startupPendingPattern) return false;
+    const text = this.stripAnsi(screen);
+    const pendingAt = lastMatchIndex(this.startupPendingPattern, text);
+    const readyAt = this.startupReadyPattern
+      ? lastMatchIndex(this.startupReadyPattern, text)
+      : -1;
+    if (readyAt >= 0 && readyAt > pendingAt) {
+      this.startupComplete = true;
+      this.startupPending = false;
+      this.startupTail = '';
+      return true;
+    }
+    if (pendingAt >= 0) this.startupPending = true;
+    return false;
+  }
+
+  /** Full snapshot evidence, separate from feed(): history must never seed
+   * readySeen, quiescence, or a synthetic turn completion. Also handles warm
+   * reattach, where this detector has never observed the loading banner. */
+  observeStartupHistory(history: string): boolean {
+    if (this.startupComplete || !this.startupReadyFromHistory?.(this.stripAnsi(history))) return false;
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
+    return true;
+  }
+
   dispose(): void {
     this.clearTimer();
     this.idleCallback = null;
@@ -315,9 +408,7 @@ export class IdleDetector {
   }
 
   private stripAnsi(str: string): string {
-    return str
-      .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
-      .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
+    return stripAnsiScreenText(str);
   }
 }
 

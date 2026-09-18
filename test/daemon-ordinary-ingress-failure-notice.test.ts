@@ -57,6 +57,13 @@ const mocks = vi.hoisted(() => {
     }),
     updateSession: vi.fn((session: any) => { sessions.set(session.sessionId, session); }),
     getSession: vi.fn((sessionId: string) => sessions.get(sessionId)),
+    listSessionsStrict: vi.fn(() => [...sessions.values()]),
+    mutateOwnedSessionsAtomically: vi.fn((ids: string[], mutate: (fresh: Map<string, any>) => unknown) => {
+      const fresh = new Map(ids.map(id => [id, structuredClone(sessions.get(id))]));
+      const result = mutate(fresh);
+      for (const [id, session] of fresh) sessions.set(id, session);
+      return { result, rows: fresh };
+    }),
     closeSession: vi.fn((sessionId: string) => {
       const session = sessions.get(sessionId);
       if (session) session.status = 'closed';
@@ -104,6 +111,9 @@ vi.mock('../src/services/session-store.js', async () => {
     createSession: mocks.createSession,
     updateSession: mocks.updateSession,
     getSession: mocks.getSession,
+    getOwnedSession: mocks.getSession,
+    listSessionsStrict: mocks.listSessionsStrict,
+    mutateOwnedSessionsAtomically: mocks.mutateOwnedSessionsAtomically,
     closeSession: mocks.closeSession,
   };
 });
@@ -141,7 +151,10 @@ import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
   __testOnly_handleThreadReply as handleThreadReply,
+  __testOnly_driveCrossPrincipalInterruptions as driveCrossPrincipalInterruptions,
+  __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
 } from '../src/daemon.js';
+import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
 import { t as tr, localeForBot } from '../src/i18n/index.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -281,6 +294,101 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
 
     expect(repliedText()).not.toContain(expectedNotice());
   });
+
+  it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {
+    const ctx = makeCtx('om_thread_queue_full', 'om_msg_queue_full');
+    ctx.ingressAdmission = { admitted: false };
+    const error = new XpiSharedCwdQueueFullError('sess-full');
+
+    await expect(notifyOrdinaryIngressFailure(ctx, error)).rejects.toBe(error);
+
+    expect(ctx.ingressAdmission.admitted).toBe(false);
+    expect(repliedText()).toContain(tr('daemon.xpi_shared_cwd_queue_full', undefined, localeForBot(APP)));
+  });
+
+  it('keeps an approved cross-principal record until the queue-full notice is delivered', async () => {
+    const ds = seedThreadSession('om_thread_owner_queue_full', 'seeded') as any;
+    const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-queue-full';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `queued-${index}`,
+      turnId: `queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi-owner-approved-full',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const beforeQueue = structuredClone(ds.session.xpiSharedCwdQueuedTurns);
+
+    await driveCrossPrincipalInterruptions(ds);
+
+    expect(repliedText()).toContain('本次未接收也不会执行');
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(ds.session.xpiSharedCwdQueuedTurns).toEqual(beforeQueue);
+  });
+
+  it('retains an approved cross-principal record when its queue-full notice fails', async () => {
+    const ds = seedThreadSession('om_thread_owner_notice_retry', 'seeded') as any;
+    const caller = { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-notice-retry';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `retry-queued-${index}`,
+      turnId: `retry-queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi-owner-approved-retry',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: { ...caller, requestUserOpenId: 'ou_proposer' },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockRejectedValue(new Error('notice transport unavailable'));
+    mocks.sendMessage.mockRejectedValue(new Error('notice transport unavailable'));
+
+    await driveCrossPrincipalInterruptions(ds);
+
+    expect(ds.session.crossPrincipalInterruptions).toEqual([
+      expect.objectContaining({ id: 'xpi-owner-approved-retry', phase: 'owner_approved' }),
+    ]);
+    expect(ds.crossPrincipalWaitTimer).toBeDefined();
+    clearTimeout(ds.crossPrincipalWaitTimer);
+    ds.crossPrincipalWaitTimer = undefined;
+  });
 });
 
 /** 让匹配 predicate 的回复失败，其余照常成功（模拟 Lark 瞬时发送故障只打中某一条）。 */
@@ -357,7 +465,15 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(ds.session.pendingRepoSetup?.turnId).toBe('om_msg_pr2');
   });
 
-  it('new topic staged + queued durably: failing repo card keeps exactly one queue item and never advises a resend', async () => {
+  // A failing repo card used to escape this handler and land here as an
+  // "admitted, do not resend" notice. That was the least-bad reading of a wedge:
+  // the turn was durably staged behind a picker that did not exist, so every
+  // follow-up hit 「请先在上方卡片中选择仓库」 and a restart re-published the same
+  // card. The publish sites now degrade instead — no picker means fork with the
+  // default cwd — so the turn actually runs. The invariant this case was written
+  // for still holds and is what it now pins: a failed card never advises a
+  // resend and never duplicates the queue item.
+  it('new topic staged + queued durably: a failing repo card degrades to a working session instead of wedging', async () => {
     const anchor = 'om_msg_nt_admitted';
     mocks.scanMultipleProjects.mockReturnValue([
       { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
@@ -372,13 +488,72 @@ describe('durable admission then failing status reply → no resend advice (PR #
       return 'om_top';
     });
 
-    await expect(
-      handleNewTopic(makeEventData(anchor, 'start a durable task'), makeCtx(anchor, anchor)),
-    ).rejects.toThrow('lark card send failure');
+    await handleNewTopic(makeEventData(anchor, 'start a durable task'), makeCtx(anchor, anchor));
 
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(repliedText()).not.toContain(resendNotice());
-    expect(repliedText()).toContain(admittedNotice());
+    expect(repliedText()).not.toContain(chooseRepoNotice());
     expect(messageQueue.readUnread(anchor).length).toBe(1);
+  });
+
+  // 同一降级的另外两个发卡点。三处的 fallback 各自不同（raw passthrough 走
+  // forkReservedInitialRawSession，auto-create 走 noteTurnReceived +
+  // forkReservedInitialSession），所以分别钉住，避免只在一处补了兜底。
+  it('initial raw passthrough: a failing repo card runs the command on the default cwd', async () => {
+    const anchor = 'om_msg_raw_passthrough';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    // /goal is claude-code's adapter default passthrough → initial raw passthrough route.
+    await handleNewTopic(makeEventData(anchor, '/goal ship the fix'), makeCtx(anchor, anchor));
+
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    // The raw command survives the degradation — it is what gets executed.
+    expect(ds?.pendingRawInput).toBe('/goal ship the fix');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(repliedText()).not.toContain(resendNotice());
+  });
+
+  it('thread auto-create: a failing repo card forks the new session on the default cwd', async () => {
+    const anchor = 'om_autocreate_root';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    // A reply under a root with no session → auto-create takes the picker route.
+    await handleThreadReply(
+      makeEventData('om_autocreate_msg', 'auto create me', anchor),
+      makeCtx(anchor, 'om_autocreate_msg'),
+    );
+
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).not.toContain(chooseRepoNotice());
   });
 
   it('a failing admitted-notice never masks the original status-reply error', async () => {

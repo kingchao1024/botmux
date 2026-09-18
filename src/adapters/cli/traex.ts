@@ -1,6 +1,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
@@ -227,7 +228,12 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId, nativeSubagentRuntimeHookCommand }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+      // TraeX shares Codex's low-quota picker and notice setting. Disable it
+      // per process so a message-submit Enter cannot confirm a model switch.
+      const modelNudgeArgs = hideRateLimitModelNudge
+        ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -243,7 +249,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         // --remote subcommand instead of being added after resume.
         return [
           ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
-          '--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId,
+          '--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
+          ...modelNudgeArgs, remoteThreadId,
         ];
       }
       const baseArgs = [
@@ -260,8 +267,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         ] : []),
         '--no-alt-screen',
+        ...modelNudgeArgs,
         ...goalEnvConfigArgs(),
       ];
+      // Keep trigger-user identity wrappers available in tool shells. Set only
+      // the requested keys, without inheriting the entire worker environment.
+      for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+      }
       if (model && model.trim()) baseArgs.push('--model', model.trim());
       if (reasoningEffort) baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       if (modelBackendVariant) baseArgs.push('-c', `model_backend_variant=${JSON.stringify(modelBackendVariant)}`);
@@ -273,7 +286,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
       const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!traeSessionId) return baseArgs;
-      return ['resume', ...baseArgs, traeSessionId];
+      // Session fork: TraeX exposes the same native subcommand shape as Codex
+      // (`traecli fork <id>`). It mints a new thread while leaving the source
+      // untouched. The worker sets forkSession only for a fork child's first
+      // spawn; later restarts use ordinary resume against the child's new id.
+      return [forkSession ? 'fork' : 'resume', ...baseArgs, traeSessionId];
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
@@ -429,22 +446,18 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.
     deferFirstPromptTimeoutUntilReady: true,
-    buildSessionRenameCommand: (title) => `/rename ${title}`,
+    // TraeX treats a literal "@" in the composer as a file-mention trigger.
+    // If an automatic title contains a Lark mention (for example "@Bot"), the
+    // Enter meant to submit /rename selects a file instead and the next user
+    // message is appended to the still-open rename command. Preserve the title
+    // text with a full-width at sign so the command remains a single submit.
+    buildSessionRenameCommand: (title) => `/rename ${title.replaceAll('@', '＠')}`,
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`
     // lists the rest; the setup flow always appends an "Other / custom"
     // free-text option so users aren't locked out.
-    modelChoices: [
-      'Seed-Dogfooding-2.0',
-      'Doubao-Seed-2.0-Code',
-      'gpt-5.5',
-      'gpt-5',
-      'o3',
-      'Doubao_1_8',
-      'DeepSeek-V4-Pro',
-      'kimi-k2.6',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['traex'],
     // Live 模型枚举：`traex debug models` 输出单行 JSON（全量目录 24+ 个模型，
     // 每条带长 description，整包可达数百 KB），故 maxBuffer 给到 16MB、8s 超时
     // 兜底。仅 dashboard 在用户选中 traex 时按需调用，不在 daemon/worker 启动

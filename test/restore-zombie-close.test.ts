@@ -101,6 +101,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  ensureReadonlyTaskContinuationAttached: vi.fn(),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
@@ -328,6 +329,87 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   sessionStore.updateSession(s);
   return s; // left active
 }
+
+describe('restoreActiveSessions — narrow XPI recovery containment', () => {
+  it('quarantines only the stale XPI session before restore side effects and keeps restoring a healthy peer', async () => {
+    const stale = makeActivePersistentSession('om_stale_xpi');
+    stale.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_synthetic_stale',
+      ownerTurnId: 'turn_owner',
+      owner: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_owner', senderType: 'user' },
+      proposer: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_proposer', senderType: 'user' },
+      phase: 'awaiting_classification',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      classificationDeadlineAt: 1,
+      messages: [{ turnId: 'turn_proposal', text: 'synthetic', createdAt: '2026-01-01T00:00:00.000Z' }],
+    }];
+    sessionStore.updateSession(stale);
+    const healthy = makeActivePersistentSession('om_healthy_peer');
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const notices = await restoreActiveSessions(map);
+
+    expect(notices).toEqual([expect.objectContaining({
+      sessionId: stale.sessionId,
+      scope: 'session',
+      reason: 'stale_legacy_xpi_record',
+    })]);
+    expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+    expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(stale.sessionId);
+    expect(sessionStore.getSession(stale.sessionId)?.xpiSharedCwdQuarantine).toMatchObject({
+      scope: 'session',
+      reason: 'stale_legacy_xpi_record',
+    });
+    expect(vi.mocked(forkWorker).mock.calls.some(([ds]) => ds.session.sessionId === stale.sessionId)).toBe(false);
+  });
+
+  it('contains a recovery transaction failure to its explicit group and restores an unrelated session', async () => {
+    const coordinator = makeActivePersistentSession('om_failed_group_coordinator');
+    const member = makeActivePersistentSession('om_failed_group_member');
+    const healthy = makeActivePersistentSession('om_healthy_outside_failed_group');
+    for (const session of [coordinator, member]) {
+      session.xpiSharedCwdAdmissionGroupId = 'xpi_group_persist_failure';
+      session.xpiSharedCwdAdmissionCoordinatorSessionId = coordinator.sessionId;
+      sessionStore.updateSession(session);
+    }
+    sessionStore.init();
+    const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
+    const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
+      if (ids.includes(coordinator.sessionId)) throw new Error('synthetic group persistence failure');
+      return originalMutate(ids, mutate, options);
+    });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    try {
+      const notices = await restoreActiveSessions(map);
+
+      expect(notices).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          sessionId: coordinator.sessionId,
+          scope: 'group',
+          reason: 'recovery_persistence_failure',
+        }),
+        expect.objectContaining({
+          sessionId: member.sessionId,
+          scope: 'group',
+          reason: 'recovery_persistence_failure',
+        }),
+      ]));
+      expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(coordinator.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(member.sessionId);
+      expect(sessionStore.getSession(coordinator.sessionId)?.restoreQuarantinedAt).toBeDefined();
+      expect(sessionStore.getSession(member.sessionId)?.restoreQuarantinedAt).toBeDefined();
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('recovery_partition_failure'));
+    } finally {
+      mutation.mockRestore();
+    }
+  });
+});
 
 describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', () => {
   // The module-level bot-registry mock serves every other describe; stash its
@@ -775,6 +857,27 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_cli_mismatch', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it.each(['exists', 'missing', 'unknown'] as const)('restores a legacy-bound Codex session after the bot switched CLI with backing %s', async (backing) => {
+    probe.result = backing;
+    const s = makeActivePersistentSession('om_legacy_bound');
+    s.cliId = 'codex';
+    s.agentFrozen = true;
+    s.cliInstanceBinding = { version: 1, source: 'legacy', instanceId: null, cliId: 'codex', codexHome: '/private/legacy-home', authMode: 'global' };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    bot.cliId = 'traex';
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({ status: 'active', cliId: 'codex', cliInstanceBinding: s.cliInstanceBinding });
+    expect(map.get(sessionKey(s.rootMessageId, 'app_test'))?.session.cliInstanceBinding).toEqual(s.cliInstanceBinding);
+    if (backing === 'exists') expect(forkWorker).toHaveBeenCalled();
+    else expect(forkWorker).not.toHaveBeenCalled();
   });
 
   it('CLI mismatch on restore preserves and reattaches an unsettled Codex App ledger', async () => {
@@ -1350,6 +1453,22 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     expect(wp.registry!.get(sessionKey('om_rt_stale', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(fresh.sessionId)!.status).toBe('active');
     expect(wp.registry!.get(sessionKey('om_rt_fresh', 'app_test'))).toBeDefined();
+  });
+
+  it.each(['pool', 'default', 'legacy'] as const)('keeps %s-bound Codex sessions across a different bot CLI/runtime default without a pool', async (source) => {
+    const s = makeActivePersistentSession('om_instance_sticky');
+    s.cliId = 'codex';
+    s.agentFrozen = true;
+    s.cliInstanceBinding = { version: 1, source, instanceId: source === 'legacy' ? null : 'a', cliId: 'codex', codexHome: '/private/instance-a', authMode: source === 'legacy' ? 'global' : 'isolated' };
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    bot.cliId = 'traex';
+    bot.cliPathOverride = '/different/runtime';
+    const outcome = await closeCliMismatchedSessionsForBot('app_test');
+    expect(outcome).toMatchObject({ closed: 0 });
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(wp.registry!.get(sessionKey(s.rootMessageId, 'app_test'))).toBe(ds);
+    expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
   });
 
   it('closes wrapper-axis mismatches for frozen sessions', async () => {

@@ -33,7 +33,10 @@ export interface TranscriptEvent {
      * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
     stop_reason?: string | null;
     /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
-     *  Code writes the placeholder `<synthetic>` on API-error records. */
+     *  Code writes the placeholder `<synthetic>` on records no model produced:
+     *  API-error records (`isApiErrorMessage:true`) and the bridge-resume
+     *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
+     *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
     model?: string;
   };
   /** API-error records. When the model call fails, Claude Code writes a
@@ -507,6 +510,37 @@ function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
 }
 
+/** Model placeholder Claude Code writes on assistant records no model produced. */
+export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
+
+/**
+ * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
+ * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
+ * bridge resume of a turn that was cut mid-flight):
+ *
+ *     {"type":"assistant","isApiErrorMessage":false,
+ *      "message":{"model":"<synthetic>","stop_reason":"stop_sequence",
+ *                 "content":[{"type":"text","text":"No response requested."}],
+ *                 "usage":{"input_tokens":0,"output_tokens":0,...}}}
+ *
+ * It is always preceded (same timestamp) by an `isMeta` user record
+ * "Continue from where you left off.", and it carries no `requestId`.
+ *
+ * Such a record has every attribute the queue reads as "the model's final
+ * answer" — visible text block, terminal `stop_reason`, not an API error — but
+ * the user's message was never answered. Treating it as `completed` closes the
+ * Lark turn silently (measured: 53 such records across 26 local sessions, 39 of
+ * them directly after a Lark-delivered user message, none surfaced anywhere).
+ * Only `message.model` distinguishes it from a real reply.
+ */
+export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.isApiErrorMessage === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+}
+
 export function classifyClaudeTerminalEvent(
   ev: TranscriptEvent,
 ): ClaudeTerminalOutcome | undefined {
@@ -545,6 +579,14 @@ export function classifyClaudeTerminalEvent(
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }
   if (ev.type === 'system' && ev.subtype === 'turn_duration') return undefined;
+  // No model call happened, so nothing was answered; the input is still intact
+  // in the transcript, so a continuation can pick it up. `provider_` prefix on
+  // purpose: the daemon routes Claude execution failures (Wait-Mode settle,
+  // async sink, failure card) on that prefix, and the retry offer stays
+  // `caveated` — the cut turn may have run tools before it was resumed.
+  if (isSyntheticNoModelReplyEvent(ev)) {
+    return { status: 'failed', errorCode: 'provider_no_model_reply', retryable: true };
+  }
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return undefined;
   const reason = ev.message?.stop_reason;
@@ -762,6 +804,9 @@ function truncateForCot(s: string, max: number): string {
  *  redeclared structurally here to keep this module dependency-free. */
 export type TranscriptCotEntry =
   | { kind: 'thinking'; text: string }
+  /** Interim assistant narration (a `text` block that is not the turn's
+   *  closing answer). Kept distinct from `thinking`: see CotEntry. */
+  | { kind: 'text'; text: string }
   | {
     kind: 'tool_call'; id: string; name: string; args: string;
     /** 截断前从完整 input 提取的单行主题（≤1000）；无可用字段时不带此键。 */
@@ -783,12 +828,21 @@ function stringifyToolResultContent(content: unknown): string {
 /**
  * Extract the CoT (thinking process) entries from one transcript event, in
  * content-block order:
- *   - assistant events → `thinking` blocks and `tool_use` blocks
- *     (id + name + JSON-stringified input, truncated);
+ *   - assistant events → `thinking` blocks, `text` blocks and `tool_use`
+ *     blocks (id + name + JSON-stringified input, truncated);
  *   - user events → `tool_result` blocks (tool_use_id + flattened text,
  *     truncated).
  * Returns [] for events carrying neither. Sidechain / error filtering is the
  * caller's job (bridge-turn-queue applies it before attribution).
+ *
+ * `text` blocks are the model's mid-turn narration. They are deliberately
+ * INCLUDED even though the turn's closing answer is a `text` block too: the
+ * transcript is consumed as a stream, so "is this the last one" is not
+ * knowable at extraction time, and a bubble that repeats the final answer at
+ * its tail is far cheaper than one that silently drops every interim line —
+ * without them a turn with extended thinking off (Claude Code's default)
+ * renders as a bare row of tool nodes. Per-entry length is left uncapped like
+ * `thinking`; the worker's accumulated cap bounds the payload.
  */
 export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
   const content = event.message?.content;
@@ -798,6 +852,8 @@ export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] 
     if (!block || typeof block !== 'object') continue;
     if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
       entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      entries.push({ kind: 'text', text: block.text });
     } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
       // 主题必须在 stringify + 截断之前从对象上取：截断后的 JSON 解析不出来。
       const subject = boundSubjectForTransport(subjectFromInputObject(block.input));

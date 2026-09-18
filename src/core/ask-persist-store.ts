@@ -41,13 +41,30 @@ interface PersistedAskFields {
   rootMessageId: string | null;
   sessionId: string;
   chatType?: 'group' | 'p2p';
+  /** Optional app-scoped responder lock for host-owned approval asks. */
+  answererOpenId?: string;
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number;
   /** Original absolute S1 activation window; both are absent for non-S1 asks. */
   notBeforeMs?: number;
   expiresAtMs?: number;
+  /** Original relative timeout. Host-owned asks defer this clock until the
+   *  interaction card is confirmed delivered; ordinary CLI asks start it at
+   *  registration as before. Optional for backward-compatible v2 records. */
+  timeoutMs?: number;
+  /** True only for daemon-hosted asks whose responder cannot act before the
+   *  card exists. An undelivered record must not expire during restore. */
+  timeoutStartsAfterDelivery?: boolean;
+  /** Timestamp at which a deferred timeout was actually armed. */
+  timeoutStartedAt?: number;
+  /** Feishu message id of the posted card, once dispatch landed. Undefined means
+   *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
+   *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
+  replyCardTarget?: { turnId: string; dispatchAttempt?: number };
+  /** Accumulated per-question selections (checkbox state), so a restart mid-
+   *  multi-select keeps the boxes the user already ticked. */
   selections: ReadonlyArray<ReadonlyArray<string>>;
   selectionActorIdentity?: string;
   answeredResult?: AskResult;
@@ -1139,7 +1156,11 @@ export function createAskPersistStore(
           try { unlinkSync(path); } catch { /* best effort */ }
           continue;
         }
-      } else if (typeof ask.deadlineAt === 'number' && ask.deadlineAt <= now) {
+      } else if (
+        !(ask.timeoutStartsAfterDelivery === true && !ask.cardMessageId)
+        && typeof ask.deadlineAt === 'number'
+        && ask.deadlineAt <= now
+      ) {
         try { unlinkSync(path); } catch { /* best effort */ }
         continue;
       }

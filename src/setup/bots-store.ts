@@ -12,6 +12,7 @@ import {
   type FileLockOptions,
 } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
+import { assertCodexInstanceConfigWrite } from '../services/codex-instance-config-guard.js';
 import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
 import {
   assertCanonicalBotsConfigTargetStable,
@@ -148,6 +149,10 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
   try {
     withFileLockSync(target.targetPath, () => {
       assertCanonicalBotsConfigTargetStable(target);
+      const previous = existsSync(target.targetPath)
+        ? JSON.parse(readFileSync(target.targetPath, 'utf8')) as any[]
+        : [];
+      assertCodexInstanceConfigWrite(previous, bots);
       assertQuotaFallbackGraphAcyclic(bots);
       // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
       const tmp = target.targetPath + '.tmp';
