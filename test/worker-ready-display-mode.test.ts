@@ -9,7 +9,8 @@
  *   1. POST path + displayMode='screenshot' → worker.send called
  *   2. POST path + displayMode='hidden' → worker.send NOT called
  *   3. PATCH path + displayMode='screenshot' → worker.send called (symmetry)
- *   4. silent recovery + displayMode='screenshot' → worker.send called without card IO
+ *   4. silent recovery + displayMode='screenshot' → refreshes only a proven
+ *      existing card's per-worker terminal URL
  *
  * Run:  pnpm vitest run test/worker-ready-display-mode.test.ts
  */
@@ -19,6 +20,7 @@ import { EventEmitter } from 'node:events';
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
 const updateMessageMock = vi.fn(async () => {});
+const getMessageDetailMock = vi.fn(async () => ({ items: [] }));
 const deleteMessageMock = vi.fn(async () => {});
 const pinMessageMock = vi.fn(async (larkAppId: string, messageId: string) => ({
   messageId, operatorId: larkAppId, operatorIdType: 'app_id',
@@ -36,6 +38,7 @@ vi.mock('../src/im/lark/client.js', () => {
   }
   return {
     updateMessage: (...args: any[]) => updateMessageMock(...args),
+    getMessageDetail: (...args: any[]) => getMessageDetailMock(...args),
     deleteMessage: (...args: any[]) => deleteMessageMock(...args),
     pinMessage: (...args: any[]) => pinMessageMock(...args),
     unpinMessage: (...args: any[]) => unpinMessageMock(...args),
@@ -58,6 +61,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptCard: vi.fn(() => '{}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
+  terminalMultiUrl: vi.fn((url: string) => ({ url, pc_url: url, android_url: url, ios_url: url })),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -242,6 +246,8 @@ describe('Worker ready: set_display_mode re-sync', () => {
     unpinMessageMock.mockResolvedValue(true);
     listChatPinsMock.mockReset();
     listChatPinsMock.mockResolvedValue([]);
+    getMessageDetailMock.mockReset();
+    getMessageDetailMock.mockResolvedValue({ items: [] });
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
       resolvedAllowedUsers: [],
@@ -964,32 +970,195 @@ describe('Worker ready: set_display_mode re-sync', () => {
     );
   });
 
-  it('silent recovery restores screenshot mode without touching the streaming card', async () => {
+  it('silent recovery refreshes only the proven card terminal URL', async () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', pinStreamingCard: true },
       resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
     } as any);
     const fakeWorker = makeFakeWorker();
+    const oldUrl = 'https://terminal.example/s/sid-ready-test?viewToken=view_old';
+    const oldCard = {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '🖥️ Claude · Test task — 等待输入' }, template: 'green' },
+      elements: [
+        { tag: 'markdown', content: 'keep the existing body' },
+        { tag: 'action', actions: [
+          {
+            tag: 'button', text: { tag: 'plain_text', content: '🖥️ 打开 Web 终端' }, type: 'primary',
+            multi_url: { url: oldUrl, pc_url: oldUrl, android_url: oldUrl, ios_url: oldUrl },
+          },
+          {
+            tag: 'button', text: { tag: 'plain_text', content: '❌ 关闭会话' }, type: 'danger',
+            value: {
+              action: 'close', root_id: 'om_root', session_id: 'sid-ready-test', cli_id: 'claude-code',
+              card_nonce: 'nonce_existing', __bm_cb: 1,
+            },
+          },
+        ] },
+      ],
+    };
+    getMessageDetailMock.mockResolvedValue({ items: [{
+      message_id: 'om_existing_card', chat_id: 'oc_chat', msg_type: 'interactive',
+      sender: { id: 'app_test', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify(oldCard) },
+    }] });
     const ds = makeDs({
       displayMode: 'screenshot',
       suppressRecoveryCard: true,
       streamCardPending: false,
       streamCardId: 'om_existing_card',
+      streamCardNonce: 'nonce_existing',
+      lastScreenContent: undefined,
+      lastScreenStatus: undefined,
       worker: fakeWorker,
     });
 
     setupActiveWorkerHandlers(ds, fakeWorker);
-    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
-    await primaryEffectsBarrier();
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', viewToken: 'view_new',
+    });
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledTimes(1));
 
-    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(getMessageDetailMock).toHaveBeenCalledWith('app_test', 'om_existing_card');
+    const refreshed = JSON.parse(updateMessageMock.mock.calls[0][2]);
+    const refreshedTerminal = refreshed.elements[1].actions[0];
+    expect(Object.values(refreshedTerminal.multi_url).every(
+      (url: unknown) => typeof url === 'string' && url.includes('viewToken=view_new') && !url.includes('view_old'),
+    )).toBe(true);
+    refreshedTerminal.multi_url = oldCard.elements[1].actions[0].multi_url;
+    expect(refreshed).toEqual(oldCard);
     expect(sessionReplyMock).not.toHaveBeenCalled();
     expect(pinMessageMock).not.toHaveBeenCalled();
     expect(fakeWorker.send).toHaveBeenCalledWith({
       type: 'set_display_mode',
       mode: 'screenshot',
     });
+  });
 
+  it.each([
+    { label: 'another app sent the message', senderId: 'app_other', nonce: 'nonce_existing' },
+    { label: 'the card belongs to another session generation', senderId: 'app_test', nonce: 'nonce_other' },
+  ])('silent recovery leaves the card untouched when $label', async ({ senderId, nonce }) => {
+    const oldUrl = 'https://terminal.example/s/sid-ready-test?viewToken=view_old';
+    getMessageDetailMock.mockResolvedValue({ items: [{
+      message_id: 'om_existing_card', chat_id: 'oc_chat', msg_type: 'interactive',
+      sender: { id: senderId, id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify({
+        elements: [{ tag: 'action', actions: [
+          { tag: 'button', multi_url: { url: oldUrl, pc_url: oldUrl, android_url: oldUrl, ios_url: oldUrl } },
+          { tag: 'button', value: {
+            action: 'close', root_id: 'om_root', session_id: 'sid-ready-test',
+            card_nonce: nonce, __bm_cb: 1,
+          } },
+        ] }],
+      }) },
+    }] });
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      suppressRecoveryCard: true, streamCardId: 'om_existing_card', streamCardNonce: 'nonce_existing',
+      lastScreenContent: undefined, lastScreenStatus: undefined, worker: fakeWorker,
+    });
+
+    setupActiveWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc', viewToken: 'view_new' });
+    await primaryEffectsBarrier();
+
+    expect(getMessageDetailMock).toHaveBeenCalledWith('app_test', 'om_existing_card');
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('silent recovery does not patch a successor that replaces the card during provenance lookup', async () => {
+    let resolveDetail!: (detail: unknown) => void;
+    getMessageDetailMock.mockImplementationOnce(() => new Promise(resolve => { resolveDetail = resolve; }));
+    const oldUrl = 'https://terminal.example/s/sid-ready-test?viewToken=view_old';
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      suppressRecoveryCard: true, streamCardId: 'om_existing_card', streamCardNonce: 'nonce_existing',
+      lastScreenContent: undefined, lastScreenStatus: undefined, worker: fakeWorker,
+    });
+    setupActiveWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc', viewToken: 'view_new' });
+    await vi.waitFor(() => expect(getMessageDetailMock).toHaveBeenCalledTimes(1));
+    ds.streamCardId = 'om_successor';
+    resolveDetail({ items: [{
+      message_id: 'om_existing_card', chat_id: 'oc_chat', msg_type: 'interactive',
+      sender: { id: 'app_test', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify({ elements: [{ tag: 'action', actions: [
+        { tag: 'button', multi_url: { url: oldUrl, pc_url: oldUrl, android_url: oldUrl, ios_url: oldUrl } },
+        { tag: 'button', value: {
+          action: 'close', root_id: 'om_root', session_id: 'sid-ready-test',
+          card_nonce: 'nonce_existing', __bm_cb: 1,
+        } },
+      ] }] }) },
+    }] });
+    await primaryEffectsBarrier();
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('silent recovery does not publish a stale URL when the worker generation changes during lookup', async () => {
+    let resolveDetail!: (detail: unknown) => void;
+    getMessageDetailMock.mockImplementationOnce(() => new Promise(resolve => { resolveDetail = resolve; }));
+    const oldUrl = 'https://terminal.example/s/sid-ready-test?viewToken=view_old';
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      suppressRecoveryCard: true, streamCardId: 'om_existing_card', streamCardNonce: 'nonce_existing',
+      lastScreenContent: undefined, lastScreenStatus: undefined, worker: fakeWorker,
+    });
+    setupActiveWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc', viewToken: 'view_new' });
+    await vi.waitFor(() => expect(getMessageDetailMock).toHaveBeenCalledTimes(1));
+    ds.workerViewToken = 'view_newer';
+    resolveDetail({ items: [{
+      message_id: 'om_existing_card', chat_id: 'oc_chat', msg_type: 'interactive',
+      sender: { id: 'app_test', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify({ elements: [{ tag: 'action', actions: [
+        { tag: 'button', multi_url: { url: oldUrl, pc_url: oldUrl, android_url: oldUrl, ios_url: oldUrl } },
+        { tag: 'button', value: {
+          action: 'close', root_id: 'om_root', session_id: 'sid-ready-test',
+          card_nonce: 'nonce_existing', __bm_cb: 1,
+        } },
+      ] }] }) },
+    }] });
+    await primaryEffectsBarrier();
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'message lookup fails', detail: null },
+    { label: 'card JSON is malformed', detail: { items: [{
+      message_id: 'om_existing_card', chat_id: 'oc_chat', msg_type: 'interactive',
+      sender: { id: 'app_test', id_type: 'app_id', sender_type: 'app' }, body: { content: '{' },
+    }] } },
+    { label: 'more than one view-capability button exists', detail: { items: [{
+      message_id: 'om_existing_card', chat_id: 'oc_chat', msg_type: 'interactive',
+      sender: { id: 'app_test', id_type: 'app_id', sender_type: 'app' },
+      body: { content: JSON.stringify({ elements: [{ tag: 'action', actions: [
+        { tag: 'button', multi_url: { url: 'https://terminal.example/a?viewToken=old_a' } },
+        { tag: 'button', multi_url: { url: 'https://terminal.example/b?viewToken=old_b' } },
+        { tag: 'button', value: {
+          action: 'close', root_id: 'om_root', session_id: 'sid-ready-test',
+          card_nonce: 'nonce_existing', __bm_cb: 1,
+        } },
+      ] }] }) },
+    }] } },
+  ])('silent recovery fails closed when $label', async ({ detail }) => {
+    if (detail) getMessageDetailMock.mockResolvedValue(detail);
+    else getMessageDetailMock.mockRejectedValue(new Error('lookup failed'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      suppressRecoveryCard: true, streamCardId: 'om_existing_card', streamCardNonce: 'nonce_existing',
+      lastScreenContent: undefined, lastScreenStatus: undefined, worker: fakeWorker,
+    });
+
+    setupActiveWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc', viewToken: 'view_new' });
+    await primaryEffectsBarrier();
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
   it('sentinel early-break (in-flight card POST) still sends set_display_mode', async () => {

@@ -2504,8 +2504,9 @@ export async function restoreActiveSessions(
           replyThreadAliases: session.replyThreadAliases,
           currentReplyTarget: session.currentReplyTarget,
           // Restart stays silent for adopt sessions too: forkAdoptWorker shares
-          // setupWorkerHandlers, so the recovery ready/screen_update would post a
-          // card without this. Cleared on the first real CLI input.
+          // setupWorkerHandlers, so the recovery ready/screen_update would publish
+          // card state without this. A proven existing card may receive only its
+          // per-worker terminal URL refresh. Cleared on the first real CLI input.
           suppressRecoveryCard: true,
         };
         const anchor = sessionAnchorId(ds);
@@ -2712,7 +2713,8 @@ export async function restoreActiveSessions(
       replyThreadAliases: session.replyThreadAliases,
       currentReplyTarget: session.currentReplyTarget,
       // Restart stays silent in the group: the recovery re-fork won't post or
-      // patch a streaming card. Cleared on the first real CLI input.
+      // re-render streaming-card state. A proven existing card may receive only
+      // its per-worker terminal URL refresh. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
     };
     if (session.deferredScheduleRun) {

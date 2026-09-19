@@ -30,8 +30,9 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageDetail, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, terminalMultiUrl } from '../im/lark/card-builder.js';
+import { BOTMUX_CALLBACK_MARKER_KEY } from '../im/lark/callback-button-marker.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
@@ -2942,6 +2943,89 @@ function ownsCurrentStreamingCard(ds: DaemonSession, messageId: string): boolean
   if (ds.session.status !== 'active' || ds.streamCardId !== messageId || isSessionTransferring(ds)) return false;
   if (remoteRetirementAdmissionPhase(ds) !== null || !retainsLarkStreamingCardTransport(ds)) return false;
   return ownsActiveStreamingCardRegistrySlot(ds);
+}
+
+function hasCurrentStreamingCardIdentity(
+  value: unknown,
+  ds: DaemonSession,
+): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(item => hasCurrentStreamingCardIdentity(item, ds));
+  const record = value as Record<string, unknown>;
+  const matches = (payload: unknown): boolean => {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    const fields = payload as Record<string, unknown>;
+    return fields[BOTMUX_CALLBACK_MARKER_KEY] === 1
+      && fields.session_id === ds.session.sessionId
+      && fields.root_id === sessionAnchorId(ds)
+      && typeof ds.streamCardNonce === 'string'
+      && fields.card_nonce === ds.streamCardNonce;
+  };
+  if (record.tag === 'button' && (matches(record.value)
+    || (Array.isArray(record.behaviors) && record.behaviors.some(behavior => {
+      if (!behavior || typeof behavior !== 'object' || Array.isArray(behavior)) return false;
+      const callback = behavior as Record<string, unknown>;
+      return callback.type === 'callback' && matches(callback.value);
+    })))) return true;
+  return Object.values(record).some(item => hasCurrentStreamingCardIdentity(item, ds));
+}
+
+function urlCarriesViewCapability(value: unknown): boolean {
+  if (typeof value !== 'string' || !value) return false;
+  try {
+    const url = new URL(value);
+    if (url.searchParams.has('viewToken')) return true;
+    const nested = url.searchParams.get('url');
+    return nested ? urlCarriesViewCapability(nested) : false;
+  } catch {
+    return false;
+  }
+}
+
+function replaceSingleTerminalViewUrl(value: unknown, url: string): boolean {
+  const candidates: Array<Record<string, unknown>> = [];
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    if (record.tag === 'button' && record.multi_url && typeof record.multi_url === 'object'
+      && Object.values(record.multi_url as Record<string, unknown>).some(urlCarriesViewCapability)) {
+      candidates.push(record);
+    }
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(value);
+  if (candidates.length !== 1) return false;
+  candidates[0].multi_url = terminalMultiUrl(url);
+  return true;
+}
+
+/** Preserve the card's visible state while rotating its per-worker read link. */
+async function refreshSilentRecoveryTerminalLink(ds: DaemonSession): Promise<void> {
+  const cardId = ds.streamCardId;
+  const viewUrl = readableTerminalUrlFor(ds);
+  const viewToken = ds.workerViewToken;
+  if (!cardId || cardId === CARD_POSTING_SENTINEL || !viewUrl || !viewToken
+    || !ds.suppressRecoveryCard || !ownsCurrentStreamingCard(ds, cardId)) return;
+  try {
+    const detail = await getMessageDetail(ds.larkAppId, cardId);
+    const item = detail?.items?.[0];
+    const sender = item?.sender;
+    const content = item?.body?.content ?? detail?.body?.content;
+    if (item?.message_id !== cardId || item?.chat_id !== ds.chatId || item?.msg_type !== 'interactive'
+      || sender?.sender_type !== 'app' || sender?.id_type !== 'app_id' || sender?.id !== ds.larkAppId
+      || typeof content !== 'string') return;
+    const card = JSON.parse(content) as unknown;
+    if (!hasCurrentStreamingCardIdentity(card, ds) || !replaceSingleTerminalViewUrl(card, viewUrl)) return;
+    if (!ds.suppressRecoveryCard || ds.workerViewToken !== viewToken
+      || !ownsCurrentStreamingCard(ds, cardId)) return;
+    scheduleCardPatch(ds, JSON.stringify(card));
+  } catch (err) {
+    logger.debug(`[${tag(ds)}] silent recovery terminal-link refresh skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function pinStreamingCardEnabled(ds: DaemonSession): boolean {
@@ -12470,14 +12554,14 @@ function setupWorkerHandlers(
         }
 
         // Restart recovery: stay silent in the group. The session was restored
-        // after a daemon restart; don't auto-post/patch a streaming card here.
-        // The owner gets a private DM summary instead, and the surviving card
-        // (if any) is left untouched. The next real user turn clears this flag
-        // (rememberLastCliInput) and the normal card flow resumes.
+        // after a daemon restart; don't auto-post or re-render card state here.
+        // Refresh only a proven surviving card's per-worker terminal capability.
+        // The next real user turn clears this flag (rememberLastCliInput) and the
+        // normal card flow resumes.
         if (ds.suppressRecoveryCard) {
-          // Startup Pin recovery owns the only safe provenance decision for a
-          // persisted current card. Re-pinning here can race ahead of its list
-          // proof and claim a human/foreign collision through idempotent create.
+          // Do not re-pin here: Pin recovery owns that separate provenance
+          // decision. The URL refresh proves the message/card identity itself.
+          void refreshSilentRecoveryTerminalLink(ds);
           logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
         }
