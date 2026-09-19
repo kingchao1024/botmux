@@ -7,6 +7,7 @@ import {
   AUTOSTART_UNIT_ENV,
   autostartPath,
   consumeAutostartUnitMarker,
+  sessionScopedFleetLifecycleWarning,
   launchProgram, launchCommand, unitContent, plistContent, windowsScriptContent,
   type AutostartOpts,
 } from '../src/autostart.js';
@@ -388,5 +389,46 @@ describe('boot-hook marker is consumed on entry, not after dependency probes', (
     const depsAt = body.indexOf('ensureSystemDependencies(');
     expect(depsAt).toBeGreaterThan(-1);
     expect(consumeAt).toBeLessThan(depsAt);
+  });
+});
+
+describe('session-scoped fleet lifecycle warning', () => {
+  it('warns for a manual Linux start/restart inside a BotMux session when systemd is enabled', () => {
+    for (const command of ['start', 'restart'] as const) {
+      expect(sessionScopedFleetLifecycleWarning(command, {
+        env: { BOTMUX_SESSION_ID: 'session-1' },
+        platform: 'linux',
+        systemdServiceEnabled: true,
+      })).toContain(`systemctl --user ${command} botmux.service`);
+    }
+  });
+
+  it('stays silent outside that exact ownership hazard', () => {
+    expect(sessionScopedFleetLifecycleWarning('restart', {
+      env: {}, platform: 'linux', systemdServiceEnabled: true,
+    })).toBeUndefined();
+    expect(sessionScopedFleetLifecycleWarning('restart', {
+      env: { BOTMUX_SESSION_ID: 'session-1' }, platform: 'darwin', systemdServiceEnabled: true,
+    })).toBeUndefined();
+    expect(sessionScopedFleetLifecycleWarning('restart', {
+      env: { BOTMUX_SESSION_ID: 'session-1' }, platform: 'linux', systemdServiceEnabled: false,
+    })).toBeUndefined();
+    expect(sessionScopedFleetLifecycleWarning('start', {
+      env: { BOTMUX_SESSION_ID: 'session-1' }, platform: 'linux', systemdServiceEnabled: true, bootHookStart: true,
+    })).toBeUndefined();
+  });
+
+  it('wires the warning into both fleet-wide lifecycle commands', () => {
+    const src = readFileSync(join(import.meta.dirname, '..', 'src', 'cli.ts'), 'utf8');
+    const start = src.slice(
+      src.indexOf('async function cmdStart(): Promise<void> {'),
+      src.indexOf('/** Validate before systemd handoff', src.indexOf('async function cmdStart(): Promise<void> {')),
+    );
+    const restart = src.slice(
+      src.indexOf('async function cmdRestart(): Promise<void> {'),
+      src.indexOf('export type StartBotLiveResult', src.indexOf('async function cmdRestart(): Promise<void> {')),
+    );
+    expect(start).toContain("warnSessionScopedFleetLifecycle('start'");
+    expect(restart).toContain("warnSessionScopedFleetLifecycle('restart'");
   });
 });

@@ -14,6 +14,7 @@
 - 禁止在 worktree 执行 install；依赖变化只能在 worktree 外处理。详见 [质量与工具链](docs/agent/quality.md)。
 - 编译态子进程必须走 `src/core/self-spawn.ts`，不得向子进程传递 `dist/` 或 `__dirname` 拼出的路径。详见 [运行可靠性](docs/agent/reliability.md)。
 - build 不会认领全局 CLI，也不改变 live daemon；认领、重启和 live 手测必须另行明确授权。详见 [运行可靠性](docs/agent/reliability.md)。
+- Linux 已启用 `botmux.service` 时，禁止从 BotMux/Trae 会话直接运行 fleet 启停命令；必须从会话外通过 systemd 管理。详见 [运行可靠性](docs/agent/reliability.md)。
 - owner 身份按应用隔离并 fail-closed；setup/onboarding 必须复用现有身份边界。详见 [安全边界](docs/agent/security.md)。
 
 ## 交付边界

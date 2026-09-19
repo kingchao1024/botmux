@@ -64,6 +64,7 @@ import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import {
   consumeAutostartUnitMarker,
+  warnSessionScopedFleetLifecycle,
   enableAutostart,
   disableAutostart,
   autostartStatus,
@@ -2630,6 +2631,7 @@ async function cmdStart(): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
   const bootHookStart = consumeAutostartUnitMarker();
+  warnSessionScopedFleetLifecycle('start', { bootHookStart });
   applyCompanionOptions(process.argv.slice(3));
   // `--systemd-service` and the PM2-God ownership gating that used to live here
   // are gone with pm2 itself: the built-in supervisor owns single-owner exclusion
@@ -2852,6 +2854,7 @@ interface RestartLifecycleFlags {
 
 
 async function cmdRestart(): Promise<void> {
+  warnSessionScopedFleetLifecycle('restart');
   applyCompanionOptions(process.argv.slice(3));
   const { refreshPersistedEnv, readFailureFallback } = prepareRestartDriverContext();
   if (!hasConfig()) {

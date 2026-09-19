@@ -54,3 +54,11 @@ The stable `current` symlink, the command wrapper, and the systemd override must
 all resolve to the same binary before restarting `botmux.service`. Keep the prior
 target and configuration backup until the new fleet, Dashboard HTTP endpoint,
 session registry, and a real Lark send/Ask callback have been verified.
+
+On Linux hosts where `botmux.service` is enabled, restart production only with
+`systemctl --user restart botmux.service`. Do not run `botmux start`,
+`botmux restart`, or `bun run daemon:restart` from a BotMux/Trae session: the
+detached supervisor can inherit that transient session scope and be killed when
+the session ends while the oneshot unit still reports `active (exited)`. After a
+restart, verify both `botmux status` and `/proc/<supervisor-pid>/cgroup`; the live
+supervisor must belong to `botmux.service`, not `botmux-session-*.scope`.

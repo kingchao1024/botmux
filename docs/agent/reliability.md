@@ -2,7 +2,7 @@
 title: 运行可靠性与发版边界
 purpose: 保留 daemon、编译态、全局认领、live 验证和发版的安全边界。
 owner: maintainers
-last_reviewed: 2026-09-22
+last_reviewed: 2026-09-24
 source_of_truth: src/core/self-spawn.ts、scripts/claim-botmux-bin.mjs、scripts/smoke-bun-binary.mjs、package.json、workflow 与相关 runbook。
 ---
 
@@ -19,6 +19,7 @@ source_of_truth: src/core/self-spawn.ts、scripts/claim-botmux-bin.mjs、scripts
 
 - `bun run build` 不会认领全局 `botmux` wrapper。`bun run use:here` 才认领，`bun run switch:here` 才是 build 加认领。
 - 需要人工 live 验证时，必须使用 `bun run switch:here && bun run daemon:restart`；不要依赖裸 `botmux restart`，否则可能重启到 PATH 中其它安装。
+- Linux 主机已启用 `botmux.service` 时，不能从 BotMux/Trae 会话直接运行 `botmux start`、`botmux restart` 或 `bun run daemon:restart`：新 supervisor 会继承临时会话的 systemd scope，会话退出后可能被一并回收，而 oneshot unit 仍显示 `active (exited)`。生产重启必须在会话外执行 `systemctl --user restart botmux.service`，再用 `botmux status` 和 `/proc/<supervisor-pid>/cgroup` 确认进程归属。
 - 上述操作会让全部 bot 使用当前 checkout。测试或合并结束后应切回 canonical checkout，避免 review worktree 删除后全局 shim 失效。
 
 ## 待验证
