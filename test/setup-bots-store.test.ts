@@ -3,11 +3,35 @@
  *
  * Run: pnpm vitest run test/setup-bots-store.test.ts
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeBotsJsonAtomic, readBotsJsonOrEmpty } from '../src/setup/bots-store.js';
+import {
+  type BotsJsonLockCaller,
+  type BotsJsonLockOperation,
+} from '../src/setup/bots-store.js';
+import {
+  FileLockTimeoutError,
+  withFileLock,
+  withFileLockSync,
+} from '../src/utils/file-lock.js';
+import {
+  readBotsJsonOrEmpty,
+  withBotsJsonLock,
+  withBotsJsonLockSync,
+  writeBotsJsonAtomic,
+} from '../src/setup/bots-store.js';
 
 let tmpDir: string;
 let botsPath: string;
@@ -22,6 +46,15 @@ afterEach(() => {
 });
 
 describe('writeBotsJsonAtomic', () => {
+  it('creates a missing registry with the same atomic-write result', () => {
+    expect(existsSync(botsPath)).toBe(false);
+
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_first' }]);
+
+    expect(JSON.parse(readFileSync(botsPath, 'utf8'))).toEqual([{ larkAppId: 'cli_first' }]);
+    expect(existsSync(botsPath + '.tmp')).toBe(false);
+  });
+
   it('writes valid JSON with trailing newline', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_1', larkAppSecret: 's1' }]);
     expect(existsSync(botsPath)).toBe(true);
@@ -76,6 +109,44 @@ describe('writeBotsJsonAtomic', () => {
     ])).toThrow('cli_a -> cli_b -> cli_a');
     expect(readFileSync(botsPath, 'utf8')).toBe(before);
   });
+
+  it.runIf(process.platform !== 'win32')('fails closed if a symlink registry retargets while its canonical target is locked', () => {
+    const first = join(tmpDir, 'first.json');
+    const second = join(tmpDir, 'second.json');
+    const alias = join(tmpDir, 'fleet.json');
+    writeFileSync(first, '[{"larkAppId":"first"}]\n', { mode: 0o600 });
+    writeFileSync(second, '[{"larkAppId":"second"}]\n', { mode: 0o600 });
+    symlinkSync(first, alias);
+
+    expect(() => withBotsJsonLockSync(alias, (targetPath) => {
+      expect(targetPath).toBe(first);
+      unlinkSync(alias);
+      symlinkSync(second, alias);
+      writeFileSync(targetPath, '[{"larkAppId":"old-target-only"}]\n', { mode: 0o600 });
+    })).toThrow(/target changed during operation/);
+
+    expect(JSON.parse(readFileSync(second, 'utf8'))[0].larkAppId).toBe('second');
+    expect(JSON.parse(readFileSync(first, 'utf8'))[0].larkAppId).toBe('old-target-only');
+  });
+
+  it.runIf(process.platform !== 'win32')('exposes an in-lock alias stability check before irreversible work', async () => {
+    const first = join(tmpDir, 'first.json');
+    const second = join(tmpDir, 'second.json');
+    const alias = join(tmpDir, 'fleet.json');
+    writeFileSync(first, '[]\n', { mode: 0o600 });
+    writeFileSync(second, '[]\n', { mode: 0o600 });
+    symlinkSync(first, alias);
+    let published = false;
+
+    await expect(withBotsJsonLock(alias, async (_targetPath, assertTargetStable) => {
+      unlinkSync(alias);
+      symlinkSync(second, alias);
+      assertTargetStable();
+      published = true;
+    })).rejects.toThrow(/target changed during operation/);
+
+    expect(published).toBe(false);
+  });
 });
 
 describe('readBotsJsonOrEmpty', () => {
@@ -91,5 +162,136 @@ describe('readBotsJsonOrEmpty', () => {
   it('returns parsed array when file is valid', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'a' }, { larkAppId: 'b' }]);
     expect(readBotsJsonOrEmpty(botsPath).map((b: any) => b.larkAppId)).toEqual(['a', 'b']);
+  });
+});
+
+describe('bots.json lock observability', () => {
+  it('does not log on successful acquisition', () => {
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      expect(withBotsJsonLockSync(botsPath, () => 'acquired')).toBe('acquired');
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('logs timeout fields while redacting an unsafe caller label', () => {
+    const lockPath = botsPath + '.lock';
+    writeFileSync(lockPath, String(process.pid), 'utf8');
+    const old = new Date(Date.now() - 1_000);
+    utimesSync(lockPath, old, old);
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    let thrown: unknown;
+    try {
+      withBotsJsonLockSync(botsPath, () => 'unreachable', {
+        maxWaitMs: 0,
+        caller: 'token-do-not-log' as BotsJsonLockCaller,
+        operation: 'config-write' as BotsJsonLockOperation,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    try {
+      expect(thrown).toBeInstanceOf(FileLockTimeoutError);
+      expect(thrown).toMatchObject({
+        code: 'FILE_LOCK_TIMEOUT',
+        holderPid: process.pid,
+      });
+      const logged = stderrWrite.mock.calls.map(([chunk]) => String(chunk)).join('');
+      expect(logged).toContain('[bots-lock] timeout');
+      expect(logged).toContain('\"lock\":\"bots.json.lock\"');
+      expect(logged).toContain('\"caller\":\"invalid\"');
+      expect(logged).toContain('\"operation\":\"invalid\"');
+      expect(logged).toContain(`\"holderPid\":${process.pid}`);
+      expect(logged).toMatch(/\"waitedMs\":\d+/);
+      expect(logged).toMatch(/\"lockAgeMs\":\d+/);
+      expect(logged).not.toContain('token-do-not-log');
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('rethrows non-timeout failures without logging', () => {
+    const expected = new Error('callback failed');
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      expect(() => withBotsJsonLockSync(botsPath, () => { throw expected; })).toThrow(expected);
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('does not mislabel an async nested lock timeout as bots.json contention', async () => {
+    const nestedTarget = join(tmpDir, 'nested.json');
+    const nestedLockPath = nestedTarget + '.lock';
+    writeFileSync(nestedLockPath, String(process.pid), 'utf8');
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    let nestedLock = false;
+    let nestedError: unknown;
+    let thrown: unknown;
+
+    try {
+      await withBotsJsonLock(botsPath, async () => {
+        nestedLock = true;
+        try {
+          return await withFileLock(nestedTarget, async () => 'unreachable', { maxWaitMs: 0 });
+        } catch (error) {
+          nestedError = error;
+          throw error;
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    try {
+      expect(nestedLock).toBe(true);
+      expect(thrown).toBeInstanceOf(FileLockTimeoutError);
+      expect(thrown).toBe(nestedError);
+      expect((thrown as FileLockTimeoutError).lockPath).toBe(nestedLockPath);
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('does not mislabel a sync nested lock timeout as bots.json contention', () => {
+    const nestedTarget = join(tmpDir, 'nested.json');
+    const nestedLockPath = nestedTarget + '.lock';
+    writeFileSync(nestedLockPath, String(process.pid), 'utf8');
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    let nestedLock = false;
+    let nestedError: unknown;
+    let thrown: unknown;
+
+    try {
+      withBotsJsonLockSync(botsPath, () => {
+        nestedLock = true;
+        try {
+          return withFileLockSync(nestedTarget, () => 'unreachable', { maxWaitMs: 0 });
+        } catch (error) {
+          nestedError = error;
+          throw error;
+        }
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    try {
+      expect(nestedLock).toBe(true);
+      expect(thrown).toBeInstanceOf(FileLockTimeoutError);
+      expect(thrown).toBe(nestedError);
+      expect((thrown as FileLockTimeoutError).lockPath).toBe(nestedLockPath);
+      expect(stderrWrite).not.toHaveBeenCalled();
+    } finally {
+      stderrWrite.mockRestore();
+    }
   });
 });

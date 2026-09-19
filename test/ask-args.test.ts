@@ -13,6 +13,7 @@ import {
   findMissingAskEnv,
   normalizeAskDispatch,
   parseAskOptions,
+  parseS1ControllerAskArgs,
   parseAskTimeoutSeconds,
 } from '../src/core/ask-args.js';
 
@@ -178,6 +179,30 @@ describe('findMissingAskEnv', () => {
     ).toBeNull();
   });
 
+  it('allows S1 binding mode with BOTMUX_LARK_APP_ID only', () => {
+    expect(
+      findMissingAskEnv(
+        {
+          BOTMUX_LARK_APP_ID: 'cli_1',
+        },
+        { s1Controller: true, s1Phase: 'binding' },
+      ),
+    ).toBeNull();
+  });
+
+  it('requires app+session+root for S1 execution mode', () => {
+    expect(
+      findMissingAskEnv(
+        {
+          BOTMUX_LARK_APP_ID: 'cli_1',
+          BOTMUX_SESSION_ID: 'sess-1',
+          BOTMUX_ROOT_MESSAGE_ID: 'om_1',
+        },
+        { s1Controller: true, s1Phase: 'execution' },
+      ),
+    ).toBeNull();
+  });
+
   it('reports the first missing var in §5 order', () => {
     expect(
       findMissingAskEnv({
@@ -193,6 +218,25 @@ describe('findMissingAskEnv', () => {
         BOTMUX_ROOT_MESSAGE_ID: 'om_1',
       }),
     ).toBe('BOTMUX_CHAT_ID');
+    expect(
+      findMissingAskEnv(
+        {
+          BOTMUX_SESSION_ID: 'sess-1',
+          BOTMUX_CHAT_ID: 'oc_1',
+          BOTMUX_ROOT_MESSAGE_ID: 'om_1',
+        },
+        { s1Controller: true, s1Phase: 'binding' },
+      ),
+    ).toBe('BOTMUX_LARK_APP_ID');
+    expect(
+      findMissingAskEnv(
+        {
+          BOTMUX_LARK_APP_ID: 'cli_1',
+          BOTMUX_ROOT_MESSAGE_ID: 'om_1',
+        },
+        { s1Controller: true, s1Phase: 'execution' },
+      ),
+    ).toBe('BOTMUX_SESSION_ID');
   });
 
   it('treats blank/whitespace as missing', () => {
@@ -204,5 +248,128 @@ describe('findMissingAskEnv', () => {
         BOTMUX_ROOT_MESSAGE_ID: 'om_1',
       }),
     ).toBe('BOTMUX_SESSION_ID');
+  });
+});
+
+describe('parseS1ControllerAskArgs', () => {
+  it('returns null in ordinary mode with no S1-only flags', () => {
+    expect(parseS1ControllerAskArgs(['--options', 'yes,no'], { json: false })).toBeNull();
+  });
+
+  it('rejects S1-only flags outside --s1-controller mode', () => {
+    expect(() => parseS1ControllerAskArgs(['--request-id', 'a'.repeat(64)], { json: true }))
+      .toThrowError(/仅可与 --s1-controller 一起使用/);
+    expect(() => parseS1ControllerAskArgs(['--recover-only'], { json: true }))
+      .toThrowError(/仅可与 --s1-controller 一起使用/);
+  });
+
+  it('requires --json for S1 controller asks', () => {
+    expect(() => parseS1ControllerAskArgs(['--s1-controller'], { json: false }))
+      .toThrowError(/requires --json/);
+  });
+
+  it('accepts a valid S1 controller contract and preserves recover-only', () => {
+    expect(parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'binding',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'a'.repeat(64),
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', '1700086400000',
+      '--recover-only',
+    ], { json: true })).toEqual({
+      phase: 'binding',
+      chatId: 'oc_chat',
+      requestId: 'a'.repeat(64),
+      notBeforeMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+      recoverOnly: true,
+    });
+  });
+
+  it('accepts exactly 24h and rejects 24h+1ms', () => {
+    expect(parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'execution',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'b'.repeat(64),
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', '1700086400000',
+    ], { json: true })).toEqual({
+      phase: 'execution',
+      chatId: 'oc_chat',
+      requestId: 'b'.repeat(64),
+      notBeforeMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_086_400_000,
+      recoverOnly: false,
+    });
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'execution',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'b'.repeat(64),
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', '1700086400001',
+    ], { json: true })).toThrowError(/窗口不得超过/);
+  });
+
+  it('requires valid --phase and non-empty --chat-id', () => {
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'd'.repeat(64),
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', '1700086400000',
+    ], { json: true })).toThrowError(/--phase/);
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'binding',
+      '--request-id', 'd'.repeat(64),
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', '1700086400000',
+    ], { json: true })).toThrowError(/--chat-id/);
+  });
+
+  it('rejects bad request ids and invalid absolute timestamps', () => {
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'binding',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'short',
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', '1700086400000',
+    ], { json: true })).toThrowError(/64hex/);
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'binding',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'A'.repeat(64),
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', '1700086400000',
+    ], { json: true })).toThrowError(/64hex/);
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'binding',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'c'.repeat(64),
+      '--not-before-ms', 'NaN',
+      '--expires-at-ms', '1700086400000',
+    ], { json: true })).toThrowError(/--not-before-ms/);
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'binding',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'c'.repeat(64),
+      '--not-before-ms', '1700000000000',
+      '--expires-at-ms', 'NaN',
+    ], { json: true })).toThrowError(/--expires-at-ms/);
+    expect(() => parseS1ControllerAskArgs([
+      '--s1-controller',
+      '--phase', 'binding',
+      '--chat-id', 'oc_chat',
+      '--request-id', 'c'.repeat(64),
+      '--not-before-ms', '1700086400000',
+      '--expires-at-ms', '1700000000000',
+    ], { json: true })).toThrowError(/必须小于/);
   });
 });

@@ -263,7 +263,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; senderIsBot?: boolean; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string },
 ): void {
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
@@ -276,6 +276,9 @@ export function beginReplyTargetTurn(
     quoteOnly: opts?.quoteOnly,
   });
   const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
+  const frozenSenderKind = opts && Object.prototype.hasOwnProperty.call(opts, 'senderIsBot')
+    ? opts.senderIsBot
+    : ds.session.quoteTargetSenderIsBot;
   // Re-insertion keeps the newest turn at the end for deterministic bounding.
   delete exactContexts[turnId];
   exactContexts[turnId] = {
@@ -284,8 +287,8 @@ export function beginReplyTargetTurn(
     ...(ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
       : {}),
-    ...(ds.session.quoteTargetSenderIsBot !== undefined
-      ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
+    ...(frozenSenderKind !== undefined
+      ? { replyTargetSenderIsBot: frozenSenderKind }
       : {}),
     // Chat-scope only: distinguishes "answered flat AT TOP LEVEL" from
     // "answered flat but the inbound was already inside a topic" (a native
@@ -321,6 +324,7 @@ export function beginReplyTargetTurn(
     updatedAt: nowIso,
     ...(isChatScope ? { quoteOnly: opts?.quoteOnly, substitute: opts?.substitute } : {}),
     ...(opts?.senderOpenId ? { senderOpenId: opts.senderOpenId } : {}),
+    ...(opts?.senderIsBot !== undefined ? { replyTargetSenderIsBot: opts.senderIsBot } : {}),
     ...(opts?.participants?.length ? { participants: dedupeParticipants(opts.participants) } : {}),
     ...(opts?.participantsIncomplete ? { participantsIncomplete: true } : {}),
   };

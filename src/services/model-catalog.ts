@@ -34,6 +34,24 @@ export interface DetectModelsOptions {
   readonly adapterFactory?: (cliId: CliId) => CliAdapter;
 }
 
+export interface StaticModelChoicesOptions {
+  /** Adapter factory seam used by tests to prove the fast path stays shell-free. */
+  readonly adapterFactory?: (cliId: CliId) => CliAdapter;
+}
+
+/**
+ * These adapters intentionally expose no static model picker, but constructing
+ * them resolves their executable through login/interactive shells. Doing that
+ * while enumerating every Dashboard option adds roughly three seconds per
+ * missing CLI and blocks the whole Bot defaults page for no useful result.
+ */
+const MODELLESS_EAGER_RESOLUTION_CLIS = new Set<CliId>([
+  'seed',
+  'relay',
+  'pi',
+  'oh-my-pi',
+]);
+
 // ─── 静态候选 ────────────────────────────────────────────────────────────────
 
 /**
@@ -43,7 +61,10 @@ export interface DetectModelsOptions {
  *  - 其它：读取 CLI_MODEL_CHOICES 元数据（无候选 → []）
  *  - 未知 key → []
  */
-export function staticModelChoices(key: string): readonly string[] {
+export function staticModelChoices(
+  key: string,
+  opts: StaticModelChoicesOptions = {},
+): readonly string[] {
   try {
     const opt = lookupCliSelection(key);
     if (!opt) return [];

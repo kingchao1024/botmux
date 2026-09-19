@@ -4,6 +4,7 @@
  * Keep this module data-only. Journal persistence, Botmux sessions, workers,
  * and provider adapters consume these shapes but must never leak into them.
  */
+import type { V3WriteExecutionBinding } from './dag.js';
 
 export type GoalAsk =
   | {
@@ -173,6 +174,7 @@ export type V3Event =
       instanceId?: string;
       waitId: string;
       hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+      writeExecution?: V3WriteExecutionBinding;
     }
   | {
       type: 'gateResolved';
@@ -183,6 +185,7 @@ export type V3Event =
       by: string;
       selected?: string;
       hostApproval?: { attemptId: string; approvalDigest: string; inputHash: string };
+      writeExecution?: V3WriteExecutionBinding;
     }
   | {
       type: 'edgeResolved';

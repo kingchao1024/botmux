@@ -9,6 +9,8 @@ import type { ChildProcess } from 'node:child_process';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { loadOrCreatePersistedToken } from '../src/dashboard/auth.js';
 import { loopbackFetch, type LoopbackFetchInit } from '../src/core/loopback-fetch.js';
+import { publishDaemonDescriptor } from '../src/utils/daemon-discovery.js';
+import { readSupervisorProcessStartIdentity } from '../src/core/process-start-identity.js';
 
 const DASHBOARD_ENTRY = resolve('src/index-dashboard.ts');
 
@@ -115,7 +117,7 @@ describe('dashboard group mutation route auth', () => {
     writeFileSync(join(botmuxDir, '.dashboard-secret'), 'dashboard-secret-for-pin-auth-test', { mode: 0o600 });
     writeFileSync(join(botmuxDir, '.data-dir'), `${dataDir}\n`, { mode: 0o600 });
     writeFileSync(botsConfigPath, JSON.stringify([{
-      larkAppId: 'cli auth-test-app',
+      larkAppId: 'cli_auth-test-app',
       larkAppSecret: 'secret',
       botName: 'auth test bot',
       cliId: 'codex',
@@ -142,15 +144,18 @@ describe('dashboard group mutation route auth', () => {
     });
     const fakeDaemonPort = await listen(fakeDaemon);
 
-    writeFileSync(join(registryDir, 'cli auth-test-app.json'), JSON.stringify({
-      larkAppId: 'cli auth-test-app',
+    publishDaemonDescriptor(registryDir, {
+      larkAppId: 'cli_auth-test-app',
       botName: 'auth test bot',
       botIndex: 0,
       ipcPort: fakeDaemonPort,
       pid: process.pid,
+      bootInstanceId: 'A'.repeat(43),
+      processStartIdentity: readSupervisorProcessStartIdentity(process.pid)!,
+      rosterRevision: 'a'.repeat(64),
       startedAt: Date.now(),
       lastHeartbeat: Date.now(),
-    }));
+    });
 
     dashboardChild = spawnTsScript(DASHBOARD_ENTRY, [], {
       cwd: resolve('.'),
@@ -181,9 +186,9 @@ describe('dashboard group mutation route auth', () => {
     );
     const base = `http://127.0.0.1:${dashboardPort}`;
     const pinRoute = `${base}/api/groups/${encodeURIComponent('oc auth/topic')}`
-      + `/pin-streaming-card/${encodeURIComponent('cli auth-test-app')}`;
+      + `/pin-streaming-card/${encodeURIComponent('cli_auth-test-app')}`;
     const renameRoute = `${base}/api/groups/${encodeURIComponent('oc auth/topic')}`
-      + `/name/${encodeURIComponent('cli auth-test-app')}`;
+      + `/name/${encodeURIComponent('cli_auth-test-app')}`;
     const anonymousPin = () => requestLoopback(pinRoute, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },

@@ -21927,6 +21927,12 @@ body.cp-fx-slice main { animation: cp-fx-slice 0.32s steps(2, end); }
 .v3r-node.st-skipped, .v3r-node.st-cancelled { opacity: .55; }
 .v3r-node.st-skipped .v3r-box, .v3r-node.st-cancelled .v3r-box { stroke-dasharray: 4 3; }
 .rs-running   { --ns: var(--v3r-running); }
+.rs-grilling,
+.rs-spec_ready,
+.rs-spec_approved,
+.rs-architect_running,
+.rs-dag_ready,
+.rs-dag_approved { --ns: var(--v3r-gate); }
 .rs-succeeded { --ns: var(--v3r-done); }
 .rs-cancelling { --ns: var(--v3r-blocked); }
 .rs-cancelled { --ns: var(--v3r-skipped); }

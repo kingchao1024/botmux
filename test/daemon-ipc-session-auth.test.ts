@@ -117,7 +117,7 @@ describe('daemon session-scoped IPC route wiring', () => {
 
   it('binds ask routing before registering an observable card', () => {
     const route = between(
-      "ipcRoute('POST', '/api/asks'",
+      "for (const askRoutePath of ['/api/asks', '/api/asks/hook']",
       "ipcRoute('POST', '/api/attention'",
     );
     const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
@@ -131,6 +131,10 @@ describe('daemon session-scoped IPC route wiring', () => {
     expect(route).not.toMatch(
       /registerAskBroker\(\{\s*larkAppId: parsed\.larkAppId,/,
     );
+    expect(route).toContain('const routeOriginKind = askOriginKindForPath(askRoutePath);');
+    expect(route).toContain("ordinaryAsk.deprecatedOriginKindHint === 'hook'");
+    expect(route).toMatch(/requestId: boundAsk\.requestId,\s*originKind,/);
+    expect(route).not.toContain('originKind: boundAsk.originKind');
   });
 
   it('binds hook identity before emitting the event', () => {

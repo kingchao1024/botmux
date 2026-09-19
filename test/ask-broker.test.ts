@@ -6,6 +6,10 @@
  *
  * Run:  pnpm vitest run test/ask-broker.test.ts
  */
+import { generateKeyPairSync } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -13,12 +17,15 @@ import {
   _getPending,
   _pendingCount,
   _resetForTest,
+  AskS1WindowExpiredError,
   findPendingAskByAnchor,
   invalidateAll,
   registerAsk,
   registerHostAsk,
   setCardDispatcher,
+  setAskPersistStore,
   setCanTalkChecker,
+  setAskReceiptRedeemer,
   submitAsk,
   submitAskFromDesktop,
   submitCustomReply,
@@ -32,6 +39,9 @@ import type {
   CreateAskInput,
   PendingAsk,
 } from '../src/core/ask-types.js';
+import { normalizeAskSubmitValue, verifyAskReceipt } from '../src/core/ask-receipt.js';
+import { createAskPersistStore } from '../src/core/ask-persist-store.js';
+import { createAskAnswerProvenanceAuthority, createAskReceiptSigner } from '../src/daemon/ask-receipt-authority.js';
 
 const OPTIONS: AskOption[] = [
   { key: 'yes', label: '继续' },
@@ -44,10 +54,21 @@ function makeInput(over: Partial<CreateAskInput> = {}): CreateAskInput {
     chatId: 'oc_chat',
     rootMessageId: 'om_root',
     sessionId: 'sess-1',
+    requestId: 'req-1',
+    originKind: 'hook',
+    backendSurvivesRestart: true,
     questions: [{ prompt: '继续发版吗？', options: OPTIONS, multiSelect: false }],
     timeoutMs: 5_000,
     ...over,
   };
+}
+
+const tempStores: string[] = [];
+
+function bindSignedPersistStore(authority: ReturnType<typeof createAskReceiptSigner>): void {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-ask-broker-'));
+  tempStores.push(dir);
+  setAskPersistStore(createAskPersistStore(join(dir, 'asks'), authority));
 }
 
 function mockDispatcher(
@@ -89,9 +110,247 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   _resetForTest();
+  for (const dir of tempStores.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 describe('registerAsk happy path', () => {
+  it('throws the typed S1 expiry error only after the exact absolute window expires', () => {
+    const signer = createAskReceiptSigner({
+      ...generateKeyPairSync('ed25519'),
+      signerInstanceId: 's1-expiry-test',
+    });
+    bindSignedPersistStore(signer);
+    setAskReceiptRedeemer(createAskAnswerProvenanceAuthority({
+      signer, daemonBootId: 's1-expiry-test',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    }).redeemer);
+    setCardDispatcher(mockDispatcher());
+    const now = Date.now();
+    const expired = {
+      ...makeInput(), originKind: 's1-controller',
+      notBeforeMs: now - 10_000, expiresAtMs: now, deadlineAt: now, timeoutMs: 10_000,
+    };
+    expect(() => registerAsk(expired)).toThrow(AskS1WindowExpiredError);
+    try { registerAsk(expired); } catch (error) {
+      expect(error).toMatchObject({ code: 'ASK_S1_WINDOW_EXPIRED', expiresAtMs: now });
+    }
+    expect(() => registerAsk({
+      ...expired, notBeforeMs: now + 1, expiresAtMs: now + 10_001, deadlineAt: now + 10_001,
+    })).toThrow(RangeError);
+  });
+
+  it('signs only a fully evidenced Lark card answer', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'test-daemon',
+    });
+    bindSignedPersistStore(signer);
+    const provenanceAuthority = createAskAnswerProvenanceAuthority({
+      signer, daemonBootId: 'boot-test',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    setAskReceiptRedeemer(provenanceAuthority.redeemer);
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const ask = d.sendCalls[0]!;
+    const issued = await provenanceAuthority.issue('cli_app', {
+      event_id: 'evt-test', operator: { open_id: 'ou_owner' },
+      context: { open_message_id: `om_card_${ask.askId}` },
+      action: { value: { action: 'ask_select', ask_id: ask.askId, nonce: ask.nonce, key: 'yes' } },
+    });
+    if (issued.kind !== 'issued') throw new Error('expected valid ask provenance token');
+    expect(tryResolveAsk({
+      askId: ask.askId, nonce: ask.nonce, selected: 'yes', by: 'ou_owner',
+      provenance: issued.token,
+    })).toBe('accepted');
+    const result = await p;
+    expect(result.kind).toBe('answered');
+    if (result.kind !== 'answered') throw new Error('answer expected');
+    expect(result.receipt).toBeDefined();
+    expect(verifyAskReceipt(result.receipt, {
+      publicKey: signer.publicKey, now: result.receipt!.payload.answeredAt,
+      expected: { askId: ask.askId, selected: 'yes', cardMessageId: `om_card_${ask.askId}` },
+    })).toMatchObject({ ok: true, expired: false });
+  });
+
+  it('marks a signed non-resumable Ask committed only after its in-memory settlement', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'test-daemon',
+    });
+    bindSignedPersistStore(signer);
+    const provenanceAuthority = createAskAnswerProvenanceAuthority({
+      signer, daemonBootId: 'boot-test',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    setAskReceiptRedeemer(provenanceAuthority.redeemer);
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const pending = registerAsk(makeInput({
+      originKind: 'explicit', requestId: undefined, backendSurvivesRestart: false,
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const ask = d.sendCalls[0]!;
+    const issued = await provenanceAuthority.issue('cli_app', {
+      event_id: 'evt-explicit', operator: { open_id: 'ou_owner' },
+      context: { open_message_id: `om_card_${ask.askId}` },
+      action: { value: { action: 'ask_select', ask_id: ask.askId, nonce: ask.nonce, key: 'yes' } },
+    });
+    if (issued.kind !== 'issued') throw new Error('expected valid ask provenance token');
+
+    expect(provenanceAuthority.wasRedeemed(issued.token)).toBe(false);
+    expect(tryResolveAsk({
+      askId: ask.askId, nonce: ask.nonce, selected: 'yes', by: 'ou_owner',
+      provenance: issued.token,
+    })).toBe('accepted');
+    expect(provenanceAuthority.wasRedeemed(issued.token)).toBe(true);
+    await expect(pending).resolves.toMatchObject({ kind: 'answered', receipt: expect.any(Object) });
+  });
+
+  it('rejects crossed submit tokens for form answers, empty confirmation, and form mode', async () => {
+    const signer = createAskReceiptSigner({
+      ...generateKeyPairSync('ed25519'),
+      signerInstanceId: 'submit-binding-test',
+    });
+    bindSignedPersistStore(signer);
+    const provenanceAuthority = createAskAnswerProvenanceAuthority({
+      signer, daemonBootId: 'boot-submit-binding',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    setAskReceiptRedeemer(provenanceAuthority.redeemer);
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    const now = Date.now();
+    const cases = [
+      {
+        name: 'form A token with form B handler arguments',
+        questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: false }],
+        callbackForm: { q0: '0::yes' } as Record<string, unknown> | undefined,
+        callbackConfirm: undefined as true | 'true' | undefined,
+        selections: [['no']] as ReadonlyArray<ReadonlyArray<string>> | undefined,
+        confirmEmpty: false,
+        hasFormValue: true,
+        submitBinding: normalizeAskSubmitValue({ q0: '0::no' }, false),
+      },
+      {
+        name: 'unconfirmed empty token with confirmed-empty handler arguments',
+        questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+        callbackForm: undefined,
+        callbackConfirm: undefined,
+        selections: undefined,
+        confirmEmpty: true,
+        hasFormValue: false,
+        submitBinding: normalizeAskSubmitValue(undefined, true),
+      },
+      {
+        name: 'form token with cumulative handler arguments',
+        questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+        callbackForm: { q0: [] } as Record<string, unknown>,
+        callbackConfirm: 'true' as const,
+        selections: undefined,
+        confirmEmpty: true,
+        hasFormValue: false,
+        submitBinding: normalizeAskSubmitValue(undefined, true),
+      },
+      {
+        name: 'cumulative token with form handler arguments',
+        questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: false }],
+        callbackForm: undefined,
+        callbackConfirm: undefined,
+        selections: [['yes']] as ReadonlyArray<ReadonlyArray<string>>,
+        confirmEmpty: false,
+        hasFormValue: true,
+        submitBinding: normalizeAskSubmitValue({ q0: '0::yes' }, false),
+      },
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+      const requestId = `submit-binding-${index}`;
+      const pendingResult = registerAsk(makeInput({
+        sessionId: `session-${requestId}`, requestId, originKind: 's1-controller',
+        questions: testCase.questions, timeoutMs: 5_000,
+        notBeforeMs: now, expiresAtMs: now + 5_000, deadlineAt: now + 5_000,
+      }));
+      await Promise.resolve(); await Promise.resolve();
+      const ask = dispatcher.sendCalls.at(-1)!;
+      const callbackValue = {
+        action: 'ask_submit', ask_id: ask.askId, nonce: ask.nonce,
+        ...(testCase.callbackConfirm === undefined
+          ? {}
+          : { confirm_empty: testCase.callbackConfirm }),
+      };
+      const issued = await provenanceAuthority.issue('cli_app', {
+        event_id: `evt-${requestId}`, operator: { open_id: 'ou_owner' },
+        context: { open_message_id: `om_card_${ask.askId}` },
+        action: {
+          value: callbackValue,
+          ...(testCase.callbackForm === undefined ? {} : { form_value: testCase.callbackForm }),
+        },
+      });
+      if (issued.kind !== 'issued') throw new Error(`expected issued token for ${testCase.name}`);
+
+      expect(submitAsk({
+        askId: ask.askId, nonce: ask.nonce, by: 'ou_owner',
+        ...(testCase.selections === undefined ? {} : { selections: testCase.selections }),
+        confirmEmpty: testCase.confirmEmpty,
+        provenance: issued.token, provenanceAction: 'ask_submit',
+        provenanceHasFormValue: testCase.hasFormValue,
+        provenanceSubmitBinding: testCase.submitBinding,
+      }), testCase.name).toBe('stale');
+      expect(_getPending(ask.askId)?.settled, testCase.name).toBe(false);
+      expect(provenanceAuthority.wasRedeemed(issued.token), testCase.name).toBe(false);
+      void pendingResult;
+    }
+  });
+
+  it('does not sign text, desktop, or incomplete card provenance', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'test-daemon',
+    });
+    bindSignedPersistStore(signer);
+    const provenanceAuthority = createAskAnswerProvenanceAuthority({
+      signer, daemonBootId: 'boot-test',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    setAskReceiptRedeemer(provenanceAuthority.redeemer);
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+
+    const plain = registerAsk(makeInput({ sessionId: 'plain' }));
+    await Promise.resolve(); await Promise.resolve();
+    const plainAsk = d.sendCalls.at(-1)!;
+    expect(tryResolveAsk({ askId: plainAsk.askId, nonce: plainAsk.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+    const plainResult = await plain;
+    expect(plainResult.kind === 'answered' ? plainResult.receipt : undefined).toBeUndefined();
+
+    const forged = registerAsk(makeInput({ sessionId: 'forged' }));
+    await Promise.resolve(); await Promise.resolve();
+    const forgedAsk = d.sendCalls.at(-1)!;
+    expect(tryResolveAsk({
+      askId: forgedAsk.askId, nonce: forgedAsk.nonce, selected: 'yes', by: 'ou_owner',
+      provenance: {} as never,
+    })).toBe('accepted');
+    const forgedResult = await forged;
+    expect(forgedResult.kind === 'answered' ? forgedResult.receipt : undefined).toBeUndefined();
+
+    const desktop = registerAsk(makeInput({ sessionId: 'desktop' }));
+    await Promise.resolve(); await Promise.resolve();
+    const desktopAsk = d.sendCalls.at(-1)!;
+    expect(submitAskFromDesktop({ askId: desktopAsk.askId, selections: [['yes']], by: 'desktop' })).toBe('accepted');
+    const desktopResult = await desktop;
+    expect(desktopResult.kind === 'answered' ? desktopResult.receipt : undefined).toBeUndefined();
+  });
+
   it('register → tryResolveAsk("yes") resolves with kind:answered', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);
@@ -438,6 +697,19 @@ describe('invalidateAll', () => {
 });
 
 describe('dispatcher failure', () => {
+  it('accepts the 24h lifetime ceiling and rejects 24h + 1ms', () => {
+    setCardDispatcher(mockDispatcher());
+    expect(() => registerAsk(makeInput({ timeoutMs: 86_400_000 }))).not.toThrow();
+    expect(() => registerAsk(makeInput({
+      requestId: 'over-limit',
+      timeoutMs: 86_400_001,
+    }))).toThrow(/timeoutMs/);
+    expect(() => registerAsk(makeInput({
+      requestId: 'fractional',
+      timeoutMs: 60_000.5,
+    }))).toThrow(/timeoutMs/);
+  });
+
   it('immediately settles the ask as invalidated if card dispatch throws', async () => {
     const d = mockDispatcher({
       send: async () => {
@@ -470,10 +742,10 @@ describe('onSettle hook is best-effort', () => {
       },
     });
     setCardDispatcher(d);
-    const p = registerAsk(makeInput({ timeoutMs: 500 }));
+    const p = registerAsk(makeInput({ timeoutMs: 1_000 }));
     await Promise.resolve();
     await Promise.resolve();
-    vi.advanceTimersByTime(500);
+    vi.advanceTimersByTime(1_000);
     // Must still resolve cleanly despite onSettle blowing up.
     const result = await p;
     expect(result.kind).toBe('timedOut');
@@ -604,6 +876,83 @@ describe('toggleAsk + submitAsk', () => {
     const askId = _allAskIds()[0]!;
     const nonce = _getPending(askId)!.nonce;
     expect(toggleAsk({ askId, nonce, questionIndex: 0, key: 'z', by: 'ou_u' })).toBe('stale');
+  });
+
+  it('invalid toggle leaves receipt eligibility and staged selections unchanged', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'toggle-test',
+    });
+    const provenanceAuthority = createAskAnswerProvenanceAuthority({
+      signer,
+      daemonBootId: 'boot-toggle-test',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    bindSignedPersistStore(signer);
+    setAskReceiptRedeemer(provenanceAuthority.redeemer);
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      requestId: 'req-toggle-test', originKind: 'hook', backendSurvivesRestart: true,
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+
+    const badIssued = await provenanceAuthority.issue('a', {
+      event_id: 'evt-bad-toggle',
+      operator: { open_id: 'ou_u' },
+      context: { open_message_id: 'm1' },
+      action: { value: { action: 'ask_toggle', ask_id: askId, nonce, key: 'z', question_index: 0 } },
+    });
+    if (badIssued.kind !== 'issued') throw new Error('expected bad toggle provenance token');
+    expect(toggleAsk({
+      askId, nonce, questionIndex: 0, key: 'z', by: 'ou_u', provenance: badIssued.token,
+    })).toBe('stale');
+    expect(_getPending(askId)?.selections).toEqual([[]]);
+
+    const goodIssued = await provenanceAuthority.issue('a', {
+      event_id: 'evt-good-select',
+      operator: { open_id: 'ou_u' },
+      context: { open_message_id: 'm1' },
+      action: { value: { action: 'ask_select', ask_id: askId, nonce, key: 'a' } },
+    });
+    if (goodIssued.kind !== 'issued') throw new Error('expected valid select provenance token');
+    expect(tryResolveAsk({
+      askId, nonce, selected: 'a', by: 'ou_u', provenance: goodIssued.token,
+    })).toBe('accepted');
+    const r = await p;
+    expect(r.kind).toBe('answered');
+    if (r.kind === 'answered') {
+      expect(r.answers).toEqual([['a']]);
+      expect(r.receipt).toBeDefined();
+    }
+  });
+
+  it('rejects submit by B when A owns the staged selections', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    expect(toggleAsk({ askId, nonce, questionIndex: 0, key: 'a', by: 'ou_a' })).toBe('toggled');
+    expect(_getPending(askId)?.selections).toEqual([['a']]);
+    expect(submitAsk({ askId, nonce, by: 'ou_b' })).toBe('unauthorized');
+    expect(_getPending(askId)?.settled).toBe(false);
+
+    expect(submitAsk({ askId, nonce, by: 'ou_a' })).toBe('accepted');
+    const r = await p;
+    expect(r.kind).toBe('answered');
+    if (r.kind === 'answered') expect(r.answers).toEqual([['a']]);
   });
 
   it('submitAsk 单选问题未选任何项时返回 stale', async () => {
@@ -859,6 +1208,58 @@ describe('自定义回复 findPendingAskByAnchor + submitCustomReply', () => {
     const { askId } = d.sendCalls[0]!;
     expect(submitCustomReply({ askId, by: 'ou_stranger', text: '随便答' })).toBe('unauthorized');
     expect(_pendingCount()).toBe(1);
+  });
+
+  it('submitCustomReply rejects actor B when actor A owns staged selections', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput({
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+    expect(toggleAsk({ askId, nonce, questionIndex: 0, key: 'yes', by: 'ou_a' })).toBe('toggled');
+
+    expect(submitCustomReply({ askId, by: 'ou_b', text: '我来替你答' })).toBe('unauthorized');
+    expect(_getPending(askId)?.settled).toBe(false);
+    expect(_getPending(askId)?.selections).toEqual([['yes']]);
+
+    expect(submitCustomReply({ askId, by: 'ou_a', text: 'A 自己提交' })).toBe('accepted');
+    const result = await p;
+    expect(result.kind).toBe('answered');
+    if (result.kind === 'answered') {
+      expect(result.by).toBe('ou_a');
+      expect(result.comment).toBe('A 自己提交');
+      expect(result.answers).toEqual([[]]);
+    }
+  });
+
+  it('detaches and freezes answered results across joined waiters and retained replay', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p1 = registerAsk(makeInput({ requestId: 'req-alias' }));
+    const p2 = registerAsk(makeInput({ requestId: 'req-alias' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId, nonce } = d.sendCalls[0]!;
+    expect(tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    const replay = await registerAsk(makeInput({ requestId: 'req-alias' }));
+    if (r1.kind !== 'answered' || r2.kind !== 'answered' || replay.kind !== 'answered') {
+      throw new Error('expected answered results');
+    }
+
+    expect(r1).not.toBe(r2);
+    expect(r1).not.toBe(replay);
+    expect(Object.isFrozen(r1)).toBe(true);
+    expect(Object.isFrozen(r1.answers)).toBe(true);
+    expect(Object.isFrozen(r1.answers[0])).toBe(true);
+
+    expect(() => ((r1.answers as unknown as string[][])[0]![0] = 'no')).toThrow();
+    expect(r2.answers).toEqual([['yes']]);
+    expect(replay.answers).toEqual([['yes']]);
   });
 
   it('submitCustomReply: 空白文字 → stale，状态不变', async () => {

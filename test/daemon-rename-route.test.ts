@@ -22,7 +22,7 @@
  * Run:  pnpm vitest run test/daemon-rename-route.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -70,6 +70,7 @@ const mocks = vi.hoisted(() => {
     }),
     updateSession: vi.fn((session: any) => { sessions.set(session.sessionId, session); }),
     getSession: vi.fn((sessionId: string) => sessions.get(sessionId)),
+    getSessionFresh: vi.fn((sessionId: string) => sessions.get(sessionId)),
     closeSession: vi.fn((sessionId: string) => {
       const session = sessions.get(sessionId);
       if (session) session.status = 'closed';
@@ -145,6 +146,8 @@ vi.mock('../src/services/session-store.js', async () => {
     createSession: mocks.createSession,
     updateSession: mocks.updateSession,
     getSession: mocks.getSession,
+    getOwnedSession: mocks.getSession,
+    getSessionFresh: mocks.getSessionFresh,
     closeSession: mocks.closeSession,
   };
 });
@@ -208,6 +211,17 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
+vi.mock('../src/im/lark/workflow-slash-command.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/workflow-slash-command.js');
+  return {
+    ...actual,
+    birthWorkflowGrillRun: (input: Record<string, unknown>) => actual.birthWorkflowGrillRun({
+      ...input,
+      baseDir: `${mocks.dataDir}/v3-runs`,
+    }),
+  };
+});
+
 import { registerBot } from '../src/bot-registry.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
@@ -234,6 +248,8 @@ import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/s
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
+import { birthWorkflowGrillRun } from '../src/im/lark/workflow-slash-command.js';
+import { GRILL_STATUS_FILE, readGrillState } from '../src/workflows/v3/grill-state.js';
 
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
@@ -524,6 +540,16 @@ function botUnionIdsPath(): string {
   return join(mocks.dataDir, 'bot-union-ids.json');
 }
 
+function workflowRunsPath(): string {
+  return join(mocks.dataDir, 'v3-runs');
+}
+
+function workflowRunIds(): string[] {
+  return existsSync(workflowRunsPath())
+    ? readdirSync(workflowRunsPath()).filter(name => !name.startsWith('.'))
+    : [];
+}
+
 function seedSiblingCrossRef(): void {
   mkdirSync(mocks.dataDir, { recursive: true });
   writeFileSync(crossRefPath(), JSON.stringify({ Codex: PEER }));
@@ -601,6 +627,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.discoverAntigravitySessions.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+    mocks.getSessionFresh.mockImplementation((sessionId: string) => mocks.sessions.get(sessionId));
     activeSessions.clear();
     __testOnly_resetSessionTurnQueues();
     resetDocCommentClaims();
@@ -610,6 +637,7 @@ describe('/rename production routing — must not pre-create a session (review P
     rmSync(botsConfigPath(), { force: true });
     rmSync(botsInfoPath(), { force: true });
     rmSync(botUnionIdsPath(), { force: true });
+    rmSync(workflowRunsPath(), { recursive: true, force: true });
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -621,6 +649,7 @@ describe('/rename production routing — must not pre-create a session (review P
 
   afterEach(() => {
     rmSync(crossRefPath(), { force: true });
+    rmSync(workflowRunsPath(), { recursive: true, force: true });
   });
 
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
@@ -1653,6 +1682,212 @@ describe('/rename production routing — must not pre-create a session (review P
       expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ turnId: 'om_workflow_new' }));
       const ds = activeSessions.get(sessionKey('om_workflow_new', APP));
       expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
+      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      expect(openingPayload?.prompt ?? openingPayload?.content ?? JSON.stringify(openingPayload))
+        .toContain('daemon 已创建并绑定本话题的 run');
+      expect(openingPayload?.prompt ?? openingPayload?.content ?? JSON.stringify(openingPayload))
+        .toContain('不要再次执行 `botmux workflow new`');
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
+  it('thread reply: births a run against the existing session before forwarding the grill prompt', async () => {
+    const ds = seedThreadSession('om_workflow_thread', 'workflow thread');
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      await handleThreadReply(
+        makeEventData('om_workflow_followup', '/workflow new 收口', 'om_workflow_thread'),
+        makeCtx('om_workflow_thread', 'om_workflow_followup'),
+      );
+      const sent = JSON.stringify((ds.worker as any).send.mock.calls);
+      expect(sent).toContain('daemon 已创建并绑定本话题的 run');
+      expect(sent).toContain('不要再次执行 `botmux workflow new`');
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
+  it.each(['conflict', 'corrupt'] as const)(
+    'existing thread: %s birth failure leaves session and reply provenance unchanged',
+    async (failure) => {
+      const rootId = `om_workflow_${failure}_root`;
+      const messageId = `om_workflow_${failure}_message`;
+      const ds = seedThreadSession(rootId, 'workflow failure');
+      ds.worker = { killed: false, send: vi.fn() } as any;
+      ds.lastMessageAt = 1_700_000_000_000;
+      ds.lastHumanMessageAt = 1_700_000_000_000;
+      Object.assign(ds.session, {
+        lastMessageAt: '2023-11-14T22:13:20.000Z',
+        lastHumanMessageAt: '2023-11-14T22:13:20.000Z',
+        quoteTargetId: 'om_previous_quote',
+        quoteTargetSenderOpenId: 'ou_previous_caller',
+        quoteTargetSenderIsBot: true,
+        lastCallerOpenId: 'ou_previous_caller',
+        replyTargets: {
+          om_previous_turn: {
+            updatedAt: '2023-11-14T22:13:20.000Z',
+            senderOpenId: 'ou_previous_caller',
+            participants: [{ openId: 'ou_previous_caller' }],
+          },
+        },
+        turnReplyContexts: {
+          om_previous_turn: {
+            target: { mode: 'thread', rootMessageId: rootId },
+            quoteTargetId: 'om_previous_quote',
+          },
+        },
+      });
+      const before = structuredClone({
+        lastMessageAt: ds.lastMessageAt,
+        lastHumanMessageAt: ds.lastHumanMessageAt,
+        session: ds.session,
+      });
+      const existing = birthWorkflowGrillRun({
+        goal: failure === 'conflict' ? '不同目标' : '会失败的目标',
+        larkAppId: APP, chatId: CHAT, chatType: 'group', rootMessageId: rootId,
+        sessionId: ds.session.sessionId, ownerOpenId: OWNER, messageId,
+      });
+      if (failure === 'corrupt') {
+        writeFileSync(
+          join(workflowRunsPath(), existing.runId, GRILL_STATUS_FILE),
+          '{"schemaVersion":"invalid"}',
+        );
+      }
+
+      process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+      try {
+        await handleThreadReply(
+          makeEventData(messageId, '/workflow new 会失败的目标', rootId),
+          makeCtx(rootId, messageId),
+        );
+
+        expect(repliedText()).toContain(
+          failure === 'conflict'
+            ? `workflow_ingress_run_conflict:${existing.runId}`
+            : `workflow_ingress_run_corrupt:${existing.runId}`,
+        );
+        expect((ds.worker as any).send).not.toHaveBeenCalled();
+        expect(mocks.updateSession).not.toHaveBeenCalled();
+        expect({
+          lastMessageAt: ds.lastMessageAt,
+          lastHumanMessageAt: ds.lastHumanMessageAt,
+          session: ds.session,
+        }).toEqual(before);
+      } finally {
+        delete process.env.BOTMUX_WORKFLOW_ENABLED;
+      }
+    },
+  );
+
+  it.each([
+    ['new topic', false],
+    ['thread auto-create', true],
+  ])('%s: an invalid working directory leaves no run and the same message can be retried', async (_label, asReply) => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    const missing = join(mocks.dataDir, 'missing-workflow-cwd');
+    const messageId = asReply ? 'om_workflow_retry_reply' : 'om_workflow_retry_new';
+    const rootId = asReply ? 'om_workflow_retry_root' : messageId;
+    const invoke = () => asReply
+      ? handleThreadReply(makeEventData(messageId, '/workflow new 可恢复收口', rootId), makeCtx(rootId, messageId))
+      : handleNewTopic(makeEventData(messageId, '/workflow new 可恢复收口'), makeCtx(rootId, messageId));
+    try {
+      let bot = registerBot({
+        larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code',
+        allowedUsers: [OWNER], workingDirs: [missing],
+      });
+      bot.resolvedAllowedUsers = [OWNER];
+
+      await invoke();
+      expect(workflowRunIds()).toEqual([]);
+      expect(activeSessions.size).toBe(0);
+
+      bot = registerBot({
+        larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code',
+        allowedUsers: [OWNER], defaultWorkingDir: '/tmp',
+      });
+      bot.resolvedAllowedUsers = [OWNER];
+      await invoke();
+
+      expect(workflowRunIds()).toHaveLength(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
+  it.each([
+    ['new topic', 'new'],
+    ['existing thread', 'existing'],
+    ['thread auto-create', 'auto'],
+  ])('%s: rebinds an untouched run only after the previous session is durably closed', async (_label, route) => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    const messageId = `om_workflow_rebind_${route}`;
+    const rootId = route === 'new' ? messageId : `om_workflow_rebind_root_${route}`;
+    const oldSessionId = `sess-closed-${route}`;
+    mocks.sessions.set(oldSessionId, { sessionId: oldSessionId, status: 'closed', larkAppId: APP });
+    const original = birthWorkflowGrillRun({
+      goal: '可恢复收口', larkAppId: APP, chatId: CHAT, chatType: 'group',
+      rootMessageId: rootId, sessionId: oldSessionId, ownerOpenId: OWNER, messageId,
+    });
+    try {
+      let expectedSession: DaemonSession | undefined;
+      if (route === 'existing') {
+        expectedSession = seedThreadSession(rootId, 'workflow rebind');
+        expectedSession.worker = { killed: false, send: vi.fn() } as any;
+        await handleThreadReply(
+          makeEventData(messageId, '/workflow new 可恢复收口', rootId),
+          makeCtx(rootId, messageId),
+        );
+      } else if (route === 'auto') {
+        await handleThreadReply(
+          makeEventData(messageId, '/workflow new 可恢复收口', rootId),
+          makeCtx(rootId, messageId),
+        );
+        expectedSession = activeSessions.get(sessionKey(rootId, APP));
+      } else {
+        await handleNewTopic(
+          makeEventData(messageId, '/workflow new 可恢复收口'),
+          makeCtx(rootId, messageId),
+        );
+        expectedSession = activeSessions.get(sessionKey(rootId, APP));
+      }
+
+      const state = readGrillState(join(workflowRunsPath(), original.runId));
+      expect(state?.chatBinding?.sessionId).toBe(expectedSession?.session.sessionId);
+      expect(state?.ingressRebindings).toEqual([expect.objectContaining({
+        previousSessionId: oldSessionId,
+        newSessionId: expectedSession?.session.sessionId,
+        reason: 'previous_session_closed_before_execution',
+      })]);
+      expect(workflowRunIds()).toEqual([original.runId]);
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
+  it('rejects rebind when the owned cache is closed but the fresh durable row is active', async () => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    const messageId = 'om_workflow_stale_closed';
+    const rootId = messageId;
+    const oldSessionId = 'sess-stale-closed';
+    mocks.sessions.set(oldSessionId, { sessionId: oldSessionId, status: 'closed', larkAppId: APP });
+    const original = birthWorkflowGrillRun({
+      goal: '可恢复收口', larkAppId: APP, chatId: CHAT, chatType: 'group',
+      rootMessageId: rootId, sessionId: oldSessionId, ownerOpenId: OWNER, messageId,
+    });
+    mocks.getSessionFresh.mockReturnValue({ sessionId: oldSessionId, status: 'active', larkAppId: APP });
+    try {
+      await handleNewTopic(
+        makeEventData(messageId, '/workflow new 可恢复收口'),
+        makeCtx(rootId, messageId),
+      );
+      const state = readGrillState(join(workflowRunsPath(), original.runId));
+      expect(state?.chatBinding?.sessionId).toBe(oldSessionId);
+      expect(state?.ingressRebindings).toBeUndefined();
+      expect(repliedText()).toContain(`workflow_ingress_run_conflict:${original.runId}`);
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
     } finally {
       delete process.env.BOTMUX_WORKFLOW_ENABLED;
     }

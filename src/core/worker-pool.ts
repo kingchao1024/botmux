@@ -30,8 +30,9 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageDetail, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, terminalMultiUrl } from '../im/lark/card-builder.js';
+import { BOTMUX_CALLBACK_MARKER_KEY } from '../im/lark/callback-button-marker.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
@@ -804,6 +805,22 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
+  ) => void | Promise<void>;
+  /** Exact worker-generation input commit. Optional sidecars must never alter acceptance. */
+  onTurnInputCommitted?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number },
+  ) => void | Promise<void>;
+  /** First exact working edge for a worker turn. */
+  onTurnExecutionStarted?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number },
+  ) => void | Promise<void>;
+  /** A canonical final-output provider receipt, emitted only after the actual
+   * Lark reply/comment send succeeds for the current worker generation. */
+  onTurnDeliveryReceipt?: (
+    ds: DaemonSession,
+    context: { sessionId: string; turnId: string; workerGeneration: number; destinationId: string; receiptRef: string; docToken?: string },
   ) => void | Promise<void>;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
@@ -2926,6 +2943,89 @@ function ownsCurrentStreamingCard(ds: DaemonSession, messageId: string): boolean
   if (ds.session.status !== 'active' || ds.streamCardId !== messageId || isSessionTransferring(ds)) return false;
   if (remoteRetirementAdmissionPhase(ds) !== null || !retainsLarkStreamingCardTransport(ds)) return false;
   return ownsActiveStreamingCardRegistrySlot(ds);
+}
+
+function hasCurrentStreamingCardIdentity(
+  value: unknown,
+  ds: DaemonSession,
+): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(item => hasCurrentStreamingCardIdentity(item, ds));
+  const record = value as Record<string, unknown>;
+  const matches = (payload: unknown): boolean => {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    const fields = payload as Record<string, unknown>;
+    return fields[BOTMUX_CALLBACK_MARKER_KEY] === 1
+      && fields.session_id === ds.session.sessionId
+      && fields.root_id === sessionAnchorId(ds)
+      && typeof ds.streamCardNonce === 'string'
+      && fields.card_nonce === ds.streamCardNonce;
+  };
+  if (record.tag === 'button' && (matches(record.value)
+    || (Array.isArray(record.behaviors) && record.behaviors.some(behavior => {
+      if (!behavior || typeof behavior !== 'object' || Array.isArray(behavior)) return false;
+      const callback = behavior as Record<string, unknown>;
+      return callback.type === 'callback' && matches(callback.value);
+    })))) return true;
+  return Object.values(record).some(item => hasCurrentStreamingCardIdentity(item, ds));
+}
+
+function urlCarriesViewCapability(value: unknown): boolean {
+  if (typeof value !== 'string' || !value) return false;
+  try {
+    const url = new URL(value);
+    if (url.searchParams.has('viewToken')) return true;
+    const nested = url.searchParams.get('url');
+    return nested ? urlCarriesViewCapability(nested) : false;
+  } catch {
+    return false;
+  }
+}
+
+function replaceSingleTerminalViewUrl(value: unknown, url: string): boolean {
+  const candidates: Array<Record<string, unknown>> = [];
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    const record = node as Record<string, unknown>;
+    if (record.tag === 'button' && record.multi_url && typeof record.multi_url === 'object'
+      && Object.values(record.multi_url as Record<string, unknown>).some(urlCarriesViewCapability)) {
+      candidates.push(record);
+    }
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(value);
+  if (candidates.length !== 1) return false;
+  candidates[0].multi_url = terminalMultiUrl(url);
+  return true;
+}
+
+/** Preserve the card's visible state while rotating its per-worker read link. */
+async function refreshSilentRecoveryTerminalLink(ds: DaemonSession): Promise<void> {
+  const cardId = ds.streamCardId;
+  const viewUrl = readableTerminalUrlFor(ds);
+  const viewToken = ds.workerViewToken;
+  if (!cardId || cardId === CARD_POSTING_SENTINEL || !viewUrl || !viewToken
+    || !ds.suppressRecoveryCard || !ownsCurrentStreamingCard(ds, cardId)) return;
+  try {
+    const detail = await getMessageDetail(ds.larkAppId, cardId);
+    const item = detail?.items?.[0];
+    const sender = item?.sender;
+    const content = item?.body?.content ?? detail?.body?.content;
+    if (item?.message_id !== cardId || item?.chat_id !== ds.chatId || item?.msg_type !== 'interactive'
+      || sender?.sender_type !== 'app' || sender?.id_type !== 'app_id' || sender?.id !== ds.larkAppId
+      || typeof content !== 'string') return;
+    const card = JSON.parse(content) as unknown;
+    if (!hasCurrentStreamingCardIdentity(card, ds) || !replaceSingleTerminalViewUrl(card, viewUrl)) return;
+    if (!ds.suppressRecoveryCard || ds.workerViewToken !== viewToken
+      || !ownsCurrentStreamingCard(ds, cardId)) return;
+    scheduleCardPatch(ds, JSON.stringify(card));
+  } catch (err) {
+    logger.debug(`[${tag(ds)}] silent recovery terminal-link refresh skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function pinStreamingCardEnabled(ds: DaemonSession): boolean {
@@ -11887,6 +11987,11 @@ function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string |
   return pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
 }
 
+function currentGatewaySenderKind(ds: DaemonSession, turnId: string): 'human' | 'bot' | undefined {
+  const senderIsBot = frozenReplyContextForTurn(ds, turnId).replyTargetSenderIsBot;
+  return senderIsBot === true ? 'bot' : senderIsBot === false ? 'human' : undefined;
+}
+
 function currentTurnProcessIdentities(
   ds: DaemonSession,
   turnId: string | undefined,
@@ -12239,6 +12344,8 @@ function setupWorkerHandlers(
         } else {
           logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
+        void Promise.resolve(cb.onTurnInputCommitted?.(ds, { turnId: msg.turnId, workerGeneration }))
+          .catch(error => logger.warn(`[${t}] task-control input-commit sidecar failed: ${String(error)}`));
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
           void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
@@ -12447,14 +12554,14 @@ function setupWorkerHandlers(
         }
 
         // Restart recovery: stay silent in the group. The session was restored
-        // after a daemon restart; don't auto-post/patch a streaming card here.
-        // The owner gets a private DM summary instead, and the surviving card
-        // (if any) is left untouched. The next real user turn clears this flag
-        // (rememberLastCliInput) and the normal card flow resumes.
+        // after a daemon restart; don't auto-post or re-render card state here.
+        // Refresh only a proven surviving card's per-worker terminal capability.
+        // The next real user turn clears this flag (rememberLastCliInput) and the
+        // normal card flow resumes.
         if (ds.suppressRecoveryCard) {
-          // Startup Pin recovery owns the only safe provenance decision for a
-          // persisted current card. Re-pinning here can race ahead of its list
-          // proof and claim a human/foreign collision through idempotent create.
+          // Do not re-pin here: Pin recovery owns that separate provenance
+          // decision. The URL refresh proves the message/card identity itself.
+          void refreshSilentRecoveryTerminalLink(ds);
           logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
         }
@@ -13026,6 +13133,10 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
+          if (ds.lastScreenStatus === 'working' && msg.turnId) {
+            void Promise.resolve(cb.onTurnExecutionStarted?.(ds, { turnId: msg.turnId, workerGeneration }))
+              .catch(error => logger.warn(`[${t}] task-control execution sidecar failed: ${String(error)}`));
+          }
           // fresh:true —— 这是「状态边沿触发的 refresh 读」，transcript 此刻刚追加完
           // 本轮输出。绕过 resolver 对懒创建 rollout 的 30s miss 负缓存，否则首轮
           // (spawn 时 rollout 还没落盘)徽标要等 30s 后某次边沿才出现。
@@ -14662,6 +14773,9 @@ function setupWorkerHandlers(
           ...((msg.turnId && currentGatewayCallerOpenId(ds, msg.turnId))
             ? { callerOpenId: currentGatewayCallerOpenId(ds, msg.turnId) }
             : {}),
+          ...((msg.turnId && currentGatewaySenderKind(ds, msg.turnId))
+            ? { senderKind: currentGatewaySenderKind(ds, msg.turnId) }
+            : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }
             : {}),
@@ -15529,11 +15643,29 @@ function deliverFinalOutput(
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
+  inheritedReceiptOwner?: {
+    sessionId: string; workerGeneration: number; worker: ChildProcess | null; dispatchRootMessageId?: string;
+  },
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
     return;
   }
+  // A provider reply may resolve after a replacement worker has taken over this
+  // DaemonSession.  The sidecar receipt is a generation-scoped authorization
+  // fact, so capture the exact owner before any provider await and never derive
+  // it later from mutable `ds` fields.
+  const receiptOwner = inheritedReceiptOwner ?? {
+    sessionId: ds.session.sessionId,
+    workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+    worker: ds.worker,
+    dispatchRootMessageId: ds.session.rootMessageId,
+  };
+  const ownsReceiptOwner = (): boolean => isStillOwned()
+    && ds.session.sessionId === receiptOwner.sessionId
+    && ds.worker === receiptOwner.worker
+    && (ds.workerGeneration ?? ds.session.workerGeneration ?? 0) === receiptOwner.workerGeneration
+    && (ds.session.workerGeneration ?? receiptOwner.workerGeneration) === receiptOwner.workerGeneration;
   let cardUsage = frozenUsage;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
@@ -15611,10 +15743,28 @@ function deliverFinalOutput(
         // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
         const chunks = chunkCommentText(msg.content);
+        let providerReceipt: { destinationId: string; receiptRef: string } | undefined;
         for (let i = 0; i < chunks.length; i++) {
-          if (!isStillOwned()) { onComplete?.(false); return; }
-          await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
-          if (!isStillOwned()) { onComplete?.(false); return; }
+          if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+          const result = await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
+          // Older adapters/mocks returned void after a successful provider send.
+          // Receipt enrichment is optional; delivery cleanup/dedupe remains the
+          // pre-existing success path when no structured receipt is available.
+          if (i === 0 && result) {
+            const commentId = result.commentId ?? docTurn.commentId;
+            const receiptId = result.replyId ?? commentId;
+            if (commentId && receiptId) providerReceipt = { destinationId: `task-comment:${commentId}`, receiptRef: `task-comment:${receiptId}` };
+          }
+          if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+        }
+        if (providerReceipt) {
+          // The provider accepted the comment, but a newer worker now owns the
+          // session. Never let the old receipt settle the new generation.
+          if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+          void Promise.resolve(cb.onTurnDeliveryReceipt?.(ds, {
+            sessionId: receiptOwner.sessionId, turnId: msg.turnId, workerGeneration: receiptOwner.workerGeneration,
+            ...providerReceipt, docToken: docTurn.fileToken,
+          })).catch(error => logger.warn(`[${t}] task-control doc delivery receipt sidecar failed: ${String(error)}`));
         }
         // The user-visible reply is committed. Consume the route and dedupe
         // marker BEFORE best-effort reaction cleanup: a missing/expired
@@ -16009,6 +16159,17 @@ function deliverFinalOutput(
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
           : deliveryReplyOptions,
       );
+      // `scopedReply` can cross an arbitrary provider await. The visible reply
+      // is already accepted, but a receipt from the old owner must not be
+      // projected into a replacement worker generation.
+      if (!ownsReceiptOwner()) { onComplete?.(false); return; }
+      void Promise.resolve(cb.onTurnDeliveryReceipt?.(ds, {
+        sessionId: receiptOwner.sessionId, turnId: msg.turnId, workerGeneration: receiptOwner.workerGeneration,
+        // The dispatch/topic root is the controlled delivery destination; the
+        // newly returned final-output message id is an independent provider
+        // receipt. Never use a readable topic root as its own receipt.
+        destinationId: `topic-message:${receiptOwner.dispatchRootMessageId ?? messageId}`, receiptRef: `topic-message:${messageId}`,
+      })).catch(error => logger.warn(`[${t}] task-control final delivery receipt sidecar failed: ${String(error)}`));
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       if (msg.turnId.startsWith('mlrp_turn_')) {
@@ -16072,7 +16233,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, receiptOwner);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }

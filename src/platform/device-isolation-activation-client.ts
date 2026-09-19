@@ -15,11 +15,23 @@ import {
   deviceCredentialIsolationMarkerPath,
 } from '../adapters/cli/read-isolation.js';
 import {
+  ASK_RECEIPT_AUTHORITY_VERSION,
   completeDeviceCredentialIsolationMarker,
+  deviceCredentialIsolationMarkerEnablesAskReceiptAuthority,
   ensureDeviceCredentialIsolationMarker,
+  MAX_MARKER_BYTES,
+  prepareDeviceCredentialIsolationMarkerCompletion,
   readDeviceCredentialIsolationMarker,
+  withDeviceCredentialIsolationActivationLock,
   type DeviceIsolationActivationOptions,
 } from './device-isolation.js';
+import { listBlockingDeviceIsolationStartupIntents } from '../services/device-isolation-startup-intent-store.js';
+import { withBotsJsonLock } from '../setup/bots-store.js';
+import {
+  readDeviceIsolationRosterSnapshot,
+  sameDeviceIsolationRoster,
+  type DeviceIsolationRosterSnapshot,
+} from '../services/device-isolation-roster.js';
 import {
   readSecureHostFileSync,
   writeSecureHostFileSync,
@@ -41,6 +53,7 @@ export class DeviceIsolationDaemonActivationError extends Error {
 interface ActivationDaemonIdentity {
   larkAppId: string;
   bootInstanceId: string;
+  rosterRevision: string;
   pid: number;
   procStart: string;
   dataDir: string;
@@ -49,6 +62,8 @@ interface ActivationDaemonIdentity {
 interface ActivationResponse {
   ok: true;
   activationVersion: typeof DEVICE_ISOLATION_ACTIVATION_VERSION;
+  receiptAuthorityVersion: typeof ASK_RECEIPT_AUTHORITY_VERSION;
+  receiptAuthorityProtocolVersion: 1;
   nonce: string;
   leaseId: string;
   expiresAt: number;
@@ -68,10 +83,74 @@ export interface DeviceIsolationActivationClientDependencies {
   nonceFactory?: () => string;
   expectedDataDir?: string;
   now?: () => Date;
+  readRoster?: (configPath?: string) => DeviceIsolationRosterSnapshot;
+  beforeActive?: () => void | Promise<void>;
 }
 
 export interface ActivateDeviceIsolationOptions extends DeviceIsolationActivationOptions {
   dependencies?: DeviceIsolationActivationClientDependencies;
+}
+
+function daemonMembershipKey(daemon: OnlineDaemonInfo): string | null {
+  return daemon.bootInstanceId
+    && daemon.processStartIdentity
+    && Number.isSafeInteger(daemon.pid)
+    && (daemon.pid ?? 0) > 1
+    ? [
+        daemon.larkAppId,
+        daemon.bootInstanceId,
+        String(daemon.pid),
+        daemon.processStartIdentity,
+        daemon.rosterRevision,
+        String(daemon.ipcPort),
+      ].join('\u0000')
+    : null;
+}
+
+function stableDaemonMembershipKeys(daemons: readonly OnlineDaemonInfo[]): string[] {
+  const keys = daemons.map(daemonMembershipKey);
+  if (keys.some((key): key is null => key === null)) {
+    throw new DeviceIsolationDaemonActivationError('发现不支持共享锁握手的旧 daemon；请先全部重启升级');
+  }
+  return keys.filter((key): key is string => key !== null)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function sameDaemonMembership(
+  left: readonly OnlineDaemonInfo[],
+  right: readonly OnlineDaemonInfo[],
+): boolean {
+  const leftKeys = stableDaemonMembershipKeys(left);
+  const rightKeys = stableDaemonMembershipKeys(right);
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) => key === rightKeys[index]);
+}
+
+function exactRosterMembership(
+  roster: DeviceIsolationRosterSnapshot,
+  daemons: readonly OnlineDaemonInfo[],
+): boolean {
+  const seen = new Set<string>();
+  for (const daemon of daemons) {
+    if (daemon.rosterRevision !== roster.revision) return false;
+    if (seen.has(daemon.larkAppId)) return false;
+    seen.add(daemon.larkAppId);
+  }
+  return seen.size === roster.appIds.length
+    && roster.appIds.every(appId => seen.has(appId));
+}
+
+function assertNoStartingOrRosterMismatch(input: {
+  homeDir: string;
+  roster: DeviceIsolationRosterSnapshot;
+  daemons: readonly OnlineDaemonInfo[];
+}): void {
+  const starting = listBlockingDeviceIsolationStartupIntents({ homeDir: input.homeDir });
+  const startingApps = new Set(starting.map(intent => intent.larkAppId));
+  if (starting.length > 0 || startingApps.size !== starting.length
+      || !exactRosterMembership(input.roster, input.daemons)) {
+    throw new DeviceIsolationDaemonActivationError('daemon 拒绝设备隔离激活：inventory_changed');
+  }
 }
 
 function markerDigest(raw: string): string {
@@ -107,6 +186,8 @@ function parseActivationResponse(value: unknown): ActivationResponse {
   if (
     record.ok !== true
     || record.activationVersion !== DEVICE_ISOLATION_ACTIVATION_VERSION
+    || record.receiptAuthorityVersion !== ASK_RECEIPT_AUTHORITY_VERSION
+    || record.receiptAuthorityProtocolVersion !== 1
     || typeof record.nonce !== 'string'
     || typeof record.leaseId !== 'string'
     || !record.leaseId
@@ -126,6 +207,8 @@ function parseActivationResponse(value: unknown): ActivationResponse {
     || !identity.larkAppId
     || typeof identity.bootInstanceId !== 'string'
     || !identity.bootInstanceId
+    || typeof identity.rosterRevision !== 'string'
+    || !/^[a-f0-9]{64}$/.test(identity.rosterRevision)
     || typeof identity.pid !== 'number'
     || !Number.isSafeInteger(identity.pid)
     || identity.pid <= 1
@@ -139,6 +222,8 @@ function parseActivationResponse(value: unknown): ActivationResponse {
   return {
     ok: true,
     activationVersion: DEVICE_ISOLATION_ACTIVATION_VERSION,
+    receiptAuthorityVersion: ASK_RECEIPT_AUTHORITY_VERSION,
+    receiptAuthorityProtocolVersion: 1,
     nonce: record.nonce,
     leaseId: record.leaseId,
     expiresAt: record.expiresAt,
@@ -157,7 +242,12 @@ function canonicalExistingDirectory(path: string): string {
 function verifyDaemonIdentity(
   descriptor: OnlineDaemonInfo,
   response: ActivationResponse,
-  input: { nonce: string; expectedDataDir: string; processStart: (pid: number) => string | undefined },
+  input: {
+    nonce: string;
+    expectedDataDir: string;
+    expectedRosterRevision: string;
+    processStart: (pid: number) => string | undefined;
+  },
 ): void {
   const daemon = response.daemon;
   if (
@@ -165,6 +255,8 @@ function verifyDaemonIdentity(
     || descriptor.larkAppId !== daemon.larkAppId
     || !descriptor.bootInstanceId
     || descriptor.bootInstanceId !== daemon.bootInstanceId
+    || descriptor.rosterRevision !== input.expectedRosterRevision
+    || daemon.rosterRevision !== descriptor.rosterRevision
     || descriptor.pid !== daemon.pid
     || input.processStart(daemon.pid) !== daemon.procStart
     || canonicalExistingDirectory(daemon.dataDir) !== input.expectedDataDir
@@ -209,6 +301,7 @@ async function postActivation(
 async function bestEffortRelease(
   prepared: readonly PreparedDaemon[],
   nonce: string,
+  rosterRevision: string,
   markerSha256: string,
   fetchDaemon: typeof fetchDaemonIpc,
 ): Promise<void> {
@@ -218,6 +311,7 @@ async function bestEffortRelease(
     {
       activationVersion: DEVICE_ISOLATION_ACTIVATION_VERSION,
       nonce,
+      rosterRevision,
       leaseId: response.leaseId,
       abort: true,
       ...(markerSha256 ? { markerSha256 } : {}),
@@ -236,6 +330,16 @@ function isInventoryChangedActivationError(error: unknown): boolean {
     && /inventory_changed/.test(error.message);
 }
 
+function readActivationRoster(
+  dependencies: DeviceIsolationActivationClientDependencies,
+  homeDir: string,
+  configPath?: string,
+): DeviceIsolationRosterSnapshot {
+  if (dependencies.readRoster) return dependencies.readRoster(configPath);
+  if (configPath) return readDeviceIsolationRosterSnapshot({ configPath });
+  return readDeviceIsolationRosterSnapshot({ homeDir });
+}
+
 /**
  * Establish the one-way marker without leaving a legacy local CLI capable of
  * reading the first grant journal/device token. Existing valid markers are a
@@ -246,10 +350,10 @@ export async function activateDeviceCredentialIsolation(
 ): Promise<{ activated: boolean; daemonCount: number; markerSha256: string }> {
   const homeDir = options.homeDir ?? homedir();
   const markerPath = deviceCredentialIsolationMarkerPath(homeDir);
-  const existing = readSecureHostFileSync(markerPath, 4 * 1024);
+  const existing = readSecureHostFileSync(markerPath, MAX_MARKER_BYTES);
   if (existing !== null) {
     const marker = readDeviceCredentialIsolationMarker(options);
-    if (marker?.state === 'active') {
+    if (deviceCredentialIsolationMarkerEnablesAskReceiptAuthority(marker)) {
       return { activated: false, daemonCount: 0, markerSha256: markerDigest(existing) };
     }
     // PENDING (including a safe legacy marker without an explicit state) means
@@ -257,29 +361,48 @@ export async function activateDeviceCredentialIsolation(
     // old process was quiesced. Continue the full daemon transaction.
   }
 
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= MAX_ACTIVATION_INVENTORY_RETRIES; attempt += 1) {
-    try {
-      return await runDeviceCredentialIsolationActivationAttempt(options, homeDir, markerPath);
-    } catch (error) {
-      lastError = error;
-      if (attempt >= MAX_ACTIVATION_INVENTORY_RETRIES || !isInventoryChangedActivationError(error)) {
-        throw error;
+  const dependencies = options.dependencies ?? {};
+  const preLockRoster = readActivationRoster(dependencies, homeDir);
+  // Fixed host-wide order: exact bots-config writer lock -> activation gate.
+  // This matches start/restart, which holds the config lock while a child takes
+  // the activation gate, and keeps R1 pinned across every awaited daemon phase.
+  return withBotsJsonLock(preLockRoster.requestedConfigPath, (lockedConfigPath, assertTargetStable) =>
+    withDeviceCredentialIsolationActivationLock(async () => {
+      const readLockedRoster = (): DeviceIsolationRosterSnapshot =>
+        readActivationRoster(dependencies, homeDir, lockedConfigPath);
+      if (!sameDeviceIsolationRoster(preLockRoster, readLockedRoster())) {
+        throw new DeviceIsolationDaemonActivationError('daemon 拒绝设备隔离激活：inventory_changed');
       }
-      // Marker may remain PENDING after the failed attempt; that is intentional
-      // and the next attempt continues the one-way transition from there.
-    }
-  }
-  throw lastError;
+      let lastError: unknown;
+      for (let attempt = 0; attempt <= MAX_ACTIVATION_INVENTORY_RETRIES; attempt += 1) {
+        try {
+          return await runDeviceCredentialIsolationActivationAttempt(
+            options, homeDir, markerPath, readLockedRoster, assertTargetStable,
+          );
+        } catch (error) {
+          lastError = error;
+          if (attempt >= MAX_ACTIVATION_INVENTORY_RETRIES || !isInventoryChangedActivationError(error)) {
+            throw error;
+          }
+          // Marker may remain PENDING after the failed attempt; that is intentional
+          // and the next attempt continues the one-way transition from there.
+        }
+      }
+      throw lastError;
+    }, { homeDir }), { caller: 'device-isolation', operation: 'startup-admission' });
 }
 
 async function runDeviceCredentialIsolationActivationAttempt(
   options: ActivateDeviceIsolationOptions,
   homeDir: string,
   markerPath: string,
+  readRoster: () => DeviceIsolationRosterSnapshot,
+  assertConfigTargetStable: () => void,
 ): Promise<{ activated: boolean; daemonCount: number; markerSha256: string }> {
   const deps = options.dependencies ?? {};
   const daemons = (deps.listDaemons ?? listOnlineDaemons)();
+  const initialRoster = readRoster();
+  assertNoStartingOrRosterMismatch({ homeDir, roster: initialRoster, daemons });
   if (daemons.length === 0) {
     throw new DeviceIsolationDaemonActivationError(
       '未发现运行中的新版 botmux daemon；请先启动 daemon，再执行设备注册',
@@ -293,13 +416,16 @@ async function runDeviceCredentialIsolationActivationAttempt(
     throw new DeviceIsolationDaemonActivationError('设备隔离激活 nonce 无效');
   }
   const fetchDaemon = deps.fetchDaemon ?? fetchDaemonIpc;
+  const listDaemons = deps.listDaemons ?? listOnlineDaemons;
   const processStart = deps.processStart ?? readProcessStartIdentity;
   const expectedDataDir = canonicalExistingDirectory(
     deps.expectedDataDir ?? resolveBotmuxDataDir({ env: {}, homeDir }),
   );
+  const initialMembership = stableDaemonMembershipKeys(daemons);
   const prepared: PreparedDaemon[] = [];
   let markerRaw = '';
   let markerSha256 = '';
+  const activationEpoch = nonce;
   try {
     // Sequential collection makes partial failure cleanup deterministic. Every
     // successful prepare freezes that daemon before the next is contacted.
@@ -307,40 +433,97 @@ async function runDeviceCredentialIsolationActivationAttempt(
       const response = await postActivation(descriptor, PREPARE_PATH, {
         activationVersion: DEVICE_ISOLATION_ACTIVATION_VERSION,
         nonce,
+        rosterRevision: initialRoster.revision,
       }, fetchDaemon);
       prepared.push({ descriptor, response });
-      verifyDaemonIdentity(descriptor, response, { nonce, expectedDataDir, processStart });
+      verifyDaemonIdentity(descriptor, response, {
+        nonce, expectedDataDir, expectedRosterRevision: initialRoster.revision, processStart,
+      });
     }
 
     ensureDeviceCredentialIsolationMarker(options);
-    markerRaw = readSecureHostFileSync(markerPath, 4 * 1024)
+    markerRaw = readSecureHostFileSync(markerPath, MAX_MARKER_BYTES)
       ?? (() => { throw new DeviceIsolationDaemonActivationError('设备隔离 marker 写入后不可读'); })();
     // Rewrite and read back through the strict primitive so the commit is
     // crash-durable even when a pre-created marker came from an interrupted run.
-    writeSecureHostFileSync(markerPath, markerRaw);
-    markerRaw = readSecureHostFileSync(markerPath, 4 * 1024)
+    writeSecureHostFileSync(markerPath, markerRaw, MAX_MARKER_BYTES);
+    markerRaw = readSecureHostFileSync(markerPath, MAX_MARKER_BYTES)
       ?? (() => { throw new DeviceIsolationDaemonActivationError('设备隔离 marker durable 复读失败'); })();
     markerSha256 = markerDigest(markerRaw);
+    const receiptAuthorityProof = {
+      activationEpoch,
+      protocolVersion: 1 as const,
+      participants: prepared.map(({ response }) => ({
+        larkAppId: response.daemon.larkAppId,
+        bootInstanceId: response.daemon.bootInstanceId,
+        pid: response.daemon.pid,
+        procStart: response.daemon.procStart,
+      })),
+    };
+    // Construct and validate the exact final bytes before any COMMIT can make
+    // the one-way transition irreversible. Invalid/oversized fleets leave the
+    // existing PENDING marker byte-for-byte unchanged.
+    const preparedMarker = prepareDeviceCredentialIsolationMarkerCompletion({
+      ...options,
+      receiptAuthorityProof,
+    });
+    const beforeActiveDaemons = listDaemons();
+    const beforeActiveRoster = readRoster();
+    if (!sameDeviceIsolationRoster(initialRoster, beforeActiveRoster)) {
+      throw new DeviceIsolationDaemonActivationError('daemon 拒绝设备隔离激活：inventory_changed');
+    }
+    assertNoStartingOrRosterMismatch({
+      homeDir, roster: beforeActiveRoster, daemons: beforeActiveDaemons,
+    });
+    if (!sameDaemonMembership(daemons, beforeActiveDaemons)) {
+      throw new DeviceIsolationDaemonActivationError('daemon 拒绝设备隔离激活：inventory_changed');
+    }
+    const beforeActiveMembership = stableDaemonMembershipKeys(beforeActiveDaemons);
+    if (!beforeActiveMembership.every((key, index) => key === initialMembership[index])) {
+      throw new DeviceIsolationDaemonActivationError('daemon 拒绝设备隔离激活：inventory_changed');
+    }
 
     const commitResults = await Promise.allSettled(prepared.map(async (item) => {
       const committed = await postActivation(item.descriptor, COMMIT_PATH, {
         activationVersion: DEVICE_ISOLATION_ACTIVATION_VERSION,
         nonce,
+        rosterRevision: initialRoster.revision,
         leaseId: item.response.leaseId,
         markerSha256,
       }, fetchDaemon);
-      verifyDaemonIdentity(item.descriptor, committed, { nonce, expectedDataDir, processStart });
+      verifyDaemonIdentity(item.descriptor, committed, {
+        nonce, expectedDataDir, expectedRosterRevision: initialRoster.revision, processStart,
+      });
     }));
     const commitFailure = commitResults.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     );
     if (commitFailure) throw commitFailure.reason;
 
-    // All legacy processes are now gone. Only now may the one-way marker become
-    // ACTIVE; an interrupted PENDING attempt can never short-circuit a retry.
-    completeDeviceCredentialIsolationMarker(options);
-    const finalRaw = readSecureHostFileSync(markerPath, 4 * 1024);
-    if (finalRaw === null || readDeviceCredentialIsolationMarker(options)?.state !== 'active') {
+    await deps.beforeActive?.();
+    // The outer bots-config writer lock is still held here. Final roster and
+    // daemon checks plus ACTIVE publication are synchronous and indivisible
+    // with respect to every supported bots.json writer.
+    const finalRoster = readRoster();
+    const finalDaemons = listDaemons();
+    if (!sameDeviceIsolationRoster(initialRoster, finalRoster)
+        || !sameDaemonMembership(daemons, finalDaemons)) {
+      throw new DeviceIsolationDaemonActivationError('daemon 拒绝设备隔离激活：inventory_changed');
+    }
+    assertNoStartingOrRosterMismatch({ homeDir, roster: finalRoster, daemons: finalDaemons });
+    // This is the activation linearization check: alias drift observed before
+    // it aborts while the marker is still PENDING. The lock's post-callback
+    // check remains defense-in-depth after the irreversible ACTIVE transition.
+    assertConfigTargetStable();
+    completeDeviceCredentialIsolationMarker({
+      ...options,
+      receiptAuthorityProof,
+      preparedMarker,
+    });
+    const finalRaw = readSecureHostFileSync(markerPath, MAX_MARKER_BYTES);
+    if (finalRaw === null || !deviceCredentialIsolationMarkerEnablesAskReceiptAuthority(
+      readDeviceCredentialIsolationMarker(options),
+    )) {
       throw new DeviceIsolationDaemonActivationError('设备隔离 marker 最终复验失败');
     }
     markerSha256 = markerDigest(finalRaw);
@@ -349,10 +532,13 @@ async function runDeviceCredentialIsolationActivationAttempt(
       const released = await postActivation(item.descriptor, RELEASE_PATH, {
         activationVersion: DEVICE_ISOLATION_ACTIVATION_VERSION,
         nonce,
+        rosterRevision: initialRoster.revision,
         leaseId: item.response.leaseId,
         markerSha256,
       }, fetchDaemon);
-      verifyDaemonIdentity(item.descriptor, released, { nonce, expectedDataDir, processStart });
+      verifyDaemonIdentity(item.descriptor, released, {
+        nonce, expectedDataDir, expectedRosterRevision: initialRoster.revision, processStart,
+      });
     }));
     const releaseFailure = releaseResults.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',
@@ -364,7 +550,7 @@ async function runDeviceCredentialIsolationActivationAttempt(
     // place: future workers fail closed/isolate, while no grant or device secret
     // has yet been requested. Release is authenticated and best-effort; leases
     // also have a bounded server-side expiry.
-    await bestEffortRelease(prepared, nonce, markerSha256, fetchDaemon);
+    await bestEffortRelease(prepared, nonce, initialRoster.revision, markerSha256, fetchDaemon);
     throw error;
   }
 }

@@ -55,6 +55,17 @@ export const MAX_NODE_TIMEOUT_SEC = 14400;
 
 /** A humanGate frozen at authoring time — the runtime never lets a node
  *  add / skip a gate at runtime (design Q10). */
+export interface V3WriteExecutionBinding {
+  grantRef: string;
+  projectId: string;
+  phaseId: string;
+  taskGuid: string;
+  candidate: string;
+  action: string;
+  attempt: number;
+  operatorId: string;
+}
+
 export interface V3HumanGate {
   /** Approval-card body shown to the human reviewer. */
   prompt: string;
@@ -64,11 +75,17 @@ export interface V3HumanGate {
   approveOptions?: string[];
   /** Empty = any operator allowed by the outer daemon permission gate. */
   approvers?: string[];
+  /** Optional one-shot control-plane write authorized by this exact gate. */
+  writeExecution?: V3WriteExecutionBinding;
 }
 
 export const DEFAULT_HUMAN_GATE_OPTIONS: readonly string[] = ['approve', 'reject'];
 export const MAX_HUMAN_GATE_OPTIONS = 8;
 export const MAX_HUMAN_GATE_OPTION_LENGTH = 32;
+export const V3_WRITE_EXECUTION_FIELDS = [
+  'grantRef', 'projectId', 'phaseId', 'taskGuid', 'candidate', 'action', 'attempt', 'operatorId',
+] as const;
+export const MAX_WRITE_EXECUTION_FIELD_LENGTH = 512;
 
 /**
  * Declares that this node consumes an upstream node's products.  MVP pulls the
@@ -518,6 +535,12 @@ export function validateDag(raw: unknown): V3Dag {
           `host node "${id}" must declare a humanGate; v3 P0 does not allow ungated external side effects`,
         );
       } else {
+        if (humanGate.writeExecution) {
+          problems.push(
+            `host node "${id}".humanGate.writeExecution is not supported; ` +
+            'one approval must not authorize both a workflow host effect and a control-plane write',
+          );
+        }
         // Host gates authorize an external side effect. Do not inherit the
         // generic gate's legacy "first option means approve" fallback: it can
         // turn a button labelled `reject` into an approve action. P0 requires
@@ -852,7 +875,34 @@ function normHumanGate(raw: unknown, where: string, problems: string[]): V3Human
     }
   }
 
-  return { prompt: raw.prompt, options, approveOptions, approvers };
+  let writeExecution: V3WriteExecutionBinding | undefined;
+  if (raw.writeExecution !== undefined) {
+    const value = raw.writeExecution;
+    if (!isObject(value) || Object.keys(value).sort().join(',') !== [...V3_WRITE_EXECUTION_FIELDS].sort().join(',')) {
+      problems.push(`${where}.humanGate.writeExecution must contain exactly ${V3_WRITE_EXECUTION_FIELDS.join(', ')}`);
+    } else {
+      const invalidText = V3_WRITE_EXECUTION_FIELDS
+        .filter((field) => field !== 'attempt')
+        .find((field) => typeof value[field] !== 'string'
+          || (value[field] as string).trim() === ''
+          || (value[field] as string).length > MAX_WRITE_EXECUTION_FIELD_LENGTH);
+      if (invalidText) {
+        problems.push(`${where}.humanGate.writeExecution.${invalidText} must be a non-empty string up to ${MAX_WRITE_EXECUTION_FIELD_LENGTH} characters`);
+      } else if (!Number.isSafeInteger(value.attempt) || (value.attempt as number) < 1) {
+        problems.push(`${where}.humanGate.writeExecution.attempt must be a positive safe integer`);
+      } else {
+        writeExecution = value as unknown as V3WriteExecutionBinding;
+      }
+    }
+    if (writeExecution && (approvers.length !== 1 || approvers[0] !== writeExecution.operatorId)) {
+      problems.push(`${where}.humanGate.approvers must be exactly [writeExecution.operatorId]`);
+    }
+    if (writeExecution && (!options.includes('approve') || approveOptions.length !== 1 || approveOptions[0] !== 'approve')) {
+      problems.push(`${where}.humanGate.writeExecution requires options containing "approve" and approveOptions exactly ["approve"]`);
+    }
+  }
+
+  return { prompt: raw.prompt, options, approveOptions, approvers, ...(writeExecution ? { writeExecution } : {}) };
 }
 
 function parseUniqueStringList(

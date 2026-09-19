@@ -303,10 +303,11 @@ export interface DaemonSession {
   streamCardPendingTurnId?: string;
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
-  /** Set on sessions restored after a daemon restart: suppresses the automatic
-   *  card post/patch from the recovery re-fork so a restart stays silent in the
-   *  group (the owner gets a private DM summary instead). Cleared on the first
-   *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
+  /** Set on sessions restored after a daemon restart: suppresses automatic card
+   *  publication and state rendering so a restart stays silent in the group (the
+   *  existing card may still receive a proven, URL-only capability refresh).
+   *  Cleared on the first real CLI input (rememberLastCliInput) — the next turn
+   *  posts a card normally.
    *  In-memory only. See core/restart-report.ts. */
   suppressRecoveryCard?: boolean;
   /** Turn-exact ids for silent scheduled fires. Every worker→Lark output path
@@ -573,9 +574,12 @@ export interface DaemonSession {
     originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
-    /** Current human caller, carried over private worker IPC from the
+    /** Current caller, carried over private worker IPC from the
      * daemon-authenticated input envelope. Never sourced from CLI env/files. */
     callerOpenId?: string;
+    /** Sender kind for this exact turn, derived from daemon-frozen routing
+     * context. Missing is unknown and cannot authorize human-only actions. */
+    senderKind?: 'human' | 'bot';
     /** Linux pid:starttime identities already present in the CLI subtree when
      * this turn authority was published. Actor callers may not traverse one of
      * these old descendants; the long-lived CLI root itself is the exception. */

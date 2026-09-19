@@ -5,12 +5,14 @@
 import { promises as fsp } from 'node:fs';
 import { getLoadedConfigPath } from '../bot-registry.js';
 import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
-import { withFileLock } from '../utils/file-lock.js';
+import { withBotsJsonLock } from '../setup/bots-store.js';
+import { resolveCanonicalBotsConfigTarget } from '../core/config-dir.js';
 import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
 
 export async function readRawConfig(path: string): Promise<any[]> {
-  const raw = JSON.parse(await fsp.readFile(path, 'utf-8'));
-  if (!Array.isArray(raw)) throw new Error(`Config file is not a JSON array: ${path}`);
+  const target = resolveCanonicalBotsConfigTarget(path);
+  const raw = JSON.parse(await fsp.readFile(target.targetPath, 'utf-8'));
+  if (!Array.isArray(raw)) throw new Error(`Config file is not a JSON array: ${target.targetPath}`);
   return raw;
 }
 
@@ -21,10 +23,11 @@ export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<vo
   // Validate the complete next generation, not the currently loaded registry.
   // Callers invoke this while holding the cross-process lock.
   assertQuotaFallbackGraphAcyclic(raw);
-  const tmp = path + '.tmp.' + process.pid;
+  const target = resolveCanonicalBotsConfigTarget(path);
+  const tmp = target.targetPath + '.tmp.' + process.pid;
   // bots.json 含 appSecret —— 临时文件即以 0o600 写入，rename 后保持私有权限。
   await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  await fsp.rename(tmp, path);
+  await fsp.rename(tmp, target.targetPath);
 }
 
 export function findEntryIndex(raw: any[], larkAppId: string): number {
@@ -46,18 +49,18 @@ export async function rmwBotEntry<T>(
   mutate: (entry: any, raw: any[]) => { write: boolean; result: T } | T,
 ): Promise<{ ok: true; result: T } | { ok: false; reason: string }> {
   const path = requireConfigPath();
-  return withFileLock(path, async () => {
-    const raw = await readRawConfig(path);
+  return withBotsJsonLock(path, async (targetPath) => {
+    const raw = await readRawConfig(targetPath);
     const idx = findEntryIndex(raw, larkAppId);
     if (idx < 0) return { ok: false, reason: 'bot_not_in_config' };
     const entry = raw[idx];
     const out = mutate(entry, raw);
     if (out && typeof out === 'object' && 'write' in (out as any)) {
       const wrap = out as { write: boolean; result: T };
-      if (wrap.write) await writeRawConfigAtomic(path, raw);
+      if (wrap.write) await writeRawConfigAtomic(targetPath, raw);
       return { ok: true, result: wrap.result };
     }
-    await writeRawConfigAtomic(path, raw);
+    await writeRawConfigAtomic(targetPath, raw);
     return { ok: true, result: out as T };
-  });
+  }, { caller: 'config-store', operation: 'bot-entry-rmw' });
 }

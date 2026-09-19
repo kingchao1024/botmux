@@ -16,13 +16,10 @@ export function sessionTerminalHref(s: any, loc: SessionTerminalLocation | null 
   // 若在此短路返回它，只读图标会打开可写沙箱、且匿名只读面板也会拿到写能力 ——
   // 故这里一律走 webPort 分支，让读/写入口与卡片侧一一对应。
   if (!s?.webPort || !loc) return null;
-  // On the central HTTPS machine domain, terminals must go through the same
-  // origin `/s/<session>` reverse proxy. Exposing a raw port would produce a
-  // dead link because the platform only proxies 443.
-  if (loc.protocol === 'https:') {
-    return s.proxyPort ? `${loc.origin}/s/${encodeURIComponent(s.sessionId)}` : null;
-  }
-  const port = s.proxyPort ?? s.webPort;
-  const suffix = s.proxyPort ? `/s/${encodeURIComponent(s.sessionId)}` : '';
-  return `http://${loc.hostname}:${port}${suffix}`;
+  // A proxy-backed terminal must stay on the Dashboard origin for both HTTP
+  // and HTTPS. The browser may reach the Dashboard through a single public
+  // front door while every daemon's 880x proxy port remains private.
+  if (s.proxyPort) return `${loc.origin}/s/${encodeURIComponent(s.sessionId)}`;
+  // A worker-port fallback is only usable when no daemon proxy exists.
+  return loc.protocol === 'https:' ? null : `http://${loc.hostname}:${s.webPort}`;
 }

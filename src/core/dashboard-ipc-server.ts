@@ -791,12 +791,20 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // verification and then enters the durable action ledger. Keeping this one
   // aperture is what preserves managed meeting actions from inside bwrap.
   if (method === 'POST' && pathname === '/api/vc-meetings/action-request') return true;
-  // These two CLI-in-sandbox endpoints verify the same rotating capability in
+  // These CLI-in-sandbox endpoints verify the same rotating capability in
   // their handlers and bind it to body.sessionId. They cannot be bare loopback
   // exceptions: a receiver that learned another session id could otherwise
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
-  if (method === 'POST' && pathname === '/api/asks') return true;
+  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/hook')) return true;
+  // S1 ask controller execution/recover may authenticate with the issuing
+  // session's exact current capability instead of the host HMAC, but binding
+  // still remains HMAC-only in the route handler. Keep the server aperture
+  // narrow: only let these requests reach the handler unauthenticated so the
+  // route can distinguish binding vs execution on the parsed body.
+  if (method === 'POST'
+      && (pathname === '/api/asks/s1-controller'
+        || pathname === '/api/asks/s1-controller/recover')) return true;
   // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
   // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
   // 该会话的 rotating per-turn
@@ -815,6 +823,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // root server-side, then lets the trusted daemon relay to the orchestrator.
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
+  // ReviewerVerdict is the sole task-control worker aperture. Its handler
+  // re-derives the reviewer daemon/session/generation/capability and never
+  // accepts a caller-provided app, verifier, source hash or trust root.
+  if (method === 'POST' && pathname === '/api/task-control/reviewer-verdicts/submit') return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
@@ -7689,9 +7701,9 @@ export function startIpcServer(opts: {
    * deliberate secret repair cannot strand a daemon on a stale cached key.
    * Tests that omit this option retain the lightweight in-process server. */
   authRequired?: boolean;
-  /** Daemon restore barrier.  The socket/health route may come up early so its
-   * descriptor is discoverable, but every state-bearing route waits until all
-   * durable session owners have been registered. */
+  /** Daemon restore barrier. The socket may bind before startup acquires the
+   * host isolation lock, but its descriptor is not published until that lock is
+   * held; every state-bearing route still waits for durable owner restore. */
   ready?: Promise<void>;
   /** Upward-probe span on EADDRINUSE. Default DEFAULT_PROBE_SPAN (fleet daemons
    * step to the next free port so a port race can't crash boot). Core-only
