@@ -50,6 +50,7 @@ const bot = vi.hoisted(() => ({
   cliRuntime: undefined as import('../src/adapters/cli/runtime.js').CliRuntimeConfig | undefined,
   cliPathOverride: undefined as string | undefined,
   wrapperCli: undefined as string | undefined,
+  cliLaunchMode: undefined as import('../src/core/cli-launch-mode.js').CliLaunchMode | undefined,
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -102,6 +103,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
+  markReadonlyTaskContinuationInterruptedByRestart: vi.fn(() => false),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
@@ -189,6 +191,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliRuntime: bot.cliRuntime,
       cliPathOverride: bot.cliPathOverride,
       wrapperCli: bot.wrapperCli,
+      cliLaunchMode: bot.cliLaunchMode,
       workingDir: '~',
       workingDirs: ['~'],
     },
@@ -277,6 +280,8 @@ import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import {
   closeSession,
   ensureOrdinaryTurnRecoveryAttached,
+  ensureReadonlyTaskContinuationAttached,
+  markReadonlyTaskContinuationInterruptedByRestart,
   forkAdoptWorker,
   forkWorker,
   setActiveSessionSafe,
@@ -303,9 +308,12 @@ beforeEach(() => {
   bot.cliRuntime = undefined;
   bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
+  bot.cliLaunchMode = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
+  vi.mocked(ensureReadonlyTaskContinuationAttached).mockClear();
+  vi.mocked(markReadonlyTaskContinuationInterruptedByRestart).mockClear();
   vi.mocked(announceSessionRow).mockClear();
   vi.mocked(ZmxBackend.probeSessions).mockClear();
   vi.mocked(ZmxBackend.killManagedSession).mockReset();
@@ -484,6 +492,141 @@ describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', ()
 });
 
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
+  it('marks a restored automatic original turn as interrupted before reattaching', async () => {
+    vi.mocked(markReadonlyTaskContinuationInterruptedByRestart).mockImplementationOnce((ds, leaseId) => {
+      const continuation = ds.session.readonlyTaskContinuation;
+      if (continuation?.status !== 'active' || continuation.leaseId !== leaseId) return false;
+      ds.session.readonlyTaskContinuation = {
+        ...continuation,
+        status: 'awaiting_user',
+        lastErrorCode: 'daemon_restart',
+      };
+      return true;
+    });
+    const s = makeActivePersistentSession('om_automatic_continuation_restart');
+    s.readonlyTaskContinuation = {
+      leaseId: 'readonly-restart',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 6,
+      continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      status: 'active',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(markReadonlyTaskContinuationInterruptedByRestart).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+      'readonly-restart',
+    );
+    expect(ensureReadonlyTaskContinuationAttached).not.toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+    );
+    expect([...map.values()].find(ds => ds.session.sessionId === s.sessionId)?.session
+      .readonlyTaskContinuation).toMatchObject({
+        status: 'awaiting_user',
+        lastErrorCode: 'daemon_restart',
+      });
+  });
+
+  it('does not label a replacement lease created during restore as interrupted', async () => {
+    const s = makeActivePersistentSession('om_continuation_restore_race');
+    s.readonlyTaskContinuation = {
+      leaseId: 'readonly-old-process',
+      logicalTurnId: 'om_old',
+      currentTurnId: 'om_old',
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 6,
+      continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      status: 'active',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (sessions, key, ds) => {
+      ds.session.readonlyTaskContinuation = {
+        ...ds.session.readonlyTaskContinuation!,
+        leaseId: 'readonly-new-process',
+        logicalTurnId: 'om_new',
+        currentTurnId: 'om_new',
+      };
+      sessions.set(key, ds);
+      return { accepted: true };
+    });
+
+    await restoreActiveSessions(map);
+
+    expect(markReadonlyTaskContinuationInterruptedByRestart).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+      'readonly-old-process',
+    );
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(
+      expect.objectContaining({
+        session: expect.objectContaining({
+          sessionId: s.sessionId,
+          readonlyTaskContinuation: expect.objectContaining({ leaseId: 'readonly-new-process' }),
+        }),
+      }),
+    );
+  });
+
+  it('keeps an explicit restored lease on the ordinary attachment path', async () => {
+    const s = makeActivePersistentSession('om_explicit_continuation_restart');
+    s.readonlyTaskContinuation = {
+      leaseId: 'readonly-explicit',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 6,
+      continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      status: 'active',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(markReadonlyTaskContinuationInterruptedByRestart).not.toHaveBeenCalled();
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+    );
+  });
+
   it('finishes a durable prepared Mojo close without registering or re-cancelling', async () => {
     const s = makeActivePersistentSession('om_mojo_prepared_recovery');
     s.backendType = 'mojo';
@@ -819,6 +962,30 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_zmx_missing', 'app_test'))).toBeDefined();
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('restores same-named ZMX targets from their individual persisted directories', async () => {
+    const first = makeActivePersistentSession('om_zmx_directory_a', 'zmx');
+    const second = makeActivePersistentSession('om_zmx_directory_b', 'zmx');
+    first.persistentBackendTarget = { backendType: 'zmx', sessionName: 'bmx-same', socketDir: '/tmp/restore-a' };
+    second.persistentBackendTarget = { backendType: 'zmx', sessionName: 'bmx-same', socketDir: '/tmp/restore-b' };
+    sessionStore.updateSession(first);
+    sessionStore.updateSession(second);
+    const snapshot = (env?: NodeJS.ProcessEnv) => ({
+      ok: true as const, sessions: env?.ZMX_DIR === '/tmp/restore-a' ? ['bmx-same'] : [],
+      unhealthySessions: [], raw: '',
+    });
+    vi.mocked(ZmxBackend.probeSessions).mockImplementationOnce(snapshot).mockImplementationOnce(snapshot);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(2);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: first.sessionId }) }), '', true);
+    expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
   });
 
   it('classifies multiple ZMX restore rows from one full-list snapshot', async () => {
@@ -1480,6 +1647,21 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     expect(await closeCliMismatchedSessionsForBot('app_test'))
       .toMatchObject({ closed: 1 });
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('closes legacy unfrozen TraeX sessions when the bot switches to Forge x TraeX', async () => {
+    bot.cliId = 'traex';
+    bot.cliLaunchMode = 'forge-traex';
+    const s = makeActivePersistentSession('om_rt_legacy_traex_forge');
+    s.cliId = 'traex';
+    s.agentFrozen = false;
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
   });
 

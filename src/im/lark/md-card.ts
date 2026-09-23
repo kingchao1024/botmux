@@ -34,7 +34,9 @@ import {
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -108,6 +110,10 @@ export interface CardUsageSnapshot {
    *  by test/streaming-card-usage-arg.test.ts), so no call site can forget it.
    *  Not a usage metric, but the same class of runtime identity as `model`. */
   modelFallback?: ModelFallbackState;
+  /** Claude Code statusline 快照（`botmux statusline` 落盘，daemon 合并）。存在时
+   *  上下文段改渲染纯百分比 `ctx N%`，并追加 `5h N%` / `7d N%` 账号配额段。
+   *  缺省 / null ⇒ 与无 statusline 时逐字节相同（只看 `context`）。 */
+  quota?: StatuslineQuota | null;
 }
 
 export interface ReplyCardFooter {
@@ -419,9 +425,17 @@ export function contextOverCompactThreshold(
  *  window (⇒ no percentage to show). Shared so the footer text and
  *  {@link contextOverCompactThreshold} can never disagree on the value. */
 function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
-  return isNonNegativeFinite(usage.context?.percentUsed)
-    ? Math.min(100, Math.round(usage.context.percentUsed))
+  // statusline 给的 contextPercent 优先（Claude Code 的 transcript 本身没有窗口字段，
+  // 这是它唯一的百分比来源）；其余 CLI 仍走 transcript 的 percentUsed。
+  const pct = usage.quota?.contextPercent ?? usage.context?.percentUsed;
+  return isNonNegativeFinite(pct)
+    ? Math.min(100, Math.round(pct))
     : undefined;
+}
+
+/** 配额百分比（5h / 7d）：与上下文同口径 round + clamp；非法值 ⇒ undefined（省略该段）。 */
+function quotaPercent(value: unknown): number | undefined {
+  return isNonNegativeFinite(value) ? Math.min(100, Math.round(value)) : undefined;
 }
 
 export function cardUsageFooterSegment(
@@ -431,7 +445,18 @@ export function cardUsageFooterSegment(
   opts?: { compactHintThreshold?: number },
 ): string | null {
   const parts: string[] = [];
-  if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
+  const quota = usage.quota ?? undefined;
+  const quotaPct = quota ? contextPercentUsed(usage) : undefined;
+  if (quota && quotaPct !== undefined) {
+    // statusline 路径（Claude Code）：只渲染纯百分比 `ctx 23%`——不带绝对值（statusline
+    // 的 used_percentage 与 transcript 的 usedTokens 口径不同，混排会自相矛盾）、不画
+    // 进度条、不渲染 resets_at。「建议压缩」提示与下方绝对值分支同源同阈值。
+    const overThreshold = contextOverCompactThreshold(usage, opts?.compactHintThreshold);
+    parts.push(
+      `${t('card.usage.ctx', undefined, locale)} ${quotaPct}%`
+      + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
+    );
+  } else if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
     const used = compactTokenCount(usage.context.usedTokens);
     const window = usage.context.windowTokens;
     const windowSuffix = isNonNegativeFinite(window) && window > 0
@@ -449,6 +474,15 @@ export function cardUsageFooterSegment(
       `${t('card.usage.context', undefined, locale)} ${used}${suffix}`
       + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
     );
+  }
+  // 账号级配额（statusline 独有）：5h / 7d 滚动窗口用量，footer 与 streaming 都渲染——
+  // 它比 Token 累计更值得占 footer 的位置（用户关心的是「还能跑多久」）。
+  // 窗口已滚动的桶在读取端已被丢弃（readStatuslineSnapshot），这里只看是否有值。
+  if (quota) {
+    const fiveHour = quotaPercent(quota.fiveHourPercent);
+    if (fiveHour !== undefined) parts.push(`${t('card.usage.quota_5h', undefined, locale)} ${fiveHour}%`);
+    const sevenDay = quotaPercent(quota.sevenDayPercent);
+    if (sevenDay !== undefined) parts.push(`${t('card.usage.quota_7d', undefined, locale)} ${sevenDay}%`);
   }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
   // the token breakdown below is streaming-only.
@@ -601,6 +635,8 @@ export function buildReplyCardFooter(opts: {
   brand?: string;
   recipientOpenIds?: readonly string[];
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
   locale?: Locale;
 }): ReplyCardFooter | null {
   const parts: string[] = [];
@@ -610,6 +646,16 @@ export function buildReplyCardFooter(opts: {
   if (opts.usage) {
     const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
+  }
+  const durationMs = opts.executionDurationMs;
+  const hasDuration = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0;
+  const waitingMs = opts.waitingDurationMs;
+  const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
+  if (hasWaiting) {
+    parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
+  }
+  if (hasDuration) {
+    parts.push(t('card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
   }
   const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
@@ -631,9 +677,9 @@ export function buildReplyCardFooter(opts: {
   // plain link text with no mention, so it cannot trigger bot-to-bot pollution
   // and does not need the ownership marker (the parser already treats a bare
   // repo link as ordinary content, matching the long-standing "brand-only is
-  // undecidable, keep it" contract). Any footer carrying usage or a recipient
+  // undecidable, keep it" contract). Any footer carrying usage, timing, or a recipient
   // is still signed.
-  const signMarker = hasUsage || hasRecipient;
+  const signMarker = hasUsage || hasDuration || hasWaiting || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
     signedContent = parts[0]; // brand-only — no marker
@@ -749,15 +795,7 @@ function buildTableFromTokens(tokens: Token[]): any | null {
   return {
     tag: 'table',
     page_size: Math.min(10, Math.max(1, rows.length || 1)),
-    row_height: 'low',
-    header_style: {
-      text_align: 'left',
-      text_size: 'normal',
-      background_style: 'grey',
-      text_color: 'default',
-      bold: true,
-      lines: 1,
-    },
+    ...TABLE_AUTO_ROW_STYLE,
     columns,
     rows,
   };
@@ -1260,6 +1298,8 @@ export function buildCanonicalFinalReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1269,6 +1309,8 @@ export function buildCanonicalFinalReplyCard(opts: {
     brand: opts.brand,
     recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
     usage: opts.usage,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
@@ -1310,6 +1352,8 @@ export function buildContextualReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
   feedback?: { policy: FeedbackPolicy };
 }): string {
   const {
@@ -1358,6 +1402,8 @@ export function buildContextualReplyCard(opts: {
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
   });
   if (footer) {
     elements.push({ tag: 'hr' });

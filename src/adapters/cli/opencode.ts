@@ -509,6 +509,10 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Bubble Tea TUI — no reliable prompt indicator; rely on quiescence + spinner guard
+    // No reliable prompt anchor: require 4s of silence before the FIRST paste
+    // so cold start / resume→fresh cannot type into a still-booting TUI; later
+    // cycles return to the normal 2s window.
+    firstPromptQuiescenceMs: 4_000,
     busyPattern: undefined,
     isSessionBusy({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId)
