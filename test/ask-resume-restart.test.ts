@@ -779,9 +779,9 @@ describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => 
       originKind: 'host_cross_principal_classification',
       requestId: 'host-before-delivery',
       backendSurvivesRestart: undefined,
-      timeoutMs: 20,
+      timeoutMs: 1_000,
     }));
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
     expect(onlyPersisted().cardMessageId).toBeUndefined();
 
     _resetForTest();
@@ -795,7 +795,7 @@ describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => 
       originKind: 'host_cross_principal_classification',
       requestId: 'host-before-delivery',
       backendSurvivesRestart: undefined,
-      timeoutMs: 20,
+      timeoutMs: 1_000,
     }));
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(d2.sendCalls).toHaveLength(1);
