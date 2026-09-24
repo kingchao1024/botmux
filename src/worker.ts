@@ -12489,6 +12489,11 @@ async function flushPending(): Promise<void> {
             await writeRpcEngine.steerTurn(msg, expectedTurnId);
             result = { submitted: true };
             log(`Steered exact Codex RPC native turn ${expectedTurnId.slice(0, 12)} from control ${item.turnId ?? '-'}`);
+            if (writeRpcEngine.activeNativeTurnId !== expectedTurnId) {
+              queueMicrotask(() => {
+                if (writeContinuationIsCurrent()) void flushPending();
+              });
+            }
             // The currently active native turn retains the sole lifecycle
             // ownership and will release the queue at its terminal. Do not
             // create a second bridge owner for a control-only message.

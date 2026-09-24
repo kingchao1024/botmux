@@ -27513,6 +27513,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     throw new Error('incomplete supervisor startup reservation');
   }
   let startupIntent: ReturnType<typeof publishDeviceIsolationStartupIntent> | undefined;
+  let startupXpiQuarantineNotices: XpiSharedCwdStartupNotice[] = [];
   try {
     // Fixed order shared with activation and fleet start: exact bots-config
     // writer lock first, then the host activation gate. Both stay held through
@@ -27545,11 +27546,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
         delete process.env.BOTMUX_STARTUP_RESERVATION_ID;
         delete process.env.BOTMUX_STARTUP_RESERVATION_TOKEN;
+        // Normalize legacy document-native watches before restore can close
+        // their old sessions. Keep this inside the startup admission fence so
+        // restore and readiness observe one authoritative generation.
+        if (!cfg.apiOnly) normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId);
         // Restore active sessions while both the config and activation locks are
         // held, then publish only after authority and readiness are complete.
-        await restoreSessionsAndScheduleStartupRecovery({
+        startupXpiQuarantineNotices = await restoreSessionsAndScheduleStartupRecovery({
           larkAppId: cfg.larkAppId,
-          restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds),
+          restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {
+            prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+          }),
           afterRestore: activateAskReceiptAuthorityAfterRestore,
           markSessionsRestored: () => {
             sessionsRestored = true;
@@ -27602,25 +27609,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     throw error;
   }
-  // Restore complete → /api/asks may now safely 403 unknown sessions again; a
-  // reconnecting ask hook that raced the restore got retryable 503s until here.
-  // Normalize legacy document-native watches before restore can close their old sessions.
-  if (!cfg.apiOnly) normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId);
 
-  // Restore active sessions from previous run
-  const startupXpiQuarantineNotices = await restoreSessionsAndScheduleStartupRecovery({
-    larkAppId: cfg.larkAppId,
-    restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {
-      prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
-    }),
-    // Restore complete → /api/asks may now safely 403 unknown sessions again; a
-    // reconnecting ask hook that raced the restore got retryable 503s until here.
-    markSessionsRestored: () => {
-      sessionsRestored = true;
-    },
-    driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
-  });
-
+  // Restore complete: session state, Ask authority, IPC readiness, and the
+  // discoverable daemon descriptor now belong to the same admitted generation.
   // Close CoT thinking bubbles orphaned by the previous daemon generation
   // (created mid-turn, never settled — their in-memory state died with the
   // old process, so without this they spin on「执行中」forever). Scoped to

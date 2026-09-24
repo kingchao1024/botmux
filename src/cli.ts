@@ -13882,7 +13882,6 @@ export async function runHook(
     questions: parsed.questions,
     timeoutMs,
     requestId,
-    originKind: 'hook',
     ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
     ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
   };

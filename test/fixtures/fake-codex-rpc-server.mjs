@@ -33,6 +33,10 @@ const ERROR_AFTER_STARTED = process.env.FAKE_ERROR_AFTER_STARTED === '1';
 const DUPLICATE_TERMINAL = process.env.FAKE_DUPLICATE_TERMINAL === '1';
 const NO_TURN_TERMINAL = process.env.FAKE_NO_TURN_TERMINAL === '1';
 const STEER_RESPONSE_TURN_ID = process.env.FAKE_STEER_RESPONSE_TURN_ID;
+const STEER_TERMINAL_BEFORE_RESPONSE = process.env.FAKE_STEER_TERMINAL_BEFORE_RESPONSE === '1';
+const DELAY_STEER_ACK_MS = process.env.FAKE_DELAY_STEER_ACK_MS
+  ? Number(process.env.FAKE_DELAY_STEER_ACK_MS)
+  : 0;
 const TURN_STATUS = process.env.FAKE_TURN_STATUS ?? '';
 const DIE_AFTER = process.env.FAKE_DIE_AFTER_MS ? Number(process.env.FAKE_DIE_AFTER_MS) : 0;
 const DELAY_TURN_ACK_MS = process.env.FAKE_DELAY_TURN_ACK_MS
@@ -324,7 +328,17 @@ wss.on('connection', (ws) => {
             error: { code: -32602, message: 'expectedTurnId is required' },
           }));
         }
-        return reply({ turnId: STEER_RESPONSE_TURN_ID || nativeTurnId });
+        const ack = () => reply({ turnId: STEER_RESPONSE_TURN_ID || nativeTurnId });
+        if (STEER_TERMINAL_BEFORE_RESPONSE) {
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: { threadId: msg.params?.threadId, turn: { id: nativeTurnId } },
+          }));
+        }
+        if (DELAY_STEER_ACK_MS > 0) setTimeout(ack, DELAY_STEER_ACK_MS);
+        else ack();
+        return;
       }
       default: return reply({});
     }
