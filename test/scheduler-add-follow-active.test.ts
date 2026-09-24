@@ -54,7 +54,6 @@ async function freshImport() {
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'scheduler-add-follow-active-'));
 });
-
 afterEach(() => {
   rmSync(tempDir, { recursive: true, force: true });
 });
@@ -153,4 +152,3 @@ describe('scheduler.resolveTaskExecutionPosition — task position', () => {
     expect(await resolve({ executionPosition: 'task', scope: 'thread', rootMessageId: 'om_task_root' })).toBe('topic');
   });
 });
-

@@ -5,11 +5,19 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { waitForChildExit } from './helpers/child-process.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const isProcessGroupAlive = (pid: number) => {
+  try { process.kill(-pid, 0); return true; } catch { return false; }
+};
 
 // A real subprocess app-server stand-in (HTTP /readyz + JSON-RPC WS on one port).
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-rpc-server.mjs', import.meta.url));
+const STOP_WITHOUT_BARRIER_FIXTURE = fileURLToPath(
+  new URL('./fixtures/codex-rpc-stop-without-barrier.mts', import.meta.url),
+);
 beforeAll(() => { chmodSync(FIXTURE, 0o755); });
 
 type EngineDependencies = NonNullable<ConstructorParameters<typeof CodexRpcEngine>[1]>;
@@ -37,6 +45,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     const engine = makeEngine({
       cwd,
       env: childEnv,
+      bypassHookTrust: true,
       appServerFeatures: ['feature-a', 'feature-b'],
       appServerConfig: ['config-a', 'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[]}]'],
     }, {
@@ -51,6 +60,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
       expect(launches[0]).toEqual({
         command: FIXTURE,
         args: [
+          '--dangerously-bypass-hook-trust',
           'app-server',
           '--enable', 'feature-a',
           '--enable', 'feature-b',
@@ -70,7 +80,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     }
   }, 20_000);
 
-  it('keeps the same runtime authority on every turn in one thread', async () => {
+  it('keeps the same runtime authority on every ordinary turn in one thread', async () => {
     const turnFile = join(tmpdir(), `fake-turn-cfg-${Math.round(performance.now())}.jsonl`);
     const engine = makeEngine({
       env: { ...process.env, FAKE_TURN_CONFIG_FILE: turnFile },
@@ -78,14 +88,15 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.start();
     await engine.startThread();
     await engine.sendTurn('continue with inherited authority', owner('continuation-1', 1));
+    await new Promise(resolve => setTimeout(resolve, 50));
     await engine.sendTurn('ordinary user turn', owner('ordinary-2', 2));
     engine.stop();
     const turns = readFileSync(turnFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     rmSync(turnFile, { force: true });
     for (const turn of turns) {
       expect(turn).toMatchObject({
-      approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+        approvalPolicy: 'never',
+        sandboxPolicy: { type: 'dangerFullAccess' },
       });
       expect(turn.environments).toBeUndefined();
       expect(turn.runtimeWorkspaceRoots).toBeUndefined();
@@ -421,7 +432,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     engine.stop();
   });
 
-  it('keeps sequential resume/typeahead attempts isolated by native turn id', async () => {
+  it('keeps terminal-separated resume attempts isolated by native turn id', async () => {
     const terminals: any[] = [];
     const engine = makeEngine({
       sessionId: 'terminal-sequential',
@@ -430,12 +441,83 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.start();
     await engine.resumeThread('thread-persisted');
     await engine.sendTurn('one', owner('same-logical', 1));
+    await new Promise(resolve => setTimeout(resolve, 50));
     await engine.sendTurn('two', owner('same-logical', 2));
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(terminals.map(t => [t.nativeTurnId, t.identity.dispatchAttempt])).toEqual([
       ['turn-fake-1', 1],
       ['turn-fake-2', 2],
     ]);
+    engine.stop();
+  }, 20_000);
+
+  it('refuses an ordinary second turn while an exact native turn is still active', async () => {
+    let deadCount = 0;
+    const engine = makeEngine({
+      sessionId: 'ordinary-overlap',
+      env: { ...process.env, FAKE_NO_TURN_TERMINAL: '1' },
+      onDead: () => { deadCount += 1; },
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('first', owner('ordinary-first', 1)))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+
+    await expect(engine.sendTurn('second', owner('ordinary-second', 2)))
+      .rejects.toThrow('active native turn turn-fake-1');
+    expect(deadCount).toBe(0);
+    engine.stop();
+  }, 20_000);
+
+  it('steers only the exact active native turn without opening another turn', async () => {
+    const requestFile = join(tmpdir(), `fake-steer-${Math.round(performance.now())}.jsonl`);
+    const engine = makeEngine({
+      sessionId: 'exact-steer',
+      env: {
+        ...process.env,
+        FAKE_NO_TURN_TERMINAL: '1',
+        FAKE_TURN_CONFIG_FILE: requestFile,
+      },
+    });
+    await engine.start();
+    await engine.startThread();
+    const root = await engine.sendTurn('first', owner('steer-root', 1));
+
+    await expect(engine.steerTurn('change direction', root.nativeTurnId))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+    await expect(engine.steerTurn('wrong target', 'turn-not-active'))
+      .rejects.toThrow('not the current active native turn');
+
+    const requests = readFileSync(requestFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(requests).toEqual([
+      expect.objectContaining({ input: expect.any(Array) }),
+      expect.objectContaining({ expectedTurnId: 'turn-fake-1' }),
+    ]);
+    engine.stop();
+    rmSync(requestFile, { force: true });
+  }, 20_000);
+
+  it('reports a native-turn ownership conflict separately from app-server death', async () => {
+    const failures: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'steer-protocol-conflict',
+      env: {
+        ...process.env,
+        FAKE_NO_TURN_TERMINAL: '1',
+        FAKE_STEER_RESPONSE_TURN_ID: 'turn-not-the-expected-one',
+      },
+      onDead: failure => failures.push(failure),
+    });
+    await engine.start();
+    await engine.startThread();
+    const root = await engine.sendTurn('first', owner('conflict-root', 1));
+
+    await expect(engine.steerTurn('bad acknowledgement', root.nativeTurnId))
+      .rejects.toThrow('did not confirm expected native turn');
+    expect(failures).toEqual([{
+      kind: 'protocol-ownership-conflict',
+      errorCode: 'rpc_native_turn_ownership_conflict',
+    }]);
     engine.stop();
   }, 20_000);
 });
@@ -707,6 +789,140 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     engine.stop();
     await new Promise((r) => setTimeout(r, 300));
     expect(dead).toBe(false);
+  }, 20_000);
+
+  it('demonstrates that immediate worker exit drops stop()\'s unref\'d SIGKILL fallback', async () => {
+    const pidFile = join(
+      tmpdir(),
+      'codex-rpc-stop-without-barrier-' + process.pid + '-' + Date.now() + '.pid',
+    );
+    const groupChildPidFile = pidFile + '.child';
+    let appServerPid: number | undefined;
+    let groupChildPid: number | undefined;
+    try {
+      const worker = spawnNodeTsScript(STOP_WITHOUT_BARRIER_FIXTURE, [pidFile, groupChildPidFile], {
+        stdio: 'ignore',
+      });
+      await waitForChildExit(worker, { description: 'old stop fixture worker' });
+      appServerPid = Number.parseInt(readFileSync(pidFile, 'utf8'), 10);
+      groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
+      expect(Number.isInteger(appServerPid)).toBe(true);
+      expect(Number.isInteger(groupChildPid)).toBe(true);
+      expect(isAlive(appServerPid)).toBe(false);
+      expect(isAlive(groupChildPid)).toBe(true);
+      expect(isProcessGroupAlive(appServerPid)).toBe(true);
+    } finally {
+      if (appServerPid) {
+        try { process.kill(-appServerPid, 'SIGKILL'); } catch { try { process.kill(appServerPid, 'SIGKILL'); } catch { /* gone */ } }
+      }
+      rmSync(pidFile, { force: true });
+      rmSync(groupChildPidFile, { force: true });
+    }
+  }, 20_000);
+
+  it('reaps a surviving process-group descendant within the bounded SIGKILL fallback', async () => {
+    const groupChildPidFile = join(tmpdir(), 'codex-rpc-stop-barrier-' + process.pid + '-' + Date.now() + '.child');
+    let pid: number | undefined;
+    let groupChildPid: number | undefined;
+    const engine = makeEngine({
+      sessionId: 'stop-barrier',
+      env: {
+        ...process.env,
+        FAKE_GROUP_CHILD_PID_FILE: groupChildPidFile,
+        FAKE_LEADER_EXITS_ON_SIGTERM: '1',
+      },
+    });
+    try {
+      await engine.start();
+      pid = engine.appServerPid!;
+      groupChildPid = Number.parseInt(readFileSync(groupChildPidFile, 'utf8'), 10);
+      expect(isAlive(groupChildPid)).toBe(true);
+      const startedAt = Date.now();
+      await engine.stopAndWait();
+      // 2s TERM grace + 250ms SIGKILL settle, with bounded scheduler slack.
+      expect(Date.now() - startedAt).toBeLessThanOrEqual(2_750);
+      expect(isProcessGroupAlive(pid)).toBe(false);
+      expect(isAlive(groupChildPid)).toBe(false);
+    } finally {
+      engine.stop();
+      if (pid && isProcessGroupAlive(pid)) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      if (groupChildPid && isAlive(groupChildPid)) {
+        try { process.kill(groupChildPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      rmSync(groupChildPidFile, { force: true });
+    }
+  }, 20_000);
+
+  it('reports an unreaped process group and retains its marker for a later recovery', async () => {
+    const sid = 'stop-group-still-alive-' + process.pid + '-' + Date.now();
+    const marker = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers', sid + '.pid');
+    let groupAlive = true;
+    const signals: NodeJS.Signals[] = [];
+    let recovery: CodexRpcEngine | undefined;
+    const engine = makeEngine({ sessionId: sid }, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        return spawn(command, args, options);
+      },
+      isProcessGroupAlive: () => groupAlive,
+      signalProcessGroup(_pid, signal): void {
+        signals.push(signal);
+      },
+    });
+    try {
+      await engine.start();
+      const stalePid = engine.appServerPid!;
+      await expect(engine.stopAndWait()).rejects.toThrow(
+        /process group .* still alive after SIGTERM 2000ms and SIGKILL settle 250ms/,
+      );
+      expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
+      expect(existsSync(marker)).toBe(true);
+      const retainedMarker = readFileSync(marker, 'utf8');
+
+      groupAlive = false;
+      recovery = makeEngine({ sessionId: sid });
+      await recovery.start();
+      expect(isAlive(stalePid)).toBe(false);
+      expect(readFileSync(marker, 'utf8')).not.toBe(retainedMarker);
+      expect(existsSync(marker)).toBe(true);
+      recovery.stop();
+    } finally {
+      groupAlive = false;
+      engine.stop();
+      recovery?.stop();
+      rmSync(marker, { force: true });
+    }
+  }, 20_000);
+
+  it('refuses to signal an unverified current PID and leaves an unrelated process alive', async () => {
+    const signals: NodeJS.Signals[] = [];
+    const engine = makeEngine({}, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        return spawn(command, args, options);
+      },
+      hasExactProcessGroupIdentity: () => false,
+      signalProcessGroup(_pid, signal): void {
+        signals.push(signal);
+      },
+    });
+    const unrelated = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+    unrelated.unref();
+    let managedPid: number | undefined;
+    try {
+      await engine.start();
+      managedPid = engine.appServerPid!;
+      // Model a child pid that was recycled after the managed leader exited.
+      (engine as any).child = unrelated;
+      await expect(engine.stopAndWait()).rejects.toThrow(/exact app-server identity could not be verified/);
+      expect(signals).toEqual([]);
+      expect(isAlive(unrelated.pid!)).toBe(true);
+    } finally {
+      if (managedPid) {
+        try { process.kill(-managedPid, 'SIGKILL'); } catch { /* gone */ }
+      }
+      try { process.kill(-unrelated.pid!, 'SIGKILL'); } catch { /* gone */ }
+    }
   }, 20_000);
 
   it('stop releases every still-active native turn with its exact owner', async () => {

@@ -31,6 +31,8 @@ export interface FleetCommand {
   appId: string;
   /** 0-based bot index the daemon reads via BOTMUX_BOT_INDEX. */
   botIndex: number;
+  botsConfigPath?: string;
+  rosterRevision?: string;
   /** ISO enqueue time (caller-supplied; scripts have no Date in this codebase). */
   at: string;
 }
@@ -61,6 +63,12 @@ function coerce(raw: unknown): FleetCommandFile {
       name: q.name,
       appId: q.appId,
       botIndex: q.botIndex as number,
+      ...(typeof q.botsConfigPath === 'string' && q.botsConfigPath
+        ? { botsConfigPath: q.botsConfigPath }
+        : {}),
+      ...(typeof q.rosterRevision === 'string' && /^[a-f0-9]{64}$/.test(q.rosterRevision)
+        ? { rosterRevision: q.rosterRevision }
+        : {}),
       at: typeof q.at === 'string' ? q.at : '',
     });
   }

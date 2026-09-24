@@ -20,6 +20,8 @@ interface PersistedTurnSession {
     rootMessageId?: string;
     turnId?: string;
   };
+  replyTargets?: Record<string, { replyTargetSenderIsBot?: boolean }>;
+  turnReplyContexts?: Record<string, { replyTargetSenderIsBot?: boolean }>;
 }
 
 export interface CurrentTurnProvenance {
@@ -29,6 +31,7 @@ export interface CurrentTurnProvenance {
   larkAppId: string;
   chatId: string;
   chatType?: 'group' | 'p2p';
+  actorKind: 'human' | 'bot' | 'scheduled' | 'unknown';
   /**
    * The current user-visible thread anchor. Thread sessions use their durable
    * root; a chat-scope turn folded into a topic uses that turn's reply target;
@@ -52,6 +55,17 @@ export class CurrentTurnProvenanceError extends Error {
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function senderKindForTurn(
+  session: PersistedTurnSession,
+  turnId: string,
+): 'human' | 'bot' | 'unknown' {
+  const senderIsBot = session.turnReplyContexts?.[turnId]?.replyTargetSenderIsBot
+    ?? session.replyTargets?.[turnId]?.replyTargetSenderIsBot;
+  if (senderIsBot === false) return 'human';
+  if (senderIsBot === true) return 'bot';
+  return 'unknown';
 }
 
 function readPersistedSession(dataDir: string, sessionId: string): PersistedTurnSession {
@@ -178,6 +192,7 @@ export function resolveCurrentTurnProvenance(
       sessionId: marker.sessionId,
       turnId: marker.turnId,
       callerOpenId: auth.ownerOpenId,
+      actorKind: 'scheduled',
       larkAppId: session.larkAppId,
       chatId: session.chatId,
       ...(session.chatType === 'group' || session.chatType === 'p2p'
@@ -218,6 +233,7 @@ export function resolveCurrentTurnProvenance(
     sessionId: marker.sessionId,
     turnId: marker.turnId,
     callerOpenId: session.lastCallerOpenId,
+    actorKind: senderKindForTurn(session, marker.turnId),
     larkAppId: session.larkAppId,
     chatId: session.chatId,
     ...(session.chatType === 'group' || session.chatType === 'p2p'

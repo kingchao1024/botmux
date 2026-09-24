@@ -7,6 +7,7 @@
  */
 
 import type { AskOption } from './ask-types.js';
+import { ASK_MAX_TIMEOUT_MS } from './ask-limits.js';
 
 export class AskArgsError extends Error {
   constructor(
@@ -16,7 +17,15 @@ export class AskArgsError extends Error {
       | 'options_empty_key'
       | 'options_duplicate_key'
       | 'timeout_out_of_range'
-      | 'timeout_not_number',
+      | 'timeout_not_number'
+      | 's1_controller_only_flags'
+      | 's1_controller_requires_json'
+      | 's1_controller_bad_request_id'
+      | 's1_controller_bad_not_before_ms'
+      | 's1_controller_bad_expires_at_ms'
+      | 's1_controller_bad_phase'
+      | 's1_controller_bad_chat_id'
+      | 's1_controller_bad_window',
     message: string,
   ) {
     super(message);
@@ -114,6 +123,134 @@ export function parseAskTimeoutSeconds(
   return n * 1000;
 }
 
+export interface S1ControllerAskArgs {
+  phase: 'binding' | 'execution';
+  chatId: string;
+  requestId: string;
+  notBeforeMs: number;
+  expiresAtMs: number;
+  recoverOnly: boolean;
+}
+
+function hasFlag(args: readonly string[], flag: string): boolean {
+  return args.includes(flag);
+}
+
+function valueAfter(args: readonly string[], flag: string): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === flag && i + 1 < args.length) return args[i + 1];
+    if (arg.startsWith(flag + '=')) return arg.slice(flag.length + 1);
+  }
+  return undefined;
+}
+
+function parseAbsoluteSafeIntegerMs(
+  raw: string | undefined,
+  code: 's1_controller_bad_not_before_ms' | 's1_controller_bad_expires_at_ms',
+  flag: '--not-before-ms' | '--expires-at-ms',
+): number {
+  if (raw === undefined || raw.trim() === '') {
+    throw new AskArgsError(code, `${flag} 必须是绝对毫秒时间戳（safe integer）`);
+  }
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new AskArgsError(code, `${flag} 必须是绝对毫秒时间戳（safe integer），收到 "${raw}"`);
+  }
+  return n;
+}
+
+/** Parse the dedicated S1-controller ask contract.
+ *
+ *  Contract:
+ *   - disabled: S1-only flags are forbidden in ordinary ask mode
+ *   - enabled: requires `--json`, `--request-id <64hex>`,
+ *     `--not-before-ms <abs-safe-int>`, `--expires-at-ms <abs-safe-int>`
+ *   - `expiresAtMs - notBeforeMs` must be in `(0, 24h]`
+ *   - `--recover-only` only has meaning when S1 mode is enabled */
+export function parseS1ControllerAskArgs(
+  args: readonly string[],
+  options: { json: boolean },
+): S1ControllerAskArgs | null {
+  const s1Enabled = hasFlag(args, '--s1-controller');
+  const hasS1OnlyFlag =
+    hasFlag(args, '--recover-only')
+    || valueAfter(args, '--request-id') !== undefined
+    || hasFlag(args, '--request-id')
+    || valueAfter(args, '--not-before-ms') !== undefined
+    || hasFlag(args, '--not-before-ms')
+    || valueAfter(args, '--expires-at-ms') !== undefined
+    || hasFlag(args, '--expires-at-ms')
+    || valueAfter(args, '--phase') !== undefined
+    || hasFlag(args, '--phase')
+    || valueAfter(args, '--chat-id') !== undefined
+    || hasFlag(args, '--chat-id');
+
+  if (!s1Enabled) {
+    if (hasS1OnlyFlag) {
+      throw new AskArgsError(
+        's1_controller_only_flags',
+        '--phase / --chat-id / --request-id / --not-before-ms / --expires-at-ms / --recover-only 仅可与 --s1-controller 一起使用',
+      );
+    }
+    return null;
+  }
+
+  if (!options.json) {
+    throw new AskArgsError(
+      's1_controller_requires_json',
+      '--s1-controller requires --json',
+    );
+  }
+
+  const phase = valueAfter(args, '--phase');
+  if (phase !== 'binding' && phase !== 'execution') {
+    throw new AskArgsError(
+      's1_controller_bad_phase',
+      '--phase 必须是 binding 或 execution',
+    );
+  }
+  const chatId = valueAfter(args, '--chat-id');
+  if (!chatId || !chatId.trim()) {
+    throw new AskArgsError('s1_controller_bad_chat_id', '--chat-id 必须是非空字符串');
+  }
+
+  const requestId = valueAfter(args, '--request-id');
+  if (!requestId || !/^[0-9a-f]{64}$/.test(requestId)) {
+    throw new AskArgsError(
+      's1_controller_bad_request_id',
+      '--request-id 必须是固定 64hex 字符串',
+    );
+  }
+
+  const notBeforeMs = parseAbsoluteSafeIntegerMs(
+    valueAfter(args, '--not-before-ms'),
+    's1_controller_bad_not_before_ms',
+    '--not-before-ms',
+  );
+  const expiresAtMs = parseAbsoluteSafeIntegerMs(
+    valueAfter(args, '--expires-at-ms'),
+    's1_controller_bad_expires_at_ms',
+    '--expires-at-ms',
+  );
+  const windowMs = expiresAtMs - notBeforeMs;
+  if (windowMs <= 0 || windowMs > ASK_MAX_TIMEOUT_MS) {
+    throw new AskArgsError(
+      's1_controller_bad_window',
+      `--not-before-ms 必须小于 --expires-at-ms，且窗口不得超过 ${ASK_MAX_TIMEOUT_MS}ms`,
+    );
+  }
+
+  return {
+    phase,
+    chatId,
+    requestId,
+    notBeforeMs,
+    expiresAtMs,
+    recoverOnly: hasFlag(args, '--recover-only'),
+  };
+}
+
 /** Resolve the `(sub, rest)` pair for `botmux ask`'s top-level dispatch.
  *
  *  Input: positional args *after* the `ask` token. So for the user typing
@@ -137,16 +274,29 @@ export function normalizeAskDispatch(
 }
 
 /** Required env vars on the CLI side (§5). Returns the first missing one so
- *  the caller can produce a single, specific error message. */
+ *  the caller can produce a single, specific error message.
+ *
+ *  Ordinary asks still require the full trusted session context from the
+ *  parent shell. S1-controller asks bind by explicit app/chat selection, then
+ *  optionally carry trusted session/root execution hints only in execution
+ *  phase. */
 export function findMissingAskEnv(
   env: NodeJS.ProcessEnv,
+  options: { s1Controller?: boolean; s1Phase?: 'binding' | 'execution' } = {},
 ): string | null {
-  const required = [
-    'BOTMUX_SESSION_ID',
-    'BOTMUX_CHAT_ID',
-    'BOTMUX_LARK_APP_ID',
-    'BOTMUX_ROOT_MESSAGE_ID',
-  ];
+  let required: string[];
+  if (!options.s1Controller) {
+    required = [
+      'BOTMUX_SESSION_ID',
+      'BOTMUX_CHAT_ID',
+      'BOTMUX_LARK_APP_ID',
+      'BOTMUX_ROOT_MESSAGE_ID',
+    ];
+  } else if (options.s1Phase === 'execution') {
+    required = ['BOTMUX_LARK_APP_ID', 'BOTMUX_SESSION_ID', 'BOTMUX_ROOT_MESSAGE_ID'];
+  } else {
+    required = ['BOTMUX_LARK_APP_ID'];
+  }
   for (const k of required) {
     if (!env[k] || !env[k]!.trim()) return k;
   }

@@ -232,6 +232,8 @@ export interface ReplyTargetEntry {
   quoteOnly?: boolean;
   substitute?: boolean;
   senderOpenId?: string;
+  /** Exact daemon-classified sender kind for this inbound turn. */
+  replyTargetSenderIsBot?: boolean;
   /** Turn-window counterparts (sender + @-mentions, self bot excluded, deduped
    *  by open_id) accumulated across every message folded into this turn,
    *  type-ahead follow-ups included. `botmux send` reads it to decide whether

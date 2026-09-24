@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { generateKeyPairSync } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -7,14 +8,21 @@ import {
   registerAsk,
   registerHostAsk,
   restorePersistedAsks,
+  submitAsk,
+  toggleAsk,
   tryResolveAsk,
   setCardDispatcher,
   setCanTalkChecker,
   setAskPersistStore,
+  setAskReceiptRedeemer,
+  _pendingCount,
   _resetForTest,
 } from '../src/core/ask-broker.js';
 import { createAskPersistStore, askKeyFor, dispatchUuidForKey, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
 import type { AskCardDispatcher, AskResult, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
+import { canonicalAskReceiptBytes, verifyAskReceipt } from '../src/core/ask-receipt.js';
+import { createAskAnswerProvenanceAuthority, createAskReceiptSigner } from '../src/daemon/ask-receipt-authority.js';
+import { createAskCardEventClaimStore } from '../src/services/ask-card-event-claim-store.js';
 
 /**
  * Restart-resume for `botmux ask` — the AskUserQuestion picker-desync root fix,
@@ -69,6 +77,25 @@ function bindStore() {
   setAskPersistStore(createAskPersistStore(join(dataDir, 'asks')));
 }
 
+function createSignedAuthority() {
+  const pair = generateKeyPairSync('ed25519');
+  return createAskReceiptSigner({
+    privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'resume-authority',
+  });
+}
+
+function bindSignedStore(authority = createSignedAuthority(), bootId = 'boot-test') {
+  const store = createAskPersistStore(join(dataDir, 'asks'), authority);
+  const provenance = createAskAnswerProvenanceAuthority({
+    signer: authority, daemonBootId: bootId,
+    claimEvent: async () => ({ ok: true, recovered: false }),
+    completeEvent: async () => ({ ok: true, recovered: false }),
+  });
+  setAskReceiptRedeemer(provenance.redeemer);
+  setAskPersistStore(store);
+  return { authority, provenance };
+}
+
 beforeEach(() => {
   prevDataDir = process.env.SESSION_DATA_DIR;
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-resume-'));
@@ -95,6 +122,21 @@ function persistedFiles(): string[] {
   return readdirSync(dir).filter((n) => n.endsWith('.json'));
 }
 
+function retainedReceiptFiles(): string[] {
+  const dir = join(dataDir, 'asks', 'terminal-receipts');
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((n) => n.endsWith('.receipt'));
+}
+
+function readOnlyRetainedReceiptFile() {
+  const dir = join(dataDir, 'asks');
+  const files = retainedReceiptFiles();
+  if (files.length !== 1) throw new Error(`expected 1 retained receipt, got ${files.length}`);
+  return JSON.parse(readFileSync(join(dir, files[0]), 'utf-8')) as {
+    receipt: ReturnType<typeof createSignedAuthority> extends { sign: (...args: never[]) => infer T } ? T : never;
+  };
+}
+
 /** Read the single persisted ask record (fails if not exactly one). */
 function onlyPersisted(): PersistedAsk {
   const files = persistedFiles();
@@ -103,6 +145,54 @@ function onlyPersisted(): PersistedAsk {
 }
 
 describe('ask persistence (injected store)', () => {
+  it('v3 integrity rejects tampering and a wrong authority key', async () => {
+    const { authority } = bindSignedStore();
+    setCardDispatcher(mockDispatcher());
+    registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const filename = persistedFiles()[0]!;
+    const path = join(dataDir, 'asks', filename);
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    expect(record.v).toBe(3);
+    record.chatId = 'oc_tampered';
+    writeFileSync(path, JSON.stringify(record));
+    _resetForTest();
+    setAskReceiptRedeemer(createAskAnswerProvenanceAuthority({
+      signer: authority, daemonBootId: 'boot-test-2',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    }).redeemer);
+    setAskPersistStore(createAskPersistStore(join(dataDir, 'asks'), authority));
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+
+    const otherPair = generateKeyPairSync('ed25519');
+    const other = createAskReceiptSigner({
+      privateKey: otherPair.privateKey, publicKey: otherPair.publicKey, signerInstanceId: 'other',
+    });
+    setAskPersistStore(createAskPersistStore(join(dataDir, 'asks'), other));
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+  });
+
+  it('rejects a correctly signed v3 record whose Ask lifetime exceeds 24h', async () => {
+    const { authority } = bindSignedStore();
+    setCardDispatcher(mockDispatcher());
+    registerAsk(makeInput());
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const filename = persistedFiles()[0]!;
+    const path = join(dataDir, 'asks', filename);
+    const record = JSON.parse(readFileSync(path, 'utf8')) as Record<string, any>;
+    const { integrity: _oldIntegrity, ...unsigned } = record;
+    unsigned.deadlineAt = unsigned.createdAt + 86_400_001;
+    record.deadlineAt = unsigned.deadlineAt;
+    record.integrity = authority.sealPersistedState(unsigned);
+    writeFileSync(path, JSON.stringify(record), { mode: 0o600 });
+
+    _resetForTest();
+    bindSignedStore(authority, 'boot-timeout');
+    setCardDispatcher(mockDispatcher());
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+  });
+
   it('registerAsk writes a durable record; answering removes it', async () => {
     setCardDispatcher(mockDispatcher());
     const p = registerAsk(makeInput());
@@ -112,6 +202,53 @@ describe('ask persistence (injected store)', () => {
     expect(tryResolveAsk({ askId: rec.askId, nonce: rec.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
     await p;
     expect(persistedFiles()).toHaveLength(0);
+  });
+
+  it('legacy unsigned persisted selections are rejected outright and never become receipt eligible', async () => {
+    const authority = createSignedAuthority();
+    bindSignedStore(authority, 'boot-legacy-1');
+    setCardDispatcher(mockDispatcher());
+    registerAsk(makeInput({
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    await new Promise((r) => setTimeout(r, 5));
+    const filename = persistedFiles()[0]!;
+    const path = join(dataDir, 'asks', filename);
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    record.v = 2;
+    delete record.receiptEligible;
+    delete record.integrity;
+    record.selections = [['yes']];
+    writeFileSync(path, JSON.stringify(record));
+
+    _resetForTest();
+    bindSignedStore(authority, 'boot-legacy-2');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+    expect(persistedFiles()).toHaveLength(1);
+
+    const fresh = registerAsk(makeInput({
+      requestId: 'req-2',
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    await new Promise((r) => setTimeout(r, 5));
+    const files = persistedFiles();
+    expect(files).toHaveLength(2);
+    const records = files.map((name) =>
+      JSON.parse(readFileSync(join(dataDir, 'asks', name), 'utf-8')) as PersistedAsk,
+    );
+    const live = records.find((entry) => entry.requestId === 'req-2');
+    if (!live) throw new Error('expected fresh signed ask record');
+    expect(live.v).toBe(3);
+    expect(submitAsk({ askId: live.askId, nonce: live.nonce, by: 'ou_owner' })).toBe('needs_empty_confirm');
+    expect(submitAsk({ askId: live.askId, nonce: live.nonce, by: 'ou_owner', confirmEmpty: true })).toBe('accepted');
+    const result = await fresh;
+    expect(result.kind).toBe('answered');
+    if (result.kind === 'answered') {
+      expect(result.answers).toEqual([[]]);
+      expect(result.receipt).toBeUndefined();
+    }
   });
 
   it('does nothing when no store is wired (no global-dir writes)', async () => {
@@ -153,6 +290,72 @@ describe('reattach → click (hook reconnects first)', () => {
 });
 
 describe('click → reattach (durable handoff — codex P1-1)', () => {
+  it('preserves the exact signed receipt across two daemon restarts', async () => {
+    const authority = createSignedAuthority();
+    let bound = bindSignedStore(authority, 'boot-1');
+    setCardDispatcher(mockDispatcher());
+    registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const original = onlyPersisted();
+
+    _resetForTest();
+    bound = bindSignedStore(authority, 'boot-2');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    const issued = await bound.provenance.issue('cli_app', {
+      event_id: 'evt-restart-answer',
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: {
+        action: 'ask_select', ask_id: original.askId, nonce: original.nonce, key: 'yes',
+      } },
+    });
+    if (issued.kind !== 'issued') throw new Error('expected restart answer provenance token');
+    expect(tryResolveAsk({
+      askId: original.askId, nonce: original.nonce, selected: 'yes', by: 'ou_owner', provenance: issued.token,
+    })).toBe('accepted');
+    // The single authoritative file becomes an absorbing terminal record. Hook
+    // answers stay inline; only S1-controller answers allocate an outbox.
+    expect(persistedFiles()).toHaveLength(1);
+    expect(retainedReceiptFiles()).toHaveLength(0);
+    const retained = onlyPersisted();
+    if (retained.answeredResult?.kind !== 'answered' || !retained.answeredResult.receipt) {
+      throw new Error('signed inline terminal answer expected');
+    }
+    const originalReceipt = retained.answeredResult.receipt;
+    const originalBytes = canonicalAskReceiptBytes(originalReceipt.payload);
+
+    _resetForTest();
+    bindSignedStore(authority, 'boot-3');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    restorePersistedAsks(Date.now(), 'cli_app');
+
+    _resetForTest();
+    bindSignedStore(authority, 'boot-4');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    restorePersistedAsks(Date.now(), 'cli_app');
+    const claimed = await registerAsk(makeInput());
+    if (claimed.kind !== 'answered' || !claimed.receipt) throw new Error('restored signed answer expected');
+    expect(canonicalAskReceiptBytes(claimed.receipt.payload)).toEqual(originalBytes);
+    expect(claimed.receipt).toEqual(originalReceipt);
+    expect(verifyAskReceipt(claimed.receipt, {
+      publicKey: authority.publicKey, now: claimed.receipt.payload.answeredAt,
+    })).toMatchObject({ ok: true });
+
+    const wrong = createSignedAuthority();
+    expect(verifyAskReceipt(claimed.receipt, {
+      publicKey: wrong.publicKey, now: claimed.receipt.payload.answeredAt,
+    })).toEqual({ ok: false, error: 'untrusted_key' });
+    const tampered = structuredClone(claimed.receipt);
+    tampered.payload.chatId = 'oc_tampered';
+    expect(verifyAskReceipt(tampered, {
+      publicKey: authority.publicKey, now: claimed.receipt.payload.answeredAt,
+    }).ok).toBe(false);
+  });
+
   it('user answers dormant card first; hook reconnect delivers the stashed answer, 0 new cards', async () => {
     setCardDispatcher(mockDispatcher());
     registerAsk(makeInput());
@@ -203,6 +406,367 @@ describe('click → reattach (durable handoff — codex P1-1)', () => {
     if (result.kind === 'answered') expect(result.answers).toEqual([['no']]);
     expect(persistedFiles()).toHaveLength(0);
   });
+
+  it('restart preserves selection actor ownership: A submit succeeds, B submit is rejected', async () => {
+    const authority = createSignedAuthority();
+    bindSignedStore(authority, 'boot-owner-1');
+    setCardDispatcher(mockDispatcher());
+    registerAsk(makeInput({
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    await new Promise((r) => setTimeout(r, 5));
+    const original = onlyPersisted();
+    expect(toggleAsk({
+      askId: original.askId,
+      nonce: original.nonce,
+      questionIndex: 0,
+      key: 'yes',
+      by: 'ou_owner',
+    })).toBe('toggled');
+    expect((onlyPersisted() as PersistedAsk & { selectionActorIdentity?: string }).selectionActorIdentity)
+      .toBe('ou_owner');
+
+    _resetForTest();
+    bindSignedStore(authority, 'boot-owner-2');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner' || openId === 'ou_other');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+
+    const reattached = registerAsk(makeInput({
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(submitAsk({ askId: original.askId, nonce: original.nonce, by: 'ou_other' })).toBe('unauthorized');
+    expect(submitAsk({ askId: original.askId, nonce: original.nonce, by: 'ou_owner' })).toBe('accepted');
+    const result = await reattached;
+    expect(result.kind).toBe('answered');
+    if (result.kind === 'answered') expect(result.answers).toEqual([['yes']]);
+  });
+
+  it('restart rejects a delivered toggle replay and signs only the same actor submit', async () => {
+    const authority = createSignedAuthority();
+    const claimsDir = join(dataDir, 'claims');
+    const claims1 = createAskCardEventClaimStore(claimsDir, { instanceId: 'boot-claim-1' });
+    const store1 = createAskPersistStore(join(dataDir, 'asks'), authority);
+    const provenance1 = createAskAnswerProvenanceAuthority({
+      signer: authority, daemonBootId: 'boot-claim-1',
+      claimEvent: claims1.claim, completeEvent: claims1.complete,
+    });
+    setAskReceiptRedeemer(provenance1.redeemer);
+    setAskPersistStore(store1);
+    setCardDispatcher(mockDispatcher());
+    registerAsk(makeInput({
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const original = onlyPersisted();
+    const toggleEvent = {
+      event_id: 'evt-toggle-before-restart', operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: {
+        action: 'ask_toggle', ask_id: original.askId, nonce: original.nonce,
+        question_index: '0', key: 'yes',
+      } },
+    };
+    const toggleIssued = await provenance1.issue('cli_app', toggleEvent);
+    if (toggleIssued.kind !== 'issued') throw new Error('expected toggle claim');
+    expect(toggleAsk({
+      askId: original.askId, nonce: original.nonce, questionIndex: 0, key: 'yes',
+      by: 'ou_owner', provenance: toggleIssued.token,
+    })).toBe('toggled');
+    expect(await provenance1.complete(toggleIssued.token)).toMatchObject({ ok: true });
+
+    _resetForTest();
+    const claims2 = createAskCardEventClaimStore(claimsDir, { instanceId: 'boot-claim-2' });
+    const store2 = createAskPersistStore(join(dataDir, 'asks'), authority);
+    const provenance2 = createAskAnswerProvenanceAuthority({
+      signer: authority, daemonBootId: 'boot-claim-2',
+      claimEvent: claims2.claim, completeEvent: claims2.complete,
+    });
+    setAskReceiptRedeemer(provenance2.redeemer);
+    setAskPersistStore(store2);
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner' || openId === 'ou_other');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+
+    expect(await provenance2.issue('cli_app', toggleEvent))
+      .toEqual({ kind: 'rejected', reason: 'duplicate' });
+
+    const otherSubmit = await provenance2.issue('cli_app', {
+      event_id: 'evt-submit-other', operator: { open_id: 'ou_other' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: { action: 'ask_submit', ask_id: original.askId, nonce: original.nonce } },
+    });
+    if (otherSubmit.kind !== 'issued') throw new Error('expected other submit claim');
+    expect(submitAsk({
+      askId: original.askId, nonce: original.nonce, by: 'ou_other',
+      provenance: otherSubmit.token, provenanceAction: 'ask_submit', provenanceHasFormValue: false,
+    })).toBe('unauthorized');
+    expect(provenance2.wasRedeemed(otherSubmit.token)).toBe(false);
+
+    const ownerSubmit = await provenance2.issue('cli_app', {
+      event_id: 'evt-submit-owner', operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: { action: 'ask_submit', ask_id: original.askId, nonce: original.nonce } },
+    });
+    if (ownerSubmit.kind !== 'issued') throw new Error('expected owner submit claim');
+    expect(submitAsk({
+      askId: original.askId, nonce: original.nonce, by: 'ou_owner',
+      provenance: ownerSubmit.token, provenanceAction: 'ask_submit', provenanceHasFormValue: false,
+    })).toBe('accepted');
+    expect(await provenance2.complete(ownerSubmit.token)).toMatchObject({ ok: true });
+
+    const result = await registerAsk(makeInput({
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    expect(result.kind).toBe('answered');
+    if (result.kind !== 'answered') return;
+    expect(result.answers).toEqual([['yes']]);
+    expect(result.receipt?.payload).toMatchObject({
+      actor: { identity: 'ou_owner' },
+      platformEventId: 'evt-submit-owner',
+      answers: [['yes']],
+    });
+  });
+});
+
+describe('signed persistence closure (terminal tombstone + fail-closed mutations)', () => {
+  it('authoritative terminal state prevents stale signed payload revival', async () => {
+    const authority = createSignedAuthority();
+    const claimsDir = join(dataDir, 'claim-eacces');
+    const claimsA = createAskCardEventClaimStore(claimsDir, { instanceId: 'claim-a' });
+    const storeA = createAskPersistStore(join(dataDir, 'asks'), authority);
+    const provenanceA = createAskAnswerProvenanceAuthority({
+      signer: authority,
+      daemonBootId: 'boot-eacces-a',
+      claimEvent: claimsA.claim,
+      completeEvent: claimsA.complete,
+    });
+    setAskReceiptRedeemer(provenanceA.redeemer);
+    setAskPersistStore(storeA);
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner' || openId === 'ou_other');
+
+    const first = registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const original = onlyPersisted();
+
+    const issuedA = await provenanceA.issue('cli_app', {
+      event_id: 'evt-eacces-a',
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: { action: 'ask_select', ask_id: original.askId, nonce: original.nonce, key: 'yes' } },
+    });
+    if (issuedA.kind !== 'issued') throw new Error('expected signed first issuance');
+    expect(tryResolveAsk({
+      askId: original.askId,
+      nonce: original.nonce,
+      selected: 'yes',
+      by: 'ou_owner',
+      provenance: issuedA.token,
+    })).toBe('accepted');
+    const firstResult = await first;
+    expect(firstResult.kind).toBe('answered');
+    if (firstResult.kind !== 'answered' || !firstResult.receipt) {
+      throw new Error('expected first signed receipt');
+    }
+    const firstReceipt = firstResult.receipt;
+
+    const askDir = join(dataDir, 'asks');
+    const secondAuthority = bindSignedStore(authority, 'boot-eacces-b');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner' || openId === 'ou_other');
+    // The retained signed terminal is an absorbing replay/recovery barrier. It
+    // is visible to restore scanning but must never re-enter the pending set.
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    expect(_pendingCount()).toBe(0);
+
+    const second = registerAsk(makeInput({ requestId: 'req-2' }));
+    await new Promise((r) => setTimeout(r, 5));
+    const live = persistedFiles()
+      .map((name) => JSON.parse(readFileSync(join(dataDir, 'asks', name), 'utf8')) as PersistedAsk)
+      .find((entry) => entry.requestId === 'req-2');
+    if (!live) throw new Error('expected second live ask');
+    const issuedB = await secondAuthority!.provenance.issue('cli_app', {
+      event_id: 'evt-eacces-b',
+      operator: { open_id: 'ou_other' },
+      context: { open_message_id: live.cardMessageId },
+      action: { value: { action: 'ask_select', ask_id: live.askId, nonce: live.nonce, key: 'no' } },
+    });
+    if (issuedB.kind !== 'issued') throw new Error('expected signed second issuance');
+    expect(tryResolveAsk({
+      askId: live.askId,
+      nonce: live.nonce,
+      selected: 'no',
+      by: 'ou_other',
+      provenance: issuedB.token,
+    })).toBe('accepted');
+    const secondResult = await second;
+    expect(secondResult.kind).toBe('answered');
+    if (secondResult.kind !== 'answered' || !secondResult.receipt) {
+      throw new Error('expected second signed receipt');
+    }
+    expect(secondResult.receipt.payload.jti).not.toBe(firstReceipt.payload.jti);
+    expect(secondResult.receipt.payload.answers).toEqual([['no']]);
+    expect(firstReceipt.payload.answers).toEqual([['yes']]);
+  });
+
+  it('rejects stale signed rollback payload when a newer tombstone exists', async () => {
+    const authority = createSignedAuthority();
+    bindSignedStore(authority, 'boot-stale-a');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+
+    registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const before = onlyPersisted();
+    const staleBytes = readFileSync(join(dataDir, 'asks', persistedFiles()[0]!), 'utf8');
+
+    expect(tryResolveAsk({
+      askId: before.askId,
+      nonce: before.nonce,
+      selected: 'yes',
+      by: 'ou_owner',
+    })).toBe('accepted');
+
+    const stalePath = join(dataDir, 'asks', `${'x'.repeat(64)}.json`);
+    writeFileSync(stalePath, staleBytes, { mode: 0o600 });
+
+    _resetForTest();
+    bindSignedStore(authority, 'boot-stale-b');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    // The terminal record is retained as an absorbing replay barrier; the
+    // extra stale pending copy must not create a second live ask.
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    expect(_pendingCount()).toBe(0);
+  });
+
+  it('fails closed on signed toggle persistence write failure', async () => {
+    const authority = createSignedAuthority();
+    bindSignedStore(authority, 'boot-toggle-a');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+
+    registerAsk(makeInput({
+      questions: [{ prompt: 'pick', options: OPTIONS, multiSelect: true }],
+    }));
+    await new Promise((r) => setTimeout(r, 5));
+    const original = onlyPersisted();
+    const askDir = join(dataDir, 'asks');
+
+    chmodSync(askDir, 0o500);
+    try {
+      expect(toggleAsk({
+        askId: original.askId,
+        nonce: original.nonce,
+        questionIndex: 0,
+        key: 'yes',
+        by: 'ou_owner',
+      })).toBe('stale');
+    } finally {
+      chmodSync(askDir, 0o700);
+    }
+
+    _resetForTest();
+    bindSignedStore(authority, 'boot-toggle-b');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+  });
+
+  it('restores full pre-mutation single-select state when signed toggle persistence fails', async () => {
+    const authority = createSignedAuthority();
+    const firstBoot = bindSignedStore(authority, 'boot-toggle-restore-a');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner' || openId === 'ou_other');
+
+    registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const original = onlyPersisted();
+
+    const chooseYes = await firstBoot.provenance.issue('cli_app', {
+      event_id: 'evt-toggle-restore-yes',
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: { action: 'ask_toggle', ask_id: original.askId, nonce: original.nonce, key: 'yes', question_index: 0 } },
+    });
+    if (chooseYes.kind !== 'issued') throw new Error('expected signed initial toggle issuance');
+    expect(toggleAsk({
+      askId: original.askId,
+      nonce: original.nonce,
+      questionIndex: 0,
+      key: 'yes',
+      by: 'ou_owner',
+      provenance: chooseYes.token,
+    })).toBe('toggled');
+
+    const afterYes = onlyPersisted() as PersistedAsk & { selectionActorIdentity?: string; receiptEligible?: boolean };
+    expect(afterYes.selections).toEqual([['yes']]);
+    expect(afterYes.selectionActorIdentity).toBe('ou_owner');
+    expect(afterYes.receiptEligible).toBe(true);
+
+    const askDir = join(dataDir, 'asks');
+    chmodSync(askDir, 0o500);
+    try {
+      const chooseNo = await firstBoot.provenance.issue('cli_app', {
+        event_id: 'evt-toggle-restore-no',
+        operator: { open_id: 'ou_owner' },
+        context: { open_message_id: original.cardMessageId },
+        action: { value: { action: 'ask_toggle', ask_id: original.askId, nonce: original.nonce, key: 'no', question_index: 0 } },
+      });
+      if (chooseNo.kind !== 'issued') throw new Error('expected signed failing toggle issuance');
+      expect(toggleAsk({
+        askId: original.askId,
+        nonce: original.nonce,
+        questionIndex: 0,
+        key: 'no',
+        by: 'ou_owner',
+        provenance: chooseNo.token,
+      })).toBe('stale');
+    } finally {
+      chmodSync(askDir, 0o700);
+    }
+
+    const afterFailure = onlyPersisted() as PersistedAsk & { selectionActorIdentity?: string; receiptEligible?: boolean };
+    expect(afterFailure.selections).toEqual([['yes']]);
+    expect(afterFailure.selectionActorIdentity).toBe('ou_owner');
+    expect(afterFailure.receiptEligible).toBe(true);
+
+    _resetForTest();
+    const secondBoot = bindSignedStore(authority, 'boot-toggle-restore-b');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner' || openId === 'ou_other');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    const resumed = registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(submitAsk({ askId: original.askId, nonce: original.nonce, by: 'ou_other' })).toBe('unauthorized');
+    const submitIssued = await secondBoot.provenance.issue('cli_app', {
+      event_id: 'evt-toggle-restore-submit',
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: { action: 'ask_submit', ask_id: original.askId, nonce: original.nonce } },
+    });
+    if (submitIssued.kind !== 'issued') throw new Error('expected signed submit issuance');
+    expect(submitAsk({
+      askId: original.askId,
+      nonce: original.nonce,
+      by: 'ou_owner',
+      provenance: submitIssued.token,
+      provenanceAction: 'ask_submit',
+      provenanceHasFormValue: false,
+    })).toBe('accepted');
+
+    const result = await resumed;
+    expect(result.kind).toBe('answered');
+    if (result.kind !== 'answered' || !result.receipt) {
+      throw new Error('expected restored signed receipt');
+    }
+    expect(result.answers).toEqual([['yes']]);
+    expect(result.receipt.payload.answers).toEqual([['yes']]);
+    expect(result.receipt.payload.actor.identity).toBe('ou_owner');
+  });
 });
 
 describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => {
@@ -215,9 +779,9 @@ describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => 
       originKind: 'host_cross_principal_classification',
       requestId: 'host-before-delivery',
       backendSurvivesRestart: undefined,
-      timeoutMs: 20,
+      timeoutMs: 1_000,
     }));
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
     expect(onlyPersisted().cardMessageId).toBeUndefined();
 
     _resetForTest();
@@ -231,7 +795,7 @@ describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => 
       originKind: 'host_cross_principal_classification',
       requestId: 'host-before-delivery',
       backendSurvivesRestart: undefined,
-      timeoutMs: 20,
+      timeoutMs: 1_000,
     }));
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(d2.sendCalls).toHaveLength(1);
@@ -263,6 +827,108 @@ describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => 
     await new Promise((r) => setTimeout(r, 5));
     expect(d2.sendCalls).toHaveLength(1);           // re-attach re-sends exactly one
     void resolveSend!;
+  });
+});
+
+describe('startup restore sequencing', () => {
+  it('initial unsigned fallback restore skips signed v3 state until a second signed restore runs', async () => {
+    const authority = createSignedAuthority();
+    bindSignedStore(authority, 'boot-startup-1');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+
+    registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const original = onlyPersisted();
+
+    _resetForTest();
+    setAskPersistStore(createAskPersistStore(join(dataDir, 'asks')));
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+
+    const signedBoot = bindSignedStore(authority, 'boot-startup-2');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+
+    const resumed = registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const issued = await signedBoot.provenance.issue('cli_app', {
+      event_id: 'evt-startup-second-restore',
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: {
+        action: 'ask_select', ask_id: original.askId, nonce: original.nonce, key: 'yes',
+      } },
+    });
+    if (issued.kind !== 'issued') throw new Error('expected signed startup issuance');
+    expect(tryResolveAsk({
+      askId: original.askId,
+      nonce: original.nonce,
+      selected: 'yes',
+      by: 'ou_owner',
+      provenance: issued.token,
+    })).toBe('accepted');
+
+    const result = await resumed;
+    expect(result.kind).toBe('answered');
+    if (result.kind !== 'answered' || !result.receipt) {
+      throw new Error('expected signed receipt after second restore');
+    }
+    expect(result.receipt.payload.actor.identity).toBe('ou_owner');
+  });
+
+  it('a second signed restore recovers retained terminal receipts after unsigned fallback skipped them', async () => {
+    const authority = createSignedAuthority();
+    const firstBoot = bindSignedStore(authority, 'boot-startup-terminal-1');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+
+    const firstAnswered = registerAsk(makeInput());
+    await new Promise((r) => setTimeout(r, 5));
+    const original = onlyPersisted();
+    const issued = await firstBoot.provenance.issue('cli_app', {
+      event_id: 'evt-startup-terminal-answer',
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: original.cardMessageId },
+      action: { value: {
+        action: 'ask_select', ask_id: original.askId, nonce: original.nonce, key: 'yes',
+      } },
+    });
+    if (issued.kind !== 'issued') throw new Error('expected signed terminal issuance');
+    expect(tryResolveAsk({
+      askId: original.askId,
+      nonce: original.nonce,
+      selected: 'yes',
+      by: 'ou_owner',
+      provenance: issued.token,
+    })).toBe('accepted');
+
+    const answered = await firstAnswered;
+    if (answered.kind !== 'answered' || !answered.receipt) {
+      throw new Error('expected signed terminal receipt on first boot');
+    }
+
+    _resetForTest();
+    setAskPersistStore(createAskPersistStore(join(dataDir, 'asks')));
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(0);
+
+    bindSignedStore(authority, 'boot-startup-terminal-2');
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+
+    const claimed = await registerAsk(makeInput());
+    expect(claimed.kind).toBe('answered');
+    if (claimed.kind !== 'answered' || !claimed.receipt) {
+      throw new Error('expected retained terminal receipt recovery after second restore');
+    }
+    expect(claimed.receipt).toEqual(answered.receipt);
+    expect(canonicalAskReceiptBytes(claimed.receipt.payload))
+      .toEqual(canonicalAskReceiptBytes(answered.receipt.payload));
   });
 });
 

@@ -79,7 +79,13 @@ function optionButton(key: string) {
   ).find((element: any) => element.behaviors?.some((behavior: any) =>
     ['ask_select', 'ask_toggle'].includes(behavior.value?.action) && behavior.value?.key === key));
 }
-async function click(snapshot: PendingAsk, value: Record<string, string>, by = 'ou_owner', messageId = 'om_reply') {
+async function click(
+  snapshot: PendingAsk,
+  value: Record<string, string>,
+  by = 'ou_owner',
+  messageId = 'om_reply',
+  expectStandaloneCard = false,
+) {
   const response = await handleAskCardAction({
     operator: { open_id: by }, context: { open_message_id: messageId },
     action: { value: { ask_id: snapshot.askId, nonce: snapshot.nonce, ...value } },
@@ -87,8 +93,12 @@ async function click(snapshot: PendingAsk, value: Record<string, string>, by = '
   // The event dispatcher executes this only after the platform callback ACK.
   const effect = (response as { afterAck?: () => Promise<void> })?.afterAck;
   if (effect) await effect();
-  expect(response).not.toHaveProperty('card');
-  expect(response).not.toHaveProperty('body');
+  if (expectStandaloneCard) {
+    expect(response).toMatchObject({ schema: '2.0', body: { direction: 'vertical' } });
+  } else {
+    expect(response).not.toHaveProperty('card');
+    expect(response).not.toHaveProperty('body');
+  }
   return response;
 }
 
@@ -173,7 +183,7 @@ describe('Ask inside the running reply card', () => {
   });
 
   it('records timeouts without allowing a late initial snapshot to restore buttons', async () => {
-    const { snapshot, answer } = await ask({ timeoutMs: 150 });
+    const { snapshot, answer } = await ask({ timeoutMs: 1_000 });
     expect(await answer).toMatchObject({ kind: 'timedOut' });
     await publishReplyCardAsk(snapshot);
     expect(body).toContain('超时未答');
@@ -215,7 +225,7 @@ describe('Ask inside the running reply card', () => {
     expect(body).not.toContain('ask_select');
   });
 
-  it('preserves the inline target and selected options across a resumable hook restart', async () => {
+  it('preserves the inline target but discards unsigned selections across a resumable hook restart', async () => {
     const bind = () => setAskPersistStore(createAskPersistStore(join(dir, 'asks')));
     bind();
     const { snapshot } = await ask({ requestId: 'restart', originKind: 'hook', backendSurvivesRestart: true,
@@ -223,7 +233,8 @@ describe('Ask inside the running reply card', () => {
     await click(snapshot, { action: 'ask_toggle', key: 'yes', question_index: '0' });
     _resetForTest(); bind(); setCanTalkChecker(() => true); bindDispatcher();
     restorePersistedAsks(Date.now(), 'app');
-    expect(getAskSnapshot(snapshot.askId)).toMatchObject({ replyCardTarget: input.replyCardTarget, selections: [['yes']] });
+    expect(getAskSnapshot(snapshot.askId)).toMatchObject({ replyCardTarget: input.replyCardTarget, selections: [[]] });
+    await click(getAskSnapshot(snapshot.askId)!, { action: 'ask_toggle', key: 'yes', question_index: '0' });
     await click(getAskSnapshot(snapshot.askId)!, { action: 'ask_submit' });
     expect(body).not.toContain('ask_submit');
     expect(replyMessage).toHaveBeenCalledTimes(1);
@@ -295,7 +306,7 @@ describe('Ask inside the running reply card', () => {
     expect(replyMessage).toHaveBeenCalledTimes(1);
     expect(updateMessage).not.toHaveBeenCalled();
     expect(store.read(key)?.asks).toBeUndefined();
-    await click(snapshot, { action: 'ask_select', key: 'yes' });
+    await click(snapshot, { action: 'ask_select', key: 'yes' }, 'ou_owner', 'om_standalone', true);
     expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
   });
 

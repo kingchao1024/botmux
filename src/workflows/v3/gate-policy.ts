@@ -1,6 +1,7 @@
 import {
   DEFAULT_HUMAN_GATE_OPTIONS,
   type V3HumanGate,
+  type V3WriteExecutionBinding,
 } from './dag.js';
 
 export interface NormalizedGatePolicy {
@@ -8,16 +9,23 @@ export interface NormalizedGatePolicy {
   options: string[];
   approveOptions: string[];
   approvers: string[];
+  writeExecution?: V3WriteExecutionBinding;
+}
+
+function writeExecutionPrompt(gate: V3HumanGate): string {
+  if (!gate.writeExecution) return gate.prompt;
+  return `${gate.prompt}\n\nOne-time write execution (exact binding):\n\`\`\`json\n${JSON.stringify(gate.writeExecution, null, 2)}\n\`\`\``;
 }
 
 /** Normalize authored gate defaults without requiring a persistence adapter. */
 export function normalizeGateWaitInput(gate: V3HumanGate): NormalizedGatePolicy {
   const options = gate.options ?? [...DEFAULT_HUMAN_GATE_OPTIONS];
   return {
-    prompt: gate.prompt,
+    prompt: writeExecutionPrompt(gate),
     options,
     approveOptions: gate.approveOptions ?? (options.includes('approve') ? ['approve'] : [options[0]!]),
     approvers: gate.approvers ?? [],
+    ...(gate.writeExecution ? { writeExecution: gate.writeExecution } : {}),
   };
 }
 

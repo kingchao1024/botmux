@@ -24,7 +24,7 @@
 import { spawn, execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createServer } from 'node:net';
 import { get as httpGet } from 'node:http';
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
@@ -65,10 +65,21 @@ function isAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+function isProcessGroupAlive(pid: number): boolean {
+  if (process.platform === 'win32') return isAlive(pid);
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */
 function killGroup(pid: number, signal: NodeJS.Signals): void {
-  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+  if (process.platform === 'win32') process.kill(pid, signal);
+  else process.kill(-pid, signal);
 }
 
 export interface CodexRpcEngineOpts {
@@ -91,15 +102,20 @@ export interface CodexRpcEngineOpts {
   appServerFeatures?: string[];
   /** Generic process-scoped app-server config overrides. */
   appServerConfig?: string[];
+  /**
+   * Bypass TraeX's interactive hook-review gate for a botmux-managed app-server.
+   * Only set after the caller applies its automation and restricted-bot policy.
+   */
+  bypassHookTrust?: boolean;
   /** Bridge a native request_user_input server request to the host UI. */
   onRequestUserInput?: (params: unknown) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
    *  Mainly for tests that assert the wedged-app-server recovery path. */
   requestTimeoutMs?: number;
-  /** Called once if the app-server dies unexpectedly (not via stop()). The
-   *  worker uses it to kill the now-orphaned `codex --remote` pane so the normal
-   *  exit→daemon-refork→resume path re-engages RPC on a fresh app-server (P1). */
-  onDead?: () => void;
+  /** Called once when this engine can no longer safely continue (not via
+   * stop()). The worker uses the reason to distinguish an app-server outage
+   * from a native-turn ownership protocol conflict before replacing the pane. */
+  onDead?: (failure: CodexRpcEngineFailure) => void;
   /** Authoritative native turn terminal. `turn/start` returns a native Codex
    *  turn id which this engine binds to the exact Botmux delivery attempt before
    *  resolving the ack. The worker uses that identity to release only the
@@ -111,6 +127,10 @@ export interface CodexRpcEngineDependencies {
   /** Process boundary kept injectable so launch argv/env can be verified without
    * relying on platform-specific process introspection such as Linux /proc. */
   spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
+  /** Test seam for the detached app-server process-group boundary. */
+  isProcessGroupAlive?(pid: number): boolean;
+  hasExactProcessGroupIdentity?(pid: number, expectedUrl?: string): boolean;
+  signalProcessGroup?(pid: number, signal: NodeJS.Signals): void;
 }
 
 const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
@@ -136,6 +156,11 @@ export interface CodexRpcTurnTerminal {
   errorCode?: string;
 }
 
+export interface CodexRpcEngineFailure {
+  kind: 'app-server-unavailable' | 'protocol-ownership-conflict';
+  errorCode: 'rpc_engine_dead' | 'rpc_native_turn_ownership_conflict';
+}
+
 /** Server→client requests are auto-answered so codex never blocks on a human;
  *  botmux already runs codex with approvals bypassed. Mirrors codex-app-runner. */
 function autoApproval(method: string): unknown {
@@ -157,6 +182,14 @@ const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
  *  fails-closed (engage) or surfaces a resync (sendTurn). Generous because the
  *  FIRST turn on a cold app-server pays MCP/model-list startup latency. */
 const REQUEST_TIMEOUT_MS = 60_000;
+
+/** A worker that is shutting down must keep running long enough to reap its
+ * managed app-server. The graceful wait gives the server a chance to close its
+ * listener and descendants; the short second window only confirms the SIGKILL
+ * fallback has landed. */
+const APP_SERVER_STOP_GRACE_MS = 2_000;
+const APP_SERVER_STOP_KILL_SETTLE_MS = 250;
+const APP_SERVER_STOP_POLL_INTERVAL_MS = 25;
 
 /** Floor for a metadata-poll iteration's per-request budget. Below this, the
  *  poll deadline is effectively reached: issuing a thread/read with a
@@ -203,6 +236,13 @@ export class CodexRpcEngine {
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
   get appServerPid(): number | undefined { return this.child?.pid; }
+  /** The only native turn this engine currently owns. Multiple native turns are
+   * never a valid state for Botmux RPC input, so callers must not guess when
+   * ownership is absent or ambiguous. */
+  get activeNativeTurnId(): string | undefined {
+    if (this.turnOwners.size !== 1) return undefined;
+    return this.turnOwners.keys().next().value as string | undefined;
+  }
 
   private ownerKey(identity: CodexRpcTurnIdentity): string {
     return `${identity.turnId}\0${identity.dispatchAttempt ?? ''}`;
@@ -297,12 +337,15 @@ export class CodexRpcEngine {
 
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
-    this.reapStaleAppServer();
+    await this.reapStaleAppServer();
     this.port = await findFreePort();
+    const globalArgs = this.opts.bypassHookTrust
+      ? ['--dangerously-bypass-hook-trust']
+      : [];
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
       .flatMap(value => ['-c', value]);
-    this.child = this.dependencies.spawnProcess(this.opts.cliBin, ['app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
+    this.child = this.dependencies.spawnProcess(this.opts.cliBin, [...globalArgs, 'app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -400,6 +443,12 @@ export class CodexRpcEngine {
     opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
   ): Promise<{ nativeTurnId: string }> {
     if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
+    const activeNativeTurnId = this.activeNativeTurnId;
+    if (activeNativeTurnId) {
+      throw new Error(
+        `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
+      );
+    }
     const params: Json = {
       threadId: this.threadId,
       input: [{ type: 'text', text: content, text_elements: [] }],
@@ -411,6 +460,34 @@ export class CodexRpcEngine {
     await this.request('turn/start', params, opts, undefined, identity);
     const nativeTurnId = this.takeNativeTurnId(identity);
     if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
+    return { nativeTurnId };
+  }
+
+  /** Deliver a pre-authorized control into one exact active native turn. This
+   * deliberately owns no second Botmux lifecycle: the existing owner remains
+   * authoritative for the native terminal and the caller must queue if it
+   * cannot prove the expected native id. */
+  async steerTurn(
+    content: string,
+    expectedTurnId: string,
+  ): Promise<{ nativeTurnId: string }> {
+    if (!this.threadId) throw new Error('steerTurn before startThread/resumeThread');
+    if (!expectedTurnId || this.activeNativeTurnId !== expectedTurnId) {
+      throw new Error(`refusing turn/steer: ${expectedTurnId || 'missing'} is not the current active native turn`);
+    }
+    const result = await this.request('turn/steer', {
+      threadId: this.threadId,
+      input: [{ type: 'text', text: content, text_elements: [] }],
+      expectedTurnId,
+    });
+    const nativeTurnId = String(result?.turnId ?? result?.turn?.id ?? '');
+    if (nativeTurnId !== expectedTurnId) {
+      const error = new Error(
+        `turn/steer response did not confirm expected native turn ${expectedTurnId}`,
+      );
+      this.failAll(error);
+      throw error;
+    }
     return { nativeTurnId };
   }
 
@@ -541,25 +618,63 @@ export class CodexRpcEngine {
     }
   }
 
-  stop(): void {
+  stop(options: { scheduleKill?: boolean } = {}): void {
     if (this.closed) return;
     this.closed = true;
     this.emitAllTurnTerminals('stopped', 'rpc_engine_stopped');
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
+    let signalError: Error | undefined;
     if (pid) {
       // Bounded SIGTERM → SIGKILL: don't leave a stubborn child as an untracked
       // orphan. The marker is removed by the child 'exit' handler (confirmed
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
-      try { killGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
-      const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, 2000);
-      t.unref?.();
+      try {
+        this.signalManagedProcessGroup(pid, 'SIGTERM');
+      } catch (error) {
+        signalError = error instanceof Error ? error : new Error(String(error));
+      }
+      if (!signalError && options.scheduleKill !== false) {
+        const t = setTimeout(() => {
+          try { this.signalManagedProcessGroup(pid, 'SIGKILL'); }
+          catch (error) {
+            this.log('[codex-rpc] refusing SIGKILL for group ' + pid + ': ' + (error instanceof Error ? error.message : String(error)));
+          }
+        }, APP_SERVER_STOP_GRACE_MS);
+        t.unref?.();
+      }
     } else {
       this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
+    if (signalError) throw signalError;
+  }
+
+  /**
+   * Stop the managed app-server and keep the owning worker alive until its whole
+   * detached process group has exited, or until the SIGKILL fallback has had a
+   * short bounded chance to take effect. stop() remains synchronous for in-worker
+   * restart paths; this barrier prevents a native descendant outliving its Node
+   * wrapper during parent-process shutdown.
+   */
+  async stopAndWait(): Promise<void> {
+    this.stop({ scheduleKill: false });
+    const pid = this.child?.pid;
+    if (!pid) return;
+    if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_GRACE_MS)) {
+      this.removeMarkerIfOwned();
+      return;
+    }
+    this.signalManagedProcessGroup(pid, 'SIGKILL');
+    if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
+      this.removeMarkerIfOwned();
+      return;
+    }
+    throw new Error(
+      `codex app-server process group ${pid} still alive after SIGTERM ${APP_SERVER_STOP_GRACE_MS}ms and SIGKILL settle ${APP_SERVER_STOP_KILL_SETTLE_MS}ms`,
+    );
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------
@@ -586,21 +701,68 @@ export class CodexRpcEngine {
     return true;
   }
 
+  /** A group leader can exit before a native descendant. Only reap that orphaned
+   * group if a remaining member still proves the exact app-server identity from
+   * the marker; a recycled PGID alone is never enough authorization to signal. */
+  private processGroupHasOurAppServer(pid: number, markedUrl?: string): boolean {
+    if (isAlive(pid) && this.processIsOurAppServer(pid, markedUrl)) return true;
+    if (process.platform !== 'linux') return false;
+    try {
+      return readdirSync('/proc').some((entry) => {
+        if (!/^\d+$/.test(entry)) return false;
+        try {
+          const stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+          const close = stat.lastIndexOf(')');
+          const fields = stat.slice(close + 2).trim().split(/\s+/);
+          return Number(fields[2]) === pid && this.processIsOurAppServer(Number(entry), markedUrl);
+        } catch {
+          return false;
+        }
+      });
+    } catch {
+      return false;
+    }
+  }
+
   /** Kill an app-server left behind by a prior incarnation of this session
    *  (e.g. the worker was SIGKILLed so its exit hooks never ran). Identity-checked
    *  so a reused pid is never mis-killed. */
-  private reapStaleAppServer(): void {
+  private async reapStaleAppServer(): Promise<void> {
     const mp = this.markerPath();
     if (!mp || !existsSync(mp)) return;
     try {
       const [pidStr, markedUrl] = readFileSync(mp, 'utf8').trim().split('\n');
       const pid = parseInt(pidStr, 10);
-      if (Number.isInteger(pid) && pid > 0 && isAlive(pid) && this.processIsOurAppServer(pid, markedUrl)) {
-        killGroup(pid, 'SIGKILL'); // orphan from a crashed worker — no grace needed
-        this.log(`[codex-rpc] reaped stale app-server pid ${pid}`);
+      if (!Number.isInteger(pid) || pid <= 0 || !this.isManagedProcessGroupAlive(pid)) {
+        rmSync(mp, { force: true });
+        return;
       }
-      rmSync(mp, { force: true });
-    } catch { /* best effort */ }
+      // A retained marker may outlive its Node wrapper while a native descendant
+      // remains in the same process group. The marker belongs to this session and
+      // is only retained by removeMarkerIfOwned while that exact group is alive.
+      if (isAlive(pid) && !this.processIsOurAppServer(pid, markedUrl)) {
+        // The original leader pid was reused by an unrelated process. It cannot
+        // be our detached group any longer, so discard the stale marker without
+        // signalling the recycled process or blocking a new session.
+        rmSync(mp, { force: true });
+        return;
+      }
+      if (!this.processGroupHasOurAppServer(pid, markedUrl)) {
+        throw new Error(`stale codex app-server process group ${pid} could not be identity-checked`);
+      }
+      this.signalManagedProcessGroup(pid, 'SIGKILL', markedUrl);
+      if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
+        rmSync(mp, { force: true });
+        this.log(`[codex-rpc] reaped stale app-server group ${pid}`);
+        return;
+      }
+      throw new Error(
+        `stale codex app-server process group ${pid} still alive after SIGKILL settle ${APP_SERVER_STOP_KILL_SETTLE_MS}ms`,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('stale codex app-server process group')) throw error;
+      // A malformed or unreadable stale marker must not block a fresh session.
+    }
   }
 
   private writeMarker(): void {
@@ -619,10 +781,51 @@ export class CodexRpcEngine {
   private removeMarkerIfOwned(): void {
     const mp = this.markerPath();
     if (!mp) return;
+    if (this.child?.pid && this.isManagedProcessGroupAlive(this.child.pid)) return;
     try {
       const [pidStr, url] = readFileSync(mp, 'utf8').trim().split('\n');
       if (parseInt(pidStr, 10) === this.child?.pid && url === this.wsUrl) rmSync(mp, { force: true });
     } catch { /* no marker / unreadable → leave it (next reap handles it) */ }
+  }
+
+  private waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+    if (!this.isManagedProcessGroupAlive(pid)) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const finish = (exited: boolean): void => {
+        clearTimeout(timeout);
+        clearInterval(poll);
+        resolve(exited);
+      };
+      const poll = setInterval(() => {
+        if (!this.isManagedProcessGroupAlive(pid)) finish(true);
+      }, APP_SERVER_STOP_POLL_INTERVAL_MS);
+      const timeout = setTimeout(() => finish(false), timeoutMs);
+    });
+  }
+
+  private isManagedProcessGroupAlive(pid: number): boolean {
+    return this.dependencies.isProcessGroupAlive?.(pid) ?? isProcessGroupAlive(pid);
+  }
+
+  private hasExactManagedProcessGroupIdentity(pid: number, expectedUrl?: string): boolean {
+    return this.dependencies.hasExactProcessGroupIdentity?.(pid, expectedUrl)
+      ?? this.processGroupHasOurAppServer(pid, expectedUrl);
+  }
+
+  private signalManagedProcessGroup(
+    pid: number,
+    signal: NodeJS.Signals,
+    expectedUrl = this.wsUrl,
+  ): void {
+    if (!this.isManagedProcessGroupAlive(pid)) return;
+    if (!this.hasExactManagedProcessGroupIdentity(pid, expectedUrl)) {
+      throw new Error(`exact app-server identity could not be verified for process group ${pid}`);
+    }
+    if (this.dependencies.signalProcessGroup) {
+      this.dependencies.signalProcessGroup(pid, signal);
+      return;
+    }
+    killGroup(pid, signal);
   }
 
   // ---- internals -----------------------------------------------------------
@@ -849,13 +1052,22 @@ export class CodexRpcEngine {
   }
 
   private failAll(err: Error): void {
+    const failure: CodexRpcEngineFailure = /native turn .*rebound|turn\/steer response did not confirm/.test(err.message)
+      ? {
+          kind: 'protocol-ownership-conflict',
+          errorCode: 'rpc_native_turn_ownership_conflict',
+        }
+      : {
+          kind: 'app-server-unavailable',
+          errorCode: 'rpc_engine_dead',
+        };
     if (this.pending.size) this.log(`[codex-rpc] ${err.message}`);
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(err); }
     this.pending.clear();
     if (!this.closed && !this.deadNotified) {
       this.deadNotified = true;
-      this.emitAllTurnTerminals('engine-dead', 'rpc_engine_dead');
-      try { this.opts.onDead?.(); } catch { /* best effort */ }
+      this.emitAllTurnTerminals('engine-dead', failure.errorCode);
+      try { this.opts.onDead?.(failure); } catch { /* best effort */ }
     }
   }
 }

@@ -88,6 +88,40 @@ export function consumeAutostartUnitMarker(env: NodeJS.ProcessEnv = process.env)
   return raw === '1';
 }
 
+export function sessionScopedFleetLifecycleWarning(
+  command: 'start' | 'restart',
+  options: {
+    env?: NodeJS.ProcessEnv;
+    platform?: NodeJS.Platform;
+    systemdServiceEnabled: boolean;
+    bootHookStart?: boolean;
+  },
+): string | undefined {
+  const env = options.env ?? process.env;
+  const targetPlatform = options.platform ?? process.platform;
+  if (targetPlatform !== 'linux' || options.bootHookStart || !options.systemdServiceEnabled
+    || !env.BOTMUX_SESSION_ID?.trim()) return undefined;
+  return '⚠️  当前命令运行在 BotMux 会话中，且 botmux.service 已启用；直接执行可能让 fleet 继承当前会话 scope。\n'
+    + '   生产环境请改用: systemctl --user ' + command + ' botmux.service';
+}
+
+/** Best-effort operator warning only; lifecycle commands keep their existing semantics. */
+export function warnSessionScopedFleetLifecycle(
+  command: 'start' | 'restart',
+  options: { bootHookStart?: boolean } = {},
+): void {
+  if (process.platform !== 'linux' || options.bootHookStart || !process.env.BOTMUX_SESSION_ID?.trim()) return;
+  const enabled = spawnSync('systemctl', ['--user', 'is-enabled', SERVICE_NAME], {
+    stdio: 'ignore',
+    timeout: 1_000,
+  }).status === 0;
+  const warning = sessionScopedFleetLifecycleWarning(command, {
+    systemdServiceEnabled: enabled,
+    bootHookStart: options.bootHookStart,
+  });
+  if (warning) console.warn(warning);
+}
+
 const WINDOWS_TASK_NAME = 'botmux-daemon';
 
 function platform(): 'macos' | 'linux' | 'windows' | 'unsupported' {
@@ -317,6 +351,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# The supervisor/worker protocol owns RPC teardown; do not let systemd's
+# cgroup fallback kill persistent tmux sessions during a restart.
+KillMode=process
+TimeoutStopSec=20s
 WorkingDirectory=${opts.configDir}
 Environment=PATH=${autostartPath(opts.environmentPath, 'linux')}
 Environment=${AUTOSTART_UNIT_ENV}=1

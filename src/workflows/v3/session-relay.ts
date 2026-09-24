@@ -17,12 +17,17 @@ import { authorizeSessionScopedIpc } from '../../core/daemon-ipc-session-auth.js
 import {
   parseWorkflowDaemonMutationBody,
 } from './daemon-ipc-body.js';
-import type { WorkflowDaemonMutation } from './daemon-ipc-client.js';
 import {
   authorizeV3RunMutationForCurrentTuple,
   V3DaemonCommandAuthorityError,
 } from './cli-daemon-command-authority.js';
 import { isValidRunId } from './ops-projection.js';
+import { readGrillState } from './grill-state.js';
+import {
+  isHumanWorkflowAuthoringActor,
+  isV3SessionRunAuthoringMutation,
+  V3_SESSION_RUN_AUTHORING_MUTATIONS,
+} from './authoring-authority.js';
 import {
   authorizeScheduledTurn,
   parseScheduledTurnId,
@@ -31,9 +36,12 @@ import {
 
 export const V3_SESSION_RUN_MUTATION_ROUTE_PREFIX = '/api/v3/session-runs';
 
-export const V3_SESSION_RUN_MUTATIONS = ['start', 'cancel', 'retry', 'grant'] as const;
-
-export function isV3SessionRunMutation(value: string): value is WorkflowDaemonMutation {
+export const V3_SESSION_RUN_MUTATIONS = [
+  'start', 'cancel', 'retry', 'grant',
+  ...V3_SESSION_RUN_AUTHORING_MUTATIONS,
+] as const;
+export type V3SessionRunMutation = typeof V3_SESSION_RUN_MUTATIONS[number];
+export function isV3SessionRunMutation(value: string): value is V3SessionRunMutation {
   return (V3_SESSION_RUN_MUTATIONS as readonly string[]).includes(value);
 }
 
@@ -42,6 +50,7 @@ export interface V3SessionRelaySessionView {
   receiver: boolean;
   liveOrigin?: { capability: string; turnId?: string; dispatchAttempt?: number };
   callerOpenId?: string;
+  senderKind?: 'human' | 'bot';
   chatId?: string;
   larkAppId?: string;
   /** The session's CURRENT inbound turn pointer — advances the moment the next
@@ -69,11 +78,15 @@ function nonEmpty(value: unknown): value is string {
 
 /** Mutation payload keys the relay forwards; everything else is dropped so a
  * sandboxed caller cannot smuggle fields past the shared body parser. */
-const MUTATION_BODY_KEYS: Record<WorkflowDaemonMutation, readonly string[]> = {
+const MUTATION_BODY_KEYS: Record<V3SessionRunMutation, readonly string[]> = {
   start: [],
   cancel: ['reason'],
   retry: ['nodeId'],
   grant: ['loopId'],
+  'spec-finalize': [],
+  'approve-spec': [],
+  architect: [],
+  'approve-dag': [],
 };
 
 /**
@@ -87,6 +100,9 @@ export function authorizeV3SessionRunMutationRequest(input: {
   /** Parsed JSON request body (untrusted). */
   raw: unknown;
   trustedHost: boolean;
+  /** The daemon proved the loopback client belongs to this exact live CLI
+   * turn. This narrower fallback is accepted for human authoring only. */
+  currentTurnProcessAttested?: boolean;
   /** undefined when the claimed sessionId has no live session on this daemon. */
   session: V3SessionRelaySessionView | undefined;
   selfLarkAppId: string | undefined;
@@ -123,6 +139,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
   if (!body) return { ok: false, status: 400, error: 'bad_json' };
   const sessionId = body.sessionId;
   if (!nonEmpty(sessionId)) return { ok: false, status: 400, error: 'missing_session_id' };
+  const authoring = isV3SessionRunAuthoringMutation(input.mutation);
 
   const claimedAttempt = typeof body.originDispatchAttempt === 'number'
     && Number.isSafeInteger(body.originDispatchAttempt)
@@ -130,7 +147,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
     ? body.originDispatchAttempt
     : undefined;
   const verified = authorizeSessionScopedIpc({
-    trustedHost: input.trustedHost,
+    trustedHost: input.trustedHost || (authoring && input.currentTurnProcessAttested === true),
     sessionExists: !!input.session,
     receiverSession: !!input.session?.receiver,
     // A meeting receiver must not drive workflow runs: its side effects belong
@@ -163,6 +180,11 @@ export function authorizeV3SessionRunMutationRequest(input: {
   }
 
   const liveTurnId = current.liveOrigin?.turnId;
+  const scheduledTurn = !!liveTurnId && !!parseScheduledTurnId(liveTurnId);
+  const actorKind = scheduledTurn ? 'scheduled' : (current.senderKind ?? 'unknown');
+  if (authoring && !isHumanWorkflowAuthoringActor(actorKind)) {
+    return { ok: false, status: 403, error: 'workflow_authoring_requires_human_turn' };
+  }
 
   // Daemon-initiated scheduled turn (`schedule:<taskId>:<uuid>`): no human
   // inbound message exists, so the session row carries no
@@ -173,7 +195,7 @@ export function authorizeV3SessionRunMutationRequest(input: {
   // scheduled-turn-provenance). The tuple's callerOpenId is the task's
   // creator, never anything the request chooses.
   let callerOpenId: string;
-  if (liveTurnId && parseScheduledTurnId(liveTurnId)) {
+  if (scheduledTurn) {
     if (!input.sessionDataDir) {
       return {
         ok: false, status: 403, error: 'schedule_turn_unauthorized',
@@ -248,6 +270,15 @@ export function authorizeV3SessionRunMutationRequest(input: {
       detail: `run 归属 ${authority.larkAppId}`,
     };
   }
+  if (authoring) {
+    const grill = readGrillState(authority.runDir);
+    if (grill?.chatBinding?.sessionId !== sessionId) {
+      return {
+        ok: false, status: 403, error: 'run_binding_mismatch',
+        detail: `当前 session 与 run ${input.runId} 的 chatBinding 不匹配：sessionId`,
+      };
+    }
+  }
 
   // Re-validate the payload with the exact same parser the signed-envelope
   // route uses, from an allowlisted subset only.
@@ -255,7 +286,15 @@ export function authorizeV3SessionRunMutationRequest(input: {
   for (const key of MUTATION_BODY_KEYS[input.mutation]) {
     if (body[key] !== undefined) subset[key] = body[key];
   }
-  const parsed = parseWorkflowDaemonMutationBody(input.mutation, JSON.stringify(subset));
+  if (!['start', 'cancel', 'retry', 'grant'].includes(input.mutation)) {
+    return Object.keys(subset).length === 0
+      ? { ok: true, body: {}, runDir: authority.runDir, larkAppId: authority.larkAppId }
+      : { ok: false, status: 400, error: 'bad_body' };
+  }
+  const parsed = parseWorkflowDaemonMutationBody(
+    input.mutation as 'start' | 'cancel' | 'retry' | 'grant',
+    JSON.stringify(subset),
+  );
   if (!parsed.ok) return { ok: false, status: 400, error: parsed.error };
 
   return {

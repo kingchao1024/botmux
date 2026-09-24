@@ -74,6 +74,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   removeChatGrant: vi.fn(async () => ({ ok: true })),
   UserTokenMissingError: class extends Error {},
   getMessageChatId: vi.fn(),
+  getMessageDetail: vi.fn(),
 }));
 
 const forkWorkerMock = vi.fn();

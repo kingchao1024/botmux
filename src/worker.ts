@@ -46,6 +46,8 @@ import {
   botHomePath,
   shouldRedirectCliData,
   buildCliExecutableReadCarveOuts,
+  askReceiptHostAuthorityPaths,
+  detectAskAuthorityPresence,
   isolationPaneMarkerContent,
   isolationPanePolicyDigest,
   type IsolationCapability,
@@ -1314,6 +1316,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         ...(cfg.cliId === 'codex' ? ['sandbox_mode="danger-full-access"'] : []),
         ...(cfg.cliId === 'traex' ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())] : []),
       ],
+      bypassHookTrust: cfg.cliId === 'traex'
+        && cfg.disableCliBypass !== true
+        && config.bypassCodexHookTrust,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
         : undefined,
@@ -1324,7 +1329,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           cliGeneration: engineCliGeneration,
         });
       },
-      onDead: () => {
+      onDead: (failure) => {
         // Death can race after the final awaited response but before the engine
         // is published below. Record it against this exact engagement even when
         // codexRpcEngine is still undefined; otherwise the continuation can
@@ -1332,7 +1337,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // can no longer trigger onDead recovery.
         rpcEngagementFence.markDead(engagementLease);
         if (codexRpcEngine === engine) {
-          log('Codex RPC app-server died; replacing the tmux session and re-engaging the thread');
+          const restartReason = failure.kind === 'protocol-ownership-conflict'
+            ? 'Codex RPC native-turn ownership conflict; fencing this protocol generation before replacement'
+            : 'Codex RPC app-server died; replacing the tmux session and re-engaging the thread';
+          log(restartReason);
           // failAll() rejects the active sendTurn promise immediately after this
           // callback returns. Let that microtask classify/notify the ambiguous
           // submit while the old backend still exists, then replace the paired
@@ -1340,7 +1348,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           // backend first and suppresses the submit-failure notice.
           const restartTimer = setTimeout(() => {
             if (codexRpcEngine !== engine) return; // close/restart won the race
-            void restartCliProcess('Codex RPC app-server died', { immediate: true, preservePending: true });
+            void restartCliProcess(restartReason, { immediate: true, preservePending: true });
           }, 0);
           restartTimer.unref?.();
         }
@@ -12565,6 +12573,14 @@ async function flushPending(): Promise<void> {
       let result: Awaited<ReturnType<typeof writeAdapter.writeInput>> | undefined;
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
+      // The daemon consumes `@steer` and freezes this positive authorization on
+      // the IPC message. Only a bot-originated, explicitly authorized control
+      // may target an already-running native turn; all human and unmarked input
+      // remains serial even though older Codex App policy reused this field.
+      const isTrustedRpcSteer = writeRpcEngine !== undefined
+        && item.codexAppSteerable === true
+        && item.trustedCaller?.senderType === 'bot'
+        && !item.taskContinuation;
       try {
         if (item.taskContinuation && !writeRpcEngine) {
           emitTurnTerminal(
@@ -12576,6 +12592,29 @@ async function flushPending(): Promise<void> {
           break;
         }
         if (writeRpcEngine) {
+          if (isTrustedRpcSteer) {
+            const expectedTurnId = writeRpcEngine.activeNativeTurnId;
+            if (!expectedTurnId) {
+              // A control arriving during an unbound response/terminal race has
+              // no safe native target. Keep its exact FIFO position; never turn
+              // this into a second turn/start merely because it is a control.
+              pendingMessages.unshift(item);
+              log(`Queued trusted Codex RPC steer until an exact native turn is active: turn=${item.turnId ?? '-'}`);
+              break;
+            }
+            await writeRpcEngine.steerTurn(msg, expectedTurnId);
+            result = { submitted: true };
+            log(`Steered exact Codex RPC native turn ${expectedTurnId.slice(0, 12)} from control ${item.turnId ?? '-'}`);
+            if (writeRpcEngine.activeNativeTurnId !== expectedTurnId) {
+              queueMicrotask(() => {
+                if (writeContinuationIsCurrent()) void flushPending();
+              });
+            }
+            // The currently active native turn retains the sole lifecycle
+            // ownership and will release the queue at its terminal. Do not
+            // create a second bridge owner for a control-only message.
+            break;
+          }
           if (item.taskContinuation
             && (item.turnId?.startsWith('bmx-continuation-') !== true
               || item.dispatchAttempt === undefined
@@ -12632,6 +12671,13 @@ async function flushPending(): Promise<void> {
           // untouched; marking now therefore still precedes replay of any
           // already-persisted user/final events.
           bridgeTurnId = rpcTurnIdentity.turnId;
+          // A terminal can be decoded before this ACK continuation runs. Keep
+          // that exact generation-scoped evidence so the queued steer path can
+          // distinguish a proven terminal target from a missing/unknown owner.
+          const terminalArrivedBeforeAck = sameRpcGeneration(
+            pendingRpcTurnTerminals.get(rpcTurnOwnerKey(rpcTurnIdentity))?.generation,
+            rpcTurnGeneration,
+          );
           // The app-server ack confirms execution has begun, but no local
           // transcript event will follow to flip started. Mark the turn active
           // so the lifecycle gate stays asserted for the full server-side run
@@ -12645,6 +12691,39 @@ async function flushPending(): Promise<void> {
           );
           if (activated) {
             codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+            // A trusted steer can arrive while this turn/start awaits its ACK.
+            // It correctly stayed queued because no native id existed yet; once
+            // this exact owner is active, re-drive only that control queue head
+            // after the current flush releases its mutex. Ordinary input remains
+            // queued until the native terminal calls the normal release path.
+            queueMicrotask(() => {
+              if (!writeContinuationIsCurrent()) return;
+              const next = pendingMessages[0];
+              const nextIsTrustedRpcSteer = next?.codexAppSteerable === true
+                && next.trustedCaller?.senderType === 'bot'
+                && !next.taskContinuation;
+              if (!nextIsTrustedRpcSteer) return;
+              if (writeRpcEngine.activeNativeTurnId) {
+                void flushPending();
+                return;
+              }
+              if (!terminalArrivedBeforeAck) return;
+              // This continuation just received the exact turn/start ACK. With
+              // no live owner now, the engine has already replayed this root's
+              // native terminal; the queued steer has a proven-dead target, not
+              // an unbound target. Fail this control exactly once and let its
+              // ordinary successor continue — never convert it to turn/start.
+              const rejectedSteer = pendingMessages.shift();
+              if (!rejectedSteer) return;
+              emitTurnTerminal(
+                rejectedSteer.turnId ?? 'codex-rpc-steer-target-inactive',
+                'failed',
+                'steer_target_no_longer_active',
+                rejectedSteer.dispatchAttempt,
+              );
+              log(`Rejected trusted Codex RPC steer after its native target reached terminal: turn=${rejectedSteer.turnId ?? '-'}`);
+              void flushPending();
+            });
           }
         } else if (item.codexAppInput && writeAdapter.writeStructuredInput) {
           submissionBackend = writeBackend;
@@ -13002,7 +13081,10 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
-      if (item.taskContinuation) break;
+      // `turn/start` acknowledgement is not a terminal edge. In RPC mode a
+      // later ordinary message must wait for the exact native terminal instead
+      // of beginning a second start and receiving the same native id.
+      if (writeRpcEngine) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       // A type-ahead adapter may accept several queued submits in one flush.
       // Keep that optimization only within one authenticated principal: a
@@ -13694,9 +13776,10 @@ async function spawnCli(
   // Prefer force-clear so a half-finished rename cannot block the new generation.
   forceClearSessionRenameInFlight();
   currentCliCredentialIsolated = false;
-  // Enrollment writes the fixed marker before any device credential appears.
-  // From that instant onward every NEW local CLI must carry a credential
-  // boundary, regardless of adapter capability or optional sandbox toggles.
+  // Enrollment writes the fixed marker before any device credential appears;
+  // daemon startup creates the Ask receipt signing key. Once either authority
+  // exists, every NEW local CLI must carry a credential boundary, regardless
+  // of adapter capability or optional sandbox toggles.
   // lstat (not existsSync) deliberately treats a hostile/broken symlink as a
   // present authority signal and therefore fails closed.
   const hostHomeDir = homedir();
@@ -13715,9 +13798,24 @@ async function spawnCli(
       // Upgrade fail-safe: a pre-dedicated-directory credential still activates
       // mandatory confinement until the host explicitly removes/migrates it.
       || hostEntryExistsNoFollow(join(root, DEVICE_CREDENTIAL_FILE)));
+  const effectiveSessionDataDir = process.env.SESSION_DATA_DIR
+    ?? join(defaultBotmuxHome, 'data');
+  const {
+    askReceiptSigningKeyExists,
+    askCardEventLedgerExists,
+    askPersistStoreExists,
+  } = detectAskAuthorityPresence({
+    homeDir: hostHomeDir,
+    botmuxHome: configuredBotmuxHome,
+    defaultBotmuxHome,
+    sessionDataDir: effectiveSessionDataDir,
+  }, hostEntryExistsNoFollow);
   const mandatoryCredentialIsolation = credentialIsolationRequired({
     markerExists: deviceIsolationMarkerExists,
     deviceCredentialExists,
+    askReceiptSigningKeyExists,
+    askCardEventLedgerExists,
+    askPersistStoreExists,
   });
   if (mandatoryCredentialIsolation && cfg.adoptMode) {
     throw new Error(
@@ -14309,6 +14407,9 @@ async function spawnCli(
   const credentialIsolationGate = evaluateCredentialOnlyIsolationGate({
     markerExists: deviceIsolationMarkerExists,
     deviceCredentialExists,
+    askReceiptSigningKeyExists,
+    askCardEventLedgerExists,
+    askPersistStoreExists,
     remoteBackend: riffRemoteBackend,
     platform: process.platform,
     mechanismAvailable: credentialMechanismAvailable,
@@ -14330,8 +14431,7 @@ async function spawnCli(
   }
   if (sandboxRequested) appliedIsolationCapabilities.push('read', 'write');
   currentCliCredentialIsolated = appliedIsolationCapabilities.includes('credential');
-  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
-    ?? join(defaultBotmuxHome, 'data');
+  const isolationRuntimeDataDir = effectiveSessionDataDir;
   // The unified Darwin sandbox enforces both read and write isolation. Keep
   // the legacy marker fields because a live persistent pane carries the
   // compiled Seatbelt policy in-process and may only be reattached when that
@@ -14383,6 +14483,7 @@ async function spawnCli(
           defaultBotmuxHome: canonicalPolicyPath(defaultBotmuxHome),
           botmuxInstallRoot,
           nativeHookProtocolToken,
+          sessionDataDir: canonicalPolicyPath(isolationRuntimeDataDir),
         })).digest('hex')
       : undefined;
 
@@ -15980,6 +16081,16 @@ async function spawnCli(
     const hostOnlyDenyPaths: string[] = [join(canonical(dataDir), 'schedule-preconditions')];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
+    // Ask receipt signing + callback replay state are host authority. A
+    // chat-driven CLI may verify receipts from a public key but must never mint
+    // one or alter the callback ledger.
+    const askReceiptAuthorityPaths = [...new Set(askReceiptHostAuthorityPaths({
+      homeDir: sandboxHome,
+      botmuxHome: canonical(configuredBotmuxHome),
+      defaultBotmuxHome: canonical(defaultBotmuxHome),
+      sessionDataDir: canonical(dataDir),
+    }).map(canonicalNearestAncestor))];
+    mandatoryDenyPaths.push(...askReceiptAuthorityPaths);
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
     // cleanup manifest + the mode-000 empty ro-bind SOURCES. If SESSION_DATA_DIR
     // is configured INSIDE the working dir (a custom data dir under a RW-bound
@@ -16052,6 +16163,7 @@ async function spawnCli(
         homeDir: sandboxHome,
         botmuxHome: canonical(configuredBotmuxHome),
         defaultBotmuxHome: canonical(defaultBotmuxHome),
+        sessionDataDir: canonical(dataDir),
       });
       mandatoryDenyPaths.push(...credentialRules.denyPaths.map(canonical));
       mandatoryDenyRegexes.push(...credentialRules.denyRegexes);
@@ -16238,6 +16350,7 @@ async function spawnCli(
       serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
       hostOnlyDenyPaths,
+      sealedDenyPaths: askReceiptAuthorityPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
       net: cfg.sandboxNetwork !== false,
@@ -16619,6 +16732,7 @@ async function spawnCli(
       homeDir: canonical(hostHomeDir),
       botmuxHome: canonical(configuredBotmuxHome),
       defaultBotmuxHome: canonical(defaultBotmuxHome),
+      sessionDataDir: canonical(isolationRuntimeDataDir),
     });
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
@@ -16636,7 +16750,7 @@ async function spawnCli(
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
       [...rules.denyPaths.map(canonical), canonical(profileDir)],
       [canonical(originDirectory), canonical(attestationDirectory)],
-      [],
+      rules.askReceiptAuthorityPaths.map(canonical),
       [canonical(profileDir)],
       rules.denyRegexes,
       undefined,
@@ -16663,6 +16777,9 @@ async function spawnCli(
     log(`[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only Seatbelt: ${spawnBin} -f ${profilePath}`);
   }
   if (!willReattachPersistent && credentialOnlyBwrap) {
+    const canonical = (path: string) => {
+      try { return realpathSync(path); } catch { return path; }
+    };
     const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(panePolicyDir, { recursive: true });
     const hideDirectories = new Set<string>();
@@ -16688,21 +16805,21 @@ async function spawnCli(
         throw new Error(`[device-credential-isolation] authority root is not a directory: ${rawRoot}`);
       }
       processedRoots.add(root);
-      const authorityDirectory = join(root, DEVICE_AUTHORITY_DIRECTORY);
+      const deviceAuthorityDirectory = join(root, DEVICE_AUTHORITY_DIRECTORY);
       try {
-        const authorityStat = lstatSync(authorityDirectory);
+        const authorityStat = lstatSync(deviceAuthorityDirectory);
         if (!authorityStat.isDirectory()) {
           throw new Error(
-            `[device-credential-isolation] device authority path is not a directory: ${authorityDirectory}`,
+            `[device-credential-isolation] authority path is not a directory: ${deviceAuthorityDirectory}`,
           );
         }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         // A fixed empty mount target lets the child mask the entire authority
         // namespace while leaving BOTMUX_HOME itself live and writable.
-        mkdirSync(authorityDirectory, { mode: 0o700 });
+        mkdirSync(deviceAuthorityDirectory, { mode: 0o700 });
       }
-      hideDirectories.add(realpathSync(authorityDirectory));
+      hideDirectories.add(realpathSync(deviceAuthorityDirectory));
       for (const name of readdirSync(root)) {
         if (name === DEVICE_AUTHORITY_DIRECTORY) continue;
         if (!isCredentialIsolationReservedBasename(name)
@@ -16726,6 +16843,26 @@ async function spawnCli(
           // protected wholesale above.
         }
       }
+    }
+    const askAuthorityPaths = askReceiptHostAuthorityPaths({
+      homeDir: canonical(hostHomeDir),
+      botmuxHome: canonical(configuredBotmuxHome),
+      defaultBotmuxHome: canonical(defaultBotmuxHome),
+      sessionDataDir: canonical(isolationRuntimeDataDir),
+    });
+    for (const authorityDirectory of askAuthorityPaths) {
+      try {
+        const authorityStat = lstatSync(authorityDirectory);
+        if (!authorityStat.isDirectory()) {
+          throw new Error(
+            `[device-credential-isolation] authority path is not a directory: ${authorityDirectory}`,
+          );
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        mkdirSync(authorityDirectory, { recursive: true, mode: 0o700 });
+      }
+      hideDirectories.add(realpathSync(authorityDirectory));
     }
     let credentialCliBin = spawnBin;
     try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
@@ -21651,6 +21788,10 @@ process.on('message', async (raw: unknown) => {
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
+      // destroySession() can synchronously trigger the remote viewer's onExit,
+      // which clears the global engine reference. Keep this exact managed engine
+      // so local close still awaits its detached app-server group afterwards.
+      const closeRpcEngine = codexRpcEngine;
       // Local close destroys persistent owned sessions. Remote backends never
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
@@ -21659,6 +21800,16 @@ process.on('message', async (raw: unknown) => {
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
+      }
+      try {
+        // A managed RPC app-server is detached from the tmux viewer. Do not let
+        // this local close exit the worker until its bounded group barrier proves
+        // the app-server is gone; otherwise stop()'s unref timer dies with us.
+        await closeRpcEngine?.stopAndWait();
+      } catch (error) {
+        log(`Local close RPC teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+        return;
       }
       stopOwnedSessionScope('close');
       killCli();
@@ -21995,7 +22146,17 @@ function cleanup(): void {
  * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
  * retain the historical killCli shutdown path.
  */
+let parentExitShutdown: Promise<void> | null = null;
+
 function shutdownWorkerForParentExit(reason: string): void {
+  if (parentExitShutdown) return;
+  parentExitShutdown = shutdownWorkerForParentExitImpl(reason).catch((error) => {
+    log(`Parent-exit RPC teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  });
+}
+
+async function shutdownWorkerForParentExitImpl(reason: string): Promise<void> {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
@@ -22003,6 +22164,11 @@ function shutdownWorkerForParentExit(reason: string): void {
     process.exit(0);
     return;
   }
+  // App-server children are detached so a worker can manage their whole process
+  // group. Do not call process.exit() until the bounded RPC stop barrier has
+  // reaped that group; otherwise stop()'s unref'd SIGKILL timer dies with this
+  // worker and systemd eventually has to clean up the orphan.
+  await codexRpcEngine?.stopAndWait();
   killCli();
   cleanup();
   process.exit(0);

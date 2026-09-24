@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AskResult, PendingAsk } from '../src/core/ask-types.js';
@@ -15,6 +16,7 @@ import {
   registerAsk,
   setCardDispatcher,
   setCanTalkChecker,
+  setAskReceiptRedeemer,
   submitAsk,
 } from '../src/core/ask-broker.js';
 import {
@@ -24,8 +26,10 @@ import {
   buildAskCard,
   createLarkAskCardDispatcher,
   handleAskCardAction,
+  handleAskCardActionWithOutcome,
   parseFormSelections,
 } from '../src/im/lark/ask-card.js';
+import { createAskAnswerProvenanceAuthority, createAskReceiptSigner } from '../src/daemon/ask-receipt-authority.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
 
@@ -73,19 +77,19 @@ describe('buildAskCard', () => {
     ask.questions[0]!.prompt = 'Review [design](https://example.com/design?id=4&rev=2) and [preview](http://localhost:3000/path_(v2)) before _confirming_.';
     const result: AskResult | undefined = settled ? { kind: 'answered', answers: [['deploy']], by: 'ou_owner', comment: null, timedOut: false } : undefined;
     const card = JSON.parse(buildAskCard(ask, result));
-    const question = card.elements.find((item: any) => item.text?.content?.includes('Review'));
-    expect(question.text.content).toContain('[design](https://example.com/design?id=4&rev=2)');
-    expect(question.text.content).toContain('[preview](http://localhost:3000/path_%28v2%29)');
-    expect(question.text.content).toContain('\\_confirming\\_');
+    const question = card.body.elements.find((item: any) => item.content?.includes('Review'));
+    expect(question.content).toContain('[design](https://example.com/design?id=4&rev=2)');
+    expect(question.content).toContain('[preview](http://localhost:3000/path_%28v2%29)');
+    expect(question.content).toContain('\\_confirming\\_');
   });
 
   it('keeps unsupported, escaped and incomplete link markup literal', () => {
     const ask = makePending();
     ask.questions[0]!.prompt = String.raw`literal \[escaped](https://example.com) ![image](https://example.com/a.png) [unsafe](javascript:alert(1)) [file](file:///tmp/a) [broken](https://example.com`;
     const card = JSON.parse(buildAskCard(ask));
-    const question = card.elements.find((item: any) => item.text?.content?.includes('literal'));
+    const question = card.body.elements.find((item: any) => item.content?.includes('literal'));
     for (const label of ['escaped', 'image', 'unsafe', 'file', 'broken']) {
-      expect(question.text.content).toContain(`\\[${label}\\]`);
+      expect(question.content).toContain(`\\[${label}\\]`);
     }
   });
 
@@ -96,10 +100,10 @@ describe('buildAskCard', () => {
       options: [{ key: 'independent', label: 'independent' }, { key: 'suggestion', label: 'suggestion' }],
     }] });
     const card = JSON.parse(buildAskCard(ask));
-    const question = card.elements.find((item: any) => item.text?.content?.includes('choose'));
-    expect(question.text.content).toContain(tag);
-    expect(question.text.content).toContain('\\_one\\_');
-    expect(question.text.content).not.toContain('ou\\_');
+    const question = card.body.elements.find((item: any) => item.content?.includes('choose'));
+    expect(question.content).toContain(tag);
+    expect(question.content).toContain('\\_one\\_');
+    expect(question.content).not.toContain('ou\\_');
   });
 
   it('多问卡片：每问一个分区 + option buttons + 一个 submit', () => {
@@ -131,11 +135,13 @@ describe('buildAskCard', () => {
     const card = JSON.parse(buildAskCard(makePending()));
     const text = JSON.stringify(card);
 
+    expect(card.schema).toBe('2.0');
+    expect(card.body.direction).toBe('vertical');
     expect(card.header.title.content).toBe('botmux ask');
     expect(text).toContain('线上 latency');
     // 可答复栏 = canTalk 语义，统一显示「本群可对话成员」，不再按 open_id 列名单
-    const metaDiv = card.elements[0];
-    expect(metaDiv.fields[1].text.content).toContain('可对话成员');
+    const meta = card.body.elements[0];
+    expect(meta.content).toContain('可对话成员');
     expect(text).toContain('"ask_id":"ask-1"');
     expect(text).toContain('"nonce":"nonce-1"');
     // 单问单选：稳定 action button，点击即答；不使用会被飞书 silent-drop 的 form/select_static
@@ -143,6 +149,32 @@ describe('buildAskCard', () => {
     expect(text).not.toContain('select_static');
     expect(text).not.toContain('"tag":"form"');
     expect(text).toContain('继续发布');
+  });
+
+  it('只生成 Card 2.0 组件，并将按钮回调载入 behaviors.callback.value', () => {
+    const card = JSON.parse(buildAskCard(makePending()));
+    const text = JSON.stringify(card);
+
+    expect(card.schema).toBe('2.0');
+    expect(card.elements).toBeUndefined();
+    expect(text).not.toContain('\"tag\":\"action\"');
+    expect(text).not.toContain('\"tag\":\"div\"');
+    expect(text).not.toContain('\"tag\":\"note\"');
+    expect(text).not.toContain('lark_md');
+    expect(text).toContain('\"type\":\"callback\"');
+    expect(text).toContain(ASK_SELECT_ACTION);
+  });
+
+  it('单问选项按一项一行纵向排列', () => {
+    const card = JSON.parse(buildAskCard(makePending()));
+    const optionRows = card.body.elements.filter(
+      (element: Record<string, unknown>) => element.tag === 'column_set',
+    );
+
+    expect(optionRows).toHaveLength(3);
+    for (const row of optionRows) {
+      expect(row.columns).toHaveLength(1);
+    }
   });
 
   it('XPI 指定答复人只用于点击鉴权，不作为 at/person 资源写进卡片', () => {
@@ -261,6 +293,34 @@ describe('buildAskCard', () => {
 });
 
 describe('handleAskCardAction', () => {
+  it('does not sign when a direct caller fabricates callback fields without dispatcher provenance', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const signer = createAskReceiptSigner({
+      privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'direct-handler-test',
+    });
+    setAskReceiptRedeemer(createAskAnswerProvenanceAuthority({
+      signer, daemonBootId: 'boot-test',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    }).redeemer);
+    let askId = '';
+    setCardDispatcher({ async send(ask) { askId = ask.askId; return { messageId: 'om_ask' }; } });
+    const pendingResult = registerAsk({
+      larkAppId: 'cli_ask', chatId: 'oc_chat', rootMessageId: 'om_root', sessionId: 'sess-1',
+      questions: makePending().questions, timeoutMs: 10_000,
+    });
+    await Promise.resolve(); await Promise.resolve();
+    const ask = _getPending(askId)!;
+    await handleAskCardAction({
+      event_id: 'evt-fabricated', operator: { open_id: 'ou_owner' },
+      context: { open_message_id: 'om_ask' },
+      action: { value: { action: ASK_SELECT_ACTION, ask_id: ask.askId, nonce: ask.nonce, key: 'deploy' } },
+    });
+    const result = await pendingResult;
+    expect(result.kind).toBe('answered');
+    expect(result.kind === 'answered' ? result.receipt : undefined).toBeUndefined();
+  });
+
   it('旧单选路径 ask_select：resolves pending ask，返回终态卡片（同步替换）', async () => {
     let askId = '';
     setCardDispatcher({
@@ -452,6 +512,33 @@ describe('handleAskCardAction: ask_submit 路径', () => {
     await Promise.resolve();
     return captured!;
   }
+
+  it('reports mutationApplied only for successful toggle/submit, not invalid or empty-confirm callbacks', async () => {
+    const ask = await registerTestAsk({
+      questions: [{
+        prompt: 'pick', multiSelect: true,
+        options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }],
+      }],
+    });
+    const action = (eventAction: string, extra: Record<string, unknown> = {}) => ({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: eventAction, ask_id: ask.askId, nonce: ask.nonce, ...extra } },
+    });
+
+    await expect(handleAskCardActionWithOutcome(action(ASK_TOGGLE_ACTION, {
+      question_index: '9', key: 'a',
+    }))).resolves.toMatchObject({ mutationApplied: false });
+    await expect(handleAskCardActionWithOutcome(action(ASK_TOGGLE_ACTION, {
+      question_index: '0', key: 'missing',
+    }))).resolves.toMatchObject({ mutationApplied: false });
+    await expect(handleAskCardActionWithOutcome(action(ASK_SUBMIT_ACTION)))
+      .resolves.toMatchObject({ mutationApplied: false });
+    await expect(handleAskCardActionWithOutcome(action(ASK_TOGGLE_ACTION, {
+      question_index: '0', key: 'a',
+    }))).resolves.toMatchObject({ mutationApplied: true });
+    await expect(handleAskCardActionWithOutcome(action(ASK_SUBMIT_ACTION)))
+      .resolves.toMatchObject({ mutationApplied: true });
+  });
 
   it('form_value 为数组（multi_select_static）→ submitAsk 收到 selections=[["a","b"]]', async () => {
     // 注册含 1 个多选问题的 ask
@@ -728,7 +815,8 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
     // 关键（外层整形契约）：arm 响应必须包成 { card: { type:'raw', data }, toast }，
     // 不能把 card 字段摊在顶层——否则 event-dispatcher 只认 toast、raw card 不 patch。
     expect(r.card?.type).toBe('raw');
-    expect(r.card?.data?.elements).toBeDefined();
+    expect(r.card?.data?.schema).toBe('2.0');
+    expect(r.card?.data?.body?.elements).toBeDefined();
     expect('elements' in r).toBe(false); // 顶层不得直接暴露 card 字段
     expect(r.toast?.type).toBe('warning');
     // arm 卡片里有红色「确认空提交」按钮 + confirm_empty 标志 + 警示文案

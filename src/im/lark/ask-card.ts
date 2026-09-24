@@ -5,6 +5,7 @@ import type {
   AskResult,
   PendingAsk,
 } from '../../core/ask-types.js';
+import { normalizeAskSubmitValue, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
 import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
@@ -22,16 +23,42 @@ export const ASK_SUBMIT_ACTION = 'ask_submit';
 /** 累积勾选动作。飞书会 silent-drop form + select_static，所以 v0.1.8 用按钮态。 */
 export const ASK_TOGGLE_ACTION = 'ask_toggle';
 
-const MAX_BUTTONS_PER_ACTION_ROW = 4;
+// One option per row keeps decisions scannable in narrow Feishu clients.
+const MAX_BUTTONS_PER_ACTION_ROW = 1;
 
 export interface AskCardActionData {
-  context?: { open_message_id?: string };
-  open_message_id?: string;
+  event_id?: string;
+  uuid?: string;
+  header?: { event_id?: string };
+  event?: { event_id?: string };
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, unknown>;
     form_value?: Record<string, unknown>;
   };
+  context?: { open_message_id?: string };
+  open_message_id?: string;
+}
+
+export type AskCardActionResponse =
+  | { toast: { type: string; content: string } }
+  | Record<string, unknown>
+  | undefined;
+
+/** Internal result consumed by the registered event dispatcher. The response
+ * remains the exact Lark UI payload, while mutationApplied records whether the
+ * broker actually changed selection state or settled the Ask. */
+export interface AskCardActionOutcome {
+  kind: 'botmux.ask-card-action-outcome.v1';
+  mutationApplied: boolean;
+  response: AskCardActionResponse;
+}
+
+function askCardActionOutcome(
+  response: AskCardActionResponse,
+  mutationApplied: boolean,
+): AskCardActionOutcome {
+  return { kind: 'botmux.ask-card-action-outcome.v1', mutationApplied, response };
 }
 
 export interface AskCardDispatcherDeps {
@@ -195,13 +222,14 @@ export function isAskCardAction(action?: string): boolean {
   return action === ASK_SELECT_ACTION || action === ASK_SUBMIT_ACTION || action === ASK_TOGGLE_ACTION;
 }
 
-export async function handleAskCardAction(
+export async function handleAskCardActionWithOutcome(
   data: AskCardActionData,
+  provenance?: AskAnswerProvenanceToken,
   deps: AskCardActionDeps = {},
-): Promise<{ toast: { type: string; content: string } } | Record<string, unknown> | undefined> {
+): Promise<AskCardActionOutcome> {
   const value = data.action?.value;
   const action = asString(value?.action);
-  if (!isAskCardAction(action)) return undefined;
+  if (!isAskCardAction(action)) return askCardActionOutcome(undefined, false);
 
   const askId = asString(value?.ask_id);
   const nonce = asString(value?.nonce);
@@ -210,11 +238,15 @@ export async function handleAskCardAction(
   // ask falls back to the process-default locale).
   const locale = localeForBot(askId ? getAskSnapshot(askId)?.larkAppId : undefined);
   if (!askId || !nonce || !by) {
-    return staleToast(locale);
+    return askCardActionOutcome(staleToast(locale), false);
   }
   const pending = getAskSnapshot(askId);
-  if (deps.larkAppId && pending && pending.larkAppId !== deps.larkAppId) return staleToast(locale);
-  if (pending?.replyCardTarget && !replyCardAskCanAct(pending, data.context?.open_message_id ?? data.open_message_id)) return staleToast(locale);
+  if (deps.larkAppId && pending && pending.larkAppId !== deps.larkAppId) {
+    return askCardActionOutcome(staleToast(locale), false);
+  }
+  if (pending?.replyCardTarget && !replyCardAskCanAct(pending, data.context?.open_message_id ?? data.open_message_id)) {
+    return askCardActionOutcome(staleToast(locale), false);
+  }
 
   /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
    *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
@@ -228,28 +260,38 @@ export async function handleAskCardAction(
   // （异步 PATCH 在飞书侧常因回调已返回而被忽略，导致卡片停在未作答态）。
   if (action === ASK_SELECT_ACTION) {
     const selected = asString(value?.key);
-    if (!selected) return staleToast(locale);
-    const outcome = tryResolveAsk({ askId, nonce, selected, by });
-    if (outcome !== 'accepted') return outcomeResponse(outcome);
-    return settledCardResponse(askId, {
+    if (!selected) return askCardActionOutcome(staleToast(locale), false);
+    const outcome = tryResolveAsk({
+      askId, nonce, selected, by,
+      ...(provenance ? { provenance } : {}),
+    });
+    if (outcome !== 'accepted') return askCardActionOutcome(outcomeResponse(outcome), false);
+    return askCardActionOutcome(settledCardResponse(askId, {
       kind: 'answered',
       answers: [[selected]],
       by,
       comment: null,
       timedOut: false,
-    });
+    }), true);
   }
 
   if (action === ASK_TOGGLE_ACTION) {
     const questionIndex = asNumber(value?.question_index);
     const key = asString(value?.key);
-    if (!Number.isInteger(questionIndex) || !key) return staleToast(locale);
-    const outcome = toggleAsk({ askId, nonce, questionIndex, key, by });
-    if (outcome !== 'toggled') return outcomeResponse(outcome);
+    if (!Number.isInteger(questionIndex) || !key) return askCardActionOutcome(staleToast(locale), false);
+    const outcome = toggleAsk({
+      askId, nonce, questionIndex, key, by,
+      ...(provenance ? { provenance } : {}),
+    });
+    if (outcome !== 'toggled') return askCardActionOutcome(outcomeResponse(outcome), false);
     const updated = getAskSnapshot(askId);
-    if (!updated) return staleToast(locale);
-    if (updated.replyCardTarget) return inlineAskResponse(updated);
-    return JSON.parse(buildAskCard(updated)) as Record<string, unknown>;
+    if (!updated) return askCardActionOutcome(staleToast(locale), true);
+    return askCardActionOutcome(
+      updated.replyCardTarget
+        ? inlineAskResponse(updated)
+        : JSON.parse(buildAskCard(updated)) as Record<string, unknown>,
+      true,
+    );
   }
 
   // 新 Submit 路径：优先从按钮累积态提交；兼容旧 form_value 回调。
@@ -259,39 +301,63 @@ export async function handleAskCardAction(
     // next_value:'true' 与 toggle 的 String(i)），故按字符串判定；同时容忍真布尔，
     // 兼容潜在的非飞书调用方。true = 用户已在 arm 卡片上再点了一次，允许空提交落地。
     const confirmEmpty = value?.confirm_empty === 'true' || value?.confirm_empty === true;
-    const formValue = data.action?.form_value ?? {};
-    if (Object.keys(formValue).length > 0) {
-      // 推断问题数量：找最大 qN 的 N+1
-      const questionCount = guessQuestionCount(formValue);
-      const selections = parseFormSelections(formValue, questionCount);
-      const outcome = submitAsk({ askId, nonce, by, selections, confirmEmpty });
-      if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
-      if (outcome !== 'accepted') return outcomeResponse(outcome);
-      return settledCardResponse(askId, {
+    const formValue = data.action?.form_value;
+    const normalizedSubmit = normalizeAskSubmitValue(formValue, value?.confirm_empty);
+    if (normalizedSubmit.formAnswers) {
+      const selections = normalizedSubmit.formAnswers;
+      const outcome = submitAsk({
+        askId, nonce, by, selections, confirmEmpty,
+        ...(provenance ? {
+          provenance, provenanceAction: 'ask_submit' as const, provenanceHasFormValue: true,
+          provenanceSubmitBinding: normalizedSubmit,
+        } : {}),
+      });
+      if (outcome === 'needs_empty_confirm') {
+        return askCardActionOutcome(armEmptyConfirmResponse(askId, locale), false);
+      }
+      if (outcome !== 'accepted') return askCardActionOutcome(outcomeResponse(outcome), false);
+      return askCardActionOutcome(settledCardResponse(askId, {
         kind: 'answered',
         answers: selections,
         by,
         comment: null,
         timedOut: false,
-      });
+      }), true);
     }
     // 累积按钮路径。submitAsk 在鉴权 + nonce + 单选约束全过后，若「全多选且全空」返回
     // needs_empty_confirm（防手滑）——空提交二次确认的判定全在 broker 内，卡片不再自行
     // 预检（否则会绕过 nonce/canTalk，且需重复 mixed-question 规则）。
-    const outcome = submitAsk({ askId, nonce, by, confirmEmpty });
-    if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
-    if (outcome !== 'accepted') return outcomeResponse(outcome);
+    const outcome = submitAsk({
+      askId, nonce, by, confirmEmpty,
+      ...(provenance ? {
+        provenance, provenanceAction: 'ask_submit' as const, provenanceHasFormValue: false,
+        provenanceSubmitBinding: normalizedSubmit,
+      } : {}),
+    });
+    if (outcome === 'needs_empty_confirm') {
+      return askCardActionOutcome(armEmptyConfirmResponse(askId, locale), false);
+    }
+    if (outcome !== 'accepted') return askCardActionOutcome(outcomeResponse(outcome), false);
     const updated = getAskSnapshot(askId);
     const answers = updated?.selections ?? updated?.questions.map(() => []) ?? [];
-    return settledCardResponse(askId, {
+    return askCardActionOutcome(settledCardResponse(askId, {
       kind: 'answered',
       answers,
       by,
       comment: null,
       timedOut: false,
-    });
+    }), true);
   }
-  return staleToast(locale);
+  return askCardActionOutcome(staleToast(locale), false);
+}
+
+/** Stable direct-call API: callers that are not the registered dispatcher see
+ * only the historical Lark response shape and cannot influence claim state. */
+export async function handleAskCardAction(
+  data: AskCardActionData,
+  deps: AskCardActionDeps = {},
+): Promise<AskCardActionResponse> {
+  return (await handleAskCardActionWithOutcome(data, undefined, deps)).response;
 }
 
 /**
@@ -358,16 +424,14 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
 
-  // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
-  const metaDiv = {
-    tag: 'div',
-    fields: [
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } },
-    ],
-  };
-
-  const elements: Array<Record<string, unknown>> = [metaDiv];
+  // Ask 卡必须使用 Card JSON 2.0。旧版 `div/lark_md/action/note` 顶层
+  // elements 在一部分新版飞书客户端会降级或不显示；v2 要求 body.elements
+  // 与 button.behaviors[type=callback].value。
+  const elements: Array<Record<string, unknown>> = [{
+    tag: 'markdown',
+    content: `**${t('card.ask.field.deadline', undefined, locale)}**  ${escapeMd(deadline)}\n\n`
+      + `**${t('card.ask.field.answerable', undefined, locale)}**  ${escapeMd(approverSummary(ask, locale))}`,
+  }];
 
   if (status) {
     // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
@@ -376,18 +440,12 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
       elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
-        },
+        tag: 'markdown',
+        content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
       });
     }
     elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'div',
-      text: { tag: 'lark_md', content: status },
-    });
+    elements.push({ tag: 'markdown', content: status });
   } else {
     // 未 settle：只用 action/buttons，避免 form+select 被飞书服务端静默丢弃。
     elements.push({ tag: 'hr' });
@@ -400,11 +458,8 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
 
       // 问题标题
       elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
-        },
+        tag: 'markdown',
+        content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
       });
 
       const selected = new Set(selections[i] ?? []);
@@ -415,20 +470,23 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
           content: requiresSubmit ? optionLabel(q.multiSelect, selected.has(opt.key), opt.label) : opt.label,
         },
         type: selected.has(opt.key) ? 'primary' : 'default',
-        value: requiresSubmit
-          ? {
-              action: ASK_TOGGLE_ACTION,
-              ask_id: ask.askId,
-              nonce: ask.nonce,
-              question_index: String(i),
-              key: opt.key,
-            }
-          : {
-              action: ASK_SELECT_ACTION,
-              ask_id: ask.askId,
-              nonce: ask.nonce,
-              key: opt.key,
-            },
+        behaviors: [{
+          type: 'callback',
+          value: requiresSubmit
+            ? {
+                action: ASK_TOGGLE_ACTION,
+                ask_id: ask.askId,
+                nonce: ask.nonce,
+                question_index: String(i),
+                key: opt.key,
+              }
+            : {
+                action: ASK_SELECT_ACTION,
+                ask_id: ask.askId,
+                nonce: ask.nonce,
+                key: opt.key,
+              },
+        }],
       }));
       appendActionRows(elements, optionButtons);
     }
@@ -440,72 +498,51 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
       // value 打上 confirm_empty；用户再点一次才真正 settle 空答案。arm 态只活在按钮
       // value 里（随卡片走），broker 不留状态，天然对 daemon 重启幂等。
       if (confirmEmptyArmed) {
-        elements.push({
-          tag: 'div',
-          text: { tag: 'lark_md', content: t('card.ask.empty_warning', undefined, locale) },
-        });
+        elements.push({ tag: 'markdown', content: t('card.ask.empty_warning', undefined, locale) });
       }
       elements.push({
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: {
-              tag: 'plain_text',
-              content: confirmEmptyArmed
-                ? t('card.ask.submit_confirm_empty', undefined, locale)
-                : t('card.ask.submit', undefined, locale),
-            },
-            type: confirmEmptyArmed ? 'danger' : 'primary',
-            value: {
-              action: ASK_SUBMIT_ACTION,
-              ask_id: ask.askId,
-              nonce: ask.nonce,
-              // Feishu 按钮 value 只可靠地保留字符串（布尔/数字会被字符串化，见
-              // settings-card 的 `next_value:'true'` 约定 + toggle 的 `String(i)`）。
-              // 故 arm 标志用字符串 'true'，读取端按字符串判定。
-              ...(confirmEmptyArmed ? { confirm_empty: 'true' } : {}),
-            },
+        tag: 'button',
+        text: {
+          tag: 'plain_text',
+          content: confirmEmptyArmed
+            ? t('card.ask.submit_confirm_empty', undefined, locale)
+            : t('card.ask.submit', undefined, locale),
+        },
+        type: confirmEmptyArmed ? 'danger' : 'primary',
+        behaviors: [{
+          type: 'callback',
+          value: {
+            action: ASK_SUBMIT_ACTION,
+            ask_id: ask.askId,
+            nonce: ask.nonce,
+            // Feishu 按钮 value 只可靠地保留字符串（布尔/数字会被字符串化，见
+            // settings-card 的 `next_value:'true'` 约定 + toggle 的 `String(i)`）。
+            // 故 arm 标志用字符串 'true'，读取端按字符串判定。
+            ...(confirmEmptyArmed ? { confirm_empty: 'true' } : {}),
           },
-        ],
+        }],
       });
     }
 
     // 自定义回复提示：选项都不满意时，直接在话题里回复一句文字即可当答案。
     elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'note',
-      elements: [
-        { tag: 'plain_text', content: t('card.ask.custom_reply_hint', undefined, locale) },
-      ],
-    });
+    elements.push({ tag: 'markdown', content: t('card.ask.custom_reply_hint', undefined, locale) });
   }
 
   return JSON.stringify({
-    config: { wide_screen_mode: true },
+    schema: '2.0',
+    config: { update_multi: true, wide_screen_mode: true },
     header: {
       template: result ? templateForResult(result) : 'blue',
       title: { tag: 'plain_text', content: result ? t('card.ask.title_done', undefined, locale) : t('card.ask.title', undefined, locale) },
     },
-    elements,
+    body: { direction: 'vertical', elements },
   });
 }
 
 /**
  * 从 form_value 中推断问题数量（取最大 qN 索引 + 1，最少 1）。
  */
-function guessQuestionCount(formValue: Record<string, unknown>): number {
-  let max = -1;
-  for (const key of Object.keys(formValue)) {
-    const m = key.match(/^q(\d+)$/);
-    if (m) {
-      const idx = parseInt(m[1]!, 10);
-      if (idx > max) max = idx;
-    }
-  }
-  return max >= 0 ? max + 1 : 1;
-}
-
 /**
  * 防御式解析 Lark form_value，将每个 q<i> 字段的编码选项解析为选中 key 数组。
  *
@@ -520,27 +557,8 @@ export function parseFormSelections(
   formValue: Record<string, unknown>,
   questionCount: number,
 ): string[][] {
-  const result: string[][] = [];
-  for (let i = 0; i < questionCount; i++) {
-    const raw = formValue[`q${i}`];
-    // 规范化为字符串数组
-    let tokens: string[];
-    if (Array.isArray(raw)) {
-      tokens = raw.filter((v): v is string => typeof v === 'string');
-    } else if (typeof raw === 'string') {
-      // 逗号或分号分隔的备用格式
-      tokens = raw.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
-    } else {
-      tokens = [];
-    }
-    // 筛选出 prefix 匹配 `i::` 的 token，剥去前缀取 key
-    const prefix = `${i}::`;
-    const keys = tokens
-      .filter((t) => t.startsWith(prefix))
-      .map((t) => t.slice(prefix.length));
-    result.push(keys);
-  }
-  return result;
+  const normalized = normalizeAskSubmitValue(formValue, false).formAnswers ?? [];
+  return Array.from({ length: questionCount }, (_, index) => [...(normalized[index] ?? [])]);
 }
 
 /**
@@ -685,8 +703,15 @@ function optionLabel(multiSelect: boolean, selected: boolean, label: string): st
 function appendActionRows(elements: Array<Record<string, unknown>>, actions: Array<Record<string, unknown>>): void {
   for (let i = 0; i < actions.length; i += MAX_BUTTONS_PER_ACTION_ROW) {
     elements.push({
-      tag: 'action',
-      actions: actions.slice(i, i + MAX_BUTTONS_PER_ACTION_ROW),
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+      columns: actions.slice(i, i + MAX_BUTTONS_PER_ACTION_ROW).map((action) => ({
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: [action],
+      })),
     });
   }
 }

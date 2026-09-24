@@ -17,6 +17,8 @@ import {
   HANDOFF_RETENTION_MS,
   type AskPersistStore,
   type PersistedAsk,
+  type PersistedAskWrite,
+  type RecoverTerminalReceiptResult,
 } from './ask-persist-store.js';
 import type {
   AskCardDispatcher,
@@ -26,6 +28,13 @@ import type {
   PendingAsk,
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
+import type {
+  AskAnswerProvenanceRedeemer,
+  AskAnswerProvenanceToken,
+  NormalizedAskSubmitValue,
+} from './ask-receipt.js';
+import { askQuestionDigest, canonicalJson } from './ask-receipt.js';
+import { ASK_MAX_TIMEOUT_MS, ASK_MIN_TIMEOUT_MS, isSupportedAskTimeoutMs } from './ask-limits.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
  *  caller that has a reconnecting claimant after a daemon restart may persist:
@@ -33,7 +42,16 @@ import { AskDispatchError } from './ask-types.js';
  *  re-POSTs with the same requestId. An explicit `botmux ask buttons` CLI exits
  *  on restart (no claimant) and a PTY-backend hook doesn't survive, so those
  *  must NOT persist/handoff — else they leave orphan records (codex P1-4). */
-const RESUMABLE_ORIGINS = new Set(['hook']);
+const RESUMABLE_ORIGINS = new Set(['hook', 's1-controller']);
+
+export class AskS1WindowExpiredError extends Error {
+  readonly code = 'ASK_S1_WINDOW_EXPIRED';
+
+  constructor(readonly expiresAtMs: number, readonly requestedAt: number) {
+    super(`ask-broker: S1 activation window expired at ${expiresAtMs}`);
+    this.name = 'AskS1WindowExpiredError';
+  }
+}
 
 interface InternalPending extends Omit<PendingAsk, 'selections'> {
   /** Stable identity = larkAppId.sessionId.originKind.requestId (see
@@ -45,9 +63,18 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
   requestId: string;
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity. */
   originKind: string;
+  /** Exact controller-issued activation window. Required only for S1 asks and
+   * retained verbatim across restart/recovery. */
+  notBeforeMs?: number;
+  expiresAtMs?: number;
   /** Whether this ask is eligible for persistence + restart resume (its origin
    *  has a reconnecting claimant). */
   resumable: boolean;
+  /** False once answer state has been mutated outside a verified Lark callback. */
+  receiptEligible: boolean;
+  /** Last authenticated durable revision. Every signed mutation uses this as a
+   * compare-and-swap expectation so a stale daemon cannot overwrite a newer one. */
+  persistedRevision: number;
   /** Waiter Promise resolvers. Normally one; an active same-requestId replay
    *  (client reset mid-POST → re-POST) JOINS the same ask and adds another
    *  waiter here so all callers get the one result — no second ask/card
@@ -81,6 +108,10 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
    * 按问题序号（questionIndex）累积的勾选 key 集合。
    */
   selections: Map<number, Set<string>>;
+  /** Minimal ownership for accumulated toggle state. Once one actor mutates the
+   *  staged selections, only that same actor may keep mutating or submit them.
+   *  Cleared again when the staged selection set becomes empty. */
+  selectionActorIdentity?: string;
 }
 
 const pending = new Map<string, InternalPending>();
@@ -91,6 +122,7 @@ let dispatcher: AskCardDispatcher | null = null;
  *  a no-op (unit tests that don't exercise restart-resume需要绑定各自 temp
  *  store，绝不回落到全局目录). */
 let persistStore: AskPersistStore | null = null;
+let receiptRedeemer: AskAnswerProvenanceRedeemer | null = null;
 
 /** Effective handoff-retention window. Defaults to the durable-store constant;
  *  a test may shrink it via `_setHandoffRetentionForTest` so the absolute-expiry
@@ -102,6 +134,46 @@ let handoffRetentionMs: number = HANDOFF_RETENTION_MS;
  *  real dir; tests inject a temp store (and only clean their own sentinel dir). */
 export function setAskPersistStore(store: AskPersistStore | null): void {
   persistStore = store;
+}
+
+/** Recover one S1 terminal receipt without registering or dispatching a card. */
+export function recoverS1ControllerAsk(input: {
+  larkAppId: string;
+  sessionId: string;
+  chatId: string;
+  rootMessageId: string | null;
+  requestId: string;
+  questions: ReadonlyArray<CreateAskInput['questions'][number]>;
+  notBeforeMs: number;
+  expiresAtMs: number;
+  now?: number;
+}): RecoverTerminalReceiptResult {
+  if (!receiptRedeemer) return { ok: false, reason: 'storage_error' };
+  if (!persistStore) return { ok: false, reason: 'storage_error' };
+  const askKey = askKeyFor(input.larkAppId, input.sessionId, 's1-controller', input.requestId);
+  return persistStore.recoverTerminalReceipt({
+    askKey,
+    requestId: input.requestId,
+    originKind: 's1-controller',
+    larkAppId: input.larkAppId,
+    sessionId: input.sessionId,
+    chatId: input.chatId,
+    rootMessageId: input.rootMessageId,
+    questionDigest: askQuestionDigest(input.questions),
+    notBeforeMs: input.notBeforeMs,
+    expiresAtMs: input.expiresAtMs,
+    now: input.now,
+  });
+}
+
+export function askSignedAuthorityAvailable(): boolean {
+  return receiptRedeemer !== null && persistStore !== null;
+}
+
+/** Wire only the receipt redemption facet. Signing-key material never enters
+ * this module; null disables S1 issuance while ordinary Ask remains available. */
+export function setAskReceiptRedeemer(redeemer: AskAnswerProvenanceRedeemer | null): void {
+  receiptRedeemer = redeemer;
 }
 
 /** Shrink the handoff-retention window — for tests only, so the absolute-expiry
@@ -199,6 +271,36 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
   if (!dispatcher) {
     throw new Error('ask-broker: cardDispatcher not wired — daemon bootstrap bug');
   }
+  const requestedAt = Date.now();
+  const s1Controller = input.originKind === 's1-controller';
+  const trustedAbsoluteDeadline = s1Controller ? input.deadlineAt : undefined;
+  if (s1Controller && Number.isSafeInteger(input.expiresAtMs)
+      && requestedAt >= input.expiresAtMs!) {
+    throw new AskS1WindowExpiredError(input.expiresAtMs!, requestedAt);
+  }
+  const hasValidS1Window = !s1Controller || (
+    Number.isSafeInteger(input.notBeforeMs)
+    && Number.isSafeInteger(input.expiresAtMs)
+    && input.notBeforeMs! >= 0
+    && input.expiresAtMs! > input.notBeforeMs!
+    && input.expiresAtMs! - input.notBeforeMs! <= ASK_MAX_TIMEOUT_MS
+    && input.timeoutMs === input.expiresAtMs! - input.notBeforeMs!
+    && input.deadlineAt === input.expiresAtMs
+    && requestedAt >= input.notBeforeMs!
+  );
+  const remainingMs = trustedAbsoluteDeadline === undefined
+    ? input.timeoutMs
+    : trustedAbsoluteDeadline - requestedAt;
+  if (!hasValidS1Window
+      || (!s1Controller && (input.notBeforeMs !== undefined || input.expiresAtMs !== undefined))
+      || (trustedAbsoluteDeadline === undefined && !isSupportedAskTimeoutMs(input.timeoutMs))
+      || (trustedAbsoluteDeadline !== undefined
+        && (!Number.isSafeInteger(trustedAbsoluteDeadline)
+          || remainingMs <= 0 || remainingMs > ASK_MAX_TIMEOUT_MS))) {
+    throw new RangeError(
+      `ask-broker: timeoutMs must be a safe integer in [${ASK_MIN_TIMEOUT_MS}, ${ASK_MAX_TIMEOUT_MS}]`,
+    );
+  }
 
   const originKind = input.originKind ?? 'hook';
   // CLI-origin resumability is gated by TWO independent facts (codex P1-4):
@@ -209,13 +311,18 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
   //     (tmux/herdr/zellij/zmx), NOT trusted from the client. A PTY-backed hook
   //     dies with the daemon, so persisting it would orphan a record no one can
   //     ever re-claim. Undefined backend signal → false (fail closed).
+  // A caller-supplied requestId is still required (it's the re-attach identity).
+  if (originKind === 's1-controller' && (!receiptRedeemer || !persistStore)) {
+    throw new Error('ask-broker: S1 receipt authority/store unavailable');
+  }
   // A host-managed ask has a different reconnecting claimant: the daemon
   // recovers its matching durable Session record and re-registers through the
   // non-IPC registerHostAsk entry point. Both kinds require a stable requestId.
   const resumable = input.requestId !== undefined && (
     hostManaged
       ? originKind.startsWith('host_cross_principal_')
-      : RESUMABLE_ORIGINS.has(originKind) && input.backendSurvivesRestart === true
+      : RESUMABLE_ORIGINS.has(originKind)
+        && (originKind === 's1-controller' || input.backendSurvivesRestart === true)
   );
   // Invocation identity: prefer the caller-supplied requestId (hook generates it
   // once and reuses it across reconnect retries). A caller without one (explicit
@@ -265,10 +372,10 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
     }
   }
 
-  const askId = randomUUID();
+  const askId = originKind === 's1-controller' ? requestId : randomUUID();
   const nonce = randomUUID().slice(0, 8);
-  const createdAt = Date.now();
-  const deadlineAt = createdAt + input.timeoutMs;
+  const createdAt = requestedAt;
+  const deadlineAt = trustedAbsoluteDeadline ?? createdAt + input.timeoutMs;
 
   return new Promise<AskResult>((resolve) => {
     const selections = new Map<number, Set<string>>();
@@ -280,6 +387,8 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       requestId,
       originKind,
       resumable,
+      receiptEligible: receiptRedeemer !== null,
+      persistedRevision: 0,
       nonce,
       larkAppId: input.larkAppId,
       chatId: input.chatId,
@@ -291,6 +400,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       replyCardTarget: input.replyCardTarget,
       createdAt,
       deadlineAt,
+      ...(s1Controller ? { notBeforeMs: input.notBeforeMs!, expiresAtMs: input.expiresAtMs! } : {}),
       settled: false,
       waiters: [resolve],
       timeoutMs: input.timeoutMs,
@@ -302,7 +412,25 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
     // lands still leaves a resumable record; restore/re-attach re-sends.
     if (resumable) {
-      persistFromInternal(ask);
+      try {
+        if (receiptRedeemer) persistFromInternalStrict(ask);
+        else persistFromInternal(ask);
+      } catch (error) {
+        clearTimeout(ask.timeoutHandle);
+        pending.delete(askId);
+        logger.warn?.(
+          `ask-broker: initial signed persist failed for ${askId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        resolve({
+          kind: 'invalidated',
+          reason: 'ask persistence unavailable',
+          selected: null,
+          by: null,
+          comment: null,
+          timedOut: false,
+        });
+        return;
+      }
       logger.info?.(`ask-broker: registered + persisted ask ${askId} (key=${askKey}, session=${input.sessionId})`);
     }
     void sendCardForAsk(ask);
@@ -319,6 +447,11 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.chatId === input.chatId &&
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
+    (input.originKind === 's1-controller'
+      ? ask.deadlineAt === input.deadlineAt
+        && ask.notBeforeMs === input.notBeforeMs
+        && ask.expiresAtMs === input.expiresAtMs
+      : ask.deadlineAt - ask.createdAt === input.timeoutMs) &&
     ask.answererOpenId === input.answererOpenId &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
@@ -375,11 +508,31 @@ function sendCardForAsk(ask: InternalPending): void {
         const { messageId } = await dispatcher!.send(snapshot(ask));
         const cur = pending.get(ask.askId);
         if (cur && !cur.settled) {
+          const previousCardMessageId = cur.cardMessageId;
           cur.cardMessageId = messageId;
+          try {
+            if (cur.resumable && receiptRedeemer) persistFromInternalStrict(cur);
+            else if (cur.resumable) persistFromInternal(cur);
+          } catch (error) {
+            cur.cardMessageId = previousCardMessageId;
+            cur.receiptEligible = false;
+            logger.warn?.(
+              `ask-broker: card binding persist failed for ${cur.askId}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            if (cur.originKind === 's1-controller') {
+              settle(cur.askId, {
+                kind: 'invalidated',
+                reason: 'ask persistence unavailable',
+                selected: null,
+                by: null,
+                comment: null,
+                timedOut: false,
+              });
+            }
+          }
           if (cur.timeoutStartsAfterDelivery && cur.timeoutStartedAt === undefined) {
             armAskTimeout(cur, cur.timeoutMs, Date.now());
           }
-          if (cur.resumable) persistFromInternal(cur);
         }
         return; // sent (or server-deduped to the original) — done
       } catch (err) {
@@ -441,11 +594,11 @@ function findByKey(askKey: string): InternalPending | undefined {
  */
 function reattachByRequest(ask: InternalPending): Promise<AskResult> {
   if (ask.answeredResult) {
-    const result = ask.answeredResult;
+    const result = detachAskResult(ask.answeredResult);
     ask.dormant = false;
     ask.settled = true;
     ask.settledAt = Date.now();
-    ask.terminalResult = result;
+    ask.terminalResult = detachAskResult(result);
     clearTimeout(ask.timeoutHandle);
     clearTimeout(ask.handoffExpiryHandle); // claimed → cancel the unclaimed-stash reaper
     persistStore?.remove(ask.askKey); // claimed → durable record no longer needed
@@ -476,8 +629,7 @@ function persistFromInternal(ask: InternalPending): void {
   // A settled ask with a stashed answer is a durable handoff that must be KEPT
   // until claimed; a settled ask without one has nothing left to resume.
   if (ask.settled && !ask.answeredResult) return;
-  const persisted: PersistedAsk = {
-    v: 2,
+  const common = {
     askKey: ask.askKey,
     requestId: ask.requestId,
     originKind: ask.originKind,
@@ -487,6 +639,10 @@ function persistFromInternal(ask: InternalPending): void {
     chatId: ask.chatId,
     rootMessageId: ask.rootMessageId,
     sessionId: ask.sessionId,
+    ...(ask.chatType ? { chatType: ask.chatType } : {}),
+    ...(ask.originKind === 's1-controller'
+      ? { notBeforeMs: ask.notBeforeMs, expiresAtMs: ask.expiresAtMs }
+      : {}),
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
     questions: ask.questions,
@@ -498,9 +654,115 @@ function persistFromInternal(ask: InternalPending): void {
     cardMessageId: ask.cardMessageId,
     replyCardTarget: ask.replyCardTarget,
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
+    ...(ask.selectionActorIdentity ? { selectionActorIdentity: ask.selectionActorIdentity } : {}),
     ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
   };
+  const persisted: PersistedAskWrite = receiptRedeemer
+    ? { ...common, v: 3, receiptEligible: ask.receiptEligible }
+    : { ...common, v: 2 };
   persistStore.put(persisted);
+}
+
+/** Signed persistence is an authorization boundary: the durable state must land
+ *  before the mutation becomes externally visible. Legacy unsigned persistence
+ *  remains best-effort because it is resilience-only. */
+function persistFromInternalStrict(ask: InternalPending): void {
+  if (!persistStore || !ask.resumable || !receiptRedeemer) return;
+  if (ask.settled && !ask.answeredResult) return;
+  const persisted: Extract<PersistedAskWrite, { v: 3 }> = {
+    askKey: ask.askKey,
+    requestId: ask.requestId,
+    originKind: ask.originKind,
+    askId: ask.askId,
+    nonce: ask.nonce,
+    larkAppId: ask.larkAppId,
+    chatId: ask.chatId,
+    rootMessageId: ask.rootMessageId,
+    sessionId: ask.sessionId,
+    ...(ask.chatType ? { chatType: ask.chatType } : {}),
+    questions: ask.questions,
+    createdAt: ask.createdAt,
+    deadlineAt: ask.deadlineAt,
+    ...(ask.originKind === 's1-controller'
+      ? { notBeforeMs: ask.notBeforeMs, expiresAtMs: ask.expiresAtMs }
+      : {}),
+    ...(ask.cardMessageId ? { cardMessageId: ask.cardMessageId } : {}),
+    selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
+    ...(ask.selectionActorIdentity ? { selectionActorIdentity: ask.selectionActorIdentity } : {}),
+    ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
+    v: 3,
+    receiptEligible: ask.receiptEligible,
+  };
+  ask.persistedRevision = persistStore.commitSigned(persisted, ask.persistedRevision);
+}
+
+function signedPersistedProjection(ask: InternalPending): Extract<PersistedAskWrite, { v: 3 }> {
+  return {
+    askKey: ask.askKey, requestId: ask.requestId, originKind: ask.originKind,
+    askId: ask.askId, nonce: ask.nonce, larkAppId: ask.larkAppId,
+    chatId: ask.chatId, rootMessageId: ask.rootMessageId, sessionId: ask.sessionId,
+    ...(ask.chatType ? { chatType: ask.chatType } : {}),
+    questions: ask.questions, createdAt: ask.createdAt, deadlineAt: ask.deadlineAt,
+    ...(ask.originKind === 's1-controller'
+      ? { notBeforeMs: ask.notBeforeMs, expiresAtMs: ask.expiresAtMs }
+      : {}),
+    ...(ask.cardMessageId ? { cardMessageId: ask.cardMessageId } : {}),
+    selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
+    ...(ask.selectionActorIdentity ? { selectionActorIdentity: ask.selectionActorIdentity } : {}),
+    v: 3, receiptEligible: ask.receiptEligible,
+  };
+}
+
+function terminalizePersistedStrict(
+  ask: InternalPending,
+  result: AskResult,
+  committedAt: number,
+): AskResult {
+  if (!persistStore || !ask.resumable) return result;
+  if (!receiptRedeemer) {
+    persistStore.remove(ask.askKey);
+    return result;
+  }
+  if (result.kind === 'answered' && result.receipt) {
+    const committed = persistStore.commitTerminalSigned({
+      ask: signedPersistedProjection(ask),
+      expectedRevision: ask.persistedRevision,
+      answeredResult: result,
+      receipt: result.receipt,
+      now: committedAt,
+      recoverUntil: committedAt + HANDOFF_RETENTION_MS,
+    });
+    ask.persistedRevision = committed.revision;
+    return result;
+  }
+  ask.persistedRevision = persistStore.terminalizeSigned({
+    ask: signedPersistedProjection(ask),
+    expectedRevision: ask.persistedRevision,
+    result,
+    now: committedAt,
+    recoverUntil: committedAt + HANDOFF_RETENTION_MS,
+  }).revision;
+  return result;
+}
+
+interface AskMutableSnapshot {
+  selections: Array<[number, string[]]>;
+  selectionActorIdentity?: string;
+  receiptEligible: boolean;
+}
+
+function snapshotMutableAskState(ask: InternalPending): AskMutableSnapshot {
+  return {
+    selections: [...ask.selections.entries()].map(([questionIndex, selected]) => [questionIndex, [...selected]]),
+    selectionActorIdentity: ask.selectionActorIdentity,
+    receiptEligible: ask.receiptEligible,
+  };
+}
+
+function restoreMutableAskState(ask: InternalPending, snapshot: AskMutableSnapshot): void {
+  ask.selections = new Map(snapshot.selections.map(([questionIndex, selected]) => [questionIndex, new Set(selected)]));
+  ask.selectionActorIdentity = snapshot.selectionActorIdentity;
+  ask.receiptEligible = snapshot.receiptEligible;
 }
 
 /**
@@ -520,17 +782,33 @@ export function toggleAsk(args: {
   questionIndex: number;
   key: string;
   by: string;
+  provenance?: AskAnswerProvenanceToken;
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.nonce !== args.nonce) return 'stale';
   if (ask.settled) return 'already_settled';
+  if (Date.now() >= ask.deadlineAt) return 'stale';
   if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
-
   const question = ask.questions[args.questionIndex];
   if (!question) return 'stale';
   if (!question.options.some((o) => o.key === args.key)) return 'stale';
+  if (ask.selectionActorIdentity && ask.selectionActorIdentity !== args.by) return 'unauthorized';
+  const snapshot = snapshotMutableAskState(ask);
+
+  const mutationProven = receiptRedeemer?.consumeMutation(args.provenance, {
+    larkAppId: ask.larkAppId,
+    actorIdentity: args.by,
+    cardMessageId: ask.cardMessageId ?? '',
+    action: 'ask_toggle',
+    askId: ask.askId,
+    askNonce: ask.nonce,
+    optionKey: args.key,
+    questionIndex: args.questionIndex,
+    hasFormValue: false,
+  }) === true;
+  if (!mutationProven) ask.receiptEligible = false;
 
   const sel = ask.selections.get(args.questionIndex)!;
 
@@ -546,10 +824,22 @@ export function toggleAsk(args: {
     sel.clear();
     sel.add(args.key);
   }
+  ask.selectionActorIdentity = hasAnySelection(ask) ? args.by : undefined;
 
-  // Persist the updated checkbox state so a restart mid-multi-select keeps the
-  // boxes the user already ticked (best-effort; never blocks the toggle).
-  persistFromInternal(ask);
+  try {
+    // Signed v3 mutation state must be durable before the UI sees "toggled".
+    if (receiptRedeemer && ask.resumable) persistFromInternalStrict(ask);
+    else {
+      // Legacy/unsigned path stays best-effort.
+      persistFromInternal(ask);
+    }
+  } catch (error) {
+    logger.warn?.(
+      `ask-broker: strict toggle persist failed for ${ask.askId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    restoreMutableAskState(ask, snapshot);
+    return 'stale';
+  }
 
   return 'toggled';
 }
@@ -571,13 +861,48 @@ export function submitAsk(args: {
   /** 空提交二次确认已通过（用户在 arm 卡片上再点了一次）。仅影响「全多选 + 全空」
    *  这一种可确认的空提交；其它情形不看它。缺省 false。 */
   confirmEmpty?: boolean;
+  /** Opaque process-local capability issued through the configured dispatcher
+   *  authority path. Merely constructing callback-shaped fields does not grant
+   *  this capability, though arbitrary same-process code is out of scope. */
+  provenance?: AskAnswerProvenanceToken;
+  provenanceAction?: 'ask_select' | 'ask_submit';
+  provenanceHasFormValue?: boolean;
+  provenanceSubmitBinding?: NormalizedAskSubmitValue;
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.nonce !== args.nonce) return 'stale';
   if (ask.settled) return 'already_settled';
+  const answeredAt = Date.now();
+  if (answeredAt >= ask.deadlineAt) return 'stale';
   if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
+  if (ask.selectionActorIdentity && ask.selectionActorIdentity !== args.by) return 'unauthorized';
+
+  let submitBinding: NormalizedAskSubmitValue | undefined;
+  if (args.provenanceAction === 'ask_submit') {
+    if ((args.provenanceHasFormValue === true) !== (args.selections !== undefined)) return 'stale';
+    const formAnswers = args.provenanceHasFormValue
+      ? Object.freeze(args.selections!.map((keys) => Object.freeze([...keys])))
+      : null;
+    const derived = Object.freeze({
+      confirmEmpty: args.confirmEmpty === true,
+      formAnswers,
+    });
+    if (args.provenanceSubmitBinding) {
+      try {
+        if (canonicalJson(args.provenanceSubmitBinding) !== canonicalJson(derived)) return 'stale';
+      } catch {
+        return 'stale';
+      }
+      submitBinding = args.provenanceSubmitBinding;
+    } else {
+      // Direct broker callers used by restart recovery tests predate the
+      // explicit binding field. Deriving from the actual handler arguments is
+      // equally strict and cannot authorize a crossed answer.
+      submitBinding = derived;
+    }
+  }
 
   // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
@@ -623,14 +948,14 @@ export function submitAsk(args: {
     return 'needs_empty_confirm';
   }
 
-  settle(args.askId, {
+  const committed = settle(args.askId, {
     kind: 'answered',
     answers,
     by: args.by,
     comment: null,
     timedOut: false,
-  });
-  return 'accepted';
+  }, args.provenance, answeredAt, args.provenanceAction, args.provenanceHasFormValue, submitBinding);
+  return committed ? 'accepted' : 'stale';
 }
 
 /**
@@ -659,18 +984,31 @@ export function submitCustomReply(args: {
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
+  if (Date.now() >= ask.deadlineAt) return 'stale';
   if (!isAuthorizedToAnswer(ask, args.by, args.actor)) return 'unauthorized';
+  if (ask.selectionActorIdentity && ask.selectionActorIdentity !== args.by) return 'unauthorized';
   const text = args.text.trim();
   if (!text) return 'stale';
+  const previousReceiptEligibility = ask.receiptEligible;
+  ask.receiptEligible = false;
+  try {
+    if (ask.resumable && receiptRedeemer) persistFromInternalStrict(ask);
+  } catch (error) {
+    ask.receiptEligible = previousReceiptEligibility;
+    logger.warn?.(
+      `ask-broker: strict custom-reply downgrade failed for ${ask.askId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 'stale';
+  }
 
-  settle(args.askId, {
+  const committed = settle(args.askId, {
     kind: 'answered',
     answers: ask.questions.map(() => []),
     by: args.by,
     comment: text,
     timedOut: false,
   });
-  return 'accepted';
+  return committed ? 'accepted' : 'stale';
 }
 
 /**
@@ -715,12 +1053,16 @@ export function tryResolveAsk(args: {
   nonce: string;
   selected: string;
   by: string;
+  provenance?: AskAnswerProvenanceToken;
 }): AskClickOutcome {
   return submitAsk({
     askId: args.askId,
     nonce: args.nonce,
     by: args.by,
     selections: [[args.selected]],
+    provenance: args.provenance,
+    provenanceAction: 'ask_select',
+    provenanceHasFormValue: false,
   });
 }
 
@@ -783,10 +1125,17 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     for (const a of pending.values()) if (a.askKey === p.askKey && !a.settled) { dup = true; break; }
     if (dup) continue;
 
+    const persistedSelectionOwner =
+      p.v === 3 && typeof p.selectionActorIdentity === 'string'
+        ? p.selectionActorIdentity
+        : undefined;
+    const hasPersistedSelections = p.selections.some((keys) => keys.length > 0);
+    const restoreSelectionState = p.v === 3 && (!hasPersistedSelections || persistedSelectionOwner !== undefined);
     const selections = new Map<number, Set<string>>();
     for (let i = 0; i < p.questions.length; i++) {
-      selections.set(i, new Set<string>(p.selections?.[i] ?? []));
+      selections.set(i, new Set<string>(restoreSelectionState ? (p.selections?.[i] ?? []) : []));
     }
+    const restoredSelectionOwner = hasAnySelectionSets(selections) ? persistedSelectionOwner : undefined;
     const hasStashedAnswer = p.answeredResult !== undefined;
     // A stashed-answer restore is already terminal (settled), awaiting only the
     // hook's claim — it must NOT arm a deadline timer (there's nothing left to
@@ -811,6 +1160,12 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       requestId: p.requestId,
       originKind: p.originKind,
       resumable: true, // only resumable origins were ever persisted
+      receiptEligible:
+        p.v === 3
+        && p.receiptEligible === true
+        && receiptRedeemer !== null
+        && (!hasPersistedSelections || persistedSelectionOwner !== undefined),
+      persistedRevision: p.v === 3 ? p.revision : 0,
       nonce: p.nonce,
       larkAppId: p.larkAppId,
       chatId: p.chatId,
@@ -821,6 +1176,9 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
+      ...(p.originKind === 's1-controller'
+        ? { notBeforeMs: p.notBeforeMs, expiresAtMs: p.expiresAtMs }
+        : {}),
       timeoutMs: p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt),
       timeoutStartsAfterDelivery: p.timeoutStartsAfterDelivery === true,
       timeoutStartedAt: p.timeoutStartedAt,
@@ -840,6 +1198,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       // restore uses a no-op cleared handle so clearTimeout calls stay safe.
       timeoutHandle: timeoutHandle ?? setTimeout(() => {}, 0),
       selections,
+      selectionActorIdentity: restoredSelectionOwner,
     };
     if (timeoutHandle === undefined) { clearTimeout(ask.timeoutHandle); }
     pending.set(p.askId, ask);
@@ -866,9 +1225,75 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
  *  hook (best-effort, never blocks broker state transitions). The settled
  *  entry stays in the map for `SETTLED_RETENTION_MS` so late race-losers get
  *  a precise `already_settled` outcome; `gcSettled` reaps it afterward. */
-function settle(askId: string, result: AskResult): void {
+function settle(
+  askId: string,
+  result: AskResult,
+  provenance?: AskAnswerProvenanceToken,
+  answerAcceptedAt?: number,
+  action?: 'ask_select' | 'ask_submit',
+  hasFormValue = false,
+  submitBinding?: NormalizedAskSubmitValue,
+): boolean {
   const ask = pending.get(askId);
-  if (!ask || ask.settled) return;
+  if (!ask || ask.settled) return false;
+  const settledAt = answerAcceptedAt ?? Date.now();
+  let finalResult = result;
+  let receiptEligibilityDowngraded = false;
+
+  // The broker never sees signer key material. Its only minting path redeems a
+  // one-shot process-local capability issued through the configured dispatcher
+  // authority. Arbitrary code executing in this process is outside this boundary.
+  if (finalResult.kind === 'answered' && action && ask.receiptEligible) {
+    const receipt = receiptRedeemer?.mintReceipt(provenance, {
+      askId: ask.askId,
+      askKey: ask.askKey,
+      requestId: ask.requestId,
+      originKind: ask.originKind,
+      larkAppId: ask.larkAppId,
+      sessionId: ask.sessionId,
+      chatId: ask.chatId,
+      rootMessageId: ask.rootMessageId,
+      questions: ask.questions,
+      answers: finalResult.answers,
+      comment: null,
+      actorIdentity: finalResult.by,
+      cardMessageId: ask.cardMessageId ?? '',
+      action,
+      hasFormValue,
+      ...(action === 'ask_submit' ? { submitBinding } : {}),
+      askNonce: ask.nonce,
+      ...(action === 'ask_select' ? { optionKey: finalResult.answers[0]?.[0] } : {}),
+      answeredAt: settledAt,
+      deadlineAt: ask.deadlineAt,
+    });
+    if (receipt) finalResult = { ...finalResult, receipt };
+    else if (ask.originKind === 's1-controller') {
+      receiptRedeemer?.revoke(provenance);
+      return false;
+    } else {
+      ask.receiptEligible = false;
+      receiptEligibilityDowngraded = true;
+    }
+  }
+  finalResult = detachAskResult(finalResult);
+
+  // Signed settlement has one durable commit point in the store.
+  if (ask.resumable && receiptRedeemer) {
+    try {
+      if (receiptEligibilityDowngraded) persistFromInternalStrict(ask);
+      finalResult = terminalizePersistedStrict(ask, finalResult, settledAt);
+      if (finalResult.kind === 'answered' && finalResult.receipt
+          && !receiptRedeemer.markReceiptCommitted(provenance)) {
+        logger.error(`ask-broker: failed to acknowledge committed receipt for ${ask.askId}`);
+      }
+    } catch (error) {
+      logger.warn?.(
+        `ask-broker: strict terminal persist failed for ${ask.askId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      receiptRedeemer.revoke(provenance);
+      return false;
+    }
+  }
 
   // Durable handoff (codex P1-1): a dormant ask (restored after a restart, no
   // waiter yet) that receives an ANSWER must NOT drop it into the void. Stash
@@ -876,13 +1301,13 @@ function settle(askId: string, result: AskResult): void {
   // can claim it (reattachDormantAsk delivers + removes). Only answered results
   // are worth stashing — a dormant ask that timed out / was invalidated has no
   // consumer to hand off to, so it settles+cleans normally.
-  if (ask.dormant && ask.waiters.length === 0 && result.kind === 'answered') {
+  if (ask.dormant && ask.waiters.length === 0 && finalResult.kind === 'answered') {
     ask.settled = true;
     ask.settledAt = Date.now();
-    ask.answeredResult = result;
-    ask.terminalResult = result;
+    ask.answeredResult = finalResult;
+    ask.terminalResult = finalResult;
     clearTimeout(ask.timeoutHandle);
-    persistFromInternal(ask); // re-persist WITH answeredResult + answeredAt (kept until claimed)
+    if (!receiptRedeemer) persistFromInternal(ask);
     // Arm the absolute handoff-expiry timer (codex P1-4): if the reconnecting
     // hook never claims this stash (CLI gone for good), reap memory + disk
     // TOGETHER at answeredAt + HANDOFF_RETENTION_MS — not just on the next boot
@@ -890,18 +1315,27 @@ function settle(askId: string, result: AskResult): void {
     armHandoffExpiry(ask);
     logger.info?.(`ask-broker: stashed answer for dormant ask ${askId} (key=${ask.askKey}) — awaiting hook claim`);
     // Still notify the card layer so the Feishu card flips to its settled view.
-    notifyOnSettle(ask, result);
-    return;
+    notifyOnSettle(ask, finalResult);
+    return true;
   }
 
   ask.settled = true;
   ask.settledAt = Date.now();
-  ask.terminalResult = result; // retained for a same-requestId replay in the ambiguous window
+  ask.terminalResult = finalResult; // retained for a same-requestId replay in the ambiguous window
   clearTimeout(ask.timeoutHandle);
+  // Explicit/other non-resumable asks have no durable state by design. Their
+  // commit point is the in-memory terminal transition above; acknowledge a
+  // minted receipt only after that transition so the dispatcher can complete
+  // its durable event claim. Resumable asks were acknowledged only after their
+  // atomic terminal store commit in the branch above.
+  if (!ask.resumable && finalResult.kind === 'answered' && finalResult.receipt
+      && receiptRedeemer && !receiptRedeemer.markReceiptCommitted(provenance)) {
+    logger.error(`ask-broker: failed to acknowledge committed receipt for ${ask.askId}`);
+  }
   // The durable record's job is done the moment the ask leaves the pending
   // state (delivered to live waiters, or a terminal non-answer) — drop it so a
   // later restart doesn't resurrect a settled ask.
-  persistStore?.remove(ask.askKey);
+  if (!receiptRedeemer) terminalizePersistedStrict(ask, finalResult, settledAt);
   // Reap older settled entries opportunistically — keeps the map bounded
   // without paying for a dedicated GC timer.
   gcSettled();
@@ -912,7 +1346,7 @@ function settle(askId: string, result: AskResult): void {
   ask.waiters = [];
   for (const w of waiters) {
     try {
-      w(result);
+      w(detachAskResult(finalResult));
     } catch (err) {
       logger.warn?.(
         `ask-broker: ${askId} waiter threw: ${err instanceof Error ? err.message : String(err)}`,
@@ -920,7 +1354,23 @@ function settle(askId: string, result: AskResult): void {
     }
   }
 
-  notifyOnSettle(ask, result);
+  notifyOnSettle(ask, finalResult);
+  return true;
+}
+
+function detachAskResult(result: AskResult): AskResult {
+  const cloned = structuredClone(result) as AskResult;
+  if (cloned.kind === 'answered') {
+    cloned.answers = Object.freeze(cloned.answers.map((answer) => Object.freeze([...answer])));
+    if (cloned.receipt) {
+      cloned.receipt.payload.answers = cloned.answers;
+      cloned.receipt.payload.actor = Object.freeze({ ...cloned.receipt.payload.actor });
+      cloned.receipt.payload = Object.freeze({ ...cloned.receipt.payload });
+      cloned.receipt = Object.freeze({ ...cloned.receipt });
+    }
+    return Object.freeze({ ...cloned });
+  }
+  return Object.freeze(cloned);
 }
 
 /** Notify the IM-side dispatcher's onSettle hook (best-effort — never blocks
@@ -946,10 +1396,11 @@ function snapshot(ask: InternalPending): PendingAsk {
   const {
     // Runtime-only / broker-internal fields excluded from the IM contract:
     waiters: _w, timeoutHandle: _t, settledAt: _sat, selections: _sel,
+    askKey: _ak, requestId: _rid, resumable: _rs,
+    dormant: _dm, answeredResult: _ar, terminalResult: _tr, receiptEligible: _re,
+    persistedRevision: _pr,
     handoffExpiryHandle: _he,
     timeoutMs: _tm, timeoutStartsAfterDelivery: _td, timeoutStartedAt: _ts,
-    askKey: _ak, requestId: _rid, resumable: _rs,
-    dormant: _dm, answeredResult: _ar, terminalResult: _tr,
     ...rest
   } = ask;
   return {
@@ -979,6 +1430,17 @@ function gcSettled(): void {
       pending.delete(id);
     }
   }
+}
+
+function hasAnySelection(ask: InternalPending): boolean {
+  return hasAnySelectionSets(ask.selections);
+}
+
+function hasAnySelectionSets(selections: Map<number, Set<string>>): boolean {
+  for (const selected of selections.values()) {
+    if (selected.size > 0) return true;
+  }
+  return false;
 }
 
 /**
@@ -1052,6 +1514,7 @@ export function submitAskFromDesktop(args: {
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
+  if (Date.now() >= ask.deadlineAt) return 'stale';
 
   // 同 submitAsk：按 ask.questions 规范化，拒绝超长输入、缺失尾部补空集，越界槽不进结果。
   if (args.selections.length > ask.questions.length) return 'stale';
@@ -1066,15 +1529,26 @@ export function submitAskFromDesktop(args: {
     canonical.push([...sel]);
   }
   const answers = canonical;
+  const previousReceiptEligibility = ask.receiptEligible;
+  ask.receiptEligible = false;
+  try {
+    if (ask.resumable && receiptRedeemer) persistFromInternalStrict(ask);
+  } catch (error) {
+    ask.receiptEligible = previousReceiptEligibility;
+    logger.warn?.(
+      `ask-broker: strict desktop-answer downgrade failed for ${ask.askId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 'stale';
+  }
 
-  settle(args.askId, {
+  const committed = settle(args.askId, {
     kind: 'answered',
     answers,
     by: args.by ?? 'desktop',
     comment: null,
     timedOut: false,
   });
-  return 'accepted';
+  return committed ? 'accepted' : 'stale';
 }
 
 /** Read a pending ask by id — for tests only. Returns a snapshot; mutating it
@@ -1104,4 +1578,5 @@ export function _resetForTest(): void {
   // reaping a shared dataDir could wipe a LIVE pending ask). Tests own their
   // temp dir's cleanup via their own teardown.
   persistStore = null;
+  receiptRedeemer = null;
 }

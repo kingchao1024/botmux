@@ -375,9 +375,10 @@ export const config = {
   // both ends of the IPC agree. `BOTMUX_XPI_ENABLED` overrides for one process.
   get crossPrincipalInterruption(): boolean { return isCrossPrincipalInterruptionEnabled(); },
   // Live getter: whether to auto-bypass Codex's interactive hook-trust gate for
-  // Codex-family plain-TUI launches. Re-read per spawn so a Settings toggle takes
-  // effect on the next session without a daemon restart (existing panes keep their
-  // argv — argv can't be hot-swapped). Default ON (absent ⇒ true): only an explicit
+  // Codex-family managed TUI and TraeX RPC app-server launches. Re-read per spawn
+  // so a Settings toggle takes effect on the next session without a daemon restart
+  // (existing panes keep their argv — argv can't be hot-swapped). Default ON
+  // (absent ⇒ true): only an explicit
   // stored `false` disables it. The daemon ANDs this with each bot's
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },

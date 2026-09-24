@@ -205,6 +205,18 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toContain('lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot');
   });
 
+  it('blocks same-chat --top-level escape from a registered dispatch child topic', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain('dispatchChildTopLevelEscape({');
+    expect(cmdSend).toContain('sessionRootMessageId: s.rootMessageId');
+    expect(cmdSend).toContain('当前会话属于已登记的协作子话题');
+    expect(cmdSend).toContain('请用 botmux report 回报主控');
+    expect(cmdSend.indexOf('dispatchChildTopLevelEscape({'))
+      .toBeLessThan(cmdSend.indexOf('const dispatchPrimary = async'));
+  });
+
   it('fails closed when a durable turn is bound to a non-Lark delivery sink', () => {
     expect(cliSource).toContain("exactOriginDispatch?.deliverySink === 'http_wait'");
     expect(cliSource).toContain("exactOriginDispatch?.deliverySink === 'http_async'");

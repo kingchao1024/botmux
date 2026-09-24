@@ -293,6 +293,35 @@ const ROUTES: RouteDef[] = [
       return { status: 200, body: { sessions } };
     },
   },
+  {
+    method: 'POST',
+    pathRe: /^\/__daemon\/sessions\/([^/]+)\/view-link$/,
+    handle: async (m, ctx, deps) => {
+      const sessionId = decodeURIComponent(m[1]);
+      const owner = deps.ownerOf(sessionId);
+      if (owner === undefined) {
+        if (!deps.sessionExists(sessionId) || ctx.callerAppId === undefined) {
+          return { status: 404, body: { ok: false, error: 'unknown_session' } };
+        }
+        const upstream = await deps.proxyToDaemon(
+          ctx.callerAppId,
+          `/api/sessions/${encodeURIComponent(sessionId)}/view-link`,
+          { method: 'GET' },
+        );
+        return { status: upstream.status, body: await readUpstream(upstream) };
+      }
+      const isGlobal = ctx.url.searchParams.get('scope') === 'global';
+      if (!isGlobal && ctx.callerAppId !== undefined && owner !== ctx.callerAppId) {
+        return { status: 403, body: { ok: false, error: 'session_owner_mismatch' } };
+      }
+      const upstream = await deps.proxyToDaemon(
+        owner,
+        `/api/sessions/${encodeURIComponent(sessionId)}/view-link`,
+        { method: 'GET' },
+      );
+      return { status: upstream.status, body: await readUpstream(upstream) };
+    },
+  },
   // Dedicated schedules list endpoint. `?scope=global` widens only the read
   // row set; HMAC, admin, invoker, and write owner-routing gates are unchanged.
   {

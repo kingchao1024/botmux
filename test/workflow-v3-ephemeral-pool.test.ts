@@ -507,6 +507,25 @@ describe('v3 ephemeral pool', () => {
     });
   });
 
+  it('rejects a signal-interrupted CLI exit even when its numeric exit code is zero', async () => {
+    const worker = new ScriptedWorker();
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(request());
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'claude_exit', code: 0, signal: 'SIGHUP' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({ status: 'fail' });
+  });
+
   it('uses raw slash-command passthrough for native /goal', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

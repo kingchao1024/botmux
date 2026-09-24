@@ -603,6 +603,34 @@ export interface DispatchRegistryEntry {
 }
 
 /**
+ * Detect the dangerous form of `botmux send --top-level` from a registered
+ * dispatch child topic. In a topic group that flag creates a brand-new topic,
+ * so a child-topic status update silently escapes both the child and its
+ * orchestrator topic. Cross-chat publishing remains explicit and unaffected.
+ */
+export function dispatchChildTopLevelEscape(input: {
+  requestedTopLevel: boolean;
+  overrideChatId?: string;
+  into?: string;
+  sessionChatId: string;
+  sessionRootMessageId: string;
+  registry: Record<string, DispatchRegistryEntry>;
+}): { orchestratorRootMessageId: string } | undefined {
+  if (!input.requestedTopLevel
+    || (input.overrideChatId && input.overrideChatId !== input.sessionChatId)
+    || input.into) return undefined;
+  const entry = input.registry[input.sessionRootMessageId];
+  const orchestratorRootMessageId = entry?.orchRoot?.trim();
+  if (entry?.orchScope !== 'thread'
+    || !orchestratorRootMessageId?.startsWith('om_')
+    || orchestratorRootMessageId === input.sessionRootMessageId
+    || (entry.orchChatId && entry.orchChatId !== input.sessionChatId)) {
+    return undefined;
+  }
+  return { orchestratorRootMessageId };
+}
+
+/**
  * Resolve the dispatch record for either a normal thread session or a
  * regular-group chat-scope session folded from a dispatch topic.
  *

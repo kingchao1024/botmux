@@ -87,7 +87,8 @@ import {
   isV3DistillationAction,
   type V3DistillationCardHandlerDeps,
 } from './v3-distillation-card-handler.js';
-import { handleAskCardAction, isAskCardAction } from './ask-card.js';
+import { handleAskCardAction, handleAskCardActionWithOutcome, isAskCardAction } from './ask-card.js';
+import type { AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
@@ -1126,7 +1127,12 @@ async function cardReplyOptions(
   }
 }
 
-export async function handleCardAction(data: CardActionData, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
+export async function handleCardAction(
+  data: CardActionData,
+  deps: CardHandlerDeps,
+  larkAppId?: string,
+  askReceiptProvenance?: AskAnswerProvenanceToken,
+): Promise<any> {
   const { activeSessions, lastRepoScan } = deps;
   // turnId is forwarded only when the caller actually has a turn anchor
   // (e.g. the pendingRepo confirmation) — most card actions have none.
@@ -1487,7 +1493,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
 
   if (isAskCardAction(value?.action)) {
-    return handleAskCardAction(data, { larkAppId });
+    return askReceiptProvenance
+      ? handleAskCardActionWithOutcome(data, askReceiptProvenance, { larkAppId })
+      : handleAskCardAction(data, { larkAppId });
   }
 
   if (value?.action === 'oncall_group_create' && larkAppId) {

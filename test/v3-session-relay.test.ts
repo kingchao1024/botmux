@@ -8,7 +8,7 @@ import {
   V3_SESSION_RUN_MUTATIONS,
   type V3SessionRelaySessionView,
 } from '../src/workflows/v3/session-relay.js';
-import type { RunChatBinding } from '../src/workflows/v3/grill-state.js';
+import { birthRun, type RunChatBinding } from '../src/workflows/v3/grill-state.js';
 import {
   makeManualCliRunEnvelope,
   serializeRunEnvelope,
@@ -85,6 +85,10 @@ describe('v3 session relay authorization', () => {
     writeFileSync(join(runDir, 'run.json'), serializeRunEnvelope(envelope));
   }
 
+  function writeGrill(runId: string, binding: RunChatBinding): void {
+    birthRun({ goal: 'relay authoring', baseDir, runId, chatBinding: binding });
+  }
+
   function sessionView(
     overrides: Partial<V3SessionRelaySessionView> = {},
   ): V3SessionRelaySessionView {
@@ -92,6 +96,7 @@ describe('v3 session relay authorization', () => {
       receiver: false,
       liveOrigin: { capability: CAPABILITY, turnId: 'turn-1', dispatchAttempt: 1 },
       callerOpenId: 'ou_caller',
+      senderKind: 'human',
       chatId: 'oc_owner',
       larkAppId: 'cli_owner',
       quoteTargetId: 'turn-1',
@@ -253,6 +258,36 @@ describe('v3 session relay authorization', () => {
       .toEqual({ ok: false, status: 403, error: 'session_identity_incomplete' });
   });
 
+  it('accepts process attestation only for human authoring mutations', () => {
+    writeGrill('grill-bound', BINDING);
+    expect(authorize({
+      runId: 'grill-bound',
+      mutation: 'spec-finalize',
+      raw: { sessionId: 'sess-1' },
+      currentTurnProcessAttested: true,
+    }).ok).toBe(true);
+
+    writeEnvelope('bound-ok', BINDING);
+    expect(authorize({
+      mutation: 'start',
+      raw: { sessionId: 'sess-1' },
+      currentTurnProcessAttested: true,
+    })).toEqual({ ok: false, status: 403, error: 'origin_unproven' });
+  });
+
+  it('still rejects non-human authoring after process attestation', () => {
+    writeGrill('grill-bound', BINDING);
+    expect(authorize({
+      runId: 'grill-bound',
+      mutation: 'spec-finalize',
+      raw: { sessionId: 'sess-1' },
+      currentTurnProcessAttested: true,
+      session: sessionView({ senderKind: 'bot' }),
+    })).toEqual({
+      ok: false, status: 403, error: 'workflow_authoring_requires_human_turn',
+    });
+  });
+
   it('rejects a run bound to a different chat tuple, with the mismatch detail', () => {
     writeEnvelope('bound-ok', BINDING);
     const decision = authorize({ session: sessionView({ chatId: 'oc_other' }) });
@@ -315,10 +350,45 @@ describe('v3 session relay authorization', () => {
 
   it('covers every relayable mutation with a green path', () => {
     writeEnvelope('bound-ok', BINDING);
-    for (const mutation of V3_SESSION_RUN_MUTATIONS) {
+    for (const mutation of V3_SESSION_RUN_MUTATIONS.filter(
+      candidate => !['spec-finalize', 'approve-spec', 'architect', 'approve-dag'].includes(candidate),
+    )) {
       expect(authorize({ mutation }).ok, mutation).toBe(true);
     }
   });
+
+  it('authorizes only the four bounded grill mutations before run.json exists', () => {
+    writeGrill('grill-bound', BINDING);
+    for (const mutation of ['spec-finalize', 'approve-spec', 'architect', 'approve-dag'] as const) {
+      expect(authorize({ runId: 'grill-bound', mutation }).ok, mutation).toBe(true);
+    }
+    expect(authorize({ runId: 'grill-bound', mutation: 'new' })).toEqual({
+      ok: false, status: 404, error: 'unknown_mutation',
+    });
+  });
+
+  it('requires the exact bound live session for grill authoring mutations', () => {
+    writeGrill('grill-bound', { ...BINDING, sessionId: 'sess-other' });
+    for (const mutation of ['spec-finalize', 'approve-spec', 'architect', 'approve-dag'] as const) {
+      expect(authorize({ runId: 'grill-bound', mutation })).toMatchObject({
+        ok: false, status: 403, error: 'run_binding_mismatch',
+      });
+    }
+  });
+
+  it.each(['bot', undefined] as const)(
+    'rejects every grill authoring mutation when sender kind is %s',
+    senderKind => {
+      writeGrill('grill-bound', BINDING);
+      for (const mutation of ['spec-finalize', 'approve-spec', 'architect', 'approve-dag'] as const) {
+        expect(authorize({
+          runId: 'grill-bound', mutation, session: sessionView({ senderKind }),
+        })).toEqual({
+          ok: false, status: 403, error: 'workflow_authoring_requires_human_turn',
+        });
+      }
+    },
+  );
 
   describe('scheduled turns (schedule: prefix)', () => {
     function authorizeScheduled(
@@ -352,6 +422,14 @@ describe('v3 session relay authorization', () => {
         body: {},
         runDir: join(baseDir, 'sched-ok'),
         larkAppId: 'cli_owner',
+      });
+    });
+
+    it('never permits scheduled turns to mutate the grill authoring state', () => {
+      writeGrill('sched-ok', SCHED_BINDING);
+      writeScheduledTask();
+      expect(authorizeScheduled({ mutation: 'spec-finalize' })).toEqual({
+        ok: false, status: 403, error: 'workflow_authoring_requires_human_turn',
       });
     });
 

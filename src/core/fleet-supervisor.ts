@@ -11,12 +11,11 @@
  * only does the I/O the policy tells it to.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { openSync, closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
-import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import {
   builtinFleetEntryMatches,
   inspectFleetProcess,
@@ -36,6 +35,16 @@ import {
 } from './fleet-supervisor-policy.js';
 import { mutateFleetState, readFleetState } from './fleet-state-store.js';
 import type { FleetCommand } from './fleet-command-queue.js';
+import {
+  bindDeviceIsolationStartupReservationToChild,
+  clearDeviceIsolationStartupIntent,
+  reserveDeviceIsolationDaemonStartup,
+} from '../services/device-isolation-startup-intent-store.js';
+import { withDeviceCredentialIsolationActivationLockSync } from '../platform/device-isolation.js';
+import { readDeviceIsolationRosterSnapshot } from '../services/device-isolation-roster.js';
+import { FileLockTimeoutError } from '../utils/file-lock.js';
+import { botProcessName } from '../setup/bot-config-editor.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 
 export interface FleetBotSpec {
   /** botmux-<index> process name (or 'botmux-dashboard' for the dashboard). */
@@ -44,6 +53,9 @@ export interface FleetBotSpec {
   /** 0-based bot index passed to the daemon via BOTMUX_BOT_INDEX. Ignored for
    *  non-'daemon' members (the dashboard has no bot index). */
   botIndex: number;
+  /** Requested authority path and exact revision from which this daemon was planned. */
+  botsConfigPath?: string;
+  rosterRevision?: string;
   /** Which entry module to spawn. Defaults to 'daemon' — a normal bot. The
    *  dashboard is a fleet member too ('dashboard'), so the supervisor gives it
    *  the SAME crash-restart / graceful-exit / stop machinery as a bot daemon,
@@ -92,7 +104,9 @@ export interface FleetBotSpec {
      *  fleet-state so a later reconcile can detect "running from a stale config"
      *  and restart it. See FleetProcState.configHash. */
     configHash?: string;
+    /** Whether an external member is restarted after a natural exit. */
     autorestart?: boolean;
+    /** Per-member SIGTERM grace period before force-stop. */
     killTimeoutMs?: number;
   };
 }
@@ -115,6 +129,12 @@ export interface FleetSupervisorOptions {
   logDir?: string;
   /** Injected for tests; defaults to console. */
   log?: (msg: string) => void;
+  /** Test seams for the retryable pre-spawn isolation admission. */
+  startupAdmissionLockWaitMs?: number;
+  startupAdmissionRetryMs?: number;
+  startupAdmissionHomeDir?: string;
+  /** Injected only by spawn-failure tests. */
+  spawnProcess?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
   /** Injected for process-identity edge-case tests. */
   processIdentityRuntime?: FleetProcessIdentityRuntime;
 }
@@ -125,27 +145,60 @@ export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+function sameStartupGeneration(left: FleetBotSpec, right: FleetBotSpec): boolean {
+  return left.name === right.name
+    && left.appId === right.appId
+    && left.botIndex === right.botIndex
+    && left.botsConfigPath === right.botsConfigPath
+    && left.rosterRevision === right.rosterRevision
+    && (left.entry ?? 'daemon') === (right.entry ?? 'daemon');
+}
+
+function sameStartupTarget(left: FleetBotSpec, right: FleetBotSpec): boolean {
+  return left.name === right.name
+    && left.appId === right.appId
+    && left.botIndex === right.botIndex
+    && left.botsConfigPath === right.botsConfigPath
+    && (left.entry ?? 'daemon') === (right.entry ?? 'daemon');
+}
+
+interface StartupAdmissionRetry {
+  timer: ReturnType<typeof setTimeout>;
+  spec: FleetBotSpec;
+  isRestart: boolean;
+  allowRosterRevisionAdvance: boolean;
+  ownedGeneration?: number;
+}
+
 export class FleetSupervisor {
   private readonly children = new Map<string, ChildProcess>();
+  /** External callers await this exec-boundary acknowledgement so a failed
+   * plugin spawn is not reported as a successful service start. */
   private readonly spawnReady = new WeakMap<ChildProcess, Promise<void>>();
   /** Per-name generation the live child was spawned with — guards stale exits. */
   private readonly liveGeneration = new Map<string, number>();
   private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly startupAdmissionTimers = new Map<string, StartupAdmissionRetry>();
   /** Names an operator explicitly stopped (stop-bot). Their SIGTERM would look
    *  like a crash to onChildExit, so we suppress the restart for exactly one exit
    *  and mark them stopped. Cleared when the bot is explicitly started again. */
   private readonly explicitStop = new Set<string>();
-  /** Bot specs known to this supervisor (from the last start() reconcile), so a
-   *  queued start-bot/stop-bot can resolve a name→spec without re-reading config. */
+  /** Bot specs pinned by the last start() reconcile. Queue admission resolves
+   *  names here, then explicitly re-reads the authoritative roster when a
+   *  revision transition is permitted. */
   private readonly knownSpecs = new Map<string, FleetBotSpec>();
   private stopping = false;
   private readonly policy: RestartPolicy;
   private readonly killTimeoutMs: number;
+  private readonly startupAdmissionLockWaitMs: number;
+  private readonly startupAdmissionRetryMs: number;
   private readonly log: (msg: string) => void;
 
   constructor(private readonly opts: FleetSupervisorOptions) {
     this.policy = opts.policy ?? DEFAULT_RESTART_POLICY;
     this.killTimeoutMs = opts.killTimeoutMs ?? 8000;
+    this.startupAdmissionLockWaitMs = opts.startupAdmissionLockWaitMs ?? 5_000;
+    this.startupAdmissionRetryMs = opts.startupAdmissionRetryMs ?? 250;
     this.log = opts.log ?? ((m) => console.error(`[fleet-supervisor] ${m}`));
   }
 
@@ -154,6 +207,11 @@ export class FleetSupervisor {
    *  This is both the initial start and the resurrect path. */
   start(bots: readonly FleetBotSpec[]): void {
     const specByName = new Map(bots.map((b) => [b.name, b]));
+    for (const [name, pending] of this.startupAdmissionTimers) {
+      if (specByName.has(name)) continue;
+      clearTimeout(pending.timer);
+      this.startupAdmissionTimers.delete(name);
+    }
     // Remember the spec set so queued start-bot/stop-bot can resolve name→spec.
     this.knownSpecs.clear();
     for (const b of bots) this.knownSpecs.set(b.name, b);
@@ -285,9 +343,26 @@ export class FleetSupervisor {
    *  `botmux start-bot`. Idempotent: a no-op if that bot is already online+alive.
    *  Registers the spec so a later exit is handled with the right identity, and
    *  clears any explicit-stop mark (an explicit start overrides a prior stop). */
-  startOneBot(spec: FleetBotSpec): void {
+  startOneBot(spec: FleetBotSpec, allowRosterRevisionAdvance = false): void {
     if (this.stopping) return;
-    this.knownSpecs.set(spec.name, spec);
+    const prior = this.knownSpecs.get(spec.name);
+    let currentSpec = spec;
+    try {
+      if (!spec.external && (spec.entry ?? 'daemon') === 'daemon') {
+        if ((!spec.botsConfigPath || !spec.rosterRevision)
+            && (prior?.botsConfigPath || prior?.rosterRevision)) {
+          throw new Error('queued start-bot command lacks its authoritative roster generation');
+        }
+        // The queued command authenticates the stable path/index/App tuple. A
+        // same-target config update after enqueue is legitimate; start from the
+        // freshly-read full revision, never the cached generation.
+        currentSpec = this.resolveCurrentDaemonSpec(spec, allowRosterRevisionAdvance);
+      }
+    } catch (error) {
+      this.failStartupAdmission(spec, error);
+      return;
+    }
+    this.knownSpecs.set(currentSpec.name, currentSpec);
     this.explicitStop.delete(spec.name);
     // Cancel any pending crash-restart timer FIRST (mirrors stopOneBot). A bot
     // that just crashed is mid-backoff: status 'launching', pid 0, not in
@@ -300,27 +375,35 @@ export class FleetSupervisor {
     // timer makes this the single, owned (re)spawn.
     const pendingRestart = this.restartTimers.get(spec.name);
     if (pendingRestart) { clearTimeout(pendingRestart); this.restartTimers.delete(spec.name); }
-    const proc = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === spec.name);
-    if (proc && proc.status === 'online' && pidAlive(proc.pid) && this.children.has(spec.name)) {
-      this.log(`start-bot ${spec.name}: already online (pid ${proc.pid})`);
+    const pendingAdmission = this.startupAdmissionTimers.get(spec.name);
+    if (pendingAdmission && !sameStartupGeneration(pendingAdmission.spec, currentSpec)) {
+      clearTimeout(pendingAdmission.timer);
+      this.startupAdmissionTimers.delete(spec.name);
+    }
+    const proc = readFleetState(this.opts.statePath)?.procs.find((p) => p.name === currentSpec.name);
+    if (proc && proc.status === 'online' && pidAlive(proc.pid) && this.children.has(currentSpec.name)) {
+      this.log(`start-bot ${currentSpec.name}: already online (pid ${proc.pid})`);
       return;
     }
-    this.spawnBot(spec, /* isRestart */ false);
+    this.spawnBot(
+      currentSpec,
+      /* isRestart */ false,
+      undefined,
+      allowRosterRevisionAdvance,
+    );
   }
 
-  /** Replace one external definition only after its previous child has exited.
-   * Callers serialize this with remove/stop; a matching live definition is a no-op. */
+  /** Replace an external definition only after its prior child has stopped. */
   async upsertExternal(spec: FleetBotSpec): Promise<void> {
     if (!spec.external) throw new Error('fleet: external spec required');
     const known = this.knownSpecs.get(spec.name);
+    if (known && !known.external) throw new Error(`fleet: cannot replace managed member: ${spec.name}`);
     if (known && JSON.stringify(known.external) !== JSON.stringify(spec.external)) {
       await this.stopOneBot(spec.name);
     }
     this.startOneBot(spec);
     const child = this.children.get(spec.name);
     if (!child) throw new Error(`fleet: failed to start ${spec.name}`);
-    // spawn() returns before exec succeeds. A command acknowledgement must not
-    // turn ENOENT/EACCES into a successful plugin install/start.
     await this.spawnReady.get(child);
   }
 
@@ -330,9 +413,9 @@ export class FleetSupervisor {
     await this.stopOneBot(name);
     this.knownSpecs.delete(name);
     this.liveGeneration.delete(name);
-    mutateFleetState(this.opts.statePath, (cur) => {
-      cur.procs = cur.procs.filter(p => p.name !== name);
-      return cur;
+    mutateFleetState(this.opts.statePath, current => {
+      current.procs = current.procs.filter(proc => proc.name !== name);
+      return current;
     });
   }
 
@@ -343,6 +426,11 @@ export class FleetSupervisor {
   async stopOneBot(name: string): Promise<void> {
     const timer = this.restartTimers.get(name);
     if (timer) { clearTimeout(timer); this.restartTimers.delete(name); }
+    const pendingAdmission = this.startupAdmissionTimers.get(name);
+    if (pendingAdmission) {
+      clearTimeout(pendingAdmission.timer);
+      this.startupAdmissionTimers.delete(name);
+    }
     const child = this.children.get(name);
     if (!child) {
       // Nothing live to signal (already down, or mid-backoff we just cancelled).
@@ -360,30 +448,69 @@ export class FleetSupervisor {
     await this.stopOne(name, child);
   }
 
-  /** Drain + execute queued single-bot commands (SIGHUP handler). Each command is
-   *  resolved to a spec (queue carries name/appId/botIndex, so no config re-read
-   *  is required) and applied via startOneBot/stopOneBot. */
+  /** Drain + execute queued single-bot commands (SIGHUP handler). */
   async drainCommands(commands: readonly FleetCommand[]): Promise<void> {
     for (const cmd of commands) {
-      // PREFER THE KNOWN SPEC over the command payload. The queue carries only
-      // (name, appId, botIndex) — enough to respawn a bot daemon, but it cannot
-      // describe an EXTERNAL member, whose command/args/cwd/env live in the spec.
+      // PREFER THE KNOWN SPEC over the command payload. A daemon command carries
+      // its config path and roster revision for admission, but it cannot describe
+      // an EXTERNAL member, whose command/args/cwd/env live in the spec.
       // Rebuilding from the payload alone would spawn a plugin service as if it
       // were a bot daemon (resolveEntrySpawn + no scrub). start() records every
       // member in knownSpecs, so use that and fall back to the payload only for
       // a name we have never seen.
       const known = this.knownSpecs.get(cmd.name);
-      const spec: FleetBotSpec = known ?? { name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex };
+      const queuedSpec: FleetBotSpec = {
+          name: cmd.name, appId: cmd.appId, botIndex: cmd.botIndex,
+          ...(cmd.botsConfigPath ? { botsConfigPath: cmd.botsConfigPath } : {}),
+          ...(cmd.rosterRevision ? { rosterRevision: cmd.rosterRevision } : {}),
+        };
       if (cmd.op === 'start-bot') {
-        this.startOneBot(spec);
+        if (known?.external) {
+          if (known.appId !== cmd.appId || known.botIndex !== cmd.botIndex) {
+            this.failStartupAdmission(queuedSpec, new Error(`queued member tuple changed for ${cmd.name}`));
+            continue;
+          }
+          this.startOneBot(known);
+          continue;
+        }
+
+        const authoritative = !!(
+          known?.botsConfigPath || known?.rosterRevision
+          || cmd.botsConfigPath || cmd.rosterRevision
+        );
+        if (authoritative) {
+          // The queue is an admission credential, not a replacement spec. It
+          // must exactly match the generation this supervisor already pinned.
+          // Once authenticated, startOneBot re-reads that same path and may
+          // advance to a newer FULL revision when the stable tuple is unchanged.
+          if (!known || !sameStartupGeneration(known, queuedSpec)) {
+            this.failStartupAdmission(queuedSpec, new Error(`queued roster identity changed for ${cmd.name}`));
+            continue;
+          }
+          this.startOneBot(queuedSpec, true);
+          continue;
+        }
+        this.startOneBot(known ?? queuedSpec);
       } else {
         await this.stopOneBot(cmd.name);
       }
     }
   }
 
-  private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
+  private spawnBot(
+    spec: FleetBotSpec,
+    isRestart: boolean,
+    ownedGeneration?: number,
+    allowRosterRevisionAdvance = isRestart,
+  ): void {
     if (this.stopping) return;
+    const queuedAdmission = this.startupAdmissionTimers.get(spec.name);
+    if (queuedAdmission) {
+      if (sameStartupGeneration(queuedAdmission.spec, spec)
+          && queuedAdmission.isRestart === isRestart) return;
+      clearTimeout(queuedAdmission.timer);
+      this.startupAdmissionTimers.delete(spec.name);
+    }
     const entry = spec.entry ?? 'daemon';
     // An external member (a plugin service) runs an arbitrary command instead of
     // one of our entry modules. Everything BELOW this point — logs, state,
@@ -406,22 +533,37 @@ export class FleetSupervisor {
     // restart keeps history; fds are closed when the child exits (see
     // onChildExit). When no logDir is configured (tests), the child inherits
     // our stdio.
-    const logBase = spec.logBaseName ?? `daemon-${spec.botIndex}`;
-    let stdio: Array<'ignore' | 'inherit' | number> = ['ignore', 'inherit', 'inherit'];
-    let outFd: number | undefined;
-    let errFd: number | undefined;
-    if (this.opts.logDir) {
-      try {
-        mkdirSync(this.opts.logDir, { recursive: true });
-        outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
-        errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
-        stdio = ['ignore', outFd, errFd];
-      } catch (err) {
-        this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);
-        if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } outFd = undefined; }
-        if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } errFd = undefined; }
+    const spawnChild = (): ChildProcess => {
+      const logBase = spec.logBaseName ?? `daemon-${spec.botIndex}`;
+      let stdio: Array<'ignore' | 'inherit' | number> = ['ignore', 'inherit', 'inherit'];
+      let outFd: number | undefined;
+      let errFd: number | undefined;
+      if (this.opts.logDir) {
+        try {
+          mkdirSync(this.opts.logDir, { recursive: true });
+          outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
+          errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
+          stdio = ['ignore', outFd, errFd];
+        } catch (err) {
+          this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);
+          if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } outFd = undefined; }
+          if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } errFd = undefined; }
+        }
       }
-    }
+      try {
+        const spawnArgs = [...nodeArgs, ...args];
+        const spawnOptions: SpawnOptions = {
+          cwd: spec.external?.cwd ?? this.opts.cwd, stdio, env: childEnv, windowsHide: true,
+        };
+        return this.opts.spawnProcess
+          ? this.opts.spawnProcess(command, spawnArgs, spawnOptions)
+          : spawn(command, spawnArgs, spawnOptions);
+      } finally {
+        // Open only after admission and close on every success/failure path.
+        if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } }
+        if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } }
+      }
+    };
     // Bot daemons need their 0-based index (BOTMUX_BOT_INDEX); the dashboard is
     // app-agnostic and takes only the shared base env (it loads its own
     // ~/.botmux/.env H5 family in index-dashboard.ts). Injecting a bot index
@@ -437,7 +579,7 @@ export class FleetSupervisor {
     // the scrub has the last word and a plugin manifest cannot revive a key we
     // deliberately strip. This is the order the pm2 path used and stated outright
     // ("applies it AFTER the manifest env merge, so a plugin manifest cannot
-    // revive a scrubbed key"), with a test pinning it. Merging
+    // revive a scrubbed key" — plugins/pm2.ts), with a test pinning it. Merging
     // after the scrub would silently undo it for exactly the keys that matter
     // (a sibling's CLI home, the dashboard app secret, the graceful sentinel).
     // A service needing its own data root must resolve it internally.
@@ -446,28 +588,154 @@ export class FleetSupervisor {
       childEnv = { ...this.opts.daemonEnv, ...(spec.external.env ?? {}) };
       scrubExternalMemberEnv(childEnv);
     } else if (entry === 'daemon') {
-      childEnv = { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) };
+      childEnv = {
+        ...this.opts.daemonEnv,
+        BOTMUX_BOT_INDEX: String(spec.botIndex),
+        ...(spec.botsConfigPath ? { BOTS_CONFIG: spec.botsConfigPath } : {}),
+        ...(spec.rosterRevision ? {
+          BOTMUX_EXPECTED_APP_ID: spec.appId,
+          BOTMUX_ROSTER_REVISION: spec.rosterRevision,
+        } : {}),
+      };
     } else {
       childEnv = { ...this.opts.daemonEnv };
     }
-    const child = spawn(command, [...nodeArgs, ...args], {
-      cwd: spec.external?.cwd ?? this.opts.cwd,
-      stdio,
-      env: childEnv,
-      windowsHide: true,
-    });
-    let spawned = false;
+    let child: ChildProcess | undefined;
+    let provisionalErrorListener: ((error: Error) => void) | undefined;
+    let managedErrorHandler: ((error: Error) => void) | undefined;
+    let provisionalTerminalized = false;
+    let reservationCleanup = (): void => {};
+    const attachProvisionalErrorGuard = (spawned: ChildProcess, cleanup?: () => void): void => {
+      let cleaned = false;
+      reservationCleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        cleanup?.();
+      };
+      provisionalErrorListener = (error: Error) => {
+        if (managedErrorHandler) {
+          managedErrorHandler(error);
+          return;
+        }
+        reservationCleanup();
+        if (provisionalTerminalized) return;
+        provisionalTerminalized = true;
+        this.log(`${spec.name} spawn error: ${error.message}`);
+        this.failStartupAdmission(spec, error, ownedGeneration);
+      };
+      // spawn(2) failures such as ENOENT/EACCES/EAGAIN are reported
+      // asynchronously on this object, often with pid still undefined. Install
+      // the guard before inspecting pid or binding the startup reservation.
+      spawned.once('error', provisionalErrorListener);
+    };
+    const terminalizeProvisionalSpawn = (spawned: ChildProcess, error: Error): void => {
+      try { spawned.kill('SIGKILL'); } catch { /* a pidless spawn is already terminal */ }
+      reservationCleanup();
+      if (provisionalTerminalized) return;
+      provisionalTerminalized = true;
+      this.failStartupAdmission(spec, error, ownedGeneration);
+    };
+    if (entry === 'daemon' && spec.rosterRevision && spec.appId) {
+      try {
+        child = withDeviceCredentialIsolationActivationLockSync(() => {
+          const current = this.knownSpecs.get(spec.name);
+          const roster = readDeviceIsolationRosterSnapshot({ configPath: spec.botsConfigPath });
+          if (
+            !current
+            || !sameStartupGeneration(current, spec)
+            || roster.revision !== spec.rosterRevision
+            || !roster.members.some(member =>
+              member.index === spec.botIndex && member.larkAppId === spec.appId)
+          ) {
+            throw new Error(`startup admission refused stale roster generation for ${spec.name}`);
+          }
+          const reservation = reserveDeviceIsolationDaemonStartup({
+            homeDir: this.opts.startupAdmissionHomeDir,
+            larkAppId: spec.appId,
+            rosterRevision: spec.rosterRevision!,
+          });
+          childEnv.BOTMUX_STARTUP_RESERVATION_ID = reservation.intentId;
+          childEnv.BOTMUX_STARTUP_RESERVATION_TOKEN = reservation.reservationToken;
+          let spawned: ChildProcess | undefined;
+          try {
+            spawned = spawnChild();
+            const clearReservation = () => {
+              clearDeviceIsolationStartupIntent({
+                homeDir: this.opts.startupAdmissionHomeDir,
+                intentId: reservation.intentId,
+                reservationToken: reservation.reservationToken,
+              });
+            };
+            attachProvisionalErrorGuard(spawned, clearReservation);
+            if (!spawned.pid) {
+              terminalizeProvisionalSpawn(spawned, new Error(`spawn returned no pid for ${spec.name}`));
+              return undefined;
+            }
+            if (!bindDeviceIsolationStartupReservationToChild({
+              homeDir: this.opts.startupAdmissionHomeDir,
+              intentId: reservation.intentId,
+              reservationToken: reservation.reservationToken,
+              childPid: spawned.pid,
+            })) {
+              terminalizeProvisionalSpawn(spawned, new Error(`cannot bind startup reservation for ${spec.name}`));
+              return undefined;
+            }
+            return spawned;
+          } catch (error) {
+            if (spawned) {
+              terminalizeProvisionalSpawn(
+                spawned,
+                error instanceof Error ? error : new Error(String(error)),
+              );
+              return undefined;
+            }
+            clearDeviceIsolationStartupIntent({
+              homeDir: this.opts.startupAdmissionHomeDir,
+              intentId: reservation.intentId,
+              reservationToken: reservation.reservationToken,
+            });
+            throw error;
+          }
+        }, {
+          homeDir: this.opts.startupAdmissionHomeDir,
+          lock: { maxWaitMs: this.startupAdmissionLockWaitMs },
+        });
+      } catch (error) {
+        if (error instanceof FileLockTimeoutError) {
+          this.scheduleStartupAdmissionRetry(
+            spec,
+            isRestart,
+            allowRosterRevisionAdvance,
+            ownedGeneration,
+          );
+          return;
+        }
+        this.failStartupAdmission(spec, error, ownedGeneration);
+        return;
+      }
+    } else {
+      try {
+        child = spawnChild();
+        attachProvisionalErrorGuard(child);
+        if (!child.pid && !spec.external) {
+          terminalizeProvisionalSpawn(child, new Error(`spawn returned no pid for ${spec.name}`));
+          child = undefined;
+        }
+      }
+      catch (error) {
+        this.failStartupAdmission(spec, error, ownedGeneration);
+        return;
+      }
+    }
+    if (!child) return;
     const ready = new Promise<void>((resolve, reject) => {
-      child.once('spawn', () => { spawned = true; resolve(); });
-      child.once('error', reject);
+      const onSpawn = (): void => { child.removeListener('error', onError); resolve(); };
+      const onError = (error: Error): void => { child.removeListener('spawn', onSpawn); reject(error); };
+      child.once('spawn', onSpawn);
+      child.once('error', onError);
     });
-    // Automatic restarts have no awaiting caller; onChildExit still records
-    // their failures. Explicit plugin starts await the same exec boundary.
     void ready.catch(() => {});
     this.spawnReady.set(child, ready);
-    // The child dup'd the fds; close our copies so we don't leak one per respawn.
-    if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } }
-    if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } }
     const now = new Date().toISOString();
 
     // Persist the new generation + pid atomically, bumping generation on restart.
@@ -503,12 +771,122 @@ export class FleetSupervisor {
     this.liveGeneration.set(spec.name, generation);
     this.log(`${isRestart ? 'restarted' : 'started'} ${spec.name} (pid ${child.pid}, gen ${generation})`);
 
-    child.on('exit', (code, signal) => this.onChildExit(spec, generation, { code, signal }));
-    child.on('error', (err) => {
-      this.log(`${spec.name} child error: ${err.message}`);
-      // A failed kill/send is not evidence of exit. Keep tracking a spawned
-      // child until its exit event, especially when removal must fail closed.
-      if (!spawned) this.onChildExit(spec, generation, { code: 1, signal: null });
+    let childSettled = false;
+    const onManagedExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (childSettled) return;
+      childSettled = true;
+      reservationCleanup();
+      this.onChildExit(spec, generation, { code, signal });
+    };
+    const onManagedError = (error: Error): void => {
+      if (childSettled) return;
+      childSettled = true;
+      reservationCleanup();
+      this.log(`${spec.name} spawn error: ${error.message}`);
+      this.onChildExit(spec, generation, { code: 1, signal: null });
+    };
+    managedErrorHandler = onManagedError;
+    child.once('exit', onManagedExit);
+    child.once('error', onManagedError);
+    if (provisionalErrorListener) child.removeListener('error', provisionalErrorListener);
+  }
+
+  private resolveCurrentDaemonSpec(spec: FleetBotSpec, allowRevisionAdvance: boolean): FleetBotSpec {
+    if (spec.external || (spec.entry ?? 'daemon') !== 'daemon') return spec;
+    if (!spec.botsConfigPath && !spec.rosterRevision) return spec;
+    if (!spec.botsConfigPath || !spec.rosterRevision) {
+      throw new Error(`incomplete authoritative roster identity for ${spec.name}`);
+    }
+    const roster = readDeviceIsolationRosterSnapshot({ configPath: spec.botsConfigPath });
+    const member = roster.members.find(candidate =>
+      candidate.index === spec.botIndex && candidate.larkAppId === spec.appId);
+    if (!member || botProcessName(member, member.index) !== spec.name) {
+      throw new Error(`configured member tuple changed for ${spec.name}`);
+    }
+    if (!allowRevisionAdvance && roster.revision !== spec.rosterRevision) {
+      throw new Error(`queued roster generation changed for ${spec.name}`);
+    }
+    return { ...spec, botsConfigPath: roster.requestedConfigPath, rosterRevision: roster.revision };
+  }
+
+  private failStartupAdmission(
+    spec: FleetBotSpec,
+    error: unknown,
+    ownedGeneration?: number,
+  ): void {
+    if (ownedGeneration !== undefined && this.liveGeneration.get(spec.name) !== ownedGeneration) return;
+    this.log(`startup admission failed for ${spec.name}: ${error instanceof Error ? error.message : error}`);
+    // A rejected duplicate/forged start-bot command must not orphan the exact
+    // live child we already own. It has no generation authority over that child.
+    if (ownedGeneration === undefined && this.children.has(spec.name)) return;
+    const restartTimer = this.restartTimers.get(spec.name);
+    if (restartTimer) {
+      clearTimeout(restartTimer);
+      this.restartTimers.delete(spec.name);
+    }
+    const pendingAdmission = this.startupAdmissionTimers.get(spec.name);
+    if (pendingAdmission
+        && (ownedGeneration === undefined || pendingAdmission.ownedGeneration === ownedGeneration)) {
+      clearTimeout(pendingAdmission.timer);
+      this.startupAdmissionTimers.delete(spec.name);
+    }
+    mutateFleetState(this.opts.statePath, (state) => {
+      const proc = state.procs.find(candidate => candidate.name === spec.name);
+      if (ownedGeneration !== undefined) {
+        if (!proc || proc.generation !== ownedGeneration || proc.appId !== spec.appId) return state;
+      }
+      if (proc) {
+        proc.status = 'errored';
+        proc.pid = 0;
+      } else {
+        state.procs.push({
+          ...freshProc(spec.name, spec.appId, 0, new Date().toISOString()),
+          status: 'errored',
+        });
+      }
+      return state;
+    });
+    if (ownedGeneration === undefined || this.liveGeneration.get(spec.name) === ownedGeneration) {
+      this.liveGeneration.delete(spec.name);
+    }
+  }
+
+  private scheduleStartupAdmissionRetry(
+    spec: FleetBotSpec,
+    isRestart: boolean,
+    allowRosterRevisionAdvance: boolean,
+    ownedGeneration?: number,
+  ): void {
+    if (this.stopping) return;
+    const current = this.knownSpecs.get(spec.name);
+    if (!current || !sameStartupTarget(current, spec)) return;
+    const existing = this.startupAdmissionTimers.get(spec.name);
+    if (existing) return;
+    this.log(
+      `startup admission busy for ${spec.name}; retrying same roster generation `
+      + `in ${this.startupAdmissionRetryMs}ms`,
+    );
+    const timer = setTimeout(() => {
+      const pending = this.startupAdmissionTimers.get(spec.name);
+      if (!pending || pending.timer !== timer) return;
+      this.startupAdmissionTimers.delete(spec.name);
+      const latest = this.knownSpecs.get(spec.name);
+      if (
+        this.stopping
+        || !latest
+        || !sameStartupTarget(latest, spec)
+        || (ownedGeneration !== undefined && this.liveGeneration.get(spec.name) !== ownedGeneration)
+      ) return;
+      try {
+        const currentSpec = this.resolveCurrentDaemonSpec(latest, allowRosterRevisionAdvance);
+        this.knownSpecs.set(currentSpec.name, currentSpec);
+        this.spawnBot(currentSpec, isRestart, ownedGeneration, allowRosterRevisionAdvance);
+      } catch (error) {
+        this.failStartupAdmission(spec, error, ownedGeneration);
+      }
+    }, this.startupAdmissionRetryMs);
+    this.startupAdmissionTimers.set(spec.name, {
+      timer, spec, isRestart, allowRosterRevisionAdvance, ownedGeneration,
     });
   }
 
@@ -575,7 +953,22 @@ export class FleetSupervisor {
     // after scheduling the first restart). A ref'd timer holds the process until
     // the respawn fires. (stopOne's kill timer stays unref'd — it's a shutdown
     // safety net that must NOT keep the loop alive.)
-    const timer = setTimeout(() => { this.restartTimers.delete(spec.name); this.spawnBot(spec, true); }, this.policy.restartDelayMs);
+    const timer = setTimeout(() => {
+      if (this.restartTimers.get(spec.name) !== timer) return;
+      this.restartTimers.delete(spec.name);
+      if (this.stopping || this.liveGeneration.get(spec.name) !== generation) return;
+      try {
+        const known = this.knownSpecs.get(spec.name);
+        if (!known || !sameStartupTarget(known, spec)) {
+          throw new Error(`restart target changed for ${spec.name}`);
+        }
+        const currentSpec = this.resolveCurrentDaemonSpec(known, true);
+        this.knownSpecs.set(currentSpec.name, currentSpec);
+        this.spawnBot(currentSpec, true, generation);
+      } catch (error) {
+        this.failStartupAdmission(spec, error, generation);
+      }
+    }, this.policy.restartDelayMs);
     this.restartTimers.set(spec.name, timer);
   }
 
@@ -597,6 +990,8 @@ export class FleetSupervisor {
     this.stopping = true;
     for (const t of this.restartTimers.values()) clearTimeout(t);
     this.restartTimers.clear();
+    for (const pending of this.startupAdmissionTimers.values()) clearTimeout(pending.timer);
+    this.startupAdmissionTimers.clear();
     const pending = [...this.children.entries()];
     await Promise.all(pending.map(([name, child]) => this.stopOne(name, child)));
     // Reflect the stop in the durable record. onChildExit ignored these exits
@@ -629,7 +1024,7 @@ export class FleetSupervisor {
         reject(new Error(`fleet: stop not confirmed for ${name}`));
       }, timeout + 5_000);
       child.once('exit', finish);
-      try { child.kill('SIGTERM'); } catch { /* wait for exit or the deadline */ }
+      try { child.kill('SIGTERM'); } catch { /* wait for exit or deadline */ }
     });
   }
 }

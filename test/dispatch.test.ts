@@ -26,6 +26,7 @@ import {
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
+  dispatchChildTopLevelEscape,
   findDispatchRegistryEntry,
   findSubBotTopic,
   eligibleAutoMentionAliases,
@@ -39,6 +40,79 @@ import {
   resolveSendTarget,
   threadRootForReachability,
 } from '../src/core/dispatch.js';
+
+describe('dispatchChildTopLevelEscape', () => {
+  const registry = {
+    om_child: {
+      orchChatId: 'oc_project',
+      orchScope: 'thread',
+      orchRoot: 'om_orchestrator',
+    },
+  };
+
+  it('detects an unqualified same-chat --top-level escape from a dispatch child topic', () => {
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: true,
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_child',
+      registry,
+    })).toEqual({ orchestratorRootMessageId: 'om_orchestrator' });
+  });
+
+  it('does not affect normal child-topic replies or explicit --into routing', () => {
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: false,
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_child',
+      registry,
+    })).toBeUndefined();
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: true,
+      into: 'om_explicit',
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_child',
+      registry,
+    })).toBeUndefined();
+  });
+
+  it('keeps explicit cross-chat publishing and unrelated topics available', () => {
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: true,
+      overrideChatId: 'oc_release_notes',
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_child',
+      registry,
+    })).toBeUndefined();
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: true,
+      overrideChatId: 'oc_project',
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_child',
+      registry,
+    })).toEqual({ orchestratorRootMessageId: 'om_orchestrator' });
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: true,
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_unrelated',
+      registry,
+    })).toBeUndefined();
+  });
+
+  it('fails open for unusable or cross-chat orchestrator coordinates', () => {
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: true,
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_child',
+      registry: { om_child: { orchChatId: 'oc_else', orchScope: 'thread', orchRoot: 'om_orchestrator' } },
+    })).toBeUndefined();
+    expect(dispatchChildTopLevelEscape({
+      requestedTopLevel: true,
+      sessionChatId: 'oc_project',
+      sessionRootMessageId: 'om_child',
+      registry: { om_child: { orchChatId: 'oc_project', orchScope: 'chat', orchRoot: 'oc_project' } },
+    })).toBeUndefined();
+  });
+});
 
 describe('parseDispatchBotSpec', () => {
   it('parses a bare open_id', () => {

@@ -38,6 +38,7 @@
  */
 
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -73,7 +74,26 @@ mkdirSync(join(home, '.botmux'), { recursive: true });
 // An EMPTY bot list: the fleet has no bots, but the dashboard is an
 // unconditional supervisor member, so this is exactly the "operator opens the
 // dashboard to add their first bot" state — and it needs no credentials.
-writeFileSync(join(home, '.botmux', 'bots.json'), '[]');
+const botsPath = join(home, '.botmux', 'bots.json');
+const botsJson = '[]';
+writeFileSync(botsPath, botsJson);
+
+// The S1 supervisor boundary requires an immutable, secret-free launch plan.
+// Production `botmux start` captures this under the bots.json lock before it
+// spawns `__supervisor`; this smoke invokes the hidden entry directly, so it
+// must provide the same empty-roster envelope itself.
+const sha256 = (value) => createHash('sha256').update(value).digest('hex');
+const configSha256 = sha256(botsJson);
+const rosterSha256 = sha256('[]');
+const launchPlan = {
+  version: 1,
+  requestedConfigPath: botsPath,
+  canonicalConfigPath: botsPath,
+  rosterRevision: sha256(
+    `botmux-roster-v1\0${botsPath}\0${sha256(botsJson)}\0${configSha256}\0${rosterSha256}`,
+  ),
+  bots: [],
+};
 
 // Drop every inherited BOTMUX_* variable before layering the scratch config on
 // top. When this script runs INSIDE a botmux-managed CLI session (a bot doing a
@@ -92,6 +112,8 @@ const childEnv = {
   BOTMUX_DAEMON_IPC_BASE_PORT: String(PORTS.ipc),
   BOTMUX_WEB_PROXY_BASE_PORT: String(PORTS.proxy),
   BOTMUX_DASHBOARD_PORT: String(PORTS.dashboard),
+  BOTS_CONFIG: botsPath,
+  BOTMUX_FLEET_LAUNCH_PLAN_V1: Buffer.from(JSON.stringify(launchPlan), 'utf8').toString('base64url'),
 };
 
 let supervisor;

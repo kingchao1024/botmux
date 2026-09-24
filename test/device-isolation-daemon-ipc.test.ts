@@ -15,9 +15,12 @@ import {
   setDeviceIsolationDaemonIdentity,
 } from '../src/core/device-isolation-daemon.js';
 import { resetDeviceIsolationActivationForTest } from '../src/core/device-isolation-activation.js';
+import { ASK_RECEIPT_AUTHORITY_VERSION } from '../src/platform/device-isolation.js';
 
 const SECRET = 'device-isolation-ipc-test-secret';
 const NONCE = 'i'.repeat(43);
+const ROSTER_REVISION = 'a'.repeat(64);
+const BOTS_CONFIG_PATH = '/tmp/device-isolation-ipc-bots.json';
 let handle: IpcServerHandle | null = null;
 
 function digest(raw: string): string {
@@ -39,7 +42,7 @@ async function post(path: string, body: Record<string, unknown>): Promise<Respon
   return fetch(`http://127.0.0.1:${handle.port}${path}`, {
     method: 'POST',
     headers: headers(path, handle.port),
-    body: JSON.stringify(body),
+    body: JSON.stringify({ rosterRevision: ROSTER_REVISION, ...body }),
   });
 }
 
@@ -60,13 +63,19 @@ describe('device-isolation daemon IPC', () => {
       enabledAt: new Date(now).toISOString(),
     })}\n`;
     setIpcAuthSecret(SECRET);
-    setDeviceIsolationDaemonIdentity({ larkAppId: 'cli_ipc', bootInstanceId: 'boot-ipc' });
+    setDeviceIsolationDaemonIdentity({
+      larkAppId: 'cli_ipc',
+      bootInstanceId: 'boot-ipc',
+      botsConfigPath: BOTS_CONFIG_PATH,
+      rosterRevision: ROSTER_REVISION,
+    });
     setDeviceIsolationDaemonDependenciesForTest({
       now: () => now,
       dataDir: () => '/tmp/device-isolation-ipc-data',
       listSessions: () => [],
       processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
       processExists: () => false,
+      readRosterRevision: () => ROSTER_REVISION,
       readMarker: () => marker,
     });
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -87,7 +96,13 @@ describe('device-isolation daemon IPC', () => {
       ok: true,
       nonce: NONCE,
       phase: 'prepared',
-      daemon: { larkAppId: 'cli_ipc', bootInstanceId: 'boot-ipc' },
+      receiptAuthorityVersion: ASK_RECEIPT_AUTHORITY_VERSION,
+      receiptAuthorityProtocolVersion: 1,
+      daemon: {
+        larkAppId: 'cli_ipc',
+        bootInstanceId: 'boot-ipc',
+        rosterRevision: 'a'.repeat(64),
+      },
     });
 
     const leaseId = prepared.leaseId as string;
@@ -105,6 +120,17 @@ describe('device-isolation daemon IPC', () => {
       state: 'active',
       enabledAt: new Date(now).toISOString(),
       activatedAt: new Date(now + 1).toISOString(),
+      askReceiptAuthorityVersion: ASK_RECEIPT_AUTHORITY_VERSION,
+      askReceiptAuthorityProof: {
+        activationEpoch: 'a'.repeat(43),
+        protocolVersion: 1,
+        participants: [{
+          larkAppId: 'cli_ipc',
+          bootInstanceId: 'boot-ipc',
+          pid: process.pid,
+          procStart: 'daemon-start',
+        }],
+      },
     })}\n`;
     const released = await post(DEVICE_ISOLATION_RELEASE_PATH, {
       activationVersion: 1,

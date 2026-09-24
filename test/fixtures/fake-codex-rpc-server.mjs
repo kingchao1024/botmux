@@ -9,11 +9,14 @@
 //   FAKE_ERROR_AFTER_STARTED=1 → emit turn/started, reject the response, then complete
 //   FAKE_DUPLICATE_TERMINAL=1 → broadcast turn/completed twice
 //   FAKE_DIE_AFTER_MS=N  → exit(1) after N ms (crash → engine onDead)
+//   FAKE_DELAY_TURN_ACK_MS=N → delay turn/start responses after recording receipt
 //   FAKE_THREAD_CONFIG_FILE=path → write the received thread/start params to path
 //                                  (lets a test assert model/effort forwarding)
 //   FAKE_RESUME_CONFIG_FILE=path → write the received thread/resume params to path
 //                                  (lets a test assert model/effort are SUPPRESSED
 //                                   on resume)
+//   FAKE_TURN_CONFIG_FILE=path → append every turn/start and turn/steer request.
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { appendFileSync, writeFileSync } from 'node:fs';
@@ -29,8 +32,30 @@ const TERMINAL_BEFORE_RESPONSE = process.env.FAKE_TERMINAL_BEFORE_RESPONSE === '
 const ERROR_AFTER_STARTED = process.env.FAKE_ERROR_AFTER_STARTED === '1';
 const DUPLICATE_TERMINAL = process.env.FAKE_DUPLICATE_TERMINAL === '1';
 const NO_TURN_TERMINAL = process.env.FAKE_NO_TURN_TERMINAL === '1';
+const STEER_RESPONSE_TURN_ID = process.env.FAKE_STEER_RESPONSE_TURN_ID;
+const STEER_TERMINAL_BEFORE_RESPONSE = process.env.FAKE_STEER_TERMINAL_BEFORE_RESPONSE === '1';
+const DELAY_STEER_ACK_MS = process.env.FAKE_DELAY_STEER_ACK_MS
+  ? Number(process.env.FAKE_DELAY_STEER_ACK_MS)
+  : 0;
 const TURN_STATUS = process.env.FAKE_TURN_STATUS ?? '';
 const DIE_AFTER = process.env.FAKE_DIE_AFTER_MS ? Number(process.env.FAKE_DIE_AFTER_MS) : 0;
+const DELAY_TURN_ACK_MS = process.env.FAKE_DELAY_TURN_ACK_MS
+  ? Number(process.env.FAKE_DELAY_TURN_ACK_MS)
+  : 0;
+if (process.env.FAKE_EXTERNAL_PID_FILE) writeFileSync(process.env.FAKE_EXTERNAL_PID_FILE, String(process.pid));
+if (process.env.FAKE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
+if (process.env.FAKE_LEADER_EXITS_ON_SIGTERM === '1') process.on('SIGTERM', () => process.exit(0));
+if (process.env.FAKE_GROUP_CHILD_PID_FILE) {
+  const child = spawn(process.execPath, ['-e', [
+    (process.env.FAKE_GROUP_CHILD_UNVERIFIED === '1'
+      ? '// unrelated process\n'
+      : '// app-server --listen ' + listenArg + '\n'),
+    "process.on('SIGTERM', () => {})",
+    'setInterval(() => {}, 1_000)',
+  ].join(';')], { stdio: 'ignore' });
+  child.unref();
+  writeFileSync(process.env.FAKE_GROUP_CHILD_PID_FILE, String(child.pid));
+}
 const PREVIEW_DELAY_READS = Number(process.env.FAKE_PREVIEW_DELAY_READS ?? '0');
 const UPDATED_DELAY_READS = Number(process.env.FAKE_UPDATED_DELAY_READS ?? '0');
 const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
@@ -49,6 +74,9 @@ const httpServer = createServer((req, res) => {
 });
 const wss = new WebSocketServer({ server: httpServer });
 wss.on('connection', (ws) => {
+  if (process.env.FAKE_EXTERNAL_CONNECTION_FILE) {
+    writeFileSync(process.env.FAKE_EXTERNAL_CONNECTION_FILE, String(process.pid));
+  }
   let pendingTurnReply;
   let pendingNativeTurnId;
   let pendingThreadId;
@@ -274,18 +302,51 @@ wss.on('connection', (ws) => {
           setTimeout(() => emitTurnCompleted(threadId, nativeTurnId), 100);
           return;
         }
+        const ack = () => reply({ turn: { id: nativeTurnId } });
         if (TERMINAL_BEFORE_RESPONSE) {
           emitTurnLifecycle(threadId, nativeTurnId);
-          reply({ turn: { id: nativeTurnId } });
+          if (DELAY_TURN_ACK_MS > 0) setTimeout(ack, DELAY_TURN_ACK_MS);
+          else ack();
         } else {
-          reply({ turn: { id: nativeTurnId } });
-          emitTurnLifecycle(threadId, nativeTurnId);
+          if (DELAY_TURN_ACK_MS > 0) {
+            setTimeout(() => ack(), DELAY_TURN_ACK_MS);
+          } else {
+            ack();
+            emitTurnLifecycle(threadId, nativeTurnId);
+          }
         }
+        return;
+      }
+      case 'turn/steer': {
+        const nativeTurnId = msg.params?.expectedTurnId;
+        if (process.env.FAKE_TURN_CONFIG_FILE) {
+          try { appendFileSync(process.env.FAKE_TURN_CONFIG_FILE, `${JSON.stringify(msg.params ?? {})}\n`); } catch { /* test-only */ }
+        }
+        if (!nativeTurnId) {
+          return ws.send(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32602, message: 'expectedTurnId is required' },
+          }));
+        }
+        const ack = () => reply({ turnId: STEER_RESPONSE_TURN_ID || nativeTurnId });
+        if (STEER_TERMINAL_BEFORE_RESPONSE) {
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: { threadId: msg.params?.threadId, turn: { id: nativeTurnId } },
+          }));
+        }
+        if (DELAY_STEER_ACK_MS > 0) setTimeout(ack, DELAY_STEER_ACK_MS);
+        else ack();
         return;
       }
       default: return reply({});
     }
   });
 });
-httpServer.listen(port, '127.0.0.1');
+httpServer.listen(port, '127.0.0.1', () => {
+  if (process.env.FAKE_EXTERNAL_READY_FILE) {
+    writeFileSync(process.env.FAKE_EXTERNAL_READY_FILE, String(process.pid));
+  }
+});
 if (DIE_AFTER > 0) setTimeout(() => process.exit(1), DIE_AFTER);

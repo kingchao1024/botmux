@@ -57,6 +57,21 @@ describe('staticModelChoices（静态候选，shell-free）', () => {
     expect(staticModelChoices('ttadk-x-coco')).toEqual([]);
   });
 
+  it.each(['seed', 'relay', 'pi', 'oh-my-pi'] as const)(
+    '%s 无静态候选时不构造适配器（保持 Dashboard 枚举 shell-free）',
+    key => {
+      let factoryCalls = 0;
+      const models = staticModelChoices(key, {
+        adapterFactory: () => {
+          factoryCalls++;
+          throw new Error('adapter construction must stay unreachable');
+        },
+      });
+      expect(models).toEqual([]);
+      expect(factoryCalls).toBe(0);
+    },
+  );
+
   it('未知 key 返回 []', () => {
     expect(staticModelChoices('does-not-exist')).toEqual([]);
     expect(staticModelChoices('')).toEqual([]);

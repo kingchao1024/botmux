@@ -5,10 +5,16 @@ import { tmpdir } from 'node:os';
 import type { DashboardEvent } from '../src/core/dashboard-events.js';
 
 let tempDir: string;
-const watcher = vi.hoisted(() => ({ callback: undefined as undefined | ((event: string, filename: string | null) => void) }));
+const watcher = vi.hoisted(() => ({
+  callback: undefined as undefined | ((event: string, filename: string | null) => void),
+  handle: { once: vi.fn(), close: vi.fn() },
+}));
 vi.mock('node:fs', async importOriginal => ({
   ...await importOriginal<typeof import('node:fs')>(),
-  watch: vi.fn((_path, _options, callback) => { watcher.callback = callback; }),
+  watch: vi.fn((_path, _options, callback) => {
+    watcher.callback = callback;
+    return watcher.handle;
+  }),
 }));
 vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return join(tempDir, 'data'); } } } }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));

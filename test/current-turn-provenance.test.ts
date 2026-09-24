@@ -52,6 +52,7 @@ describe('resolveCurrentTurnProvenance', () => {
       ownerOpenId: 'ou_owner_a',
       lastCallerOpenId: 'ou_caller_b',
       quoteTargetId: 'turn-current',
+      turnReplyContexts: { 'turn-current': { replyTargetSenderIsBot: false } },
       ...overrides,
     };
     // The durable session record lives in the per-bot SQLite store; the frozen
@@ -87,6 +88,7 @@ describe('resolveCurrentTurnProvenance', () => {
       sessionId: 'sess-1',
       turnId: 'turn-current',
       callerOpenId: 'ou_caller_b',
+      actorKind: 'human',
       larkAppId: 'cli_real',
       chatId: 'oc_real',
       chatType: 'p2p',
@@ -186,6 +188,7 @@ describe('resolveCurrentTurnProvenance', () => {
         sessionId: 'sess-1',
         turnId: SCHED_TURN_ID,
         callerOpenId: 'ou_task_owner',
+      actorKind: 'scheduled',
         larkAppId: 'cli_real',
         chatId: 'oc_real',
         chatType: 'p2p',
@@ -206,6 +209,7 @@ describe('resolveCurrentTurnProvenance', () => {
       expect(resolveCurrentTurnProvenance({ dataDir, startPid: process.pid })).toMatchObject({
         rootMessageId: 'om_shared_topic',
         callerOpenId: 'ou_task_owner',
+        actorKind: 'scheduled',
       });
     });
 

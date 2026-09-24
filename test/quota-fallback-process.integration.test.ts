@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FleetSupervisor, type FleetBotSpec } from '../src/core/fleet-supervisor.js';
 import { readFleetState } from '../src/core/fleet-state-store.js';
-import { resolveFleetBotsFromEntries } from '../src/core/fleet-runtime.js';
+import { captureFleetLaunchPlan, resolveFleetBotsFromEntries } from '../src/core/fleet-runtime.js';
+import { encodeFleetLaunchPlan, FLEET_LAUNCH_PLAN_ENV } from '../src/core/fleet-launch-plan.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const SUPERVISOR_PATH = fileURLToPath(new URL('../src/index-supervisor.ts', import.meta.url));
@@ -69,7 +70,9 @@ describe('quota fallback process boundaries', () => {
     const home = tmp();
     const configDir = join(home, '.botmux');
     mkdirSync(configDir, { recursive: true });
-    writeFileSync(join(configDir, 'bots.json'), JSON.stringify(cyclicBots().slice(0, 2)));
+    const configPath = join(configDir, 'bots.json');
+    writeFileSync(configPath, JSON.stringify(cyclicBots().slice(0, 2)));
+    const launchPlan = captureFleetLaunchPlan(configPath);
 
     const child = spawnTsScript(SUPERVISOR_PATH, [], {
       cwd: process.cwd(),
@@ -79,6 +82,7 @@ describe('quota fallback process boundaries', () => {
         SESSION_DATA_DIR: join(configDir, 'data'),
         BOTS_CONFIG: join(configDir, 'bots.json'),
         BOTMUX_WORKFLOW: '',
+        [FLEET_LAUNCH_PLAN_ENV]: encodeFleetLaunchPlan(launchPlan),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

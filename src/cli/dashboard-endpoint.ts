@@ -59,6 +59,45 @@ export type DashboardResult =
 
 type FetchImpl = typeof fetch;
 
+/** `current` proves a ready, authenticated dashboard without minting a token. */
+export function dashboardCurrentProvesReadiness(result: DashboardResult): boolean {
+  return result.ok || result.reason === 'no-active-token';
+}
+
+/**
+ * Probe one exact candidate: the persisted port when present, otherwise the
+ * configured/default port. Unlike general CLI discovery this never scans, so
+ * `timeoutMs` bounds the whole readiness attempt.
+ */
+export async function probeDashboardReadiness(opts: {
+  configDir: string;
+  defaultPort: number;
+  envPort?: string;
+  host?: string;
+  timeoutMs: number;
+  fetchImpl?: FetchImpl;
+}): Promise<boolean> {
+  const secretPath = join(opts.configDir, '.dashboard-secret');
+  let secret: string | null;
+  try { secret = loadDashboardSecret(secretPath); } catch { return false; }
+  if (!secret) return false;
+  const portFile = join(opts.configDir, '.dashboard-port');
+  const recorded = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+    || opts.envPort
+    || String(opts.defaultPort);
+  const port = Number(recorded);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return false;
+  const result = await requestDashboardAt({
+    host: opts.host ?? '127.0.0.1',
+    port,
+    path: '/__cli/current',
+    secret,
+    timeoutMs: Math.max(1, opts.timeoutMs),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+  });
+  return dashboardCurrentProvesReadiness(result);
+}
+
 /**
  * Classify a 404 from a `/__cli/*` request. A genuine "no token yet" only comes
  * from `/__cli/current` carrying `{ error: 'no_active_token' }`; everything else

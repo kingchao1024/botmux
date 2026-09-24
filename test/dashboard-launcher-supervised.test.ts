@@ -107,7 +107,8 @@ describe('dashboard launcher — source pins', () => {
 
   it('cmdRestart health-gates on fleet MEMBERS so a down dashboard fails the restart', () => {
     const cli = read('cli.ts');
-    expect(cli).toContain('fleetMemberNames');
+    expect(cli).toContain('waitFleetReady');
+    expect(cli).toContain('probeDashboardReadyWithin');
   });
 
   it('reports quota fallback cycles before restart and keeps the recoverable fleet path', () => {
@@ -120,7 +121,7 @@ describe('dashboard launcher — source pins', () => {
     expect(preflight).toBeGreaterThanOrEqual(0);
     expect(preflight).toBeLessThan(restart.indexOf("cleanupLegacyPm2('restart')"));
     expect(preflight).toBeLessThan(restart.indexOf('stopPluginServicesForCli'));
-    expect(preflight).toBeLessThan(restart.indexOf('restartFleet({ refreshPersistedEnv, readFailureFallback })'));
+    expect(preflight).toBeLessThan(restart.indexOf('restartFleet(launchPlan, { refreshPersistedEnv, readFailureFallback })'));
     expect(cli).toContain('Dashboard 和其它 Bot 将继续启动。');
     expect(cli).toContain('已跳过');
     expect(cli).toContain('修复入口: Dashboard → Bot 配置 → 高级 → 额度耗尽交接');

@@ -1010,7 +1010,18 @@ describe('handleSessionsCardAction', () => {
         row({ sessionId, status: 'idle', title: 'visible row' }),
         row({ sessionId: 'sess_other', status: 'working', title: 'other' }),
       ];
-      const requestSpy = vi.fn(async () => ({ status: 200, body: { sessions }, raw: '' }));
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET' && req.path === '/__daemon/sessions-list') {
+          return { status: 200, body: { sessions }, raw: '' };
+        }
+        if (req.method === 'POST' && req.path === `/__daemon/sessions/${sessionId}/view-link`) {
+          return {
+            status: 200, raw: '',
+            body: { ok: true, url: `http://dashboard.test:7891/s/${sessionId}/?viewToken=view-capability` },
+          };
+        }
+        throw new Error('unexpected: ' + JSON.stringify(req));
+      });
       return {
         createClient: vi.fn(() => ({ request: requestSpy } as any)),
         getOwnerOpenId: () => INVOKER,
@@ -1027,8 +1038,14 @@ describe('handleSessionsCardAction', () => {
         LARK_APP_ID,
         deps,
       );
-      expect(deps.requestSpy).toHaveBeenCalledOnce();
+      expect(deps.requestSpy).toHaveBeenCalledTimes(2);
       expect(deps.requestSpy.mock.calls[0][0]).toEqual({ method: 'GET', path: '/__daemon/sessions-list' });
+      expect(deps.requestSpy.mock.calls[1][0]).toEqual({
+        method: 'POST',
+        path: '/__daemon/sessions/sess_a/view-link',
+        retries: 0,
+        timeoutMs: 1_000,
+      });
       expect(r.toast).toBeUndefined();
       expect(r.card?.type).toBe('raw');
       const cardJson = JSON.stringify(r.card?.data);
@@ -1036,6 +1053,9 @@ describe('handleSessionsCardAction', () => {
       expect(cardJson).toContain('会话详情');
       expect(cardJson).toContain(SESSIONS_ACTION_CLOSE);
       expect(cardJson).toContain('sess_a');
+      expect(cardJson).toContain('dashboard.test:7891');
+      expect(cardJson).toContain('viewToken=view-capability');
+      expect(cardJson).not.toContain(':880');
     });
 
     it('session_id not in list → toast session_not_found, no card', async () => {
@@ -1139,6 +1159,51 @@ describe('handleSessionsCardAction', () => {
       );
       expect(r.toast?.content).toContain('bad_signature');
       expect(r.card).toBeUndefined();
+    });
+
+    it('view-link failure keeps detail usable but disables terminal without raw-port fallback', async () => {
+      const sessions = [row({ sessionId: 'sess_a', status: 'idle', webPort: 8800, proxyPort: 8800 })];
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET') return { status: 200, body: { sessions }, raw: '' };
+        return { status: 409, body: { ok: false, error: 'terminal_unavailable' }, raw: '' };
+      });
+      const r = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+        LARK_APP_ID,
+        {
+          createClient: () => ({ request: requestSpy } as any),
+          getOwnerOpenId: () => INVOKER,
+          locale: 'zh',
+          nowMs: () => 2_000_000,
+        },
+      );
+      const cardJson = JSON.stringify(r.card?.data);
+      expect(cardJson).not.toContain('multi_url');
+      expect(cardJson).not.toContain(':8800');
+    });
+
+    it('rejects a malformed or writable terminal capability returned by Route B', async () => {
+      const sessions = [row({ sessionId: 'sess_a', status: 'idle', webPort: 8800, proxyPort: 8800 })];
+      for (const unsafeUrl of [
+        'javascript:alert(1)',
+        'http://dashboard.test:7891/s/sess_a/?token=write-secret',
+        'http://dashboard.test:7891/s/sess_a/',
+      ]) {
+        const requestSpy = vi.fn(async (req: any) => req.method === 'GET'
+          ? { status: 200, body: { sessions }, raw: '' }
+          : { status: 200, body: { ok: true, url: unsafeUrl }, raw: '' });
+        const r = await handleSessionsCardAction(
+          makeAction({ action: SESSIONS_ACTION_DETAIL, invoker_open_id: INVOKER, session_id: 'sess_a' }),
+          LARK_APP_ID,
+          {
+            createClient: () => ({ request: requestSpy } as any),
+            getOwnerOpenId: () => INVOKER,
+            locale: 'zh',
+            nowMs: () => 2_000_000,
+          },
+        );
+        expect(JSON.stringify(r.card?.data)).not.toContain('multi_url');
+      }
     });
   });
 
@@ -1611,6 +1676,12 @@ describe('handleSessionsCardAction', () => {
         if (req.method === 'POST' && req.path === `/__daemon/sessions/${sessionId}/resume`) {
           return { status: postResp.status, body: postResp.body, raw: '' };
         }
+        if (req.method === 'POST' && req.path === `/__daemon/sessions/${sessionId}/view-link`) {
+          return {
+            status: 200, raw: '',
+            body: { ok: true, url: `http://dashboard.test:7891/s/${sessionId}/?viewToken=view-capability` },
+          };
+        }
         throw new Error('unexpected: ' + JSON.stringify(req));
       });
       return {
@@ -1629,13 +1700,16 @@ describe('handleSessionsCardAction', () => {
         LARK_APP_ID,
         deps as any,
       );
-      // 3 calls: pre-GET + POST + post-GET
-      expect(deps.requestSpy).toHaveBeenCalledTimes(3);
+      // 4 calls: pre-GET + resume POST + post-GET + view-link POST.
+      expect(deps.requestSpy).toHaveBeenCalledTimes(4);
       expect(deps.requestSpy.mock.calls[0][0].method).toBe('GET');
       expect(deps.requestSpy.mock.calls[1][0]).toEqual(
         expect.objectContaining({ method: 'POST', path: '/__daemon/sessions/sess_r/resume' }),
       );
       expect(deps.requestSpy.mock.calls[2][0].method).toBe('GET');
+      expect(deps.requestSpy.mock.calls[3][0]).toEqual(expect.objectContaining({
+        method: 'POST', path: '/__daemon/sessions/sess_r/view-link', retries: 0,
+      }));
       // Fresh row → idle status → card no longer shows resume button.
       expect(r.toast).toBeUndefined();
       const cardJson = JSON.stringify(r.card?.data);

@@ -11,6 +11,7 @@ import {
   unlinkSync,
   watch,
   writeFileSync,
+  type FSWatcher,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -928,10 +929,21 @@ export function appendOutputLog(taskId: string, content: string): string {
  * Reconcile on the watcher turn so synchronous compound writes/rollbacks have
  * finished; repeated filesystem notifications produce no additional diff.
  */
-let watcherStarted = false;
+const WATCH_RETRY_MS = 30_000;
+let externalWriteWatcher: FSWatcher | undefined;
+let watcherRetryTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleExternalWriteWatcherRetry(): void {
+  if (watcherRetryTimer || externalWriteWatcher) return;
+  watcherRetryTimer = setTimeout(() => {
+    watcherRetryTimer = undefined;
+    startExternalWriteWatcher();
+  }, WATCH_RETRY_MS);
+  watcherRetryTimer.unref?.();
+}
+
 export function startExternalWriteWatcher(): void {
-  if (watcherStarted) return;
-  watcherStarted = true;
+  if (externalWriteWatcher || watcherRetryTimer) return;
 
   // Watch this daemon's OWN bot store (the only one it executes/serves). Make
   // sure the BOT_HOME + file exist before we try to watch — fs.watch on a
@@ -958,7 +970,7 @@ export function startExternalWriteWatcher(): void {
     // Watch the directory, not the file inode: every commit atomically replaces
     // schedules.json, so a file-level watcher would remain attached to the old
     // inode after the first external write.
-    watch(dirname(fp), { persistent: false }, (_eventType, filename) => {
+    const watcher = watch(dirname(fp), { persistent: false }, (_eventType, filename) => {
       try {
         if (filename && filename.toString() !== basename(fp)) return;
         if (!existsSync(fp)) return;
@@ -992,6 +1004,14 @@ export function startExternalWriteWatcher(): void {
         logger.debug(`[schedule-store] watch handler error: ${err}`);
       }
     });
+    externalWriteWatcher = watcher;
+    watcher.once('error', (err) => {
+      if (externalWriteWatcher !== watcher) return;
+      externalWriteWatcher = undefined;
+      try { watcher.close(); } catch { /* best effort */ }
+      logger.warn(`[schedule-store] File watcher failed; retrying in ${WATCH_RETRY_MS / 1000}s: ${err.message}`);
+      scheduleExternalWriteWatcherRetry();
+    });
     // Dashboard mutations can announce a richer row before fs.watch runs.
     // Reconcile it with an update, not another create that would replace its
     // presentation metadata. Track lifecycle only: a partial eager update
@@ -1004,7 +1024,19 @@ export function startExternalWriteWatcher(): void {
       }
     });
     logger.info(`[schedule-store] Watching ${fp} for external writes`);
-  } catch (err: any) {
-    logger.warn(`[schedule-store] Failed to start file watcher: ${err.message}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn(`[schedule-store] Failed to start file watcher; retrying in ${WATCH_RETRY_MS / 1000}s: ${message}`);
+    scheduleExternalWriteWatcherRetry();
   }
+}
+
+/** Test-only lifecycle reset for the module-level watcher state. */
+export function __resetExternalWriteWatcherForTest(): void {
+  if (watcherRetryTimer) clearTimeout(watcherRetryTimer);
+  watcherRetryTimer = undefined;
+  if (externalWriteWatcher) {
+    try { externalWriteWatcher.close(); } catch { /* best effort */ }
+  }
+  externalWriteWatcher = undefined;
 }
