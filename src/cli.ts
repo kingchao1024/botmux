@@ -39,6 +39,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { closeResidualClause, describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
   findAncestorSessionContext as findLiveAncestorSessionContext,
+  findAuthenticatedAncestorSessionContext,
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
@@ -15539,6 +15540,56 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
     process.exit(1);
   }
   const command = matches[0];
+  if (rawCommand === 'task:new' && command.pluginId === 'task-control') {
+    const dataDir = resolveDataDir();
+    let liveContext: ReturnType<typeof findAuthenticatedAncestorSessionContext>;
+    try {
+      liveContext = findAuthenticatedAncestorSessionContext(dataDir);
+    } catch {
+      console.error('botmux task:new 无法验证当前受管会话；请在有效 Botmux 会话中运行。');
+      process.exitCode = 2;
+      return true;
+    }
+    const managedSessionId = liveContext?.sessionId;
+    const managedEnvPresent = [
+      process.env.BOTMUX_SESSION_ID,
+      process.env.BOTMUX_CHAT_ID,
+      process.env.BOTMUX_SESSION_SCOPE,
+      process.env.BOTMUX_ROOT_MESSAGE_ID,
+      process.env.BOTMUX_TURN_ID,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_LARK_APP_ID,
+    ].some(value => !!value?.trim());
+    if (managedSessionId) {
+      const managedSession = loadSessions().get(managedSessionId);
+      if (!managedSession) {
+        console.error('botmux task:new 无法解析当前受管会话；请在有效 Botmux 会话中运行。');
+        process.exitCode = 2;
+        return true;
+      }
+      if (managedSession.scope === 'chat') {
+        const { readGroupCollaborationMode } = await import('./services/group-collaboration-mode-store.js');
+        let mode: ReturnType<typeof readGroupCollaborationMode>;
+        try {
+          mode = readGroupCollaborationMode(dataDir, managedSession.chatId);
+        } catch {
+          console.error('botmux task:new 项目群配置无效；请修复后重试。');
+          process.exitCode = 2;
+          return true;
+        }
+        if (mode?.mode === 'project') {
+          console.error('botmux task:new 在 project_group 普通群中不可用；请使用 botmux dispatch 派发子任务。');
+          process.exitCode = 2;
+          return true;
+        }
+      }
+    } else if (managedEnvPresent) {
+      console.error('botmux task:new 无法验证当前受管会话；请在有效 Botmux 会话中运行。');
+      process.exitCode = 2;
+      return true;
+    }
+  }
   const registry = await loadPluginRegistryForCommand();
   const record = registry.plugins[command.pluginId];
   const { pluginRuntimeDir } = await import('./core/plugins/paths.js');
