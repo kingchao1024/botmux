@@ -26,6 +26,8 @@
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
+import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
+import { readSchedulePromptUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
@@ -227,6 +229,7 @@ import {
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
+import { DISPATCH_USER_DELIVERY_ROUTE } from './core/dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -6659,6 +6662,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
        --new-topic [--topic-title ...] 每次创建新话题和独立会话
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
+  schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
@@ -6818,6 +6822,25 @@ function detectCurrentSession(): CurrentSession | null {
  */
 async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | null> {
   const dataDir = resolveDataDir();
+  let attested: ManagedOriginAttestation | undefined;
+  const attestCurrentOrigin = async () => {
+    const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir, includeHostSession: true });
+    if (!isolated?.originChannelId) return undefined;
+    return attestManagedOrigin({
+      context: {
+        sessionId: isolated.sessionId,
+        channelId: isolated.originChannelId,
+        capability: isolated.capability,
+        dataDir,
+        larkAppId: isolated.larkAppId,
+        ipcPortFallback: isolated.ipcPortFallback,
+      },
+      resolveIpcPort: appId => {
+        try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+  };
   let provenance: {
     sessionId: string;
     turnId: string;
@@ -6873,25 +6896,8 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
       // absence of host ancestors as a detached call. A sandbox fixture/legacy
       // session without that capability fails closed; a claimed BotMux session
       // must never degrade to a standalone OWNERLESS task.
-      const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
-      if (!isolated?.originChannelId) throw hostError;
-      const attested = await attestManagedOrigin({
-        context: {
-          sessionId: isolated.sessionId,
-          channelId: isolated.originChannelId,
-          capability: isolated.capability,
-          dataDir,
-          ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
-          ...(isolated.ipcPortFallback !== undefined
-            ? { ipcPortFallback: isolated.ipcPortFallback }
-            : {}),
-        },
-        resolveIpcPort: (appId) => {
-          try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
-          catch { return undefined; }
-        },
-      });
-      if (!attested.callerOpenId || !attested.larkAppId) throw hostError;
+      attested = await attestCurrentOrigin();
+      if (!attested?.callerOpenId || !attested.larkAppId) throw hostError;
       provenance = {
         sessionId: attested.sessionId,
         turnId: attested.turnId,
@@ -6902,8 +6908,8 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
   }
   if (!provenance) return null;
   const s = loadSessions().get(provenance.sessionId);
-  if (!s || s.status !== 'active') return null;
-  if (provenance.larkAppId !== s.larkAppId) return null;
+  if (!s || s.status !== 'active') throw new Error('authenticated schedule session is no longer active');
+  if (provenance.larkAppId !== s.larkAppId) throw new Error('schedule creator bot does not match the session');
   // The current-turn provenance authenticates the human who actually invoked
   // this command. A persisted session owner is useful when present, but older
   // bot/schedule-created sessions can legitimately be ownerless. In that case
@@ -6917,35 +6923,27 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
     }
     ownerUnionId = s.ownerUnionId;
   } else {
-    // `botmux schedule ...` runs in a short-lived CLI process whose in-memory
-    // daemon registry is intentionally not initialized. Reconstruct the same
-    // fail-closed allowlist view from durable config + its last-known-good
-    // raw-entry resolution cache instead of calling getBot().
-    const configuredBot = loadBotsJson().find(bot => bot?.larkAppId === s.larkAppId);
-    if (!configuredBot) {
-      throw new Error(`cannot load bot config for ${s.larkAppId}`);
+    // macOS can retain host ancestry while denying bots.json, so consult the
+    // managed origin for ownerless sessions even when PID provenance succeeded.
+    attested ??= await attestCurrentOrigin();
+    if (attested) {
+      if (attested.sessionId !== provenance.sessionId || attested.turnId !== provenance.turnId
+        || attested.larkAppId !== provenance.larkAppId || attested.callerOpenId !== provenance.callerOpenId) {
+        throw new Error('schedule creator provenance changed during authorization');
+      }
+      ownerUnionId = requireScheduleCreatorUnionId(attested.scheduleCreator);
+    } else {
+      // Standalone host CLI retains its durable allowlist lookup. Managed CLI
+      // must never fall back from an unsupported/denied proof to host config.
+      const configuredBot = loadBotsJson().find(bot => bot?.larkAppId === s.larkAppId);
+      ownerUnionId = requireScheduleCreatorUnionId(authorizeOwnerlessScheduleCreator({
+        callerOpenId: provenance.callerOpenId,
+        allowedUsers: configuredBot && (Array.isArray(configuredBot.allowedUsers)
+          ? configuredBot.allowedUsers.filter((entry: unknown): entry is string => typeof entry === 'string')
+          : []),
+        resolutionCache: readAllowedUsersResolveCache(dataDir, s.larkAppId),
+      }));
     }
-    const allowedRaw: string[] = Array.isArray(configuredBot.allowedUsers)
-      ? configuredBot.allowedUsers.filter((entry: unknown): entry is string => typeof entry === 'string')
-      : [];
-    const cache = readAllowedUsersResolveCache(dataDir, s.larkAppId);
-    const resolvedAllowedUsers = new Set(
-      allowedRaw
-        .map((entry: string) => entry.startsWith('ou_') ? entry : cache[entry])
-        .filter((entry): entry is string => typeof entry === 'string' && entry.startsWith('ou_')),
-    );
-    if (!resolvedAllowedUsers.has(provenance.callerOpenId)) {
-      throw new Error('current turn caller is not an allowed bot operator');
-    }
-    const matches = [...new Set(
-      allowedRaw
-        .filter((entry: string) => entry.startsWith('on_'))
-        .filter((entry: string) => cache[entry] === provenance.callerOpenId),
-    )];
-    if (matches.length !== 1) {
-      throw new Error('cannot resolve the current turn caller union_id');
-    }
-    ownerUnionId = matches[0];
   }
   return {
     sessionId: s.sessionId,
@@ -6959,6 +6957,18 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
     ownerOpenId: provenance.callerOpenId,
     ownerUnionId,
   };
+}
+
+/** Re-attest at the effect boundary; detached calls must not acquire authority. */
+async function revalidateScheduleCreator(current: CurrentSession | null): Promise<CurrentSession | null> {
+  if (!current) return null;
+  const fresh = await detectAuthenticatedCurrentSession();
+  if (!fresh || fresh.sessionId !== current.sessionId || fresh.turnId !== current.turnId
+    || fresh.larkAppId !== current.larkAppId || fresh.ownerOpenId !== current.ownerOpenId
+    || fresh.ownerUnionId !== current.ownerUnionId) {
+    throw new Error('schedule creator provenance changed before write');
+  }
+  return fresh;
 }
 
 /** Pick a value from --flag <value> or --flag=value style args. */
@@ -7386,6 +7396,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
 }
 
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
+  if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
+    console.log(SCHEDULE_UPDATE_USAGE);
+    return;
+  }
   // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
   // writes to the right file even when invoked outside the daemon env.
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
@@ -7572,18 +7586,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       // effect boundary so a turn rotation cannot carry an earlier proof into
       // a later schedule write. If the first lookup was ownerless, do not
       // opportunistically gain an identity at this later point.
-      if (authenticatedCur) {
-        const fresh = await detectAuthenticatedCurrentSession();
-        if (!fresh
-          || fresh.sessionId !== authenticatedCur.sessionId
-          || fresh.turnId !== authenticatedCur.turnId
-          || fresh.larkAppId !== authenticatedCur.larkAppId
-          || fresh.ownerOpenId !== authenticatedCur.ownerOpenId
-          || fresh.ownerUnionId !== authenticatedCur.ownerUnionId) {
-          throw new Error('schedule creator provenance changed before write');
-        }
-        authenticatedCur = fresh;
-      }
+      authenticatedCur = await revalidateScheduleCreator(authenticatedCur);
       task = scheduler.addTask({
         id: explicitTaskId,
         name,
@@ -7674,6 +7677,32 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   };
 
   switch (sub) {
+    case 'update': {
+      const prompt = readSchedulePromptUpdate(rest);
+      const authenticatedCur = await detectAuthenticatedCurrentSession();
+      if (!scheduleStore.getTask(id) && !retargetIfElsewhere()) {
+        throw new Error(`未找到任务 ${id}`);
+      }
+      if (authenticatedCur && authenticatedCur.larkAppId !== scheduleStore.getScheduleScope()) {
+        throw new Error('沙盒会话只能管理自己 bot 的任务。');
+      }
+      await revalidateScheduleCreator(authenticatedCur);
+      // A protected precondition sidecar records a hash of the task's canonical
+      // input (prompt included) and lives in a host-only directory the sandboxed
+      // CLI can neither read nor rebind. Rewriting the prompt here would leave
+      // the stored hash stale, so every later fire fails resolution with
+      // canonical_input_mismatch and the task silently stops forever. Dashboard
+      // edits go through updateTaskWithOptionalPrecondition, which rebinds; the
+      // CLI must refuse instead of reporting success.
+      const bound = scheduleStore.getTask(id);
+      if (bound?.preconditionRef) {
+        throw new Error(`任务 ${id} 绑定了守护前置条件（precondition），CLI 更新会破坏其安全绑定导致任务停止执行；请在 Dashboard 的定时任务页修改提示词。`);
+      }
+      const result = scheduler.updateTask(id, { prompt });
+      if (!result.ok) throw new Error(`无法更新任务 ${id}: ${result.error}`);
+      console.log(`✅ 已更新任务 ${id} 的 prompt；后续执行生效，未触发补跑。`);
+      break;
+    }
     case 'remove':
     case 'rm':
     case 'delete':
@@ -7718,7 +7747,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       }
       break;
     default:
-      console.error(`未知子命令: ${sub}\n可用: list | add | remove | pause | resume | run`);
+      console.error(`未知子命令: ${sub}\n可用: list | add | update | remove | pause | resume | run`);
       process.exit(1);
   }
 }
@@ -11982,12 +12011,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     ? JSON.stringify({ zh_cn: { title: '', content: built.threadContent } })
     : undefined;
 
+  const deliverKickoff = async (rootId: string, content: string): Promise<string> => {
+    const response = await postCurrentSessionDaemonRoute({
+      path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId,
+      body: { rootId, chatId: targetChatId, content,
+        targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0 },
+    });
+    const result: any = await response.json();
+    if (!response.ok || result?.ok !== true || typeof result.messageId !== 'string') {
+      throw new Error(`dispatch delivery failed: ${result?.error ?? response.status}`);
+    }
+    return result.messageId;
+  };
+
   let dispatchRootForLifecycle = intoRoot;
   try {
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
       const sentAtMs = Date.now();
-      const kickoffId = await replyMessage(appId, intoRoot, intoBriefJson!, 'post', true);
+      const kickoffId = await deliverKickoff(intoRoot, intoBriefJson!);
       const acceptance = parsedBotApps.length > 0
         ? await waitForExactDispatchAcceptance({
             targetAppIds: parsedBotApps.map(item => item.appId),
@@ -12107,7 +12149,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       });
       const kickoffBriefJson = JSON.stringify({ zh_cn: { title: '', content: kickoffBuilt.threadContent } });
       const sentAtMs = Date.now();
-      kickoffId = await replyMessage(appId, seedId, kickoffBriefJson, 'post', true);
+      kickoffId = await deliverKickoff(seedId, kickoffBriefJson);
       if (parsedBotApps.length > 0) {
         acceptance = await waitForExactDispatchAcceptance({
           targetAppIds: parsedBotApps.map(item => item.appId),

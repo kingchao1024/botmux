@@ -719,15 +719,15 @@ describe('codex buildArgs', () => {
     });
     // pure --remote viewer: no paste-mode bypass flag, no stale resume path
     expect(args).toEqual([
-      '--remote', 'ws://127.0.0.1:9931', 'resume', '--no-alt-screen',
+      '--remote', 'ws://127.0.0.1:9931',
       '-c', 'check_for_update_on_startup=false',
       '-c', 'notice.hide_rate_limit_model_nudge=true',
-      'thread-abc',
+      'resume', '--no-alt-screen', 'thread-abc',
     ]);
-    // the -c disable must land BEFORE the thread id (a resume-subcommand config)
+    // The -c overrides must stay before resume so launcher overrides survive.
     const cIdx = args.indexOf('-c');
     expect(args[cIdx + 1]).toBe('check_for_update_on_startup=false');
-    expect(args.indexOf('thread-abc')).toBeGreaterThan(cIdx);
+    expect(args.indexOf('resume')).toBeGreaterThan(cIdx);
     // no interactive-paste bypass flag leaks into the viewer args
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     // the app-server (behind --remote) rejects --dangerously-bypass-hook-trust and
@@ -913,7 +913,7 @@ describe('codex buildArgs', () => {
     expect(idx).toBeGreaterThan(0);
     expect(fresh[idx - 1]).toBe('-c');
 
-    // Must survive resume as well, placed before the resumed session id.
+    // Must survive resume as well, placed before the subcommand.
     const resumed = adapter.buildArgs({
       hideRateLimitModelNudge: true,
       sessionId: 'sess-4',
@@ -922,7 +922,7 @@ describe('codex buildArgs', () => {
     });
     const resumeIdx = resumed.indexOf('notice.hide_rate_limit_model_nudge=true');
     expect(resumeIdx).toBeGreaterThan(0);
-    expect(resumeIdx).toBeLessThan(resumed.indexOf('codex-session-id'));
+    expect(resumeIdx).toBeLessThan(resumed.indexOf('resume'));
   });
 
   it('also suppresses the luna nudge popup on the pure --remote RPC viewer', () => {
@@ -940,23 +940,54 @@ describe('codex buildArgs', () => {
     expect(idx).toBeLessThan(args.indexOf('thread-abc'));
   });
 
-  it('keeps the startup update override on resume before the Codex session id', () => {
+  it('keeps the startup update override before the resume subcommand', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-4',
       resume: true,
       resumeSessionId: 'codex-session-id',
     });
     const configIdx = args.indexOf('check_for_update_on_startup=false');
-    expect(args[0]).toBe('resume');
     expect(args[configIdx - 1]).toBe('-c');
-    expect(configIdx).toBeLessThan(args.indexOf('codex-session-id'));
+    expect(configIdx).toBeLessThan(args.indexOf('resume'));
+    expect(args.at(-1)).toBe('codex-session-id');
+    expect(args.indexOf('--no-alt-screen')).toBeGreaterThan(args.indexOf('resume'));
+  });
+
+  it.each([
+    { command: 'resume', forkSession: false },
+    { command: 'fork', forkSession: true },
+  ])('keeps BotMux overrides before $command so a launcher proxy override survives', ({ command, forkSession }) => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-proxy', resume: true, resumeSessionId: 'codex-existing',
+      forkSession, quietResume: true, reasoningEffort: 'high', model: 'gpt-5.4',
+      shellSubprocessEnv: { BOTMUX_IDENTITY_BIN: '/tmp/identity.bin' },
+    });
+    // codex-app-ies prepends this temporary proxy override before BotMux args.
+    const fullArgs = [
+      '-c', 'model_providers.llmproxy.base_url="http://127.0.0.1:12345"',
+      '--profile', 'llmrouter-app-ies', ...args,
+    ];
+    const commandIdx = fullArgs.indexOf(command);
+    expect(commandIdx).toBeGreaterThan(0);
+    expect(fullArgs.at(-1)).toBe('codex-existing');
+    for (let index = 0; index < fullArgs.length; index++) {
+      if (fullArgs[index] === '-c') expect(index).toBeLessThan(commandIdx);
+    }
+    for (const option of ['--dangerously-bypass-approvals-and-sandbox', '--no-alt-screen', '--model']) {
+      expect(fullArgs.indexOf(option)).toBeGreaterThan(commandIdx);
+    }
+    expect(fullArgs[fullArgs.indexOf('--model') + 1]).toBe('gpt-5.4');
+    expect(fullArgs).toContain('shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/tmp/identity.bin"');
+    expect(fullArgs).toContain('model_reasoning_effort="high"');
+    expect(fullArgs.includes('tui.auto_recap=false')).toBe(!forkSession);
   });
 
   it('disables automatic recap for a quiet resume without adding a prompt', () => {
     const normal = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing' });
     const quiet = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing', quietResume: true });
     expect(normal).not.toContain('tui.auto_recap=false');
-    expect(quiet).toEqual([...normal.slice(0, -1), '-c', 'tui.auto_recap=false', 'codex-existing']);
+    const commandIdx = normal.indexOf('resume');
+    expect(quiet).toEqual([...normal.slice(0, commandIdx), '-c', 'tui.auto_recap=false', ...normal.slice(commandIdx)]);
     expect(adapter.buildArgs({ sessionId: 'sess-quiet', resume: false, quietResume: true })).not.toContain('tui.auto_recap=false');
   });
 
@@ -966,10 +997,10 @@ describe('codex buildArgs', () => {
       hideRateLimitModelNudge: true,
       remoteWsUrl: 'ws://127.0.0.1:9933', remoteThreadId: 'thread-existing',
     });
-    expect(args.slice(-5)).toEqual([
+    expect(args.slice(-7)).toEqual([
       '-c', 'notice.hide_rate_limit_model_nudge=true',
       '-c', 'tui.auto_recap=false',
-      'thread-existing',
+      'resume', '--no-alt-screen', 'thread-existing',
     ]);
   });
 
@@ -2535,10 +2566,13 @@ describe('antigravity buildArgs', () => {
     expect(args[idx + 1]).toBe('eb4cabea-3060-4b76-8e85-5778cc7ddb49');
   });
 
-  it('ignores configured model because this adapter has no modelChoices', () => {
-    const args = adapter.buildArgs({ sessionId: 'bm-7', resume: false, model: 'gemini-3-pro-preview' });
-    expect(args).not.toContain('--model');
-    expect(adapter.modelChoices).toBeUndefined();
+  it('passes configured model via --model and exposes curated modelChoices', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-7', resume: false, model: 'gemini-3.8-flash-high' });
+    expect(args).toContain('--model');
+    const idx = args.indexOf('--model');
+    expect(args[idx + 1]).toBe('gemini-3.8-flash-high');
+    expect(adapter.modelChoices).toBeDefined();
+    expect(adapter.modelChoices).toContain('gemini-3.8-flash-high');
   });
 
   it('resume without resumeSessionId starts fresh (no --continue, no random id)', () => {
@@ -2997,8 +3031,13 @@ describe('readyPattern', () => {
     expect(createOpenCodeAdapter('/bin/opencode').readyPattern).toBeUndefined();
   });
 
-  it('antigravity has no readyPattern', () => {
-    expect(createAntigravityAdapter('/bin/agy').readyPattern).toBeUndefined();
+  it('antigravity readyPattern and busyPattern are set to match its TUI footer states', () => {
+    const adapter = createAntigravityAdapter('/bin/agy');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('? for shortcuts')).toBe(true);
+    expect(adapter.busyPattern).toBeDefined();
+    expect(adapter.busyPattern!.test('esc to cancel')).toBe(true);
+    expect(typeof adapter.isSessionBusy).toBe('function');
   });
 
   it('mtr has no readyPattern', () => {
