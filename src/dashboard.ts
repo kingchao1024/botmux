@@ -9,6 +9,8 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.js';
+import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
@@ -16,6 +18,7 @@ import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-se
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { createCompanionApi, loadCompanionSecret, type CompanionRuntime } from './dashboard/companion-api.js';
+import { handleOncallServiceSecret } from './dashboard/oncall-service-secret.js';
 import {
   deleteTeamRoleFile,
   readTeamRoleInjectMode,
@@ -24,7 +27,7 @@ import {
   writeTeamRoleInjectMode,
 } from './core/role-resolver.js';
 import { readBotsJsonOrEmpty } from './setup/bots-store.js';
-import { listenWithProbe } from './utils/listen-with-probe.js';
+import { listenWithProbe, LISTEN_RELEASE_WEDGED_CODE, type VerifyBoundResult } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind,
   projectWorkbenchOperationCapabilities, previewInteractionWriteAllowed,
@@ -48,6 +51,7 @@ import {
   managementUpgradeOrigin,
 } from './dashboard/control-csrf.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
+import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
@@ -165,7 +169,7 @@ import {
 } from './services/model-catalog.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
+import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -245,6 +249,7 @@ import {
   renameGroup,
   setPinStreamingCardForGroup,
   setDefaultModelsForGroup,
+  setSerialInputForGroup,
   unbindOncall,
   type GroupsActionDeps,
   type HandlerResult as GroupsHandlerResult,
@@ -286,7 +291,7 @@ import {
   enrichPacksForDashboard,
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
-import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -332,6 +337,7 @@ import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
+import { startAutoCleanup, stopAutoCleanup, resolveCleanupHours, resolveCleanupIntervalMs } from './dashboard/auto-cleanup.js';
 import {
   compatMachineIdForAuthenticatedRequest,
   handleDesktopCompat,
@@ -606,11 +612,21 @@ const DASHBOARD_SELF_NONCE = randomBytes(16).toString('hex');
  * a 0.0.0.0 bind succeeds anyway while loopback routing favours the occupant —
  * so the dashboard would advertise a port it doesn't actually own on loopback.
  * This runs AFTER listen: dial 127.0.0.1:port/__selfcheck and require OUR nonce
- * back. A shadow answers with its own body/404 → reject → listenWithProbe steps
+ * back. A shadow answers with its own body/404 → `false` → listenWithProbe steps
  * up. Number-independent: it works no matter which port or who is shadowing.
  * Loopback-host binds can't be shadowed, so they short-circuit to true.
+ *
+ * Only an actual HTTP answer that is not ours counts as a shadow. A timeout or a
+ * connection error is `'unconfirmed'`: the request is to OUR OWN process, so
+ * "no answer in time" means this event loop did not get around to serving it —
+ * which is exactly what happens on a fleet host where 55 daemons restart at
+ * once. 2026-09 the old 2s/`false` version timed out under that load, released
+ * a port the dashboard owned, and the release wedged: no LISTEN, no tunnel, no
+ * log line, until someone restarted it by hand. listenWithProbe retries
+ * 'unconfirmed' and then keeps the port.
  */
-function verifyDashboardBinding(port: number): Promise<boolean> {
+const DASHBOARD_SELF_CHECK_TIMEOUT_MS = 10_000;
+function verifyDashboardBinding(port: number): Promise<VerifyBoundResult> {
   if (!isWildcardBindHost(config.dashboard.host)) return Promise.resolve(true);
   return new Promise((resolve) => {
     const req = httpGet({ host: '127.0.0.1', port, path: '/__selfcheck', agent: false }, (res) => {
@@ -618,9 +634,11 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
       res.setEncoding('utf8');
       res.on('data', (c) => { body += c; if (body.length > 128) req.destroy(); });
       res.on('end', () => resolve(res.statusCode === 200 && body === DASHBOARD_SELF_NONCE));
+      // Connection dropped mid-response: transport trouble, not a verdict.
+      res.on('error', () => resolve('unconfirmed'));
     });
-    req.setTimeout(2000, () => { req.destroy(); resolve(false); });
-    req.on('error', () => resolve(false));
+    req.setTimeout(DASHBOARD_SELF_CHECK_TIMEOUT_MS, () => { req.destroy(); resolve('unconfirmed'); });
+    req.on('error', () => resolve('unconfirmed'));
   });
 }
 
@@ -1085,6 +1103,13 @@ interface ResolvedDashboardSettings {
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. */
   workflow: { enabled: boolean };
+  /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
+   *  生效值（含默认回退）。 */
+  sessionCleanup: {
+    enabled: boolean;
+    olderThanHours: SessionCleanupHours;
+    intervalMinutes: number;
+  };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1665,6 +1690,11 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || isAutoUpdateSupportedInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
     workflow: { enabled: global.workflow?.enabled === true }, // default OFF
+    sessionCleanup: {
+      enabled: global.sessionCleanup?.enabled === true, // default OFF
+      olderThanHours: resolveCleanupHours(global.sessionCleanup),
+      intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
+    },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
@@ -1681,7 +1711,18 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
     fetchDaemonIpc(d.ipcPort, '/api/locale/reload', { method: 'POST' }).catch(() => undefined),
   ));
 }
-const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
+async function disableCrossPrincipalInterruptionOnAllDaemons(): Promise<void> {
+  await fanoutCrossPrincipalInterruptionDisable(
+    registry.list(),
+    fetchDaemonIpc,
+    message => logger.warn(message),
+  );
+}
+const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(
+  resolveDashboardSettings,
+  reloadLocaleOnAllDaemons,
+  disableCrossPrincipalInterruptionOnAllDaemons,
+);
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
 
@@ -2086,6 +2127,36 @@ void runCodexNotifierWorkerSupervisor({
   },
 });
 
+// bots.json for the monitor's daemon seeds, re-parsed only when the file changes.
+// loadBotConfigs() parses and validates the whole registry on every call — a
+// couple of MB on a large fleet — and the sampler asked for it every 10s, on the
+// event loop. Keyed on mtime+size so a hot edit still shows up on the next tick;
+// a read failure keeps the last good snapshot rather than throwing out of the
+// sampler's timer (which would be an uncaught exception in this process).
+let monitorBotConfigsMemo: { key: string; configs: BotConfig[] } | null = null;
+function monitorBotConfigsKey(): string | null {
+  try {
+    // getLoadedConfigPath() honours BOTS_CONFIG once the registry has been
+    // loaded at least once (it has, long before the sampler's first tick).
+    const st = statSync(getLoadedConfigPath() ?? BOTS_JSON_PATH);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return null;
+  }
+}
+function monitorBotConfigs(): BotConfig[] {
+  const key = monitorBotConfigsKey();
+  if (key !== null && monitorBotConfigsMemo?.key === key) return monitorBotConfigsMemo.configs;
+  try {
+    const configs = loadBotConfigs();
+    const loadedKey = monitorBotConfigsKey();
+    monitorBotConfigsMemo = loadedKey === null ? null : { key: loadedKey, configs };
+    return configs;
+  } catch {
+    return monitorBotConfigsMemo?.configs ?? [];
+  }
+}
+
 const resourceMonitor = createResourceMonitorService({
   intervalMs: 10_000,
   topSessionLimit: 30,
@@ -2097,7 +2168,7 @@ const resourceMonitor = createResourceMonitorService({
       .filter(s => s.status !== 'closed')
       .map(s => toResourceMonitorSessionSeed(s, names.get(String(s.larkAppId ?? ''))));
   },
-  listDaemons: () => buildResourceMonitorDaemonSeeds(loadBotConfigs(), registry.list()),
+  listDaemons: () => buildResourceMonitorDaemonSeeds(monitorBotConfigs(), registry.list()),
 });
 resourceMonitor.start();
 
@@ -2546,6 +2617,19 @@ async function handlePluginManagementApi(
     return pluginJson(res, 200, await listDashboardPluginsPayload());
   }
 
+  const settingsMatch = url.pathname.match(/^\/api\/plugins\/([^/]+)\/settings$/);
+  if (settingsMatch) {
+    return handlePluginSettingsRequest(req, res, settingsMatch[1], {
+      isInstalled: pluginId => {
+        const record = requireInstalledPlugin(pluginId);
+        return !!record && dashboardEntriesForRecord(record).length > 0;
+      },
+      resolveEntry: pluginId => resolvePluginPath(pluginRuntimeDir(pluginId), 'server/settings.js'),
+      createConfig: createConfigApi,
+      readBody: readJsonBody,
+    });
+  }
+
   let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/pin$/);
   if (match) {
     if (req.method !== 'PUT') return pluginJson(res, 405, { ok: false, error: 'method_not_allowed' });
@@ -2758,7 +2842,7 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -2768,6 +2852,7 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       // Bot Defaults endpoint.
       cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
+      cliLaunchMode: b.cliLaunchMode,
       model: b.model,
       modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
@@ -2815,6 +2900,7 @@ async function configuredBotDefaultsRecoveryRows(
           cliRuntime: bot.cliRuntime,
           cliPathOverride: bot.cliRuntime ? undefined : bot.cliPathOverride,
           wrapperCli: bot.wrapperCli,
+          cliLaunchMode: bot.cliLaunchMode,
           model: bot.model,
           modelBackendVariant: bot.modelBackendVariant,
           reasoningEffort: bot.reasoningEffort,
@@ -2826,6 +2912,7 @@ async function configuredBotDefaultsRecoveryRows(
           displayName: bot.displayName ?? null,
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
           quotaFallbackBot: rawEntry?.quotaFallbackBot,
+          autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
         });
         return {
           ...payload,
@@ -2839,18 +2926,19 @@ async function configuredBotDefaultsRecoveryRows(
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string }>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant'] }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
+  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant'] }>,
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
     cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
     cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
+    cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
     model: bot.model || fallback?.model,
     modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
@@ -3061,7 +3149,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       for (const c of j.chats ?? []) {
         const {
           oncallChat,
-          defaultModels, agentCliId, agentModel, agentReasoningEffort,
+          defaultModels, serialInput, agentCliId, agentModel, agentReasoningEffort,
           firstSeenAt,
           hasRole,
           hasMessageListener,
@@ -3087,6 +3175,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           inChat: true,
           oncallChat: oncallChat ?? null,
           defaultModels: defaultModels ?? {},
+          serialInput: serialInput === true,
           agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
@@ -3150,7 +3239,7 @@ async function closeSessionsMatching(
       const upstream = await proxyToDaemon(
         s.larkAppId as string,
         `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-        { method: 'POST' },
+        { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
       );
       const text = await upstream.text();
       let body: any = null;
@@ -3633,6 +3722,17 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
+    // Loopback self-identification (no auth): echoes this process's nonce so the
+    // post-bind shadow check (listen-with-probe verifyBound) can distinguish our
+    // server from a process shadowing 127.0.0.1:port. Returns only the nonce.
+    // FIRST, before anything that awaits: the check runs on a 10s budget while
+    // the process is still booting, and every extra loop turn on this path is a
+    // chance for startup work to land in between and push it past the deadline.
+    if (url.pathname === '/__selfcheck') {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      return res.end(DASHBOARD_SELF_NONCE);
+    }
+
     // Closed companion surface: it buffers bodies only for this exact prefix,
     // before the ordinary Dashboard auth/router touches the request stream.
     if (companionApi && await companionApi(req, res, url.search ? `${url.pathname}${url.search}` : url.pathname)) return;
@@ -3643,14 +3743,6 @@ const server = createServer(async (req, res) => {
     // Health probe (no auth) — for pm2
     if (url.pathname === '/__health') {
       return jsonRes(res, 200, { ok: true });
-    }
-
-    // Loopback self-identification (no auth): echoes this process's nonce so the
-    // post-bind shadow check (listen-with-probe verifyBound) can distinguish our
-    // server from a process shadowing 127.0.0.1:port. Returns only the nonce.
-    if (url.pathname === '/__selfcheck') {
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      return res.end(DASHBOARD_SELF_NONCE);
     }
 
     // Desktop shell compatibility probe (read-only, no token required). Keep it
@@ -4325,7 +4417,7 @@ const server = createServer(async (req, res) => {
           const upstream = await proxyToDaemon(
             s.larkAppId as string,
             `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
-            { method: 'POST' },
+            { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
           );
           const text = await upstream.text();
           let parsed: any = null;
@@ -5361,6 +5453,7 @@ const server = createServer(async (req, res) => {
           const availability = checkCliAvailability({
             cliId: o.cliId,
             wrapperCli: o.wrapperCli,
+            cliLaunchMode: o.cliLaunchMode,
           }, { shellFallback: false });
           // 静态模型候选（shell-free）：模型下拉的初始选项；live 增量由
           // /api/cli-options/models 按需探测。staticModelChoices 自身 fail-soft，
@@ -5377,6 +5470,7 @@ const server = createServer(async (req, res) => {
             available: availability.available,
             command: availability.command,
             availabilityReason: availability.reason,
+            ...(o.cliLaunchMode ? { cliLaunchMode: o.cliLaunchMode } : {}),
             modelChoices,
             // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
             ...(isTtadkWrapper(o.wrapperCli)
@@ -5432,15 +5526,17 @@ const server = createServer(async (req, res) => {
       // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
       let cliId: CliId;
       let wrapperCli: string | undefined;
+      let cliLaunchMode: BotConfig['cliLaunchMode'];
       try {
         const key = typeof parsed.cliId === 'string' && parsed.cliId.trim() ? parsed.cliId.trim() : 'claude-code';
         const sel = resolveCliSelection(key);
         cliId = sel.cliId;
         wrapperCli = sel.wrapperCli;
+        cliLaunchMode = sel.cliLaunchMode;
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
       }
-      const availability = checkCliAvailability({ cliId, wrapperCli });
+      const availability = checkCliAvailability({ cliId, wrapperCli, cliLaunchMode });
       if (!availability.available) {
         return jsonRes(res, 400, {
           ok: false,
@@ -5509,6 +5605,7 @@ const server = createServer(async (req, res) => {
         ...(registrationMode === 'web' ? { sessionMode, expectedIdentity } : {}),
         cliId,
         wrapperCli,
+        cliLaunchMode,
         workingDir,
         dirMode,
         model,
@@ -5772,6 +5869,22 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/trigger-result${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/trigger-result\/supersede$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/trigger-result/supersede`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.concat(chunks).toString('utf8'),
+      });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -6157,6 +6270,27 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Message listeners (proxy to daemon) ───────────────────────────────
+    const mGlobalListener = url.pathname.match(/^\/api\/global-message-listener\/([^/]+)$/);
+    if (mGlobalListener && (req.method === 'GET' || req.method === 'PUT')) {
+      const larkAppId = decodeURIComponent(mGlobalListener[1]);
+      const chunks: Buffer[] = [];
+      if (req.method === 'PUT') for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(larkAppId, '/api/global-message-listener', req.method === 'PUT'
+        ? { method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}' }
+        : { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
+    const mGroupListener = url.pathname.match(/^\/api\/group-message-listeners\/([^/]+)(?:\/([^/]+))?$/);
+    if (mGroupListener && (req.method === 'GET' || req.method === 'PUT')) {
+      const larkAppId = decodeURIComponent(mGroupListener[1]);
+      const chatId = mGroupListener[2] ? `/${encodeURIComponent(decodeURIComponent(mGroupListener[2]))}` : '';
+      const chunks: Buffer[] = [];
+      if (req.method === 'PUT') for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(larkAppId, `/api/group-message-listeners${chatId}`, req.method === 'PUT'
+        ? { method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}' }
+        : { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
     // GET    /api/message-listeners/:larkAppId/:chatId
     // PUT    /api/message-listeners/:larkAppId/:chatId
     // DELETE /api/message-listeners/:larkAppId/:chatId
@@ -6286,6 +6420,64 @@ const server = createServer(async (req, res) => {
       const larkAppId = decodeURIComponent(mGroupMembersDisplay[1]);
       const chatId = decodeURIComponent(mGroupMembersDisplay[2]);
       const upstream = await proxyToDaemon(larkAppId, `/api/groups/${encodeURIComponent(chatId)}/members-display`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // ─── 成员授权 / 黑名单 / 整群授权（proxy to daemon；管理写路径，不在
+    // PUBLIC_READ_PATHS，非 manager 已在 resolveDashboardRequestGate 被 deny401）───
+    let mBotBlockedUsers: RegExpMatchArray | null;
+    if ((mBotBlockedUsers = url.pathname.match(/^\/api\/bots\/([^/]+)\/blocked-users$/))) {
+      const appId = decodeURIComponent(mBotBlockedUsers[1]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(appId, '/api/blocked-users', { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(appId, '/api/blocked-users', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
+    let mBotChatGrant: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mBotChatGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/grants\/chat$/))) {
+      const appId = decodeURIComponent(mBotChatGrant[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, '/api/grants/chat', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    let mBotChatGroupGrant: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotChatGroupGrant = url.pathname.match(/^\/api\/bots\/([^/]+)\/chat-group-grant$/))) {
+      const appId = decodeURIComponent(mBotChatGroupGrant[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, '/api/chat-group-grant', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -6593,6 +6785,18 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    let mSerialInput: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mSerialInput = url.pathname.match(/^\/api\/groups\/([^/]+)\/serial-input\/([^/]+)$/))) {
+      let body: unknown;
+      try { body = await readJsonBody(req, 4096); }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const result = await setSerialInputForGroup(
+        decodeURIComponent(mSerialInput[1]), decodeURIComponent(mSerialInput[2]),
+        JSON.stringify(body), groupsActionDeps,
+      );
+      return writeHandlerResult(res, result);
+    }
+
     let mDefaultModels: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mDefaultModels = url.pathname.match(/^\/api\/groups\/([^/]+)\/default-models\/([^/]+)$/))) {
       let body: unknown;
@@ -6652,6 +6856,9 @@ const server = createServer(async (req, res) => {
               ? j.cliPathOverride ?? undefined
               : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
+            cliLaunchMode: Object.prototype.hasOwnProperty.call(j, 'cliLaunchMode')
+              ? j.cliLaunchMode ?? undefined
+              : d.cliLaunchMode,
             model: j.model || d.model,
             modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
               ? j.modelBackendVariant ?? undefined
@@ -6934,6 +7141,20 @@ const server = createServer(async (req, res) => {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (await handleOncallServiceSecret(req, res, url, { identity: requestIdentity, csrfTokens: controlCsrfTokens })) return;
+
+    const mOncallGroup = url.pathname.match(/^\/api\/bots\/([^/]+)\/oncall-group$/);
+    if (req.method === 'PUT' && mOncallGroup) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(mOncallGroup[1]), '/api/bot-oncall-group', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}',
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
@@ -7309,6 +7530,26 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/reply-delivery — proxy to that bot's daemon.
+    // Body `{ replyDelivery: 'transcript'|'send'|'' }` (''/other clears back to
+    // the default send). 最终回复投递方式的 per-bot 开关；'send' 与 'transcript'
+    // 都显式落盘。
+    let mBotReplyDelivery: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotReplyDelivery = url.pathname.match(/^\/api\/bots\/([^/]+)\/reply-delivery$/))) {
+      const appId = decodeURIComponent(mBotReplyDelivery[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-reply-delivery`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/skill-injection — proxy to that bot's daemon. Body
     // `{ skillInjection: 'global'|'prompt'|'off'|'' }` (''/other clears back to
     // the machine default). Governs how botmux built-in skills reach global-
@@ -7450,6 +7691,25 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-max-live-workers`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/idle-suspend-minutes — proxy to that bot's daemon.
+    // Body `{ idleSuspendMinutes: number | null }` (null = clear → idle TTL
+    // disabled; a positive integer sets the minutes threshold).
+    let mBotIdleTtl: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotIdleTtl = url.pathname.match(/^\/api\/bots\/([^/]+)\/idle-suspend-minutes$/))) {
+      const appId = decodeURIComponent(mBotIdleTtl[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-idle-suspend-minutes`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
@@ -7991,6 +8251,24 @@ server.headersTimeout = 80_000;
 // a second botmux instance on this host (or a stray process) holding the
 // configured port would otherwise tear the dashboard process down on bind.
 // The bound port is persisted so `botmux dashboard` can still reach us.
+//
+// Everything that makes this machine reachable from the platform hangs off the
+// resolution below (startPlatformTunnelIfBound). A bind that neither resolves
+// nor rejects is therefore "machine offline" with an empty log — so keep a
+// heartbeat on it: if we are still not listening after a while, say so, and say
+// what to look at. listenWithProbe itself is bounded and will reject rather
+// than hang; this is the belt to that suspenders.
+const LISTEN_PENDING_WARN_MS = 30_000;
+const listenStartedAt = Date.now();
+const listenPendingWarn = setInterval(() => {
+  const waitedS = Math.round((Date.now() - listenStartedAt) / 1000);
+  logger.warn(
+    `[dashboard] still not listening on ${config.dashboard.host}:${config.dashboard.port} after ${waitedS}s`
+    + ' — platform tunnel not started yet. Likely a starved event loop (check this process\'s CPU)'
+    + ' or a loopback occupant on the port; a bounded release failure will surface as an error below.',
+  );
+}, LISTEN_PENDING_WARN_MS);
+listenPendingWarn.unref();
 listenWithProbe({
   server,
   port: config.dashboard.port,
@@ -7999,6 +8277,7 @@ listenWithProbe({
   verifyBound: verifyDashboardBinding,
   log: (m) => logger.warn(`[dashboard] ${m}`),
 }).then((port) => {
+  clearInterval(listenPendingWarn);
   boundDashboardPort = port;
   try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
@@ -8008,8 +8287,47 @@ listenWithProbe({
   // (crash/restart mid-delete). Best-effort and fire-and-forget.
   sweepStoreTrash();
   startPlatformTunnelIfBound();
+  // Scheduled auto-cleanup of idle sessions (config-gated, default OFF). Runs in
+  // the dashboard process — the only one holding the cross-bot session view and
+  // the per-bot close fan-out, and a single host-wide process (so no N-way
+  // duplication). It shares the manual /cleanup-idle response handling and adds
+  // the same bounded close deadline used by the single-session action route.
+  startAutoCleanup({
+    getSessions: () => aggregator.getSessions(),
+    closeCandidate: async (s) => {
+      try {
+        const upstream = await proxyToDaemon(
+          s.larkAppId ?? '',
+          `/api/sessions/${encodeURIComponent(s.sessionId)}/close`,
+          { method: 'POST', signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs('close')) },
+        );
+        const text = await upstream.text();
+        let parsed: any = null;
+        try { parsed = JSON.parse(text); } catch { /* tolerate */ }
+        const ok = upstream.ok && parsed?.ok === true;
+        const residual = ok ? parseCloseResidual(parsed) : undefined;
+        return {
+          sessionId: s.sessionId,
+          ok,
+          ...(residual ? { residual } : {}),
+          error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
+        };
+      } catch (e: any) {
+        return { sessionId: s.sessionId, ok: false, error: e?.message ?? String(e) };
+      }
+    },
+    log: (m) => logger.info(`[auto-cleanup] ${m}`),
+  });
 }).catch((err) => {
-  logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
+  clearInterval(listenPendingWarn);
+  if ((err as NodeJS.ErrnoException).code === LISTEN_RELEASE_WEDGED_CODE) {
+    // The http server got stuck between close() and re-listen; nothing in this
+    // process can recover that. Exit so the fleet supervisor respawns a fresh
+    // one — a visible restart beats an invisible dashboard with no tunnel.
+    logger.error(`[dashboard] ${(err as Error).message} — exiting so the supervisor restarts the dashboard.`);
+  } else {
+    logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
+  }
   process.exit(1);
 });
 
@@ -8257,6 +8575,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 // Graceful shutdown
 function shutdown(): void {
   codexNotifierAbort.abort();
+  stopAutoCleanup();
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();

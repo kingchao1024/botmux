@@ -18,6 +18,7 @@ import {
   assertCanonicalBotsConfigTargetStable,
   resolveCanonicalBotsConfigTarget,
 } from '../core/config-dir.js';
+import { assertChangedBotConfigInvariants } from '../services/bot-config-invariants.js';
 
 export type BotsJsonLockCaller =
   | 'bots-store'
@@ -153,6 +154,7 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
         ? JSON.parse(readFileSync(target.targetPath, 'utf8')) as any[]
         : [];
       assertCodexInstanceConfigWrite(previous, bots);
+      assertChangedBotConfigInvariants(previous, bots);
       assertQuotaFallbackGraphAcyclic(bots);
       // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
       const tmp = target.targetPath + '.tmp';

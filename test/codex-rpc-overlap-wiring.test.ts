@@ -6,7 +6,7 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 describe('Codex RPC overlap wiring', () => {
   it('keeps ordinary RPC type-ahead behind the native terminal', () => {
     const start = workerSource.indexOf('if (rpcLifecycleFailClosedOwners.size > 0) break;');
-    const end = workerSource.indexOf('if (item.readonlyContinuation) break;', start);
+    const end = workerSource.indexOf("if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;", start);
     const tail = workerSource.slice(start, end);
 
     expect(start).toBeGreaterThanOrEqual(0);
@@ -15,7 +15,7 @@ describe('Codex RPC overlap wiring', () => {
 
   it('uses turn/steer only for an authenticated bot control with an exact native id', () => {
     const start = workerSource.indexOf('if (isTrustedRpcSteer) {');
-    const end = workerSource.indexOf('if (item.readonlyContinuation) {', start);
+    const end = workerSource.indexOf('if (item.taskContinuation', start);
     const rpcBranch = workerSource.slice(start, end);
 
     expect(start).toBeGreaterThanOrEqual(0);

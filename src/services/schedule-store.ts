@@ -74,7 +74,7 @@ export class IdempotencyConflictError extends Error {
  * Includes only the fields that callers control as task **input** (events
  * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
  *   - `creator*` (audit metadata, not input)
- *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
+ *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastRunId`, `lastError`,
  *     `lastDeliveryError` (runtime state, mutates over task lifetime)
  *   - `createdAt` (metadata)
  *   - `repeat.completed` (counter, mutates per run)
@@ -107,6 +107,10 @@ export function canonicalScheduleInput(t: {
   followActive?: boolean;
   model?: string;
   reasoningEffort?: ScheduleReasoningEffort;
+  /** Human creator whose scheduled turns authenticate workflow commands (see
+   *  scheduled-turn-provenance). Part of canonical input: the same workflow
+   *  attempt run as a different creator is a different schedule. */
+  ownerOpenId?: string;
 }): unknown {
   const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
@@ -151,6 +155,10 @@ export function canonicalScheduleInput(t: {
     // and their canonical JSON stays byte-for-byte what it was.
     model: t.model?.trim() || undefined,
     reasoningEffort: t.reasoningEffort,
+    // Absent/blank on every pre-existing and ownerless task, so the undefined
+    // slot is dropped by computeInputHash and their canonical JSON is
+    // byte-for-byte unchanged.
+    ownerOpenId: t.ownerOpenId?.trim() || undefined,
   };
 }
 
@@ -308,7 +316,7 @@ function migrate(raw: any): ScheduledTask | null {
   }
 
   const executionPosition: ScheduleExecutionPosition | undefined =
-    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic'
+    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic' || raw.executionPosition === 'task'
       ? raw.executionPosition
       : raw.deliver === 'new-topic'
         ? 'new-topic'
@@ -361,10 +369,14 @@ function migrate(raw: any): ScheduledTask | null {
     ownerOpenId: raw.ownerOpenId,
     ownerUnionId: raw.ownerUnionId,
     enabled: raw.enabled !== false,
+    disabledReason: raw.disabledReason === 'once_completed' || raw.disabledReason === 'manual'
+      ? raw.disabledReason
+      : undefined,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
     nextRunAt: raw.nextRunAt,
     lastStatus: raw.lastStatus,
+    lastRunId: raw.lastRunId,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
     repeat: raw.repeat,
@@ -547,6 +559,19 @@ function load(appId?: string): void {
   installSnapshot(nextMap, fp);
 }
 
+/** Allowed task id alphabet/width. Producers are the 8-hex legacy ids and the
+ *  workflow idempotency keys (`wf_`/`wf3_` + truncated sha256 hex, width 50);
+ *  task ids are used as schedules.json keys and per-task output-dir segments,
+ *  so anything outside [0-9a-z_] (path separators, dots, spaces) is rejected
+ *  up front. */
+const TASK_ID_RE = /^[0-9a-z_]{1,50}$/;
+
+function assertValidTaskId(id: string): void {
+  if (!TASK_ID_RE.test(id)) {
+    throw new TypeError(`invalid schedule task id: ${JSON.stringify(id)}`);
+  }
+}
+
 /**
  * Create a scheduled task — or return the existing one with the same input
  * when called with a workflow-supplied `id` that already exists.
@@ -593,6 +618,7 @@ export function createTask(params: {
   reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
   const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
+  if (params.id) assertValidTaskId(params.id);
   // Route to the OWNING bot's file: a task explicitly created for another bot
   // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
   // its daemon (the only one that executes it) can see it. Sandboxed callers
@@ -624,6 +650,7 @@ export function createTask(params: {
 
     let id = params.id ?? randomUUID().substring(0, 8);
     while (!params.id && working.has(id)) id = randomUUID().substring(0, 8);
+    assertValidTaskId(id);
     const task: ScheduledTask = {
       id,
       preconditionRef: params.preconditionRef,
@@ -679,7 +706,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): void {
@@ -702,6 +729,13 @@ export function updateTask(
         ? { ...ordinaryUpdates, deliver: 'origin' as const }
         : ordinaryUpdates,
     );
+    // Generic enable/disable writes are operator actions. Automatic one-shot
+    // completion is written directly by markRun below so the two states remain
+    // distinguishable for exact in-flight scheduled-turn authorization.
+    if (updates.enabled === true) delete task.disabledReason;
+    else if (updates.enabled === false && updates.disabledReason === undefined) {
+      task.disabledReason = 'manual';
+    }
     if (targets) {
       task.chatId = targets.chatId;
       if (targets.chatIds) task.chatIds = targets.chatIds;
@@ -711,11 +745,57 @@ export function updateTask(
   }, appId);
 }
 
+export type ScheduleRunClaimResult =
+  | { ok: true; task: ScheduledTask }
+  | { ok: false; error: 'not_found' | 'already_running' };
+
+/** Atomically claim a task for dispatch. The file lock makes this the single
+ * admission point shared by natural ticks and Dashboard run-now requests. */
+export function claimRun(
+  id: string,
+  claim: Pick<ScheduledTask, 'lastRunAt' | 'nextRunAt' | 'lastRunId'>,
+  appId?: string,
+): ScheduleRunClaimResult {
+  return mutateTasks<ScheduleRunClaimResult>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    Object.assign(task, claim, {
+      lastStatus: 'running' as const,
+      lastError: undefined,
+      lastDeliveryError: undefined,
+    });
+    return { result: { ok: true, task } as const, changed: true };
+  }, appId);
+}
+
+/** Atomically make a task due without re-arming one that is already running. */
+export function requestRunNow(
+  id: string,
+  nextRunAt = new Date().toISOString(),
+  appId?: string,
+): { ok: true } | { ok: false; error: 'not_found' | 'already_running' } {
+  return mutateTasks<{ ok: true } | { ok: false; error: 'not_found' | 'already_running' }>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    task.nextRunAt = nextRunAt;
+    return { result: { ok: true } as const, changed: true };
+  }, appId);
+}
+
 /** Record a skipped check without consuming a run or disabling a one-shot. */
-export function markSkipped(id: string, nextRunAt?: string): void {
+export function markSkipped(id: string, nextRunAt?: string, runId?: string): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     task.lastRunAt = new Date().toISOString();
     task.lastStatus = 'skipped';
@@ -730,10 +810,19 @@ export function markSkipped(id: string, nextRunAt?: string): void {
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
  */
-export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
+export function markRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  runId?: string,
+): void {
   const completedRepeat = mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     const now = new Date().toISOString();
     task.lastRunAt = now;
@@ -754,6 +843,7 @@ export function markRun(id: string, success: boolean, error?: string, deliveryEr
     // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
     if (task.parsed.kind === 'once') {
       task.enabled = false;
+      task.disabledReason = 'once_completed';
       task.nextRunAt = undefined;
     }
     return { result: undefined, changed: true };

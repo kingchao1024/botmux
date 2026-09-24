@@ -39,6 +39,9 @@ export interface FrozenCard {
   /** Whether this historical turn deliberately completed with no reply. The
    *  value belongs to this frozen card, not to the session's latest turn. */
   silentIdle?: boolean;
+  /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
+   *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
+  idleLabel?: 'silent' | 'completed';
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -65,6 +68,10 @@ export interface DaemonSession {
   /** Independent read-only xterm capability. Optional for hydrated/legacy
    * sessions; live workers publish it with their ready event. */
   workerViewToken?: string | null;
+  /** Read-only capability placed in long-lived Lark cards. Unlike
+   * workerViewToken it remains stable across worker replacement within the
+   * same logical session lifecycle. */
+  workerCardViewToken?: string | null;
   /** Latest process identity reported over the trusted worker IPC channel.
    * Used to quiesce legacy unconfined CLIs before device credentials exist. */
   localProcessAttestation?: {
@@ -72,23 +79,20 @@ export interface DaemonSession {
     credentialIsolated: boolean;
     cliPid?: number;
     cliProcStart?: string;
+    enginePid?: number;
+    engineProcStart?: string;
     workerGeneration?: number;
   };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
-  /** In-memory proof emitted by this exact worker + TraeX RPC generation. */
-  readonlyContinuationRpcProof?: {
+  /** Liveness proof for the exact worker + RPC generation. This proves only
+   * that continuation delivery will use the same live thread; it grants no
+   * permissions and carries no provider capability assumptions. */
+  taskContinuationRpcProof?: {
     workerGeneration: number;
     rpcGeneration: string;
     checkedAt: number;
-  };
-  /** Exact live synthetic turn whose hook-level native subagent requests must
-   * be denied. Derived only from trusted worker IPC for the current generation. */
-  readonlyContinuationTurnOrigin?: {
-    workerGeneration: number;
-    turnId: string;
-    dispatchAttempt: number;
   };
   larkAppId: string;
   chatId: string;
@@ -329,7 +333,7 @@ export interface DaemonSession {
   streamingCardForced?: boolean;
   /** One-shot override for the native CoT (thinking process) message: when
    *  true, the bubble renders for the current/next turn even if the chat is
-   *  in `noCotChats` or the bot-level `thinkingCard` switch is off. Flipped on
+   *  in `noCotChats` or the bot-level `cotEnabled` switch is off. Flipped on
    *  by `/cot show`; auto-cleared when that turn settles (turn_terminal), so
    *  it is a single peek, not a toggle. In-memory only. */
   cotForced?: boolean;
@@ -340,6 +344,8 @@ export interface DaemonSession {
    *  ended). Cleared on turn_terminal: a bubble created after its turn
    *  settled would never receive RUN_FINISHED and spin forever. */
   lastThinkingUpdate?: { entries: CotEntry[]; turnId: string; dispatchAttempt?: number };
+  /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
+  turnReceivedAtMs?: Map<string, number>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -353,6 +359,14 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /**
+   * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
+   * (stamped on the non-idle → idle edge, cleared on any other status). Drives
+   * the per-bot `idleSuspendMinutes` TTL. In-memory only, never persisted: a
+   * session restored after a daemon restart has no stamp and is not TTL-suspended
+   * until its next real idle edge.
+   */
+  idleSinceAt?: number;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -366,6 +380,10 @@ export interface DaemonSession {
    *  silence" from "stuck". Cleared by every new-turn entry point
    *  (beginNewTurn and both worker-exited re-fork branches). In-memory only. */
   silentIdleTurnId?: string;
+  /** transcript 模式（replyDelivery=transcript）下最终回复卡已投递成功的轮次：
+   *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
+   *  完全一致（每个新轮次入口）。内存态，不落盘。 */
+  completedIdleTurnId?: string;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -386,10 +404,19 @@ export interface DaemonSession {
   activeInteractiveTurn?: {
     turnId: string;
     caller: import('../types.js').TrustedCaller;
+    /** Business prompt before daemon-owned quote/application wrappers. Kept
+     * only in memory so an approved XPI suggestion can replay the owner's
+     * actual request instead of duplicating transport context. */
+    userPrompt?: string;
     /** Stable authenticated task/session owner, when distinct from the caller
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;
   };
+  /** Daemon-authenticated scheduled creator identities waiting for the worker
+   * to publish the matching managed-turn capability. Keyed by the exact
+   * daemon-minted schedule turn id and never persisted. The worker can name a
+   * turn id but cannot add or change the identity behind it. */
+  scheduledTurnCallers?: Map<string, TrustedCaller>;
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */
@@ -410,6 +437,11 @@ export interface DaemonSession {
     approved?: boolean;
   }>;
   crossPrincipalSuggestionConfirming?: boolean;
+  /** replyDelivery=transcript 下本轮是否 solo 会话（只有 owner 与本 bot：私聊，或
+   *  仅 owner + 本 bot 的普通群）。solo 时逐轮信封去壳：裸文本、无 <sender/>。
+   *  daemon 在构建 CLI 输入前按轮重算（resolveSoloSessionForTurn）；send 模式恒为
+   *  false 且不发额外 API。内存态，不持久化——重启后首轮重算即可。 */
+  soloSession?: boolean;
   /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
    *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
    *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
@@ -516,13 +548,14 @@ export interface DaemonSession {
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
-    status: 'pending' | 'completed' | 'failed';
+    status: 'pending' | 'completed' | 'failed' | 'interrupted';
     createdAt: number;
     completedAt?: number;
     failedAt?: number;
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;

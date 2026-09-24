@@ -209,13 +209,19 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
-  it('omits dangerous permission flags/keys AND --settings entirely when disableCliBypass is true', () => {
+  it('omits dangerous permission flags/keys when disableCliBypass is true (--settings stays for statusLine only)', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).toContain('--disallowed-tools');
     // SessionStart 就绪 hook 改走全局 settings.json（见 hookInstall.sessionStartCommand），
-    // 不再注入进程级 --settings；bypass 键也没有 → 没东西可传 → 干脆不带 --settings。
-    expect(args).not.toContain('--settings');
+    // 不再注入进程级 --settings；bypass 键也没有。claude-code 仍恒传 --settings，但只承载
+    // statusLine（→ `botmux statusline`，单值不能写全局），不含任何 bypass / hooks 键。
+    const idx = args.indexOf('--settings');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const parsed = JSON.parse(args[idx + 1]);
+    expect(Object.keys(parsed)).toEqual(['statusLine']);
+    expect(parsed.statusLine.type).toBe('command');
+    expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
@@ -350,6 +356,98 @@ describe('claude-code buildArgs', () => {
     // Omitting the arg and passing false must be identical (no accidental gate).
     expect(sysDefault).toBe(sysExplicitFalse);
     expect(shellDefault).toBe(shellExplicitFalse);
+    // 适配器层 replyDelivery 缺省（省略参数）与显式 'send' 字节相同：claude-code 的
+    // 「缺省 transcript」由 daemon（effectiveReplyDelivery）算好后经 init 冻结传入，
+    // 适配器自身不补缺省（fail-closed）。
+    expect(buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'send' })).toBe(sysDefault);
+    expect(buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'send', solo: true })).toBe(sysDefault);
+    expect(buildBotmuxShellHints('en', false, 'send').join('\n')).toBe(shellDefault);
+  });
+
+  // ── replyDelivery=transcript（claude-code 的 daemon 缺省）：最终回复由 daemon 从
+  //    转写自动转发，两条注入路径都彻底不提 botmux send——没有 send 用法、heredoc、
+  //    @ 决策、附件用法；只留改口 intro、botmux history / bots list、哨兵（fallback
+  //    的抑制规则）、workflow 与防注入。
+  it('never mentions botmux send on EITHER injection path for replyDelivery=transcript, keeps the silence sentinel', () => {
+    const sys = buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'transcript' });
+    const shell = buildBotmuxShellHints('en', false, 'transcript').join('\n');
+    for (const prompt of [sys, shell]) {
+      expect(prompt).toContain('automatically forwarded back to Lark');
+      expect(prompt).not.toContain('botmux send');
+      expect(prompt).not.toContain("<<'EOF'");
+      expect(prompt).not.toContain('--mention');
+      expect(prompt).not.toContain('--images');
+      expect(prompt).not.toContain('you MUST reply via');
+      expect(prompt).not.toContain('the only way');
+      // 以「send 是最终回复」为前提的两条提示不再注入。
+      expect(prompt).not.toContain('--response-kind final');
+      expect(prompt).not.toContain('no visible');
+      // 哨兵语义与上下文命令保留。
+      expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+      expect(prompt).toContain('botmux history');
+      expect(prompt).toContain('hidden runtime context');
+    }
+    const sysZh = buildBotmuxSystemPromptText({ locale: 'zh', replyDelivery: 'transcript' });
+    const shellZh = buildBotmuxShellHints('zh', false, 'transcript').join('\n');
+    for (const prompt of [sysZh, shellZh]) {
+      expect(prompt).toContain('自动转发回飞书');
+      expect(prompt).not.toContain('botmux send');
+      expect(prompt).not.toContain('唯一方式');
+      expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+      expect(prompt).toContain('botmux history');
+    }
+    expect(sys).not.toBe(buildBotmuxSystemPromptText({ locale: 'en' }));
+  });
+
+  it('transcript identity keeps the three routing rules minus mention_must; solo drops routing_rules; noTransport still wins', () => {
+    const solo = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
+    expect(solo).toContain('<name>Bot</name>');
+    expect(solo).toContain('<open_id>ou_x</open_id>');
+    expect(solo).not.toContain('<routing_rules>');
+    expect(solo).not.toContain('botmux send');
+    const group = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
+    expect(group).toContain('<routing_rules>');
+    expect(group).toContain('Route by @name and open_id');
+    expect(group).toContain('Do only your part');
+    expect(group).toContain('stay silent');
+    expect(group).toContain('Do not pull other bots in');
+    // mention_must 整句围绕 botmux send --mention，transcript 下不注入。
+    expect(group).not.toContain('you MUST `botmux send --mention');
+    expect(group).not.toContain('botmux send');
+    // noTransport 优先级最高：transcript 标志不改变 no-transport 的折叠输出。
+    const noTransport = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true });
+    expect(buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true, replyDelivery: 'transcript', solo: true })).toBe(noTransport);
+    expect(buildBotmuxShellHints('en', true, 'transcript')).toEqual(buildBotmuxShellHints('en', true));
+  });
+
+  it('forwards replyDelivery/solo into --append-system-prompt (claude-code daemon default = transcript, no botmux send), but v3 goal-mode pins send wording', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
+    const prompt = args[args.indexOf('--append-system-prompt') + 1];
+    expect(prompt).toContain('自动转发回飞书');
+    expect(prompt).not.toContain('botmux send');
+    expect(prompt).not.toContain("<<'EOF'");
+    expect(prompt).not.toContain('--mention');
+    expect(prompt).not.toContain('<routing_rules>');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(prompt).toContain('botmux history');
+    // 非 solo：identity 保留归属三条规则，仍不提 send。
+    const groupArgs = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
+    const groupPrompt = groupArgs[groupArgs.indexOf('--append-system-prompt') + 1];
+    expect(groupPrompt).toContain('<routing_rules>');
+    expect(groupPrompt).toContain('只做分给自己的部分');
+    expect(groupPrompt).not.toContain('botmux send');
+    const previous = process.env[GOAL_ENV.V3_MARKER];
+    process.env[GOAL_ENV.V3_MARKER] = '1';
+    try {
+      const v3 = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
+      const v3Prompt = v3[v3.indexOf('--append-system-prompt') + 1];
+      expect(v3Prompt).toContain('必须用 `botmux send`');
+      expect(v3Prompt).not.toContain('自动转发回飞书');
+      expect(v3Prompt).toContain('<routing_rules>');
+    } finally {
+      if (previous === undefined) delete process.env[GOAL_ENV.V3_MARKER];
+      else process.env[GOAL_ENV.V3_MARKER] = previous;
+    }
   });
 
   it('passes configured model with --model', () => {
@@ -369,15 +467,32 @@ describe('mimocode adapter', () => {
   const adapter = createMiMoCodeAdapter('/usr/bin/mimo');
 
   it('uses the MiMoCode executable and isolated state roots', () => {
-    expect(adapter.id).toBe('mimocode');
-    expect(adapter.resolvedBin).toBe('/usr/bin/mimo');
-    expect(adapter.authPaths).toEqual([
-      '~/.config/mimocode',
-      '~/.local/share/mimocode',
-      '~/.local/state/mimocode',
-      '~/.cache/mimocode',
-    ]);
-    expect(adapter.skillsDir).toBe('~/.config/mimocode/skills');
+    // 断言字面 `~` 默认路径时必须 hermetic：全局单测 setup（fence-home-env）会把
+    // 已存在的 XDG_* 重定向到临时 HOME（CI 预置了 XDG_CONFIG_HOME），在 describe
+    // 顶层构造会让 config 路径变成绝对路径。这里显式清空四个 XDG 变量再构造。
+    const xdgKeys = ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'];
+    const previous: Record<string, string | undefined> = {};
+    for (const k of xdgKeys) {
+      previous[k] = process.env[k];
+      delete process.env[k];
+    }
+    try {
+      const defaultAdapter = createMiMoCodeAdapter('/usr/bin/mimo');
+      expect(defaultAdapter.id).toBe('mimocode');
+      expect(defaultAdapter.resolvedBin).toBe('/usr/bin/mimo');
+      expect(defaultAdapter.authPaths).toEqual([
+        '~/.config/mimocode',
+        '~/.local/share/mimocode',
+        '~/.local/state/mimocode',
+        '~/.cache/mimocode',
+      ]);
+      expect(defaultAdapter.skillsDir).toBe('~/.config/mimocode/skills');
+    } finally {
+      for (const k of xdgKeys) {
+        if (previous[k] === undefined) delete process.env[k];
+        else process.env[k] = previous[k]!;
+      }
+    }
   });
 
   it('reuses the OpenCode-compatible prompt and model argument shape', () => {
@@ -711,6 +826,8 @@ describe('codex buildArgs', () => {
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);
@@ -726,11 +843,68 @@ describe('codex buildArgs', () => {
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);
     // a restricted bot must not silently gain hook trust either
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
+  });
+
+  it('pre-trusts the session cwd via a process-level projects override', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/srv/app' });
+    const idx = args.indexOf('projects={"/srv/app"={trust_level="trusted"}}');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-c');
+  });
+
+  it('emits no projects trust override when workingDir is absent', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+  });
+
+  it('omits the cwd trust override on a true resume (cwd is not pinned with -C)', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-sess-1', workingDir: '/srv/app',
+    });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+    expect(args).not.toContain('-C');
+  });
+
+  it('omits the cwd trust override on fork (same resumed cwd semantics as resume)', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-sess-1',
+      forkSession: true, workingDir: '/srv/app',
+    });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+    expect(args).not.toContain('-C');
+  });
+
+  it('never sends the projects trust override to the --remote app-server viewer', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-rpc', resume: true, workingDir: '/srv/app',
+      remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+    });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+  });
+
+  it('uses inline-table TOML with a quoted key so dotted cwd paths cannot split the key', () => {
+    // Dotted-key spelling projects."/a/b".trust_level breaks when the cwd itself
+    // contains dots (e.g. versioned release dirs). The inline table keeps the
+    // whole path inside one quoted TOML string.
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: false, workingDir: '/opt/app-1.2.3/work',
+    });
+    const override = args.find(a => a.startsWith('projects='));
+    expect(override).toBe('projects={"/opt/app-1.2.3/work"={trust_level="trusted"}}');
+  });
+
+  it('TOML-escapes quotes inside the cwd rather than breaking the inline table', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: false, workingDir: '/weird"dir',
+    });
+    expect(args).toContain('projects={"/weird\\"dir"={trust_level="trusted"}}');
   });
 
   it('always disables the startup update picker for botmux-managed launches', () => {
