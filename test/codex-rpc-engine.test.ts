@@ -113,6 +113,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.start();
     await engine.startThread();
     await engine.sendTurn('continue safely', readonlyOwner('readonly-1', 1));
+    await new Promise(resolve => setTimeout(resolve, 50));
     await engine.sendTurn('ordinary user turn', owner('ordinary-2', 2));
     engine.stop();
     const turns = readFileSync(turnFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -574,7 +575,7 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     engine.stop();
   });
 
-  it('keeps sequential resume/typeahead attempts isolated by native turn id', async () => {
+  it('keeps terminal-separated resume attempts isolated by native turn id', async () => {
     const terminals: any[] = [];
     const engine = makeEngine({
       sessionId: 'terminal-sequential',
@@ -583,12 +584,83 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.start();
     await engine.resumeThread('thread-persisted');
     await engine.sendTurn('one', owner('same-logical', 1));
+    await new Promise(resolve => setTimeout(resolve, 50));
     await engine.sendTurn('two', owner('same-logical', 2));
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(terminals.map(t => [t.nativeTurnId, t.identity.dispatchAttempt])).toEqual([
       ['turn-fake-1', 1],
       ['turn-fake-2', 2],
     ]);
+    engine.stop();
+  }, 20_000);
+
+  it('refuses an ordinary second turn while an exact native turn is still active', async () => {
+    let deadCount = 0;
+    const engine = makeEngine({
+      sessionId: 'ordinary-overlap',
+      env: { ...process.env, FAKE_NO_TURN_TERMINAL: '1' },
+      onDead: () => { deadCount += 1; },
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('first', owner('ordinary-first', 1)))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+
+    await expect(engine.sendTurn('second', owner('ordinary-second', 2)))
+      .rejects.toThrow('active native turn turn-fake-1');
+    expect(deadCount).toBe(0);
+    engine.stop();
+  }, 20_000);
+
+  it('steers only the exact active native turn without opening another turn', async () => {
+    const requestFile = join(tmpdir(), `fake-steer-${Math.round(performance.now())}.jsonl`);
+    const engine = makeEngine({
+      sessionId: 'exact-steer',
+      env: {
+        ...process.env,
+        FAKE_NO_TURN_TERMINAL: '1',
+        FAKE_TURN_CONFIG_FILE: requestFile,
+      },
+    });
+    await engine.start();
+    await engine.startThread();
+    const root = await engine.sendTurn('first', owner('steer-root', 1));
+
+    await expect(engine.steerTurn('change direction', root.nativeTurnId))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+    await expect(engine.steerTurn('wrong target', 'turn-not-active'))
+      .rejects.toThrow('not the current active native turn');
+
+    const requests = readFileSync(requestFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(requests).toEqual([
+      expect.objectContaining({ input: expect.any(Array) }),
+      expect.objectContaining({ expectedTurnId: 'turn-fake-1' }),
+    ]);
+    engine.stop();
+    rmSync(requestFile, { force: true });
+  }, 20_000);
+
+  it('reports a native-turn ownership conflict separately from app-server death', async () => {
+    const failures: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'steer-protocol-conflict',
+      env: {
+        ...process.env,
+        FAKE_NO_TURN_TERMINAL: '1',
+        FAKE_STEER_RESPONSE_TURN_ID: 'turn-not-the-expected-one',
+      },
+      onDead: failure => failures.push(failure),
+    });
+    await engine.start();
+    await engine.startThread();
+    const root = await engine.sendTurn('first', owner('conflict-root', 1));
+
+    await expect(engine.steerTurn('bad acknowledgement', root.nativeTurnId))
+      .rejects.toThrow('did not confirm expected native turn');
+    expect(failures).toEqual([{
+      kind: 'protocol-ownership-conflict',
+      errorCode: 'rpc_native_turn_ownership_conflict',
+    }]);
     engine.stop();
   }, 20_000);
 });
