@@ -645,6 +645,8 @@ import {
   type DaemonSession,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
+import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -1569,7 +1571,7 @@ function scheduledContinuationTrustedCaller(
 function ordinaryTurnRecoveryStillOwnsSession(ds: DaemonSession): boolean {
   if (ds.session.status !== 'active') return false;
   if (!activeSessionsRegistry) return true;
-  return activeSessionsRegistry.get(sessionKey(sessionAnchorId(ds), ds.larkAppId)) === ds;
+  return activeSessionsRegistry.get(activeSessionKey(ds)) === ds;
 }
 
 function ordinaryTurnRecoveryWarning(
@@ -3130,7 +3132,7 @@ function retainsLarkStreamingCardTransportFor(larkAppId: string, chatId: string)
 
 function ownsActiveStreamingCardRegistrySlot(ds: DaemonSession): boolean {
   if (!activeSessionsRegistry) return false;
-  const key = sessionKey(sessionAnchorId(ds), ds.larkAppId);
+  const key = activeSessionKey(ds);
   return activeSessionsRegistry.get(key) === ds;
 }
 
@@ -3139,6 +3141,8 @@ function ownsActiveStreamingCardRegistrySlot(ds: DaemonSession): boolean {
 export type StreamingCardPublicationFence = {
   session: DaemonSession['session'];
   larkAppId: string;
+  /** Registry identity captured separately from the visible Lark anchor. */
+  runtimeKey: string;
   anchorId: string;
   /** The live id expected while this POST is in flight. For resume reposts this
    * is the prior card id: it must remain current until the fresh card commits. */
@@ -3155,9 +3159,10 @@ export function canCommitStreamingCardPublication(
 ): boolean {
   if (ds.session !== fence.session || ds.session.status !== 'active') return false;
   if (ds.larkAppId !== fence.larkAppId || sessionAnchorId(ds) !== fence.anchorId) return false;
+  if (activeSessionKey(ds) !== fence.runtimeKey) return false;
   if (ds.streamCardId !== fence.expectedPriorCardId || isSessionTransferring(ds)) return false;
   if (remoteRetirementAdmissionPhase(ds) !== null || !retainsLarkStreamingCardTransport(ds)) return false;
-  return activeSessionsRegistry?.get(sessionKey(fence.anchorId, fence.larkAppId)) === ds;
+  return activeSessionsRegistry?.get(fence.runtimeKey) === ds;
 }
 
 function ownsCurrentStreamingCard(ds: DaemonSession, messageId: string): boolean {
@@ -3533,7 +3538,7 @@ function snapshotBotStreamingCardReconcileSessions(larkAppId: string): DaemonSes
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.status !== 'active') continue;
     if (isSessionTransferring(ds)) continue;
-    const key = sessionKey(sessionAnchorId(ds), ds.larkAppId);
+    const key = activeSessionKey(ds);
     if (activeSessionsRegistry.get(key) !== ds) continue;
     sessions.set(ds.session.sessionId, ds);
   }
@@ -3957,8 +3962,8 @@ async function postTurnStartingStatusCard(
   const generation = ds.streamCardTurnGeneration ?? 0;
   const sessionAtPost = ds.session;
   const larkAppIdAtPost = ds.larkAppId;
-  const anchorAtPost = sessionAnchorId(ds);
-  const registryKeyAtPost = sessionKey(anchorAtPost, larkAppIdAtPost);
+  const displayAnchorAtPost = sessionAnchorId(ds);
+  const runtimeKeyAtPost = activeSessionKey(ds);
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
   const previousCardId = ds.streamCardId;
@@ -3974,7 +3979,7 @@ async function postTurnStartingStatusCard(
   const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
-    sessionAnchorId(ds),
+    displayAnchorAtPost,
     readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     '',
@@ -4003,11 +4008,12 @@ async function postTurnStartingStatusCard(
     ds.session === sessionAtPost
     && ds.session.status === 'active'
     && ds.larkAppId === larkAppIdAtPost
-    && sessionAnchorId(ds) === anchorAtPost
+    && sessionAnchorId(ds) === displayAnchorAtPost
+    && activeSessionKey(ds) === runtimeKeyAtPost
     && !isSessionTransferring(ds)
     && ds.streamCardId === CARD_POSTING_SENTINEL
     && ds.streamCardNonce === nonce
-    && activeSessionsRegistry?.get(registryKeyAtPost) === ds;
+    && activeSessionsRegistry?.get(runtimeKeyAtPost) === ds;
   const stillOwnsPost = (): boolean =>
     ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null;
   const restorePrePostIdentityForRetirement = (): boolean => {
@@ -4018,9 +4024,10 @@ async function postTurnStartingStatusCard(
     persistStreamCardState(ds);
     return true;
   };
+  if (!stillOwnsPost()) return false;
   try {
     const messageId = await sessionReply(
-      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, cardReplyTarget.turnId,
+      displayAnchorAtPost, cardJson, 'interactive', larkAppIdAtPost, cardReplyTarget.turnId,
     );
     if (!stillOwnsPost()) {
       void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -4107,15 +4114,15 @@ export async function postFreshStreamingCard(
   const prevPending = ds.streamCardPending;
   const sessionAtPost = ds.session;
   const appIdAtPost = ds.larkAppId;
-  const anchorAtPost = sessionAnchorId(ds);
-  const registryKeyAtPost = sessionKey(anchorAtPost, appIdAtPost);
+  const displayAnchorAtPost = sessionAnchorId(ds);
+  const runtimeKeyAtPost = activeSessionKey(ds);
   const cardReplyTarget = captureStreamingCardReplyTarget(ds);
 
   const postingNonce = randomBytes(4).toString('hex');
   ds.streamCardNonce = postingNonce;
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
-    sessionAnchorId(ds),
+    displayAnchorAtPost,
     readUrl,
     title,
     ds.lastScreenContent ?? '',
@@ -4142,11 +4149,12 @@ export async function postFreshStreamingCard(
     ds.session === sessionAtPost
     && ds.session.status === 'active'
     && ds.larkAppId === appIdAtPost
-    && sessionAnchorId(ds) === anchorAtPost
+    && sessionAnchorId(ds) === displayAnchorAtPost
+    && activeSessionKey(ds) === runtimeKeyAtPost
     && !isSessionTransferring(ds)
     && ds.streamCardId === CARD_POSTING_SENTINEL
     && ds.streamCardNonce === postingNonce
-    && activeSessionsRegistry?.get(registryKeyAtPost) === ds;
+    && activeSessionsRegistry?.get(runtimeKeyAtPost) === ds;
   const restorePrePostIdentityForRetirement = (): boolean => {
     if (remoteRetirementAdmissionPhase(ds) === null || !ownsPost()) return false;
     ds.streamCardId = prevCardId;
@@ -4160,9 +4168,10 @@ export async function postFreshStreamingCard(
     ownsPost()
     && remoteRetirementAdmissionPhase(ds) === null
     && retainsLarkStreamingCardTransport(ds);
+  if (!stillOwnsPost()) return false;
   try {
     const messageId = await sessionReply(
-      anchorAtPost, cardJson, 'interactive', appIdAtPost, cardReplyTarget.turnId,
+      displayAnchorAtPost, cardJson, 'interactive', appIdAtPost, cardReplyTarget.turnId,
     );
     if (!stillOwnsPost()) {
       void deleteMessage(appIdAtPost, messageId).catch(() => { /* stale result */ });
@@ -8497,9 +8506,48 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
   return true;
 }
 
+export function ensurePrincipalLaneInboundTurnBinding(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+): void {
+  if (ds.session.principalLane) {
+    const binding = freezePrincipalLaneTurnBinding(ds, turnId, workerGeneration!, turnId)!;
+    const existing = sessionStore.readTrustedMessageProvenance(
+      turnId, binding.sourceSessionId,
+    );
+    if (!existing) {
+      const now = new Date().toISOString();
+      sessionStore.recordMessageProvenance({
+        messageId: turnId,
+        larkAppId: binding.larkAppId,
+        chatId: ds.chatId,
+        ...(ds.scope === 'thread' ? { displayRootId: ds.session.rootMessageId } : {}),
+        sourceSessionId: binding.sourceSessionId,
+        laneId: binding.laneId,
+        sessionId: binding.sessionId,
+        turnId: binding.turnId,
+        principalKey: binding.principalKey,
+        workerGeneration: binding.workerGeneration,
+        direction: 'inbound',
+        trustState: 'trusted',
+        createdAt: now,
+        updatedAt: now,
+      });
+    } else if (existing.direction !== 'inbound'
+        || existing.sessionId !== binding.sessionId
+        || existing.laneId !== binding.laneId
+        || existing.turnId !== binding.turnId
+        || existing.workerGeneration !== binding.workerGeneration) {
+      throw new Error('principal-lane inbound provenance identity conflict');
+    }
+  }
+}
+
 function sendOrdinaryImDeliveryTracked(
   ds: DaemonSession,
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
+  onIpcDispatchAttempted?: () => void,
 ): boolean {
   const turnId = message.turnId;
   const worker = ds.worker;
@@ -8507,6 +8555,7 @@ function sendOrdinaryImDeliveryTracked(
   if (!turnId || !worker || worker.killed || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0) {
     return false;
   }
+  ensurePrincipalLaneInboundTurnBinding(ds, turnId, workerGeneration!);
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration!);
   if (pendingOrdinaryImDeliveries.has(key)) return true;
   const record: OrdinaryImDelivery = {
@@ -8522,6 +8571,7 @@ function sendOrdinaryImDeliveryTracked(
     delayNotified: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
+  onIpcDispatchAttempted?.();
   return sendOrdinaryImDeliveryAttempt(record);
 }
 
@@ -9095,7 +9145,7 @@ export async function transferSession(
   const sourceAnchor = sessionAnchorId(ds);
   const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootMessageId;
   if (targetAnchor === sourceAnchor) return { ok: false, error: 'same_anchor' };
-  const sourceKey = sessionKey(sourceAnchor, ds.larkAppId);
+  const sourceRuntimeKey = activeSessionKey(ds);
   const targetKey = sessionKey(targetAnchor, ds.larkAppId);
   const validateSourceIdentity = (): { ok: false; error: string } | undefined => {
     if (
@@ -9114,7 +9164,8 @@ export async function transferSession(
         runtimeWorkingDir: ds.workingDir,
         runtimeAdoptedFrom: ds.adoptedFrom,
       }) !== sourceLifecycleIdentity
-      || activeSessionsRegistry?.get(sourceKey) !== ds
+      || activeSessionKey(ds) !== sourceRuntimeKey
+      || activeSessionsRegistry?.get(sourceRuntimeKey) !== ds
     ) {
       return { ok: false, error: 'session_not_active' };
     }
@@ -9255,6 +9306,7 @@ export async function transferSession(
 
   const tagPrefix = sessionId.substring(0, 8);
   const oldAnchor = sessionAnchorId(ds);
+  const oldRuntimeKey = activeSessionKey(ds);
   const oldChatId = ds.chatId;
   const oldStreamCardId = ds.streamCardId;
   const sourcePinnedStreamingTargets = captureLifecycleStreamingCardCleanupTargets(
@@ -9325,7 +9377,9 @@ export async function transferSession(
       logger.warn(`[${tagPrefix}] build source-chat frozen card failed: ${err instanceof Error ? err.message : err}`);
     }
   }
-  activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
+  if (activeSessionsRegistry?.get(oldRuntimeKey) === ds) {
+    activeSessionsRegistry.delete(oldRuntimeKey);
+  }
 
   // Rewrite routing fields per the requested target scope.
   //   chat-scope:   routes by chatId; `targetRootMessageId` (e.g. an M1 id) is
@@ -9358,8 +9412,9 @@ export async function transferSession(
   sessionStore.updateSession(ds.session);
 
   const newAnchor = sessionAnchorId(ds);
+  const newRuntimeKey = activeSessionKey(ds);
   if (activeSessionsRegistry) {
-    if (!setActiveSessionIfActive(activeSessionsRegistry, sessionKey(newAnchor, ds.larkAppId), ds)) {
+    if (!setActiveSessionIfActive(activeSessionsRegistry, newRuntimeKey, ds)) {
       return { ok: false, error: 'session_not_active' };
     }
   }
@@ -9400,7 +9455,7 @@ export async function transferSession(
   if (
     ds.session.status === 'active'
     && (!activeSessionsRegistry
-      || activeSessionsRegistry.get(sessionKey(newAnchor, ds.larkAppId)) === ds)
+      || activeSessionsRegistry.get(newRuntimeKey) === ds)
   ) {
     try {
       forkTransferReplacement(ds, fkw);
@@ -9427,7 +9482,7 @@ export async function transferSession(
       && !routingCommitted
       && ds.session.status === 'active'
       && (!activeSessionsRegistry
-        || activeSessionsRegistry.get(sourceKey) === ds)
+        || activeSessionsRegistry.get(sourceRuntimeKey) === ds)
     ) {
       // A target/device/lifecycle race after a successful detach leaves the
       // routing on the source. Reattach even when no user input happened
@@ -10678,7 +10733,7 @@ function deliverPendingMojoQuarantineNotice(
     ds.larkAppId,
     // The turn that actually carried this delivery, not a stale reply target.
     turnId,
-    ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+    { sourceSessionId: ds.session.sessionId },
   ).then(markDelivered).catch((err) => {
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
@@ -10721,7 +10776,7 @@ function deliverPendingMojoLegacyPinNotice(
     'text',
     ds.larkAppId,
     turnId,
-    ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+    { sourceSessionId: ds.session.sessionId },
   ).then(() => {
     ds.session.mojoLegacyPinNoticePending = false;
     // Best-effort, same as the queueing side (review N2): the notice IS
@@ -10992,6 +11047,10 @@ export type ForkResumeOrTurnId = boolean | string | {
    * invoked with reserveWorkerGeneration's actual result after every earlier
    * fork gate has passed and before a worker is replaced or spawned. */
   onWorkerGenerationReserved?: (workerGeneration: number) => void;
+  /** Fires at the exact boundary where the opening turn may enter worker IPC.
+   * Errors before this callback are proven not-dispatched and remain retryable;
+   * errors after it are commit-unknown and must not replay automatically. */
+  onIpcDispatchAttempted?: () => void;
 };
 
 export type WorkerForkAdmission = 'accepted' | 'deferred' | 'rejected';
@@ -11279,6 +11338,7 @@ export function forkWorker(
   let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
   let initAtMostOnce: boolean | undefined;
   let onWorkerGenerationReserved: ((workerGeneration: number) => void) | undefined;
+  let onIpcDispatchAttempted: (() => void) | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
@@ -11289,6 +11349,7 @@ export function forkWorker(
     initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
     initAtMostOnce = resumeOrTurnId.atMostOnce;
     onWorkerGenerationReserved = resumeOrTurnId.onWorkerGenerationReserved;
+    onIpcDispatchAttempted = resumeOrTurnId.onIpcDispatchAttempted;
   } else {
     resume = resumeOrTurnId;
   }
@@ -11397,7 +11458,7 @@ export function forkWorker(
         'text',
         ds.larkAppId,
         fallbackTurnId(ds, initTurnId),
-        ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+        { sourceSessionId: ds.session.sessionId },
       ).catch(error => logger.error(
         `[${tag(ds)}] Failed to report blocked worker admission: `
         + `${error instanceof Error ? error.message : String(error)}`,
@@ -11661,6 +11722,9 @@ export function forkWorker(
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
   onWorkerGenerationReserved?.(workerGeneration);
+  if (initAttributionTurnId?.startsWith('om_')) {
+    ensurePrincipalLaneInboundTurnBinding(ds, initAttributionTurnId, workerGeneration);
+  }
 
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
@@ -11988,9 +12052,7 @@ export function forkWorker(
       fallbackTurnId(ds, initAttributionTurnId),
       // A meeting-driven turn (listener_thread delivery) that DOES surface must
       // still attribute to the meeting session so the send policy resolves it.
-      forkErrorMeetingDriven
-        ? { sourceSessionId: ds.session.sessionId }
-        : undefined,
+      { sourceSessionId: ds.session.sessionId },
     ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
   });
 
@@ -12260,9 +12322,12 @@ export function forkWorker(
   initializeWorkerIpcBootstrap(worker);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
-    sendOrdinaryImDeliveryTracked(ds, initMsg);
+    sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted);
   } else {
-    afterWorkerIpcBootstrap(worker, () => worker.send(initMsg));
+    afterWorkerIpcBootstrap(worker, () => {
+      onIpcDispatchAttempted?.();
+      worker.send(initMsg);
+    });
   }
   if (prompt.length > 0) {
     recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId ?? `admitted-turn-${randomUUID()}`, {
@@ -12608,21 +12673,27 @@ function setupWorkerHandlers(
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
-  const scopedReply = (
+  const scopedReplyTo = (
+    displayAnchor: string,
+    larkAppId: string,
     content: string,
     msgType?: string,
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => cb.sessionReply(
-    sessionAnchorId(ds),
+    displayAnchor,
     content,
     msgType,
-    ds.larkAppId,
+    larkAppId,
     fallbackTurnId(ds, turnId),
-    ds.session.vcMeetingReceiver
-      ? { ...opts, sourceSessionId: ds.session.sessionId }
-      : opts,
+    { ...opts, sourceSessionId: ds.session.sessionId },
   );
+  const scopedReply = (
+    content: string,
+    msgType?: string,
+    turnId?: string,
+    opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
+  ) => scopedReplyTo(sessionAnchorId(ds), ds.larkAppId, content, msgType, turnId, opts);
   const ordinaryManagedSuppression = (
     turnId?: string,
     dispatchAttempt?: number,
@@ -13110,16 +13181,17 @@ function setupWorkerHandlers(
         if (restoredCardId) {
           const restoredSession = ds.session;
           const restoredAppId = ds.larkAppId;
-          const restoredAnchor = sessionAnchorId(ds);
-          const restoredRegistryKey = sessionKey(restoredAnchor, restoredAppId);
+          const restoredDisplayAnchor = sessionAnchorId(ds);
+          const restoredRuntimeKey = activeSessionKey(ds);
           const ownsRestoredCard = (): boolean =>
             ds.session === restoredSession
             && ds.session.status === 'active'
             && ds.larkAppId === restoredAppId
-            && sessionAnchorId(ds) === restoredAnchor
+            && sessionAnchorId(ds) === restoredDisplayAnchor
+            && activeSessionKey(ds) === restoredRuntimeKey
             && !isSessionTransferring(ds)
             && ds.streamCardId === restoredCardId
-            && activeSessionsRegistry?.get(restoredRegistryKey) === ds;
+            && activeSessionsRegistry?.get(restoredRuntimeKey) === ds;
           try {
             const initTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
             // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
@@ -13135,7 +13207,7 @@ function setupWorkerHandlers(
             const codexTierAtBuild = ds.codexServiceTier;
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
-              sessionAnchorId(ds),
+              restoredDisplayAnchor,
               readOnlyUrl,
               initTitle,
               ds.lastScreenContent ?? '',
@@ -13157,8 +13229,9 @@ function setupWorkerHandlers(
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
-            await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
-            if (!ownsLifecycleMutation()) break;
+            if (!ownsLifecycleMutation() || !ownsRestoredCard()) break;
+            await updateMessage(restoredAppId, restoredCardId, streamCardJson);
+            if (!ownsLifecycleMutation() || !ownsRestoredCard()) break;
             ds.parkedStreamCardNonce = undefined;
             // Worker IPC handlers may run while the direct restore PATCH is in
             // flight. Re-queue readiness after it completes so an older
@@ -13204,8 +13277,8 @@ function setupWorkerHandlers(
         const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
         const postingSession = ds.session;
         const postingAppId = ds.larkAppId;
-        const postingAnchor = sessionAnchorId(ds);
-        const postingRegistryKey = sessionKey(postingAnchor, postingAppId);
+        const postingDisplayAnchor = sessionAnchorId(ds);
+        const postingRuntimeKey = activeSessionKey(ds);
         ds.streamCardId = CARD_POSTING_SENTINEL;
         let ownsFreshReadyPost = (): boolean => false;
         let restoreFreshReadyPrePostIdentityForRetirement = (): boolean => false;
@@ -13217,11 +13290,12 @@ function setupWorkerHandlers(
             ds.session === postingSession
             && ds.session.status === 'active'
             && ds.larkAppId === postingAppId
-            && sessionAnchorId(ds) === postingAnchor
+            && sessionAnchorId(ds) === postingDisplayAnchor
+            && activeSessionKey(ds) === postingRuntimeKey
             && !isSessionTransferring(ds)
             && ds.streamCardId === CARD_POSTING_SENTINEL
             && ds.streamCardNonce === postingNonce
-            && activeSessionsRegistry?.get(postingRegistryKey) === ds;
+            && activeSessionsRegistry?.get(postingRuntimeKey) === ds;
           restoreFreshReadyPrePostIdentityForRetirement = (): boolean => {
             if (remoteRetirementAdmissionPhase(ds) === null || !ownsFreshReadyPost()) return false;
             ds.streamCardId = undefined;
@@ -13241,7 +13315,7 @@ function setupWorkerHandlers(
             : (ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting'));
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
-            sessionAnchorId(ds),
+            postingDisplayAnchor,
             readOnlyUrl,
             initTitle,
             // For /relay resume, ds.lastScreenContent is the cached pane
@@ -13267,8 +13341,13 @@ function setupWorkerHandlers(
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           );
-          const postedCardId = await scopedReply(
-            streamCardJson, 'interactive', cardReplyTarget.turnId,
+          if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) break;
+          const postedCardId = await scopedReplyTo(
+            postingDisplayAnchor,
+            postingAppId,
+            streamCardJson,
+            'interactive',
+            cardReplyTarget.turnId,
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) {
             void deleteMessage(postingAppId, postedCardId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -13918,18 +13997,19 @@ function setupWorkerHandlers(
           ds.streamCardId = CARD_POSTING_SENTINEL;
           const postingSession = ds.session;
           const postingAppId = ds.larkAppId;
-          const postingAnchor = sessionAnchorId(ds);
-          const postingRegistryKey = sessionKey(postingAnchor, postingAppId);
+          const postingDisplayAnchor = sessionAnchorId(ds);
+          const postingRuntimeKey = activeSessionKey(ds);
           const postingNonce = ds.streamCardNonce;
           const ownsFreshScreenPost = (): boolean =>
             ds.session === postingSession
             && ds.session.status === 'active'
             && ds.larkAppId === postingAppId
-            && sessionAnchorId(ds) === postingAnchor
+            && sessionAnchorId(ds) === postingDisplayAnchor
+            && activeSessionKey(ds) === postingRuntimeKey
             && !isSessionTransferring(ds)
             && ds.streamCardId === CARD_POSTING_SENTINEL
             && ds.streamCardNonce === postingNonce
-            && activeSessionsRegistry?.get(postingRegistryKey) === ds;
+            && activeSessionsRegistry?.get(postingRuntimeKey) === ds;
           const restoreFreshScreenPrePostIdentityForRetirement = (): boolean => {
             if (remoteRetirementAdmissionPhase(ds) === null || !ownsFreshScreenPost()) return false;
             ds.streamCardId = undefined;
@@ -13941,7 +14021,14 @@ function setupWorkerHandlers(
             && remoteRetirementAdmissionPhase(ds) === null
             && retainsLarkStreamingCardTransport(ds);
           const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
-          scopedReply(cardJson, 'interactive', cardReplyTarget.turnId)
+          if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) break;
+          scopedReplyTo(
+            postingDisplayAnchor,
+            postingAppId,
+            cardJson,
+            'interactive',
+            cardReplyTarget.turnId,
+          )
             .then(async msgId => {
               if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) {
                 void deleteMessage(postingAppId, msgId).catch(() => { /* best-effort stale-card cleanup */ });
@@ -14868,9 +14955,56 @@ function setupWorkerHandlers(
       }
 
       case 'explicit_reply_observed': {
-        if (ds.worker !== worker) {
+        if (ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration) {
           logger.warn(`[${t}] Ignored explicit_reply_observed from stale worker generation`);
           break;
+        }
+        if (ds.session.principalLane && msg.messageId) {
+          const binding = readPrincipalLaneTurnBinding(ds, msg.turnId);
+          if (!binding
+            || binding.workerGeneration !== workerGeneration
+            || activeSessionsRegistry?.get(binding.runtimeKey) !== ds) {
+            logger.warn(
+              `[${t}] Ignored explicit_reply_observed without current principal-lane authority `
+              + `turn=${msg.turnId.substring(0, 16)} generation=${workerGeneration}`,
+            );
+          } else {
+            const now = new Date().toISOString();
+            settlePrincipalLaneOutboundProvenance({
+              messageId: msg.messageId,
+              larkAppId: binding.larkAppId,
+              chatId: ds.chatId,
+              ...(ds.scope === 'thread' ? { displayRootId: ds.session.rootMessageId } : {}),
+              sourceSessionId: binding.sourceSessionId,
+              laneId: binding.laneId,
+              sessionId: binding.sessionId,
+              turnId: binding.turnId,
+              principalKey: binding.principalKey,
+              workerGeneration: binding.workerGeneration,
+              direction: 'outbound',
+              trustState: 'trusted',
+              createdAt: now,
+              updatedAt: now,
+            }, {
+              beginTrustAttempt: value => sessionStore.beginMessageProvenanceTrustAttempt(value),
+              recordTrusted: (value, attemptId) => {
+                sessionStore.recordMessageProvenance(value, attemptId);
+              },
+              completeTrustAttempt: (value, attemptId) => {
+                sessionStore.completeMessageProvenanceTrustAttempt(value, attemptId);
+              },
+              abortTrustAttempt: (value, attemptId) => {
+                sessionStore.abortMessageProvenanceTrustAttempt(value, attemptId);
+              },
+              markUntrusted: value => { sessionStore.markMessageProvenanceUntrusted(value); },
+              warn: message => logger.warn(
+                `[principal-lane:${binding.larkAppId}] `
+                + `message=${msg.messageId!.substring(0, 12)} ${message}`,
+              ),
+            });
+          }
         }
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewReplied(msg.turnId, {
@@ -16553,9 +16687,7 @@ function deliverFinalOutput(
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    ds.session.vcMeetingReceiver
-      ? { ...opts, sourceSessionId: ds.session.sessionId }
-      : opts,
+    { ...opts, sourceSessionId: ds.session.sessionId },
   );
   setTimeout(async () => {
     if (!isStillOwned()) {
@@ -17185,6 +17317,7 @@ export function forkAdoptWorker(
     atMostOnce?: boolean;
     trustedCaller?: TrustedCaller;
     onWorkerGenerationReserved?: (workerGeneration: number) => void;
+    onIpcDispatchAttempted?: () => void;
   },
 ): 'accepted' | 'rejected' {
   if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
@@ -17465,7 +17598,10 @@ export function forkAdoptWorker(
   setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
   ds.worker = worker;
   initializeWorkerIpcBootstrap(worker);
-  afterWorkerIpcBootstrap(worker, () => worker.send(initMsg));
+  afterWorkerIpcBootstrap(worker, () => {
+    opts?.onIpcDispatchAttempted?.();
+    worker.send(initMsg);
+  });
   } catch (err) {
     if (ds.worker === worker) ds.worker = null;
     try { worker.kill(); } catch { /* best-effort pre-init child fence */ }

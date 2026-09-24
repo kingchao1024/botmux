@@ -1,3 +1,4 @@
+import { parseLinkDestination } from 'markdown-it/lib/helpers/index.mjs';
 import type {
   AskCardDispatcher,
   AskClickOutcome,
@@ -439,11 +440,8 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
       elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
-        },
+        tag: 'markdown',
+        content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
       });
     }
     elements.push({ tag: 'hr' });
@@ -461,7 +459,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
       // 问题标题
       elements.push({
         tag: 'markdown',
-        content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+        content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
       });
 
       const selected = new Set(selections[i] ?? []);
@@ -721,6 +719,28 @@ function appendActionRows(elements: Array<Record<string, unknown>>, actions: Arr
 function truncate(s: string, maxChars: number, locale?: Locale): string {
   if (s.length <= maxChars) return s || t('common.empty_paren', undefined, locale);
   return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
+}
+
+/** Keep labelled web links usable without enabling arbitrary question markup. */
+function escapeQuestion(s: string): string {
+  let cursor = 0;
+  let rendered = '';
+  for (const match of s.matchAll(/\[([^\]\r\n]+)\]\(/g)) {
+    const start = match.index!;
+    if (start < cursor || s[start - 1] === '!') continue;
+    const escapes = s.slice(0, start).match(/\\+$/)?.[0].length ?? 0;
+    if (escapes % 2) continue;
+    const destination = parseLinkDestination(s, start + match[0].length, s.length);
+    if (!destination.ok || s[destination.pos] !== ')') continue;
+    let url: URL;
+    try { url = new URL(destination.str); } catch { continue; }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
+    // Parentheses are legal URL characters but must not terminate a Markdown link.
+    const href = url.href.replace(/\(/g, '%28').replace(/\)/g, '%29');
+    rendered += escapeMd(s.slice(cursor, start)) + `[${escapeMd(match[1]!)}](${href})`;
+    cursor = destination.pos + 1;
+  }
+  return rendered + escapeMd(s.slice(cursor));
 }
 
 function escapeMd(s: string): string {

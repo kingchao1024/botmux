@@ -1372,15 +1372,15 @@ describe('codex writeInput submission confirmation', () => {
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1396,15 +1396,15 @@ describe('codex writeInput submission confirmation', () => {
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
       workingDir: '/repo/root',
     })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1417,15 +1417,15 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       'new-codex-session',
     ]);
   });
@@ -1439,15 +1439,15 @@ describe('codex writeInput submission confirmation', () => {
       appendCodexHistory('<session_id>custom-botmux-session</session_id>', 'custom-codex-session');
       const adapter = createCodexAdapter('/bin/codex');
       expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'custom-botmux-session', resume: true })).toEqual([
-        'resume',
-        '--dangerously-bypass-approvals-and-sandbox',
-        '--no-alt-screen',
         '-c',
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         '-c',
         'check_for_update_on_startup=false',
         '-c',
         'notice.hide_rate_limit_model_nudge=true',
+        'resume',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--no-alt-screen',
         'custom-codex-session',
       ]);
 
