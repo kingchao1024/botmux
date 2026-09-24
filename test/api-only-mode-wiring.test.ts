@@ -808,7 +808,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     const helperCall = region(
       daemonSource,
       'await restoreSessionsAndScheduleStartupRecovery({',
-      '\n\n  // Close CoT thinking bubbles orphaned by the previous daemon generation',
+      '\n\n  // Restore complete:',
     );
     expect(helperCall).toContain(
       'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {',
