@@ -116,10 +116,10 @@ export interface CodexRpcEngineOpts {
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
    *  Mainly for tests that assert the wedged-app-server recovery path. */
   requestTimeoutMs?: number;
-  /** Called once if the app-server dies unexpectedly (not via stop()). The
-   *  worker uses it to kill the now-orphaned `codex --remote` pane so the normal
-   *  exit→daemon-refork→resume path re-engages RPC on a fresh app-server (P1). */
-  onDead?: () => void;
+  /** Called once when this engine can no longer safely continue (not via
+   * stop()). The worker uses the reason to distinguish an app-server outage
+   * from a native-turn ownership protocol conflict before replacing the pane. */
+  onDead?: (failure: CodexRpcEngineFailure) => void;
   /** Authoritative native turn terminal. `turn/start` returns a native Codex
    *  turn id which this engine binds to the exact Botmux delivery attempt before
    *  resolving the ack. The worker uses that identity to release only the
@@ -165,6 +165,11 @@ export interface CodexRpcTurnTerminal {
   nativeTurnId: string;
   status: CodexRpcTurnTerminalStatus;
   errorCode?: string;
+}
+
+export interface CodexRpcEngineFailure {
+  kind: 'app-server-unavailable' | 'protocol-ownership-conflict';
+  errorCode: 'rpc_engine_dead' | 'rpc_native_turn_ownership_conflict';
 }
 
 /** Server→client requests are auto-answered so codex never blocks on a human;
@@ -246,6 +251,13 @@ export class CodexRpcEngine {
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
   get appServerPid(): number | undefined { return this.child?.pid; }
+  /** The only native turn this engine currently owns. Multiple native turns are
+   * never a valid state for Botmux RPC input, so callers must not guess when
+   * ownership is absent or ambiguous. */
+  get activeNativeTurnId(): string | undefined {
+    if (this.turnOwners.size !== 1) return undefined;
+    return this.turnOwners.keys().next().value as string | undefined;
+  }
 
   private ownerKey(identity: CodexRpcTurnIdentity): string {
     return `${identity.turnId}\0${identity.dispatchAttempt ?? ''}`;
@@ -449,6 +461,12 @@ export class CodexRpcEngine {
     opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
   ): Promise<{ nativeTurnId: string }> {
     if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
+    const activeNativeTurnId = this.activeNativeTurnId;
+    if (activeNativeTurnId) {
+      throw new Error(
+        `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
+      );
+    }
     const readonlyContinuation = identity.readonlyContinuation === true;
     const params: Json = {
       threadId: this.threadId,
@@ -485,6 +503,34 @@ export class CodexRpcEngine {
     }
     const nativeTurnId = this.takeNativeTurnId(identity);
     if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
+    return { nativeTurnId };
+  }
+
+  /** Deliver a pre-authorized control into one exact active native turn. This
+   * deliberately owns no second Botmux lifecycle: the existing owner remains
+   * authoritative for the native terminal and the caller must queue if it
+   * cannot prove the expected native id. */
+  async steerTurn(
+    content: string,
+    expectedTurnId: string,
+  ): Promise<{ nativeTurnId: string }> {
+    if (!this.threadId) throw new Error('steerTurn before startThread/resumeThread');
+    if (!expectedTurnId || this.activeNativeTurnId !== expectedTurnId) {
+      throw new Error(`refusing turn/steer: ${expectedTurnId || 'missing'} is not the current active native turn`);
+    }
+    const result = await this.request('turn/steer', {
+      threadId: this.threadId,
+      input: [{ type: 'text', text: content, text_elements: [] }],
+      expectedTurnId,
+    });
+    const nativeTurnId = String(result?.turnId ?? result?.turn?.id ?? '');
+    if (nativeTurnId !== expectedTurnId) {
+      const error = new Error(
+        `turn/steer response did not confirm expected native turn ${expectedTurnId}`,
+      );
+      this.failAll(error);
+      throw error;
+    }
     return { nativeTurnId };
   }
 
@@ -1245,14 +1291,23 @@ export class CodexRpcEngine {
   }
 
   private failAll(err: Error): void {
+    const failure: CodexRpcEngineFailure = /native turn .*rebound|turn\/steer response did not confirm/.test(err.message)
+      ? {
+          kind: 'protocol-ownership-conflict',
+          errorCode: 'rpc_native_turn_ownership_conflict',
+        }
+      : {
+          kind: 'app-server-unavailable',
+          errorCode: 'rpc_engine_dead',
+        };
     if (this.pending.size) this.log(`[codex-rpc] ${err.message}`);
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(err); }
     this.pending.clear();
     if (!this.closed && !this.deadNotified) {
       this.deadNotified = true;
-      this.emitAllTurnTerminals('engine-dead', 'rpc_engine_dead');
+      this.emitAllTurnTerminals('engine-dead', failure.errorCode);
       this.clearReadonlyOwnership();
-      try { this.opts.onDead?.(); } catch { /* best effort */ }
+      try { this.opts.onDead?.(failure); } catch { /* best effort */ }
     }
   }
 }

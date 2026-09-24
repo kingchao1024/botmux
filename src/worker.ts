@@ -1315,7 +1315,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           cliGeneration: engineCliGeneration,
         });
       },
-      onDead: () => {
+      onDead: (failure) => {
         // Death can race after the final awaited response but before the engine
         // is published below. Record it against this exact engagement even when
         // codexRpcEngine is still undefined; otherwise the continuation can
@@ -1323,7 +1323,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         // can no longer trigger onDead recovery.
         rpcEngagementFence.markDead(engagementLease);
         if (codexRpcEngine === engine) {
-          log('Codex RPC app-server died; replacing the tmux session and re-engaging the thread');
+          const restartReason = failure.kind === 'protocol-ownership-conflict'
+            ? 'Codex RPC native-turn ownership conflict; fencing this protocol generation before replacement'
+            : 'Codex RPC app-server died; replacing the tmux session and re-engaging the thread';
+          log(restartReason);
           // failAll() rejects the active sendTurn promise immediately after this
           // callback returns. Let that microtask classify/notify the ambiguous
           // submit while the old backend still exists, then replace the paired
@@ -1331,7 +1334,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           // backend first and suppresses the submit-failure notice.
           const restartTimer = setTimeout(() => {
             if (codexRpcEngine !== engine) return; // close/restart won the race
-            void restartCliProcess('Codex RPC app-server died', { immediate: true, preservePending: true });
+            void restartCliProcess(restartReason, { immediate: true, preservePending: true });
           }, 0);
           restartTimer.unref?.();
         }
@@ -12211,6 +12214,14 @@ async function flushPending(): Promise<void> {
       let result: Awaited<ReturnType<typeof writeAdapter.writeInput>> | undefined;
       let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
       let rpcTurnGeneration: RpcTurnGeneration | undefined;
+      // The daemon consumes `@steer` and freezes this positive authorization on
+      // the IPC message. Only a bot-originated, explicitly authorized control
+      // may target an already-running native turn; all human and unmarked input
+      // remains serial even though older Codex App policy reused this field.
+      const isTrustedRpcSteer = writeRpcEngine !== undefined
+        && item.codexAppSteerable === true
+        && item.trustedCaller?.senderType === 'bot'
+        && !item.readonlyContinuation;
       try {
         if (item.readonlyContinuation && !writeRpcEngine) {
           emitTurnTerminal(
@@ -12222,6 +12233,24 @@ async function flushPending(): Promise<void> {
           break;
         }
         if (writeRpcEngine) {
+          if (isTrustedRpcSteer) {
+            const expectedTurnId = writeRpcEngine.activeNativeTurnId;
+            if (!expectedTurnId) {
+              // A control arriving during an unbound response/terminal race has
+              // no safe native target. Keep its exact FIFO position; never turn
+              // this into a second turn/start merely because it is a control.
+              pendingMessages.unshift(item);
+              log(`Queued trusted Codex RPC steer until an exact native turn is active: turn=${item.turnId ?? '-'}`);
+              break;
+            }
+            await writeRpcEngine.steerTurn(msg, expectedTurnId);
+            result = { submitted: true };
+            log(`Steered exact Codex RPC native turn ${expectedTurnId.slice(0, 12)} from control ${item.turnId ?? '-'}`);
+            // The currently active native turn retains the sole lifecycle
+            // ownership and will release the queue at its terminal. Do not
+            // create a second bridge owner for a control-only message.
+            break;
+          }
           if (item.readonlyContinuation) {
             const exactRestrictedInput = item.turnId?.startsWith('bmx-readonly-')
               && item.dispatchAttempt !== undefined
@@ -12291,6 +12320,13 @@ async function flushPending(): Promise<void> {
           // untouched; marking now therefore still precedes replay of any
           // already-persisted user/final events.
           bridgeTurnId = rpcTurnIdentity.turnId;
+          // A terminal can be decoded before this ACK continuation runs. Keep
+          // that exact generation-scoped evidence so the queued steer path can
+          // distinguish a proven terminal target from a missing/unknown owner.
+          const terminalArrivedBeforeAck = sameRpcGeneration(
+            pendingRpcTurnTerminals.get(rpcTurnOwnerKey(rpcTurnIdentity))?.generation,
+            rpcTurnGeneration,
+          );
           // The app-server ack confirms execution has begun, but no local
           // transcript event will follow to flip started. Mark the turn active
           // so the lifecycle gate stays asserted for the full server-side run
@@ -12304,6 +12340,39 @@ async function flushPending(): Promise<void> {
           );
           if (activated) {
             codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+            // A trusted steer can arrive while this turn/start awaits its ACK.
+            // It correctly stayed queued because no native id existed yet; once
+            // this exact owner is active, re-drive only that control queue head
+            // after the current flush releases its mutex. Ordinary input remains
+            // queued until the native terminal calls the normal release path.
+            queueMicrotask(() => {
+              if (!writeContinuationIsCurrent()) return;
+              const next = pendingMessages[0];
+              const nextIsTrustedRpcSteer = next?.codexAppSteerable === true
+                && next.trustedCaller?.senderType === 'bot'
+                && !next.readonlyContinuation;
+              if (!nextIsTrustedRpcSteer) return;
+              if (writeRpcEngine.activeNativeTurnId) {
+                void flushPending();
+                return;
+              }
+              if (!terminalArrivedBeforeAck) return;
+              // This continuation just received the exact turn/start ACK. With
+              // no live owner now, the engine has already replayed this root's
+              // native terminal; the queued steer has a proven-dead target, not
+              // an unbound target. Fail this control exactly once and let its
+              // ordinary successor continue — never convert it to turn/start.
+              const rejectedSteer = pendingMessages.shift();
+              if (!rejectedSteer) return;
+              emitTurnTerminal(
+                rejectedSteer.turnId ?? 'codex-rpc-steer-target-inactive',
+                'failed',
+                'steer_target_no_longer_active',
+                rejectedSteer.dispatchAttempt,
+              );
+              log(`Rejected trusted Codex RPC steer after its native target reached terminal: turn=${rejectedSteer.turnId ?? '-'}`);
+              void flushPending();
+            });
           }
         } else if (item.codexAppInput && writeAdapter.writeStructuredInput) {
           submissionBackend = writeBackend;
@@ -12658,6 +12727,10 @@ async function flushPending(): Promise<void> {
       // adjacent IM turns wait for separate idle edges so neither can be
       // HOL-dropped or steered into the other.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
+      // `turn/start` acknowledgement is not a terminal edge. In RPC mode a
+      // later ordinary message must wait for the exact native terminal instead
+      // of beginning a second start and receiving the same native id.
+      if (writeRpcEngine) break;
       if (item.readonlyContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       // A type-ahead adapter may accept several queued submits in one flush.
