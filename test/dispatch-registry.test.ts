@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
-import { recordDispatchRegistryEntry } from '../src/core/dispatch-registry.js';
+import { findDispatchOperation, recordDispatchRegistryEntry } from '../src/core/dispatch-registry.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 
 const registryModuleUrl = pathToFileURL(fileURLToPath(new URL('../src/core/dispatch-registry.ts', import.meta.url))).href;
@@ -67,6 +67,18 @@ describe('dispatch registry persistence', () => {
       seed_old: { orchSessionId: 'session-old' },
       seed_new: { orchSessionId: 'session-new' },
     });
+  });
+
+  it('finds the latest entry for a stable dispatch operation even after transport failure', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-dispatch-registry-'));
+    roots.push(root);
+    const registryPath = join(root, 'orchestrate-dispatch.json');
+    writeFileSync(registryPath, JSON.stringify({
+      om_live: { dispatchOperationId: 'same', status: 'dispatched' },
+      om_latest: { dispatchOperationId: 'same', status: 'failed' },
+    }));
+    expect(findDispatchOperation(registryPath, 'same')).toMatchObject({ dispatchRoot: 'om_latest' });
+    expect(findDispatchOperation(registryPath, 'missing')).toBeUndefined();
   });
 
   it('rejects replacing an existing dispatch report binding with another target', async () => {

@@ -58,4 +58,29 @@ describe('buildProjectGroupCard workstream table', () => {
     const card = buildProjectGroupCard(makeProject({ workstreams: [] })) as any;
     expect(card.body.elements.some((e: any) => e.tag === 'table')).toBe(false);
   });
+
+  it('shows in-review workstreams as pending acceptance with reviewer and latest review', () => {
+    const base = makeProject();
+    const workstream = {
+      ...base.workstreams[0]!,
+      status: 'in_review' as const,
+      reviewerAppIds: ['cli_reviewer'],
+      delivery: {
+        reportedByAppId: 'cli_worker', content: '第二轮交付', reportedAt: base.updatedAt, round: 2,
+      },
+      review: {
+        reviewerAppId: 'cli_reviewer', verdict: 'fail' as const, content: '补充边界测试',
+        reviewedAt: base.updatedAt, round: 1,
+      },
+    };
+    const card = buildProjectGroupCard(makeProject({ workstreams: [workstream] })) as any;
+    const serialized = JSON.stringify(card);
+    const table = card.body.elements.find((element: { tag?: string }) => element.tag === 'table');
+    expect(serialized).toContain('待验收');
+    expect(table.rows[0].wf).toContain('Reviewer');
+    expect(table.rows[0].wf).toContain('cli\\_reviewer');
+    expect(serialized).toContain('交付轮次 · 2');
+    expect(serialized).toContain('补充边界测试');
+    expect(serialized).toContain('进行中');
+  });
 });

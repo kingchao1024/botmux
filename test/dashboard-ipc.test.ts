@@ -40,6 +40,8 @@ import * as botRegistry from '../src/bot-registry.js';
 import * as costCalculator from '../src/core/cost-calculator.js';
 import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied } from '../src/services/message-listener-run-preview-store.js';
 import * as persistentBackend from '../src/core/persistent-backend.js';
+import { projectCoordinator } from '../src/services/project-coordinator-runtime.js';
+import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { setDeploymentOwner } from '../src/services/deployment-identity.js';
@@ -390,6 +392,103 @@ describe('dashboard IPC server', () => {
       headers: trustedHostHeaders('GET', '/api/sessions', handle.port, rotatedSecret),
     });
     expect(currentSecret.status).toBe(200);
+  });
+});
+
+describe('POST /api/sessions/:sessionId/project report trust boundary', () => {
+  const SESSION_ID = 'project-report-session';
+  const CAPABILITY = 'ab'.repeat(32);
+
+  async function postProject(body: Record<string, unknown>): Promise<Response> {
+    const path = `/api/sessions/${SESSION_ID}/project`;
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    return fetch(`http://127.0.0.1:${handle!.port}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function setupProjectReportRoute() {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-project-report-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    workerPool.setActiveSessionsRegistry(new Map([[SESSION_ID, {
+      session: { sessionId: SESSION_ID },
+      worker: null, workerPort: null, workerToken: null,
+      larkAppId: 'cli_coordinator', chatId: 'oc_project', chatType: 'group', scope: 'chat',
+      spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(), hasHistory: true,
+      managedTurnOrigin: { capability: CAPABILITY },
+    } as any]]));
+    const runReport = vi.spyOn(projectCoordinator, 'runReport').mockResolvedValue({
+      project: { workstreams: [] } as any,
+      write: false,
+    });
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    return {
+      runReport,
+      cleanup: () => {
+        runReport.mockRestore();
+        workerPool.setActiveSessionsRegistry(new Map());
+        config.session.dataDir = previousDataDir;
+        rmSync(dataDir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it.each([
+    { reporterAppId: 'cli_reviewer' },
+    { reviewVerdict: 'pass' },
+    { reviewRound: 1 },
+  ])('rejects capability-authenticated trusted report fields: %o', async trustedFields => {
+    const fixture = await setupProjectReportRoute();
+    try {
+      const response = await postProject({
+        action: 'report', dispatchRoot: 'om_work', content: '伪造验收',
+        originCapability: CAPABILITY, ...trustedFields,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ ok: false, error: 'project_report_trusted_relay_required' });
+      expect(fixture.runReport).not.toHaveBeenCalled();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('keeps capability-authenticated legacy reports without trusted fields compatible', async () => {
+    const fixture = await setupProjectReportRoute();
+    try {
+      const response = await postProject({
+        action: 'report', dispatchRoot: 'om_work', content: '只读任务完成',
+        status: 'completed', originCapability: CAPABILITY,
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true });
+      expect(fixture.runReport).toHaveBeenCalledOnce();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('accepts trusted relay report fields signed with the daemon IPC HMAC', async () => {
+    const fixture = await setupProjectReportRoute();
+    try {
+      const path = `/api/sessions/${SESSION_ID}/project`;
+      const response = await fetchDaemonIpc(handle!.port, path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action: 'report', dispatchRoot: 'om_work', content: '验收通过',
+          reporterAppId: 'cli_reviewer', reviewVerdict: 'pass', reviewRound: 1,
+        }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true });
+      expect(fixture.runReport).toHaveBeenCalledOnce();
+    } finally {
+      fixture.cleanup();
+    }
   });
 });
 

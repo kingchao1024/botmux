@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import {
   writeHeartbeatTo,
   anyDaemonBusyTo,
+  daemonHeartbeatForAppTo,
   heartbeatDirIn,
   HEARTBEAT_FRESH_MS,
+  HEARTBEAT_FUTURE_SKEW_MS,
 } from '../src/core/daemon-heartbeat.js';
 
 const T0 = Date.parse('2026-06-07T04:00:00.000Z');
@@ -57,5 +59,74 @@ describe('daemon heartbeat / anyDaemonBusy', () => {
   it('writes atomically (no .tmp leftover)', () => {
     writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0));
     expect(readdirSync(heartbeatDirIn(dir)).filter(f => f.endsWith('.tmp'))).toEqual([]);
+  });
+});
+
+describe('daemon heartbeat / daemonHeartbeatForAppTo', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'botmux-hb-app-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('reports a fresh zero-count heartbeat as idle', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 0, iso(T0));
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0 + 5_000)).toEqual({
+      availability: 'idle',
+      busyCount: 0,
+      observedAt: iso(T0),
+    });
+  });
+
+  it('reports a fresh positive-count heartbeat as busy', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 2, '2026-06-07T04:00:00Z');
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0 + 5_000)).toEqual({
+      availability: 'busy',
+      busyCount: 2,
+      observedAt: iso(T0),
+    });
+  });
+
+  it('returns no evidence for a stale heartbeat', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0));
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0 + HEARTBEAT_FRESH_MS + 1)).toBeNull();
+  });
+
+  it('accepts a heartbeat at the future clock-skew boundary', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0 + HEARTBEAT_FUTURE_SKEW_MS));
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0)).toMatchObject({
+      availability: 'busy',
+      observedAt: iso(T0 + HEARTBEAT_FUTURE_SKEW_MS),
+    });
+  });
+
+  it('returns no evidence for a heartbeat beyond the future clock-skew boundary', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0 + HEARTBEAT_FUTURE_SKEW_MS + 1));
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0)).toBeNull();
+  });
+
+  it('returns no evidence for a corrupt heartbeat', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0));
+    writeFileSync(join(heartbeatDirIn(dir), 'cli_app_a.json'), '{bad');
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0 + 1_000)).toBeNull();
+  });
+
+  it('returns no evidence for a negative busy count', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', -1, iso(T0));
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0 + 1_000)).toBeNull();
+    expect(anyDaemonBusyTo(dir, T0 + 1_000)).toBe(false);
+  });
+
+  it('returns no evidence when the heartbeat belongs to a different app', () => {
+    writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0));
+    const path = join(heartbeatDirIn(dir), 'cli_app_a.json');
+    writeFileSync(path, JSON.stringify({ larkAppId: 'cli_app_b', busyCount: 1, at: iso(T0) }));
+
+    expect(daemonHeartbeatForAppTo(dir, 'cli_app_a', T0 + 1_000)).toBeNull();
   });
 });

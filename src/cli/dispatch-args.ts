@@ -11,8 +11,10 @@ export interface DispatchArgs {
   into?: string;
   standby: boolean;
   steer: boolean;
+  readOnly: boolean;
   bots: string[];
   botApps: string[];
+  writeScopes: string[];
 }
 
 export type DispatchArgsErrorCode =
@@ -36,14 +38,16 @@ const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   ['--into', 'into'],
 ]);
 
-const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps'>([
+const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps' | 'writeScopes'>([
   ['--bot', 'bots'],
   ['--bot-app', 'botApps'],
+  ['--write-scope', 'writeScopes'],
 ]);
 
-const BOOLEAN_FLAGS = new Map<string, 'standby' | 'steer' | 'help'>([
+const BOOLEAN_FLAGS = new Map<string, 'standby' | 'steer' | 'readOnly' | 'help'>([
   ['--standby', 'standby'],
   ['--steer', 'steer'],
+  ['--read-only', 'readOnly'],
   ['--help', 'help'],
   ['-h', 'help'],
 ]);
@@ -67,8 +71,10 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
     help: false,
     standby: false,
     steer: false,
+    readOnly: false,
     bots: [],
     botApps: [],
+    writeScopes: [],
   };
 
   // Preserve the historical help short-circuit exactly: help has always been

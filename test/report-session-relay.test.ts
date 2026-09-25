@@ -8,6 +8,7 @@ import {
   isReportRelayOriginalSessionUnavailable,
   REPORT_SESSION_RELAY_MAX_BYTES,
   REPORT_SESSION_RELAY_ROUTE,
+  parseProjectReviewOptions,
   resolveReportRelayFallbackTarget,
   type ReportSessionRelaySessionView,
 } from '../src/core/report-session-relay.js';
@@ -77,15 +78,34 @@ function authorize(
 }
 
 describe('report session relay authorization', () => {
+  it('accepts only paired review options on an explicit registry-backed route', () => {
+    expect(parseProjectReviewOptions({ verdict: 'pass', round: '2', explicitDispatchRoot: true }))
+      .toEqual({ ok: true, reviewVerdict: 'pass', reviewRound: 2 });
+    expect(parseProjectReviewOptions({ explicitDispatchRoot: true })).toEqual({ ok: true });
+    for (const input of [
+      { verdict: 'pass', explicitDispatchRoot: true },
+      { round: '1', explicitDispatchRoot: true },
+      { verdict: 'approve', round: '1', explicitDispatchRoot: true },
+      { verdict: 'fail', round: '0', explicitDispatchRoot: true },
+      { verdict: 'fail', round: '1.5', explicitDispatchRoot: true },
+      { verdict: 'pass', round: '1', explicitDispatchRoot: false },
+      { verdict: 'pass', round: '1', explicitDispatchRoot: true, into: true },
+      { verdict: 'pass', round: '1', explicitDispatchRoot: true, topLevel: true },
+      { verdict: 'pass', round: '1', explicitDispatchRoot: true, legacyDispatch: true },
+    ]) expect(parseProjectReviewOptions(input)).toMatchObject({ ok: false });
+  });
+
   it('authorizes the current isolated thread session and derives both identities server-side', () => {
     expect(authorize()).toEqual({
       ok: true,
-      source: { sessionId: 'session-source', larkAppId: 'cli_source' },
+      source: { sessionId: 'session-source', larkAppId: 'cli_source', turnId: 'turn-current' },
       target: { larkAppId: 'cli_orchestrator', sessionId: 'session-orchestrator' },
       dispatchRoot: 'om_dispatch',
       sourceName: '指标页修复',
       content: '子项目完成',
       projectUpdate: {},
+      reporterAppId: 'cli_source',
+      projectRequired: false,
     });
   });
 
@@ -241,6 +261,54 @@ describe('report session relay authorization', () => {
         originCapability: CAPABILITY, status: 'done',
       },
     })).toEqual({ ok: false, status: 400, error: 'bad_project_status' });
+  });
+
+  it('validates review fields as an exact pair and derives reporter identity from the session', () => {
+    const reviewed = authorize({
+      raw: {
+        sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: '验收通过',
+        originCapability: CAPABILITY, reviewVerdict: 'pass', reviewRound: 2,
+      },
+    });
+    expect(reviewed).toMatchObject({
+      ok: true, reporterAppId: 'cli_source',
+      projectUpdate: { reviewVerdict: 'pass', reviewRound: 2 },
+    });
+    expect(authorize({
+      raw: {
+        sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: '伪造身份',
+        originCapability: CAPABILITY, reporterAppId: 'cli_forged',
+      },
+    })).toEqual({ ok: false, status: 400, error: 'untrusted_reporter_app_id' });
+    for (const raw of [
+      { reviewVerdict: 'approve', reviewRound: 1 },
+      { reviewVerdict: 'pass' },
+      { reviewRound: 1 },
+      { reviewVerdict: 'fail', reviewRound: 0 },
+      { reviewVerdict: 'fail', reviewRound: 1.5 },
+      { reviewVerdict: 'fail', reviewRound: Number.MAX_SAFE_INTEGER + 1 },
+    ]) {
+      expect(authorize({ raw: {
+        sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: 'review',
+        originCapability: CAPABILITY, ...raw,
+      } })).toEqual({ ok: false, status: 400, error: 'bad_project_review' });
+    }
+  });
+
+  it('marks an access-bound registry entry as requiring durable project sync', () => {
+    const decision = authorize({
+      registry: {
+        om_dispatch: {
+          access: { mode: 'write', scopes: ['/repo'] },
+          reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+            dispatchRoot: 'om_dispatch', targetLarkAppId: 'cli_orchestrator',
+            targetSessionId: 'session-orchestrator', sourceName: '写任务',
+            issuedAt: '2026-08-07T07:00:00.000Z',
+          }),
+        },
+      },
+    });
+    expect(decision).toMatchObject({ ok: true, projectRequired: true });
   });
 });
 
@@ -429,6 +497,25 @@ describe('report session relay fallback target', () => {
 });
 
 describe('report session relay delivery', () => {
+  it('returns a non-success result when the trigger landed but durable project mutation failed', async () => {
+    const authorized = authorize();
+    expect(authorized.ok).toBe(true);
+    if (!authorized.ok) return;
+    const delivered = await deliverReportSessionRelay({
+      decision: authorized,
+      triggerMeta: { requestId: 'report:partial', receivedAt: '2026-08-07T07:00:00.000Z' },
+      fetchTarget: async () => ({ ok: true, status: 202, json: async () => ({ ok: true, triggerId: 'trg_1' }) }),
+      postProjectUpdate: async () => ({ projectSynced: false, projectSyncError: 'file-lock timeout' }),
+    });
+    expect(delivered).toEqual({
+      status: 409,
+      body: {
+        ok: false, error: 'project_sync_failed', triggerAccepted: true, triggerId: 'trg_1',
+        reportTarget: authorized.target, projectSynced: false, projectSyncError: 'file-lock timeout',
+      },
+    });
+  });
+
   it.each([
     { name: '403', response: { ok: false, status: 403, body: { ok: false, errorCode: 'forbidden' } } },
     { name: '500', response: { ok: false, status: 500, body: { ok: false, errorCode: 'trigger_failed' } } },
@@ -558,7 +645,9 @@ describe('report session relay delivery', () => {
           ? { ok: false, status: 404, json: async () => ({ errorCode: 'session_not_found' }) }
           : { ok: true, status: 202, json: async () => ({ ok: true }) };
       },
-      postProjectUpdate: async target => ({ projectSynced: target.sessionId === 'session-current' }),
+      postProjectUpdate: async target => ({
+        projectSynced: target.sessionId === 'session-current', deliveryRound: 2,
+      }),
     });
 
     expect(calls.map(call => call.path)).toEqual(['/api/trigger', '/api/sessions', '/api/trigger']);
@@ -571,6 +660,7 @@ describe('report session relay delivery', () => {
         reportTarget: { sessionId: 'session-current', larkAppId: 'cli_orchestrator' },
         originalReportTarget: { sessionId: 'session-orchestrator', larkAppId: 'cli_orchestrator' },
         projectSynced: true,
+        deliveryRound: 2,
       },
     });
   });
@@ -606,5 +696,16 @@ describe('report session relay wiring', () => {
       'raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);',
     );
     expect(daemonSource).toContain('if (error instanceof JsonBodyTooLargeError)');
+  });
+
+  it('injects the authenticated source app into the project report update', () => {
+    expect(daemonSource).toContain('reporterAppId: decision.reporterAppId');
+    expect(daemonSource).not.toContain('reporterAppId: body');
+  });
+
+  it('uses a stable report request id so an exact retry cannot wake the orchestrator twice', () => {
+    expect(daemonSource).toContain("const reportRequestId = 'report:' + createHash('sha256')");
+    expect(daemonSource).toContain('sourceTurnId: decision.source.turnId');
+    expect(daemonSource).toContain('triggerMeta: { ...triggerMeta, requestId: reportRequestId }');
   });
 });

@@ -11,6 +11,7 @@ import {
   writeProjectOnboardingCard,
 } from '../src/services/group-collaboration-mode-store.js';
 import { renderProjectGroupModeBlock } from '../src/core/session-manager.js';
+import { parseProjectCoordinatorAction } from '../src/services/project-coordinator.js';
 
 const roots: string[] = [];
 
@@ -179,31 +180,31 @@ describe('project dispatch policy', () => {
   it('allows only the configured coordinator and worker set', () => {
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
-      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false,
+      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false, readOnly: true,
     })).toEqual({ ok: true, projectMode: true });
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_other', sourceChatId: 'oc_project', targetChatId: 'oc_project',
-      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false,
+      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false, readOnly: true,
     })).toEqual({ ok: false, error: 'project_coordinator_required' });
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
-      targetAppIds: ['cli_other'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false,
+      targetAppIds: ['cli_other'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false, readOnly: true,
     })).toEqual({ ok: false, error: 'project_worker_not_allowed', disallowedAppIds: ['cli_other'] });
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_elsewhere',
-      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false,
+      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false, readOnly: true,
     })).toEqual({ ok: false, error: 'project_cross_chat_dispatch_forbidden' });
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
-      targetAppIds: [], hasLegacyBots: true, title: '移动端验收', existingDispatch: false,
+      targetAppIds: [], hasLegacyBots: true, title: '移动端验收', existingDispatch: false, readOnly: true,
     })).toEqual({ ok: false, error: 'project_dispatch_requires_app_ids' });
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
-      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '子任务', existingDispatch: false,
+      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '子任务', existingDispatch: false, readOnly: true,
     })).toEqual({ ok: false, error: 'project_dispatch_title_required' });
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
-      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '这是一个明显超过二十四个字符并且不适合展示在项目卡片里的标题', existingDispatch: false,
+      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '这是一个明显超过二十四个字符并且不适合展示在项目卡片里的标题', existingDispatch: false, readOnly: true,
     })).toEqual({ ok: false, error: 'project_dispatch_title_too_long' });
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
@@ -216,6 +217,66 @@ describe('project dispatch policy', () => {
       config: undefined, sourceAppId: 'cli_any', sourceChatId: 'oc_project', targetChatId: 'oc_elsewhere',
       targetAppIds: [], hasLegacyBots: true,
     })).toEqual({ ok: true, projectMode: false });
+  });
+
+  it('requires exactly one access mode for new project workstreams and forbids access on --into', () => {
+    const base = {
+      config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
+      targetAppIds: ['cli_worker'], hasLegacyBots: false, title: '移动端验收', existingDispatch: false,
+    };
+    expect(evaluateProjectDispatchPolicy(base)).toEqual({
+      ok: false, error: 'project_dispatch_access_required',
+    });
+    expect(evaluateProjectDispatchPolicy({ ...base, readOnly: true })).toEqual({ ok: true, projectMode: true });
+    expect(evaluateProjectDispatchPolicy({ ...base, writeScopes: ['/repo/src'] })).toEqual({ ok: true, projectMode: true });
+    expect(evaluateProjectDispatchPolicy({ ...base, readOnly: true, writeScopes: ['/repo/src'] })).toEqual({
+      ok: false, error: 'project_dispatch_access_ambiguous',
+    });
+    expect(evaluateProjectDispatchPolicy({
+      ...base, existingDispatch: true, title: '', readOnly: true,
+    })).toEqual({ ok: false, error: 'project_existing_dispatch_access_forbidden' });
+    expect(evaluateProjectDispatchPolicy({ ...base, existingDispatch: true, title: '' })).toEqual({
+      ok: true, projectMode: true,
+    });
+    expect(evaluateProjectDispatchPolicy({
+      ...base, existingDispatch: true, title: '', targetAppIds: ['cli_other'],
+      assignedAppIds: ['cli_worker', 'cli_reviewer'],
+    })).toEqual({
+      ok: false, error: 'project_workstream_bot_not_allowed', disallowedAppIds: ['cli_other'],
+    });
+  });
+
+  it('wires access fields through the dashboard project policy route', () => {
+    const source = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy'");
+    const end = source.indexOf('\n});', start) + 4;
+    const route = source.slice(start, end);
+
+    expect(route).toContain('body?.readOnly === true');
+    expect(route).toContain('body?.writeScopes');
+    expect(route).toContain('readOnly,');
+    expect(route).toContain('writeScopes,');
+    expect(route).toContain('dispatchRoot');
+  });
+
+  it('uses the durable report path and returns projection warnings without failing the request', () => {
+    const source = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/project'");
+    const end = source.indexOf('\n});', start) + 4;
+    const route = source.slice(start, end);
+    expect(route).toContain('projectCoordinator.runReport');
+    expect(route).toContain('projectionWarning');
+    expect(route).toContain('logger.warn');
+  });
+
+  it('rejects malformed trusted review fields instead of downgrading them to a worker report', () => {
+    expect(parseProjectCoordinatorAction({
+      action: 'report', dispatchRoot: 'om_work', content: '伪造验收',
+      reporterAppId: 'cli_worker', reviewVerdict: 'approve', reviewRound: 1,
+    })).toBeUndefined();
+    expect(parseProjectCoordinatorAction({
+      action: 'report', dispatchRoot: 'om_work', content: '孤立轮次', reporterAppId: 'cli_worker', reviewRound: 1,
+    })).toBeUndefined();
   });
 });
 

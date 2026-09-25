@@ -707,9 +707,9 @@ botmux bots list
 - \`mentionable\`：**你能不能可靠地 @ 到它**（关键）
 - \`mentionSource\`：\`cross-ref\` | \`observed\` | \`self\` | \`fallback\`
 
-另外每行还带两块**派活前的只读决策信息**（都是从本地配置推导，不代表运行时在线）：
+另外每行还带两块**派活前的只读决策信息**：
 - \`dispatch\`：\`trigger\`（唤醒方式，恒为 \`mention\`）+ \`workspace\`（派活要不要指定仓库：\`required\`|\`optional\`|\`none\`|\`unknown\`）
-- \`collaboration\`：\`reachability\`（能否可靠寻址）、\`workspace\`（仓库要求 + 工作区候选来源）、\`authorization\`（\`talk\` 对话授权 / \`operate\` 管理动作授权，两层分开判）、\`session\`（普通群 \`mentionMode\` 要不要 @、\`replyMode\` 回复落哪）、\`runtime\`（\`transport\` 有无飞书通道、\`deployment\` 本地/远端、\`stale\` 健康证据是否过期）
+- \`collaboration\`：\`reachability\`（能否可靠寻址）、\`workspace\`（仓库要求 + 工作区候选来源）、\`authorization\`（\`talk\` 对话授权 / \`operate\` 管理动作授权，两层分开判）、\`session\`（普通群 \`mentionMode\` 要不要 @、\`replyMode\` 回复落哪）、\`runtime\`（\`transport\` 有无飞书通道、\`deployment\` 本地/远端、\`availability\` 可信运行态；busy 时还带 \`busyCount\`，fresh heartbeat 可带 \`observedAt\`）
 
 顶层还有一个 \`collaborationHelp\`：**逐字段逐枚举值的中文解释就印在同一份输出里**——不确定某个值什么意思，直接查它，不用来问。
 
@@ -727,7 +727,7 @@ botmux bots list
         "workspace": { "requirement": "required", "source": "oncall" },
         "authorization": { "talk": "preflight-required", "operate": false },
         "session": { "mentionMode": "always", "replyMode": "chat-topic" },
-        "runtime": { "transport": true, "deployment": "local", "stale": "unknown" }
+        "runtime": { "transport": true, "deployment": "local", "availability": "busy", "busyCount": 1, "observedAt": "2026-06-07T04:00:00.000Z" }
       } }
   ],
   "total": 1,
@@ -740,8 +740,9 @@ botmux bots list
 1. **只 @ \`mentionable=true\` 的机器人**。\`mentionable=false\` 表示"知道它在群里，但当前点不准"（飞书 open_id 按 app 隔离）——这种先让它 / 用户在群里 \`/introduce\` 一次，再点名。
 2. 按 \`capability\` 挑合适的队友，而不是乱点。
 3. **\`unknown\` ≠ 不可用、更 ≠ 离线**：只是这条命令当前没有足够证据。别把 \`unknown\` 当成"它挂了"而放弃派活；语义拿不准就查 \`collaborationHelp\`。
-4. \`authorization.operate\` 默认按 \`false\`/\`unknown\` 处理：能对话不等于能让它跑 \`/repo\`、\`/restart\` 等管理动作，那类要单独授权。
-5. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
+4. \`runtime.availability\` 四态：\`idle\` 表示本机 daemon 在线且当前无执行中 turn，可立即派单；\`busy\` 表示有执行中 turn，但仍可排队，不是硬失败；\`offline\` 表示本机权威 registry 可读且目标没有在线 daemon；\`unknown\` 表示隔离、外部 Bot、读取异常或 heartbeat 不可用，证据不足。运行态只供决策参考，不是权限凭据，也不承诺按负载自动选 Bot。
+5. \`authorization.operate\` 默认按 \`false\`/\`unknown\` 处理：能对话不等于能让它跑 \`/repo\`、\`/restart\` 等管理动作，那类要单独授权。
+6. 配合 botmux send：\`botmux send --mention "ou_yyy:后端Bot" "请帮忙处理"\`
 
 ## 团队维度：跨机发现 + 拉群（--scope team）
 
@@ -1440,18 +1441,20 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 \`\`\`bash
 botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
 \`\`\`
+project mode 新开任务必须显式声明访问方式：只读任务加 \`--read-only\`；会写文件的任务至少加一个可重复的 \`--write-scope <绝对目录>\`。write scope 用来阻止并发子项目写入相同或父子目录，是协调门禁，不是 OS sandbox。write 任务的 \`--bot-app\` 必须明确分配 \`:worker\`/\`:coder\` 和 \`:reviewer\`，至少各一名；\`--into\` 沿用已有 workstream 的 access，不能再带访问参数。
+
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
 - 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
-- 然后用 \`botmux report "子项目X 完成 + 产出位置"\` 回报（**别在本话题 @ 主bot**——会另起一个无上下文的新会话；\`botmux dispatch\` 已把这条「完成回报」协议自动追加进简报，子 bot 照做即可）；
-- coder 写完先 @ reviewer 在本话题 review，过了再标完成。
+- worker/coder 完成后用 \`botmux report --dispatch-root <root> --status completed "子项目X 完成 + 产出位置"\` 交付，write 任务会进入待验收并返回当前 round；
+- 指定 reviewer 检查后用 \`botmux report --dispatch-root <root> --review-verdict pass|fail --review-round <round> "验收结论"\`；只有当前 round 的 pass 才算完成。
 
 > repo 预设：\`--repo\` 让子 bot 起会话直接进该目录、免手点「选仓库」卡。注意**跨 owner 的 repo 预设可能受授权限制**——若子 bot 已配 defaultWorkingDir，可省略 \`--repo\`。
 > **OnCall 省 \`--repo\` 现按 bot 计**：OnCall 绑定是 per-bot 的——只有**目标子 bot 自己**在该群绑了 OnCall（\`@该bot /oncall bind <仓库路径>\`，多个 bot 一起绑用 \`@bot1 @bot2 /oncall bind <路径>\`）或配了 \`defaultWorkingDir\` 时，dispatch 才可省 \`--repo\`。否则子 bot **不会**跨 bot 继承群目录（除非同话题已有 sibling 在跑可继承），dispatch 仍应显式传 \`--repo\`，不然子 bot 会弹「选仓库」卡。
 > 想「先把 bot 拉起待命、稍后再派具体任务」：用 \`--standby\`（只定目录不派简报），之后用 \`botmux dispatch --into <话题root> --bot ... --brief ...\` 激活。
 
 ### 6. 收结果 + 推进
-子 bot \`botmux report\` → 你（主编排会话，带完整上下文）被唤起 → 读任务板确认完成、看产出。然后：
+子 bot \`botmux report\` → 你（主编排会话，带完整上下文）被唤起 → 读任务板确认状态和产出。write 任务只有指定 reviewer 对当前 round 给出 pass 后，主 bot 才汇总为完成。然后：
 - 有依赖的下一波：依赖满足了再 dispatch 下一批；
 - 卡住/超时：去对应话题 \`botmux dispatch --into <root>\` @ 它问进展，或改派；
 - 全程把关键节点用 \`botmux send\` 同步用户（人看任务板也能一眼掌握）。

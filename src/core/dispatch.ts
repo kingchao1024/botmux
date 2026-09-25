@@ -15,6 +15,7 @@
  */
 
 import { resolveSendTarget, type SessionReplyTarget } from './reply-target.js';
+import type { ProjectDispatchAccess } from './dispatch-write-scope.js';
 
 export { resolveSendTarget };
 
@@ -25,6 +26,28 @@ export interface DispatchBot {
   name?: string;
   /** Short role label, e.g. "coder" / "reviewer". */
   role?: string;
+}
+
+export function partitionProjectDispatchRoles(
+  bots: readonly Readonly<{ appId: string; role?: string }>[],
+): { workerAppIds: string[]; reviewerAppIds: string[] } {
+  const workerAppIds: string[] = [];
+  const reviewerAppIds: string[] = [];
+  const seen = new Set<string>();
+  for (const bot of bots) {
+    const appId = bot.appId.trim();
+    const role = bot.role?.trim().toLowerCase();
+    if (!role) throw new Error('project_write_role_required');
+    if (role !== 'worker' && role !== 'coder' && role !== 'reviewer') {
+      throw new Error('project_write_role_invalid');
+    }
+    if (seen.has(appId)) throw new Error('project_write_role_duplicate');
+    seen.add(appId);
+    (role === 'reviewer' ? reviewerAppIds : workerAppIds).push(appId);
+  }
+  if (workerAppIds.length === 0) throw new Error('project_worker_required');
+  if (reviewerAppIds.length === 0) throw new Error('project_reviewer_required');
+  return { workerAppIds, reviewerAppIds };
 }
 
 export type PostNode = { tag: 'text'; text: string } | { tag: 'at'; user_id: string };
@@ -47,6 +70,8 @@ export interface ProjectDispatchSyncAction {
   title: string;
   purpose: string;
   owners?: string[];
+  targetAppIds?: string[];
+  access?: ProjectDispatchAccess;
   status?: ProjectDispatchSyncStatus;
   progress?: number;
 }
@@ -64,6 +89,8 @@ export function buildProjectDispatchSyncAction(input: {
   title: string;
   purpose: string;
   owners: string[];
+  targetAppIds?: string[];
+  access?: ProjectDispatchAccess;
   status: ProjectDispatchSyncStatus;
   progress: number;
 }): ProjectDispatchSyncAction {
@@ -75,7 +102,12 @@ export function buildProjectDispatchSyncAction(input: {
   };
   return input.existingDispatch
     ? base
-    : { ...base, owners: input.owners, status: input.status, progress: input.progress };
+    : {
+        ...base, owners: input.owners,
+        ...(input.targetAppIds ? { targetAppIds: input.targetAppIds } : {}),
+        ...(input.access ? { access: input.access } : {}),
+        status: input.status, progress: input.progress,
+      };
 }
 
 const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
@@ -104,6 +136,17 @@ export function appendDispatchReportProtocol(brief: string, dispatchRootId: stri
     + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
 }
 
+function appendWriteReviewProtocol(brief: string, dispatchRootId: string): string {
+  const root = dispatchRootId.trim();
+  if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
+  return brief.trimEnd()
+    + '\n\n— 写任务交付与验收 —\n'
+    + 'Worker 完成后运行 `botmux report --dispatch-root ' + root + ' --status completed \"交付摘要 + 证据\"`；'
+    + '成功回执会返回 deliveryRound。Reviewer 独立验收后运行 '
+    + '`botmux report --dispatch-root ' + root + ' --review-verdict pass --review-round <deliveryRound> \"验收证据\"` '
+    + '或把 pass 改为 fail。';
+}
+
 /** Additionally ask the assignee to leave a human-visible copy in the task topic. */
 export function appendDispatchCompletionProtocol(brief: string): string {
   return brief.trimEnd()
@@ -118,10 +161,16 @@ export function buildDispatchCompletionBrief(input: {
   dispatchRootId: string;
   exactReportRootEnabled: boolean;
   sameTopicSendEnabled: boolean;
+  writeReviewRequired?: boolean;
 }): string {
-  const withReport = input.exactReportRootEnabled
-    ? appendDispatchReportProtocol(input.brief, input.dispatchRootId)
-    : appendLegacyDispatchReportProtocol(input.brief);
+  let withReport: string;
+  if (input.writeReviewRequired) {
+    withReport = appendWriteReviewProtocol(input.brief, input.dispatchRootId);
+  } else if (input.exactReportRootEnabled) {
+    withReport = appendDispatchReportProtocol(input.brief, input.dispatchRootId);
+  } else {
+    withReport = appendLegacyDispatchReportProtocol(input.brief);
+  }
   return input.sameTopicSendEnabled
     ? appendDispatchCompletionProtocol(withReport)
     : withReport;

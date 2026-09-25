@@ -15,6 +15,7 @@ import {
 const STATUS_META: Record<ProjectWorkstreamStatus, { label: string; color: string }> = {
   pending: { label: '未开始', color: 'neutral' },
   in_progress: { label: '进行中', color: 'blue' },
+  in_review: { label: '待验收', color: 'purple' },
   blocked: { label: '阻塞', color: 'orange' },
   completed: { label: '已完成', color: 'green' },
   failed: { label: '失败', color: 'red' },
@@ -23,9 +24,10 @@ const STATUS_META: Record<ProjectWorkstreamStatus, { label: string; color: strin
 const STATUS_ORDER: Record<ProjectWorkstreamStatus, number> = {
   blocked: 0,
   in_progress: 1,
-  pending: 2,
-  failed: 3,
-  completed: 4,
+  in_review: 2,
+  pending: 3,
+  failed: 4,
+  completed: 5,
 };
 
 function escapeMarkdown(value: string): string {
@@ -87,11 +89,12 @@ function projectProgressSummary(project: ProjectGroupState): string {
   const counts = project.workstreams.reduce((acc, item) => {
     acc[item.status] += 1;
     return acc;
-  }, { pending: 0, in_progress: 0, blocked: 0, completed: 0, failed: 0 });
+  }, { pending: 0, in_progress: 0, in_review: 0, blocked: 0, completed: 0, failed: 0 });
   const parts = [
     counts.blocked > 0 ? `${counts.blocked} 项阻塞` : '',
     counts.failed > 0 ? `${counts.failed} 项失败` : '',
     counts.in_progress > 0 ? `${counts.in_progress} 项进行中` : '',
+    counts.in_review > 0 ? `${counts.in_review} 项待验收` : '',
     counts.pending > 0 ? `${counts.pending} 项待开始` : '',
     counts.completed > 0 ? `${counts.completed} 项已完成` : '',
   ].filter(Boolean);
@@ -216,7 +219,8 @@ function planSurface(
 
 function planElements(project: ProjectGroupState, brand: Brand): Array<Record<string, unknown>> {
   const ordered = displayWorkstreams(project);
-  const doing = ordered.filter(item => item.status === 'blocked' || item.status === 'failed' || item.status === 'in_progress')
+  const doing = ordered.filter(item => item.status === 'blocked' || item.status === 'failed'
+    || item.status === 'in_progress' || item.status === 'in_review')
     .map(item => workstreamPlanItem(project, item, brand));
   const pending = ordered.filter(item => item.status === 'pending')
     .map(item => workstreamTitleItem(project, item, brand));
@@ -252,8 +256,17 @@ function workstreamRows(project: ProjectGroupState, brand: Brand): Array<Record<
     const blocker = item.status === 'blocked'
       ? `<font color='orange'>${escapeMarkdown(truncate(item.blocker || '原因待补充', 72))}</font>`
       : '';
+    const reviewers = item.reviewerAppIds?.length
+      ? `\n<font color='purple'>Reviewer · ${escapeMarkdown(truncate(item.reviewerAppIds.join('、'), 48))}</font>`
+      : '';
+    const deliveryRound = item.delivery
+      ? `\n<font color='grey'>交付轮次 · ${item.delivery.round}</font>`
+      : '';
+    const review = item.review
+      ? `\n<font color='grey'>Review · ${escapeMarkdown(truncate(item.review.content, 72))}</font>`
+      : '';
     return {
-      wf: `**<font color='indigo'>${escapeMarkdown(workstreamTitle(item))}</font>**\n<font color='grey'>${escapeMarkdown(truncate(item.purpose, 72))}</font>\n<font color='purple'>负责人 · ${owner}</font>`,
+      wf: `**<font color='indigo'>${escapeMarkdown(workstreamTitle(item))}</font>**\n<font color='grey'>${escapeMarkdown(truncate(item.purpose, 72))}</font>\n<font color='purple'>负责人 · ${owner}</font>${reviewers}${deliveryRound}${review}`,
       status: `<text_tag color='${status.color}'>${status.label}</text_tag>${link ? `\n**${link}**` : ''}${blocker ? `\n${blocker}` : ''}`,
     };
   });

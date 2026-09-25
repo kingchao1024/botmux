@@ -46,6 +46,10 @@ export type ProjectDispatchPolicyDecision =
         | 'project_dispatch_requires_app_ids'
         | 'project_dispatch_title_required'
         | 'project_dispatch_title_too_long'
+        | 'project_dispatch_access_required'
+        | 'project_dispatch_access_ambiguous'
+        | 'project_existing_dispatch_access_forbidden'
+        | 'project_workstream_bot_not_allowed'
         | 'project_worker_not_allowed';
       disallowedAppIds?: string[];
     };
@@ -205,6 +209,9 @@ export function evaluateProjectDispatchPolicy(input: {
   hasLegacyBots: boolean;
   title?: string;
   existingDispatch?: boolean;
+  readOnly?: boolean;
+  writeScopes?: string[];
+  assignedAppIds?: string[];
 }): ProjectDispatchPolicyDecision {
   const config = input.config;
   if (!config || config.mode !== 'project') return { ok: true, projectMode: false };
@@ -215,7 +222,24 @@ export function evaluateProjectDispatchPolicy(input: {
     return { ok: false, error: 'project_cross_chat_dispatch_forbidden' };
   }
   if (input.hasLegacyBots) return { ok: false, error: 'project_dispatch_requires_app_ids' };
+  const hasWriteScopes = (input.writeScopes?.length ?? 0) > 0;
+  if (input.existingDispatch && (input.readOnly || hasWriteScopes)) {
+    return { ok: false, error: 'project_existing_dispatch_access_forbidden' };
+  }
+  if (input.existingDispatch && input.assignedAppIds) {
+    const assigned = new Set(input.assignedAppIds);
+    const disallowedAppIds = [...new Set(input.targetAppIds.filter(appId => !assigned.has(appId)))];
+    if (disallowedAppIds.length > 0) {
+      return { ok: false, error: 'project_workstream_bot_not_allowed', disallowedAppIds };
+    }
+  }
   if (!input.existingDispatch) {
+    if ((input.readOnly === true) === hasWriteScopes) {
+      return {
+        ok: false,
+        error: input.readOnly ? 'project_dispatch_access_ambiguous' : 'project_dispatch_access_required',
+      };
+    }
     const title = input.title?.trim() ?? '';
     if (!title || title === '子任务' || title === '子项目') {
       return { ok: false, error: 'project_dispatch_title_required' };

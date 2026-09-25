@@ -23,6 +23,13 @@ export interface Heartbeat {
 /** A heartbeat older than this is treated as "daemon not reporting" → ignored.
  *  Daemons should write well within this window (≈ every 15s). */
 export const HEARTBEAT_FRESH_MS = 60_000;
+export const HEARTBEAT_FUTURE_SKEW_MS = 2_000;
+
+export type FreshDaemonHeartbeat = Readonly<{
+  availability: 'idle' | 'busy';
+  busyCount: number;
+  observedAt: string;
+}>;
 
 export function heartbeatDirIn(dir: string): string {
   return join(dir, 'heartbeats');
@@ -56,10 +63,31 @@ export function anyDaemonBusyTo(dir: string, nowMs: number, freshMs: number = HE
   return false;
 }
 
+/** Fresh runtime evidence for one configured app, or null when none is trustworthy. */
+export function daemonHeartbeatForAppTo(
+  dir: string,
+  larkAppId: string,
+  nowMs: number,
+  freshMs: number = HEARTBEAT_FRESH_MS,
+): FreshDaemonHeartbeat | null {
+  const beat = readBeat(join(heartbeatDirIn(dir), `${sanitize(larkAppId)}.json`));
+  if (!beat || beat.larkAppId !== larkAppId) return null;
+  const at = Date.parse(beat.at);
+  if (!Number.isFinite(at) || nowMs - at > freshMs || at - nowMs > HEARTBEAT_FUTURE_SKEW_MS) return null;
+  return {
+    availability: beat.busyCount > 0 ? 'busy' : 'idle',
+    busyCount: beat.busyCount,
+    observedAt: new Date(at).toISOString(),
+  };
+}
+
 function readBeat(path: string): Heartbeat | null {
   try {
     const v = JSON.parse(readFileSync(path, 'utf-8'));
-    if (v && typeof v === 'object' && typeof v.busyCount === 'number' && typeof v.at === 'string') {
+    if (v && typeof v === 'object'
+        && Number.isSafeInteger(v.busyCount)
+        && v.busyCount >= 0
+        && typeof v.at === 'string') {
       return v as Heartbeat;
     }
   } catch {

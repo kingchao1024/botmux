@@ -2405,15 +2405,28 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   if (groupMode?.mode === 'project' && groupMode.coordinatorAppId !== ds.larkAppId) {
     return jsonRes(res, 403, { ok: false, error: 'project_coordinator_required' });
   }
+  const hasTrustedReportFields = body?.action === 'report'
+    && ['reporterAppId', 'reviewVerdict', 'reviewRound'].some(field => Object.hasOwn(body ?? {}, field));
+  if (hasTrustedReportFields && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'project_report_trusted_relay_required' });
+  }
   const action = parseProjectCoordinatorAction(body);
   if (!action) return jsonRes(res, 400, { ok: false, error: 'invalid_project_action' });
   try {
-    const project = await projectCoordinator.run({
+    const context = {
       dataDir: config.session.dataDir,
       chatId: ds.chatId,
       larkAppId: ds.larkAppId,
       coordinatorSessionId: ds.session.sessionId,
-    }, action);
+    };
+    if (action.action === 'report') {
+      const { project, projectionWarning } = await projectCoordinator.runReport(context, action);
+      if (projectionWarning) {
+        logger.warn(`[project] report persisted but card projection failed: ${projectionWarning}`);
+      }
+      return jsonRes(res, 200, { ok: true, project, ...(projectionWarning ? { projectionWarning } : {}) });
+    }
+    const project = await projectCoordinator.run(context, action);
     return jsonRes(res, 200, { ok: true, project });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -2611,7 +2624,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy', async (req,
   const targetAppIds = Array.isArray(body?.targetAppIds)
     ? body.targetAppIds.filter((value): value is string => typeof value === 'string').map(value => value.trim()).filter(Boolean)
     : undefined;
-  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId) || !targetAppIds) {
+  const readOnly = body?.readOnly === true;
+  const dispatchRoot = typeof body?.dispatchRoot === 'string' ? body.dispatchRoot.trim() : undefined;
+  const writeScopes = Array.isArray(body?.writeScopes)
+    && body.writeScopes.length <= 64
+    && body.writeScopes.every(value => typeof value === 'string' && value.trim() === value && value.length > 0)
+    ? body.writeScopes as string[]
+    : undefined;
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId) || !targetAppIds
+    || (body?.existingDispatch === true && (!dispatchRoot || !/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot)))
+    || (body?.readOnly !== undefined && typeof body.readOnly !== 'boolean')
+    || (body?.writeScopes !== undefined && !writeScopes)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_project_dispatch_policy_request' });
   }
   const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
@@ -2627,6 +2650,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy', async (req,
     hasLegacyBots: body?.hasLegacyBots === true,
     title,
     existingDispatch: body?.existingDispatch === true,
+    readOnly,
+    writeScopes,
+    ...(body?.existingDispatch === true && dispatchRoot
+      ? { assignedAppIds: readProjectGroup(config.session.dataDir, ds.chatId)?.workstreams
+          .find(item => item.dispatchRoot === dispatchRoot)?.targetAppIds ?? [] }
+      : {}),
   });
   if (!decision.ok) return jsonRes(res, 403, decision);
   return jsonRes(res, 200, { ok: true, projectMode: decision.projectMode });
