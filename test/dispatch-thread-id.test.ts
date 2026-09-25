@@ -1,11 +1,13 @@
 /** Execute the real CLI command and message.get wrappers without booting the CLI
  * entry point. Only transport, session storage and daemon IPC are substituted. */
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
-  buildRepoPrimeText, parseDispatchBotSpec } from '../src/core/dispatch.js';
+  buildRepoPrimeText, parseDispatchBotSpec, partitionProjectDispatchRoles } from '../src/core/dispatch.js';
+import { normalizeDispatchWriteScopes } from '../src/core/dispatch-write-scope.js';
 
 function extract(path: string, names: string[]): string {
   const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -30,6 +32,9 @@ function harness(mode: Mode, options: {
   threadId?: unknown;
   failure?: 'permission' | 'network' | 'timeout' | 'send';
   acceptance?: 'accepted' | 'timed_out';
+  access?: 'read_only' | 'write';
+  projectMode?: boolean;
+  registrationFailure?: 'commit';
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
   const stdout: string[] = [];
@@ -68,7 +73,14 @@ function harness(mode: Mode, options: {
       return { ok: true, json: async () => ({ ok: true, messageId }) };
     }
     steps.push('seed');
-    return { ok: true, json: async () => ({ ok: true, dispatchRoot: root }) };
+    if (options.registrationFailure === 'commit') {
+      return { ok: false, status: 500, json: async () => ({
+        ok: false, error: 'project_dispatch_commit_failed', seedCreated: true, dispatchRoot: root,
+      }) };
+    }
+    return { ok: true, json: async () => ({
+      ok: true, dispatchRoot: root, projectSynced: options.projectMode === true,
+    }) };
   });
   const persistDispatchLifecycle = vi.fn(async (input: Record<string, unknown>) => ({
     transportState: input.transportState, acceptanceState: input.acceptanceState, errorCode: input.errorCode,
@@ -83,7 +95,7 @@ function harness(mode: Mode, options: {
   });
   const state = {
     parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
-    buildRepoPrimeText, parseDispatchBotSpec,
+    buildRepoPrimeText, parseDispatchBotSpec, partitionProjectDispatchRoles, normalizeDispatchWriteScopes,
     process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
       exit: (code: number) => { throw new Error('exit:' + code); } },
     console: { log: (text: string) => stdout.push(text), error: (text: string) => stderr.push(text) },
@@ -91,7 +103,7 @@ function harness(mode: Mode, options: {
     assertTurnTransportOrExit: vi.fn(), assertSessionTransportOrExit: vi.fn(),
     loadSessions: () => new Map([['source', { chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     envPinnedRiffBot: undefined,
-    assertProjectDispatchPolicy: vi.fn(async () => {}),
+    assertProjectDispatchPolicy: vi.fn(async () => options.projectMode === true),
     ensureLocalBotCollaboration: vi.fn(async () => {}),
     resolveDataDir: () => '/isolated/data', join: (...parts: string[]) => parts.join('/'),
     readFileSync: () => '[]',
@@ -105,12 +117,17 @@ function harness(mode: Mode, options: {
     trySyncProjectDispatch: vi.fn(async () => true),
     __import: async (path: string) => {
       if (path === './bot-registry.js') return {
-        registerBot: vi.fn(), loadBotConfigs: () => [{ larkAppId: 'cli_source' }, { larkAppId: 'cli_target' }],
+        registerBot: vi.fn(), loadBotConfigs: () => [
+          { larkAppId: 'cli_source' }, { larkAppId: 'cli_target' }, { larkAppId: 'cli_reviewer' },
+        ],
       };
       if (path === './im/lark/client.js') return {
         getMessageThreadId, replyMessage,
         resolveCurrentChatBotOpenIdsByLarkAppIds: async () => ({
-          ok: true, mappings: [{ larkAppId: 'cli_target', subjectOpenId: 'ou_target' }],
+          ok: true, mappings: [
+            { larkAppId: 'cli_target', subjectOpenId: 'ou_target' },
+            { larkAppId: 'cli_reviewer', subjectOpenId: 'ou_reviewer' },
+          ],
         }),
       };
       if (path === './core/role-resolver.js') return { readRoleDispatchCompletionEnabled: () => false };
@@ -118,11 +135,15 @@ function harness(mode: Mode, options: {
     },
   };
   const command = new Function('state', 'with (state) { ' + cliCode + '; return cmdDispatch; }')(state);
-  const args = ['--session-id', 'source', ...(options.acceptance ? ['--bot-app', 'cli_target'] : ['--bot', 'ou_target'])];
+  const args = ['--session-id', 'source', ...(options.projectMode && options.access === 'write'
+    ? ['--bot-app', 'cli_target:worker', '--bot-app', 'cli_reviewer:reviewer']
+    : options.acceptance ? ['--bot-app', 'cli_target'] : ['--bot', 'ou_target'])];
   if (mode === 'into') args.push('--into', root, '--brief', '完成任务');
   else if (mode === 'standby') args.push('--title', '任务', '--repo', '/repo', '--standby');
   else args.push('--title', '任务', '--brief', '完成任务');
-  return { run: () => command(args), root, stdout, stderr, state, steps, request,
+  if (options.access === 'read_only') args.push('--read-only');
+  if (options.access === 'write') args.push('--write-scope', resolve('.'));
+  return { run: () => command(args), runArgs: (extra: string[]) => command([...args, ...extra]), root, stdout, stderr, state, steps, request,
     replyMessage, postCurrentSessionDaemonRoute, persistDispatchLifecycle, timeout, timeoutSignals };
 }
 
@@ -131,7 +152,7 @@ function oldReceipt(mode: Mode) {
     success: true, sourceSessionId: 'source', targetAppIds: [], transportState: 'dispatched',
     acceptanceState: 'not_requested', errorCode: null, taskSent: mode !== 'standby', mode,
     threadRootId: mode === 'into' ? 'om_existing' : 'om_seed', chatId: 'oc_chat',
-    bots: ['ou_target'], collaborationReady: false, projectSynced: true,
+    bots: ['ou_target'], collaborationReady: false, projectSynced: true, access: null,
   };
   if (mode === 'into') return { ...common, kickoffMessageId: 'om_kickoff' };
   return { ...common, seedMessageId: 'om_seed', repo: mode === 'standby' ? '/repo' : null,
@@ -191,6 +212,11 @@ for (const mode of ['dispatch', 'standby', 'into'] as const) {
         threadRootId: h.root, threadId: null, transportState: 'failed', acceptanceState: 'failed',
         errorCode: 'TRANSPORT_FAILED', detail: 'reply failed',
       });
+      if (mode === 'dispatch') {
+        expect(h.state.trySyncProjectDispatch).toHaveBeenCalledWith(expect.objectContaining({
+          action: { action: 'fail_dispatch', dispatchRoot: h.root, reason: 'dispatch delivery failed' },
+        }));
+      }
       expect(h.request).not.toHaveBeenCalled();
     });
   });
@@ -205,4 +231,58 @@ it.each(['dispatch', 'into'] as const)('%s keeps acceptance timeout independent 
     accepted: false, acceptedBotAppIds: [], missingBotAppIds: ['cli_target'],
   });
   expect(h.state.process.exitCode).toBe(1);
+});
+
+it('passes normalized access through policy and registration, then skips duplicate project sync', async () => {
+  const h = harness('dispatch', { access: 'write', projectMode: true });
+  await h.run();
+  expect(h.state.assertProjectDispatchPolicy).toHaveBeenCalledWith(expect.objectContaining({
+    readOnly: false, writeScopes: [resolve('.')],
+  }));
+  expect(h.postCurrentSessionDaemonRoute).toHaveBeenCalledWith(expect.objectContaining({
+    path: '/dispatch-report/register',
+    body: expect.objectContaining({
+      access: { mode: 'write', scopes: [resolve('.')] },
+      workerAppIds: ['cli_target'], reviewerAppIds: ['cli_reviewer'],
+    }),
+  }));
+  expect(h.state.trySyncProjectDispatch).not.toHaveBeenCalled();
+  expect(JSON.parse(h.stdout[0])).toMatchObject({
+    access: { mode: 'write', scopes: [resolve('.')] }, projectSynced: true,
+  });
+});
+
+it.each([
+  ['--bot-app', 'cli_target'],
+  ['--bot-app', 'cli_target:observer'],
+  ['--bot-app', 'cli_target:worker', '--bot-app', 'cli_target:reviewer'],
+])('rejects invalid project write roles before registration: %o', async (...botArgs) => {
+  const h = harness('dispatch', { projectMode: true });
+  const args = ['--session-id', 'source', '--title', '任务', '--brief', '完成任务',
+    '--write-scope', resolve('.'), ...botArgs];
+  await expect(h.runArgs(args)).rejects.toThrow('exit:1');
+  expect(h.postCurrentSessionDaemonRoute).not.toHaveBeenCalledWith(expect.objectContaining({
+    path: '/dispatch-report/register',
+  }));
+});
+
+it.each([
+  ['--read-only', '--write-scope', resolve('.')],
+  ['--into', 'om_existing', '--read-only'],
+  ['--into', 'om_existing', '--write-scope', resolve('.')],
+])('rejects incompatible access arguments before policy or transport: %o', async (...accessArgs) => {
+  const h = harness('dispatch');
+  await expect(h.runArgs(accessArgs)).rejects.toThrow('exit:1');
+  expect(h.state.assertProjectDispatchPolicy).not.toHaveBeenCalled();
+  expect(h.postCurrentSessionDaemonRoute).not.toHaveBeenCalled();
+});
+
+it('does not send a kickoff after a durable commit failure', async () => {
+  const h = harness('dispatch', { access: 'read_only', projectMode: true, registrationFailure: 'commit' });
+  await expect(h.run()).rejects.toThrow('exit:1');
+  expect(h.steps).toEqual(['seed']);
+  expect(h.replyMessage).not.toHaveBeenCalled();
+  expect(JSON.parse(h.stderr[0])).toMatchObject({
+    success: false, threadRootId: null, detail: expect.stringContaining('project_dispatch_commit_failed'),
+  });
 });

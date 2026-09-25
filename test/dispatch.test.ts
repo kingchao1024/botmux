@@ -22,6 +22,7 @@ import {
   appendLegacyDispatchReportProtocol,
   buildDispatchCompletionBrief,
   buildProjectDispatchSyncAction,
+  partitionProjectDispatchRoles,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -200,6 +201,39 @@ describe('buildProjectDispatchSyncAction', () => {
       owners: ['worker-a'], status: 'in_progress', progress: 20,
     });
   });
+
+  it('preserves target app identity and access only for a new project workstream', () => {
+    const access = { mode: 'write' as const, scopes: ['/repo/src'] };
+    expect(buildProjectDispatchSyncAction({
+      ...input, existingDispatch: false, targetAppIds: ['cli_worker'], access,
+    })).toMatchObject({ targetAppIds: ['cli_worker'], access });
+    expect(buildProjectDispatchSyncAction({
+      ...input, existingDispatch: true, targetAppIds: ['cli_worker'], access,
+    })).not.toHaveProperty('access');
+  });
+});
+
+describe('partitionProjectDispatchRoles', () => {
+  it('maps worker and coder roles to workers and reviewer to reviewers', () => {
+    expect(partitionProjectDispatchRoles([
+      { appId: 'cli_worker', role: 'worker' },
+      { appId: 'cli_coder', role: 'coder' },
+      { appId: 'cli_reviewer', role: 'reviewer' },
+    ])).toEqual({
+      workerAppIds: ['cli_worker', 'cli_coder'],
+      reviewerAppIds: ['cli_reviewer'],
+    });
+  });
+
+  it.each([
+    [[{ appId: 'cli_worker' }], 'project_write_role_required'],
+    [[{ appId: 'cli_worker', role: 'observer' }], 'project_write_role_invalid'],
+    [[{ appId: 'cli_worker', role: 'worker' }, { appId: 'cli_worker', role: 'reviewer' }], 'project_write_role_duplicate'],
+    [[{ appId: 'cli_worker', role: 'worker' }], 'project_reviewer_required'],
+    [[{ appId: 'cli_reviewer', role: 'reviewer' }], 'project_worker_required'],
+  ] as const)('rejects invalid write role assignment: %o', (bots, error) => {
+    expect(() => partitionProjectDispatchRoles(bots)).toThrow(error);
+  });
 });
 
 describe('dispatch completion switch wiring', () => {
@@ -246,6 +280,15 @@ describe('dispatch completion switch wiring', () => {
     expect(result.includes('botmux report --dispatch-root om_seed_exact')).toBe(exactReport);
     expect(result.includes('botmux report "子项目完成 + 产出位置/摘要"')).toBe(!exactReport);
     expect(result.includes('botmux send --no-mention')).toBe(sameTopicSend);
+  });
+
+  it('adds the write delivery and reviewer commands to a project write kickoff', () => {
+    const result = buildDispatchCompletionBrief({
+      brief: '完成实现并自测', dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: true, sameTopicSendEnabled: false, writeReviewRequired: true,
+    });
+    expect(result).toContain('botmux report --dispatch-root om_seed_exact --status completed');
+    expect(result).toContain('--review-verdict pass --review-round <deliveryRound>');
   });
 
   it('authenticates the exact report callback through daemon IPC', () => {

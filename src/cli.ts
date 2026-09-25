@@ -54,7 +54,7 @@ import {
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, dispatchChildTopLevelEscape, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, dispatchChildTopLevelEscape, parseDispatchBotSpec, partitionProjectDispatchRoles, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
   persistDispatchLifecycle as persistDispatchLifecycleRecord,
   type DispatchAcceptanceState,
@@ -244,7 +244,7 @@ import {
   type V3SessionRunAuthoringMutation,
 } from './workflows/v3/authoring-authority.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
-import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
+import { parseProjectReviewOptions, REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
 import { DISPATCH_USER_DELIVERY_ROUTE } from './core/dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
@@ -268,10 +268,13 @@ import {
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   collaborationHelp,
+  configuredBotRuntimeFacts,
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
   type BotCollaborationFactsByAppId,
 } from './cli/bots-list-output.js';
+import { daemonHeartbeatForAppTo } from './core/daemon-heartbeat.js';
+import { normalizeDispatchWriteScopes, type ProjectDispatchAccess } from './core/dispatch-write-scope.js';
 import { ensureBotChatGrantMatrix, requestExactChatGrant } from './cli/exact-chat-grant-client.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
 import {
@@ -11887,7 +11890,8 @@ async function postCurrentSessionDaemonRoute(input: {
 async function trySyncProjectDispatch(input: {
   sessionId: string;
   larkAppId: string;
-  action: ReturnType<typeof buildProjectDispatchSyncAction>;
+  action: ReturnType<typeof buildProjectDispatchSyncAction>
+    | { action: 'fail_dispatch'; dispatchRoot: string; reason: string };
 }): Promise<boolean> {
   try {
     const response = await postCurrentSessionDaemonRoute({
@@ -11914,7 +11918,10 @@ async function assertProjectDispatchPolicy(input: {
   hasLegacyBots: boolean;
   title: string;
   existingDispatch: boolean;
-}): Promise<void> {
+  readOnly: boolean;
+  writeScopes: string[];
+  dispatchRoot?: string;
+}): Promise<boolean> {
   const response = await postCurrentSessionDaemonRoute({
     path: `/api/sessions/${encodeURIComponent(input.sessionId)}/project-dispatch-policy`,
     sessionId: input.sessionId,
@@ -11925,14 +11932,18 @@ async function assertProjectDispatchPolicy(input: {
       hasLegacyBots: input.hasLegacyBots,
       title: input.title,
       existingDispatch: input.existingDispatch,
+      readOnly: input.readOnly,
+      writeScopes: input.writeScopes,
+      ...(input.dispatchRoot ? { dispatchRoot: input.dispatchRoot } : {}),
     },
   });
   const body = await response.json().catch(() => ({})) as {
     ok?: boolean;
+    projectMode?: boolean;
     error?: string;
     disallowedAppIds?: string[];
   };
-  if (response.ok && body.ok) return;
+  if (response.ok && body.ok) return body.projectMode === true;
   const disallowed = body.disallowedAppIds?.length ? ` (${body.disallowedAppIds.join(', ')})` : '';
   throw new Error(`${body.error ?? `HTTP ${response.status}`}${disallowed}`);
 }
@@ -12103,6 +12114,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief-file <path>   从文件读取简报
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
+  --read-only           project mode 新任务声明只读访问；与 --write-scope 二选一
+  --write-scope <path>  project mode 新任务声明写目录，可重复；必须是本机现存绝对目录
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
@@ -12129,6 +12142,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const steer = dispatchArgs.steer;
   const botSpecs = dispatchArgs.bots;
   const botAppSpecs = dispatchArgs.botApps;
+  const readOnly = dispatchArgs.readOnly;
+  let writeScopes: string[];
+  if (readOnly && dispatchArgs.writeScopes.length > 0) {
+    console.error('--read-only 与 --write-scope 不能同用。');
+    process.exit(1);
+  }
+  if (intoRoot && (readOnly || dispatchArgs.writeScopes.length > 0)) {
+    console.error('--into 不能携带 --read-only 或 --write-scope；已有 workstream 沿用原 access。');
+    process.exit(1);
+  }
+  try {
+    writeScopes = normalizeDispatchWriteScopes(dispatchArgs.writeScopes);
+  } catch (error) {
+    console.error(`--write-scope 无效: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+  const access: ProjectDispatchAccess | null = readOnly
+    ? { mode: 'read_only' }
+    : writeScopes.length > 0 ? { mode: 'write', scopes: writeScopes } : null;
 
   let brief = dispatchArgs.brief ?? '';
   if (briefFile) {
@@ -12226,8 +12258,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (!parsedBotApps.some(item => item.appId === targetAppId)) parsedBotApps.push({ appId: targetAppId, role });
   }
 
+  let projectMode = false;
   try {
-    await assertProjectDispatchPolicy({
+    projectMode = await assertProjectDispatchPolicy({
       sessionId: sid,
       larkAppId: appId,
       targetChatId,
@@ -12235,10 +12268,21 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       hasLegacyBots: legacyBots.length > 0,
       title: title.trim(),
       existingDispatch: !!intoRoot,
+      readOnly,
+      writeScopes,
+      ...(intoRoot ? { dispatchRoot: intoRoot } : {}),
     });
   } catch (error) {
     console.error(`dispatch 不符合当前群的协作模式: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
+  }
+  let projectRoles: { workerAppIds: string[]; reviewerAppIds: string[] } | undefined;
+  if (projectMode && access?.mode === 'write') {
+    try { projectRoles = partitionProjectDispatchRoles(parsedBotApps); }
+    catch (error) {
+      console.error(`project write 角色无效: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
   }
 
   let appBots: Array<{ openId: string; name?: string; role?: string }> = [];
@@ -12278,6 +12322,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     dispatchRootId,
     exactReportRootEnabled,
     sameTopicSendEnabled,
+    writeReviewRequired: projectMode && access?.mode === 'write',
   });
   let built;
   try {
@@ -12363,6 +12408,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         threadId: await resolveDispatchThreadId(appId, intoRoot),
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
         collaborationReady: parsedBotApps.length > 0,
+        access,
         projectSynced,
         ...(acceptance ? {
           accepted,
@@ -12392,6 +12438,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         bots: built.mentionedOpenIds,
         purpose: brief,
         owners: bots.map(bot => bot.name ?? bot.openId),
+        access,
+        ...(projectRoles ?? {}),
       },
     });
     const registrationBody: any = await registration.json().catch(() => ({}));
@@ -12462,7 +12510,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       acceptedBotAppIds: acceptance?.acceptedBotAppIds,
       missingBotAppIds: acceptance?.missingBotAppIds,
     });
-    const projectSynced = await trySyncProjectDispatch({
+    const projectSynced = registrationBody.projectSynced === true || await trySyncProjectDispatch({
       sessionId: sid,
       larkAppId: s.larkAppId,
       action: buildProjectDispatchSyncAction({
@@ -12492,6 +12540,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       chatId: targetChatId,
       bots: built.mentionedOpenIds,
       collaborationReady: parsedBotApps.length > 0,
+      access,
       projectSynced,
       ...(acceptance ? {
         accepted,
@@ -12518,15 +12567,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       await trySyncProjectDispatch({
         sessionId: sid,
         larkAppId: s.larkAppId,
-        action: buildProjectDispatchSyncAction({
-          existingDispatch: Boolean(intoRoot),
-          dispatchRoot: dispatchRootForLifecycle,
-          title: title.trim() || (intoRoot ? '' : '子任务'),
-          purpose: intoRoot ? '' : brief,
-          owners: bots.map(bot => bot.name ?? bot.openId),
-          status: 'failed',
-          progress: 0,
-        }),
+        action: intoRoot
+          ? buildProjectDispatchSyncAction({
+              existingDispatch: true, dispatchRoot: dispatchRootForLifecycle,
+              title: '', purpose: '', owners: [], status: 'failed', progress: 0,
+            })
+          : { action: 'fail_dispatch', dispatchRoot: dispatchRootForLifecycle, reason: 'dispatch delivery failed' },
       });
     }
     console.error(JSON.stringify({
@@ -12594,6 +12640,8 @@ async function cmdReport(rest: string[]): Promise<void> {
   --progress <0-100>     同步子任务完成百分比
   --remaining <text>     同步该子任务待完成内容
   --milestone <text>     同步一条项目里程碑
+  --review-verdict <v>   write 任务验收结论：pass|fail；必须配合 --review-round
+  --review-round <n>     当前 delivery 的正整数轮次；必须配合 --review-verdict
   --legacy-dispatch      legacy / 跨机器 dispatch 自动注入的兼容标记
   --session-id <id>      指定来源会话（默认自动推断）`);
     return;
@@ -12623,6 +12671,22 @@ async function cmdReport(rest: string[]): Promise<void> {
   const explicitDispatchRoot = argValue(rest, '--dispatch-root')?.trim();
   if (explicitDispatchRoot && !/^om_[A-Za-z0-9_-]{1,128}$/.test(explicitDispatchRoot)) {
     console.error('--dispatch-root 必须是有效的 om_ 消息 id。');
+    process.exit(1);
+  }
+  for (const flag of ['--review-verdict', '--review-round']) {
+    if (flagPresentButValueMissing(rest, flag)) {
+      console.error(`${flag} 需要一个值。`);
+      process.exit(1);
+    }
+  }
+  const reviewOptions = parseProjectReviewOptions({
+    verdict: argValue(rest, '--review-verdict'),
+    round: argValue(rest, '--review-round'),
+    explicitDispatchRoot: !!explicitDispatchRoot,
+    into: !!explicitInto, topLevel: explicitTopLevel, legacyDispatch,
+  });
+  if (!reviewOptions.ok) {
+    console.error(reviewOptions.error);
     process.exit(1);
   }
   if (rest.filter(arg => arg === '--recipient-root' || arg.startsWith('--recipient-root=')).length > 1) {
@@ -12828,6 +12892,9 @@ async function cmdReport(rest: string[]): Promise<void> {
           ...(projectProgressRaw !== undefined ? { progress: Number(projectProgressRaw) } : {}),
           ...(projectRemaining ? { remaining: projectRemaining } : {}),
           ...(projectMilestone ? { milestone: projectMilestone } : {}),
+          ...(reviewOptions.reviewVerdict ? {
+            reviewVerdict: reviewOptions.reviewVerdict, reviewRound: reviewOptions.reviewRound,
+          } : {}),
         },
       });
     } catch (err: any) {
@@ -12863,6 +12930,8 @@ async function cmdReport(rest: string[]): Promise<void> {
         },
         triggerId: triggerBody.triggerId,
         projectSynced: triggerBody.projectSynced === true,
+        ...(Number.isSafeInteger(triggerBody.deliveryRound) && triggerBody.deliveryRound > 0
+          ? { deliveryRound: triggerBody.deliveryRound } : {}),
       }));
       return;
     }
@@ -14608,8 +14677,22 @@ botmux bots — 机器人协作花名册 / 团队补人
     const facts: Record<string, BotCollaborationFactsByAppId[string]> = Object.create(null);
     const wanted = new Set(appIds.filter(Boolean));
     try {
+      let registryReadable = false;
+      let onlineAppIds = new Set<string>();
+      if (!isolatedCliProcess()) {
+        try {
+          const registryDir = join(dataDir, 'dashboard-daemons');
+          try { readdirSync(registryDir); } catch (err) {
+            throw err;
+          }
+          onlineAppIds = new Set(listOnlineDaemons().map(daemon => daemon.larkAppId));
+          registryReadable = true;
+        } catch { /* unreadable/invalid registry: runtime stays unknown */ }
+      }
+      const nowMs = Date.now();
       for (const cfg of loadBotConfigs()) {
         if (!wanted.has(cfg.larkAppId)) continue;
+        const online = registryReadable && onlineAppIds.has(cfg.larkAppId);
         facts[cfg.larkAppId] = {
           workspaceSource: cfg.oncallChats?.some(c => c.chatId === s.chatId)
             ? 'oncall'
@@ -14617,6 +14700,13 @@ botmux bots — 机器人协作花名册 / 团队补人
           mentionMode: cfg.regularGroupMentionMode ?? 'always',
           replyMode: cfg.chatReplyModes?.[s.chatId] ?? cfg.regularGroupReplyMode ?? 'chat-topic',
           transport: cfg.apiOnly !== true,
+          runtime: configuredBotRuntimeFacts({
+            registryReadable,
+            online,
+            heartbeat: online
+              ? daemonHeartbeatForAppTo(dataDir, cfg.larkAppId, nowMs)
+              : null,
+          }),
         };
       }
     } catch { /* config unreadable under isolation: all facts stay unknown */ }

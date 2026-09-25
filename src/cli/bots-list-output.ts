@@ -1,4 +1,11 @@
 import type { ChatBotMember } from '../im/lark/client.js';
+import type { FreshDaemonHeartbeat } from '../core/daemon-heartbeat.js';
+
+export type BotRuntimeFacts = Readonly<{
+  availability: 'idle' | 'busy' | 'offline' | 'unknown';
+  busyCount?: number;
+  observedAt?: string;
+}>;
 
 export type BotInfoEntryForList = {
   larkAppId: string;
@@ -12,6 +19,7 @@ export type BotCollaborationFacts = {
   mentionMode: 'always' | 'topic' | 'never' | 'ambient';
   replyMode: 'chat' | 'chat-topic' | 'new-topic' | 'shared';
   transport: boolean;
+  runtime?: BotRuntimeFacts;
 };
 
 export type BotCollaborationFactsByAppId = Readonly<Record<string, BotCollaborationFacts>>;
@@ -58,7 +66,9 @@ export type BotListOutputEntry = {
     runtime: {
       transport: boolean | 'unknown';
       deployment: 'local' | 'remote' | 'unknown';
-      stale: boolean | 'unknown';
+      availability: 'idle' | 'busy' | 'offline' | 'unknown';
+      busyCount?: number;
+      observedAt?: string;
     };
   };
 };
@@ -147,16 +157,27 @@ export const collaborationHelp = {
         unknown: '当前输出无法确定部署归属。',
       },
     },
-    'runtime.stale': {
-      description: '已有运行时健康证据是否过期。',
+    'runtime.availability': {
+      description: '基于本机 daemon registry 与 fresh heartbeat 的只读运行态；不作为授权凭据。',
       values: {
-        true: '健康证据已过期；派发前刷新状态。',
-        false: '有近期权威健康证据。',
-        unknown: '没有健康时间戳或探针证据；不能据此判断在线或离线。',
+        idle: '本机 daemon 在线且 fresh heartbeat 显示当前没有执行中 turn，可立即派单。',
+        busy: '本机 daemon 在线且有执行中 turn；仍可排队，不是硬失败。',
+        offline: '本机权威 registry 可读，目标已配置但没有在线 daemon。',
+        unknown: '隔离、外部 Bot、读取异常或 heartbeat 不可用导致证据不足，不能据此判断在线或离线。',
       },
     },
   },
 } as const;
+
+export function configuredBotRuntimeFacts(input: Readonly<{
+  registryReadable: boolean;
+  online: boolean;
+  heartbeat: FreshDaemonHeartbeat | null;
+}>): BotRuntimeFacts {
+  if (!input.registryReadable) return { availability: 'unknown' };
+  if (!input.online) return { availability: 'offline' };
+  return input.heartbeat ?? { availability: 'unknown' };
+}
 
 function dispatchGuide(capability: string | null | undefined): BotListOutputEntry['dispatch'] {
   const workspace = capability?.match(/\bworkspace\s*:\s*(required|optional|none)\b/i)?.[1]?.toLowerCase();
@@ -203,7 +224,7 @@ function collaborationGuide(
       deployment: row.larkAppId !== '' && ((live && row.source === 'configured') || facts !== undefined)
         ? 'local'
         : 'unknown',
-      stale: 'unknown',
+      ...(facts?.runtime ?? { availability: 'unknown' }),
     },
   };
 }

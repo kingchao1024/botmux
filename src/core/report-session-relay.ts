@@ -6,6 +6,30 @@ import type { ProjectWorkstreamStatus } from '../services/project-group-store.js
 export const REPORT_SESSION_RELAY_ROUTE = '/api/report-relay';
 export const REPORT_SESSION_RELAY_MAX_BYTES = 256 * 1024;
 
+export type ProjectReviewOptionsResult =
+  | { ok: true; reviewVerdict?: 'pass' | 'fail'; reviewRound?: number }
+  | { ok: false; error: string };
+
+export function parseProjectReviewOptions(input: {
+  verdict?: string; round?: string; explicitDispatchRoot: boolean;
+  into?: boolean; topLevel?: boolean; legacyDispatch?: boolean;
+}): ProjectReviewOptionsResult {
+  const present = input.verdict !== undefined || input.round !== undefined;
+  if (!present) return { ok: true };
+  if (input.verdict !== 'pass' && input.verdict !== 'fail') {
+    return { ok: false, error: '--review-verdict 必须是 pass|fail' };
+  }
+  if (!input.round || !/^[1-9][0-9]*$/.test(input.round)) {
+    return { ok: false, error: '--review-round 必须是正整数' };
+  }
+  const reviewRound = Number(input.round);
+  if (!Number.isSafeInteger(reviewRound)) return { ok: false, error: '--review-round 必须是正整数' };
+  if (!input.explicitDispatchRoot || input.into || input.topLevel || input.legacyDispatch) {
+    return { ok: false, error: 'review verdict 仅支持显式 --dispatch-root，且不能与 --into/--top-level/--legacy-dispatch 同用' };
+  }
+  return { ok: true, reviewVerdict: input.verdict, reviewRound };
+}
+
 export interface ReportSessionRelaySessionView {
   sessionId: string;
   larkAppId?: string;
@@ -49,18 +73,22 @@ export type ReportSessionRelayFallbackDecision =
 export type ReportSessionRelayDecision =
   | {
       ok: true;
-      source: { sessionId: string; larkAppId: string };
+      source: { sessionId: string; larkAppId: string; turnId: string };
       target: { sessionId: string; larkAppId: string };
       targetChatId?: string;
       targetScope?: 'thread' | 'chat';
       dispatchRoot: string;
       sourceName: string;
       content: string;
+      reporterAppId: string;
+      projectRequired: boolean;
       projectUpdate: {
         status?: ProjectWorkstreamStatus;
         progress?: number;
         remaining?: string;
         milestone?: string;
+        reviewVerdict?: 'pass' | 'fail';
+        reviewRound?: number;
       };
     }
   | { ok: false; status: number; error: string };
@@ -77,6 +105,9 @@ export function authorizeReportSessionRelayRequest(input: {
     ? input.raw as Record<string, unknown>
     : undefined;
   if (!body) return { ok: false, status: 400, error: 'bad_json' };
+  if (Object.hasOwn(body, 'reporterAppId')) {
+    return { ok: false, status: 400, error: 'untrusted_reporter_app_id' };
+  }
 
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
   const dispatchRoot = typeof body.dispatchRoot === 'string' ? body.dispatchRoot.trim() : '';
@@ -98,6 +129,14 @@ export function authorizeReportSessionRelayRequest(input: {
   )) return { ok: false, status: 400, error: 'bad_project_progress' };
   const remaining = typeof body.remaining === 'string' ? body.remaining.trim().slice(0, 300) : undefined;
   const milestone = typeof body.milestone === 'string' ? body.milestone.trim().slice(0, 300) : undefined;
+  const reviewVerdict = body.reviewVerdict === undefined ? undefined
+    : body.reviewVerdict === 'pass' || body.reviewVerdict === 'fail' ? body.reviewVerdict : null;
+  const reviewRound = body.reviewRound === undefined ? undefined : body.reviewRound;
+  if (reviewVerdict === null
+    || (reviewRound !== undefined && (!Number.isSafeInteger(reviewRound) || (reviewRound as number) <= 0))
+    || (reviewVerdict === undefined) !== (reviewRound === undefined)) {
+    return { ok: false, status: 400, error: 'bad_project_review' };
+  }
 
   const current = input.session;
   const verified = authorizeSessionScopedIpc({
@@ -156,10 +195,13 @@ export function authorizeReportSessionRelayRequest(input: {
       error: resolved.error,
     };
   }
+  const registryEntry = input.registry[dispatchRoot];
+  const projectRequired = !!registryEntry && typeof registryEntry === 'object' && !Array.isArray(registryEntry)
+    && Object.hasOwn(registryEntry, 'access');
 
   return {
     ok: true,
-    source: { sessionId: current.sessionId, larkAppId: current.larkAppId },
+    source: { sessionId: current.sessionId, larkAppId: current.larkAppId, turnId: liveTurnId },
     target: {
       sessionId: resolved.binding.targetSessionId,
       larkAppId: resolved.binding.targetLarkAppId,
@@ -169,11 +211,14 @@ export function authorizeReportSessionRelayRequest(input: {
     dispatchRoot,
     sourceName: resolved.binding.sourceName,
     content,
+    reporterAppId: current.larkAppId,
+    projectRequired,
     projectUpdate: {
       ...(projectStatus ? { status: projectStatus } : {}),
       ...(typeof progress === 'number' ? { progress } : {}),
       ...(remaining ? { remaining } : {}),
       ...(milestone ? { milestone } : {}),
+      ...(reviewVerdict ? { reviewVerdict, reviewRound: reviewRound as number } : {}),
     },
   };
 }
@@ -302,6 +347,7 @@ export async function deliverReportSessionRelay(input: {
   postProjectUpdate(target: { larkAppId: string; sessionId: string }): Promise<{
     projectSynced: boolean;
     projectSyncError?: string;
+    deliveryRound?: number;
   }>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { decision } = input;
@@ -316,6 +362,16 @@ export async function deliverReportSessionRelay(input: {
     : {};
   if (response.ok) {
     const project = await input.postProjectUpdate(decision.target);
+    if (!project.projectSynced && project.projectSyncError) {
+      return {
+        status: 409,
+        body: {
+          ok: false, error: 'project_sync_failed', triggerAccepted: true,
+          ...(typeof responseRecord.triggerId === 'string' ? { triggerId: responseRecord.triggerId } : {}),
+          reportTarget: decision.target, ...project,
+        },
+      };
+    }
     return {
       status: response.status,
       body: { ...responseRecord, reportTarget: decision.target, ...project },

@@ -345,9 +345,12 @@ import {
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
 
-import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
+import { findDispatchOperation, recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
+import { normalizeDispatchWriteScopes, type ProjectDispatchAccess } from './core/dispatch-write-scope.js';
+import { partitionProjectDispatchRoles } from './core/dispatch.js';
 import { projectCoordinator } from './services/project-coordinator-runtime.js';
+import { readProjectGroup } from './services/project-group-store.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
@@ -6686,6 +6689,35 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       .map(item => item.trim()).filter(Boolean).slice(0, 64)
     : [];
   const targetAppIds = stringArray(body?.targetAppIds);
+  const exactAppIds = (value: unknown): string[] | null => {
+    if (!Array.isArray(value) || value.length > 64
+      || value.some(item => typeof item !== 'string' || !/^cli_[A-Za-z0-9_-]{1,128}$/.test(item))) return null;
+    const ids = value as string[];
+    return new Set(ids).size === ids.length ? ids : null;
+  };
+  let access: ProjectDispatchAccess | null = null;
+  if (body?.access !== null && body?.access !== undefined) {
+    if (typeof body.access !== 'object' || Array.isArray(body.access)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_project_dispatch_access' });
+    }
+    const rawAccess = body.access as Record<string, unknown>;
+    const accessKeys = Object.keys(rawAccess).sort();
+    if (rawAccess.mode === 'read_only' && accessKeys.length === 1) access = { mode: 'read_only' };
+    else if (rawAccess.mode === 'write' && Array.isArray(rawAccess.scopes)
+      && accessKeys.length === 2 && accessKeys[0] === 'mode' && accessKeys[1] === 'scopes'
+      && rawAccess.scopes.every(scope => typeof scope === 'string')) {
+      try {
+        const scopes = normalizeDispatchWriteScopes(rawAccess.scopes as string[]);
+        if (scopes.length === 0) throw new Error('write_scope_required');
+        access = { mode: 'write', scopes };
+      } catch (error) {
+        return jsonRes(res, 400, {
+          ok: false, error: 'invalid_project_dispatch_access',
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } else return jsonRes(res, 400, { ok: false, error: 'invalid_project_dispatch_access' });
+  }
   const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
   const dispatchPolicy = evaluateProjectDispatchPolicy({
     config: groupMode,
@@ -6696,13 +6728,91 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     hasLegacyBots: body?.hasLegacyBots === true,
     title,
     existingDispatch: false,
+    readOnly: access?.mode === 'read_only',
+    writeScopes: access?.mode === 'write' ? access.scopes : [],
   });
   if (!dispatchPolicy.ok) return jsonRes(res, 403, dispatchPolicy);
+  if (dispatchPolicy.projectMode && !access) {
+    return jsonRes(res, 400, { ok: false, error: 'project_dispatch_access_required' });
+  }
+  let workerAppIds: string[] | undefined;
+  let reviewerAppIds: string[] | undefined;
+  if (access?.mode === 'write') {
+    workerAppIds = exactAppIds(body?.workerAppIds) ?? undefined;
+    reviewerAppIds = exactAppIds(body?.reviewerAppIds) ?? undefined;
+    if (!workerAppIds || !reviewerAppIds) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_project_dispatch_roles' });
+    }
+    try {
+      const partitioned = partitionProjectDispatchRoles([
+        ...workerAppIds.map(appId => ({ appId, role: 'worker' })),
+        ...reviewerAppIds.map(appId => ({ appId, role: 'reviewer' })),
+      ]);
+      const assigned = [...partitioned.workerAppIds, ...partitioned.reviewerAppIds].sort();
+      const targets = [...targetAppIds].sort();
+      if (assigned.length !== targets.length || assigned.some((id, index) => id !== targets[index])) {
+        throw new Error('project_dispatch_role_targets_mismatch');
+      }
+    } catch (error) {
+      return jsonRes(res, 400, {
+        ok: false, error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const origin = ds.managedTurnOrigin;
+  const dispatchOperationId = dispatchPolicy.projectMode && origin?.turnId
+    ? createHash('sha256').update(JSON.stringify({
+        sessionId, turnId: origin.turnId, dispatchAttempt: origin.dispatchAttempt,
+        seedText, targetChatId, targetAppIds: [...targetAppIds].sort(), acceptanceRequested,
+        title, purpose, access, workerAppIds, reviewerAppIds,
+      })).digest('hex')
+    : undefined;
+  const registryPath = join(config.session.dataDir, 'orchestrate-dispatch.json');
+  const prior = dispatchOperationId ? findDispatchOperation(registryPath, dispatchOperationId) : undefined;
+  if (prior) {
+    const priorWorkstream = readProjectGroup(config.session.dataDir, ds.chatId)?.workstreams
+      .find(item => item.dispatchRoot === prior.dispatchRoot);
+    if (priorWorkstream && priorWorkstream.status !== 'completed' && priorWorkstream.status !== 'failed') {
+      return jsonRes(res, 200, {
+        ok: true, dispatchRoot: prior.dispatchRoot, projectSynced: true, access, replayed: true,
+      });
+    }
+  }
+
+  const projectContext = {
+    dataDir: config.session.dataDir, chatId: ds.chatId, larkAppId: ds.larkAppId,
+    coordinatorSessionId: ds.session.sessionId,
+  };
+  const reservationId = dispatchPolicy.projectMode ? randomUUID() : undefined;
+  let reservationActive = false;
+  const abortReservation = async (): Promise<void> => {
+    if (!reservationId || !reservationActive) return;
+    try {
+      await projectCoordinator.run(projectContext, { action: 'abort_dispatch', reservationId, targetAppIds });
+      reservationActive = false;
+    } catch (error) {
+      logger.warn(`[project:${ds.chatId}] dispatch reservation abort failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  if (reservationId) {
+    try {
+      await projectCoordinator.run(projectContext, {
+        action: 'reserve_dispatch', reservationId, targetAppIds, access: access!,
+      });
+      reservationActive = true;
+    } catch (error) {
+      return jsonRes(res, 409, {
+        ok: false, error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 
   let dispatchRoot: string;
   try {
     dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text');
   } catch (error) {
+    await abortReservation();
     return jsonRes(res, 502, {
       ok: false,
       error: 'dispatch_seed_send_failed',
@@ -6726,7 +6836,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   const botOpenIds = stringArray(body?.bots);
   try {
     await recordDispatchRegistryEntry(
-      join(config.session.dataDir, 'orchestrate-dispatch.json'),
+      registryPath,
       dispatchRoot,
       {
         orchRoot: ds.session.rootMessageId ?? '',
@@ -6736,15 +6846,20 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
         orchSessionId: ds.session.sessionId,
         targetChatId,
         targetAppIds,
+        ...(access ? { access } : {}),
+        ...(workerAppIds ? { workerAppIds } : {}),
+        ...(reviewerAppIds ? { reviewerAppIds } : {}),
         title,
         bots: botOpenIds,
         ...initialDispatchLifecycle(acceptanceRequested),
         createdAt: issuedAt,
         updatedAt: issuedAt,
         reportBinding,
+        ...(dispatchOperationId ? { dispatchOperationId } : {}),
       },
     );
   } catch (error) {
+    await abortReservation();
     return jsonRes(res, 500, {
       ok: false,
       error: 'dispatch_registry_write_failed',
@@ -6752,22 +6867,25 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     });
   }
   let projectSynced = false;
-  if (dispatchPolicy.projectMode && ds.chatType === 'group' && ds.scope === 'chat' && targetChatId === ds.chatId) {
+  if (reservationId) {
     try {
-      await projectCoordinator.run({
-        dataDir: config.session.dataDir,
-        chatId: ds.chatId,
-        larkAppId: ds.larkAppId,
-        coordinatorSessionId: ds.session.sessionId,
-      }, {
-        action: 'dispatch', dispatchRoot, title: title || '子任务', purpose,
-        owners: stringArray(body?.owners), status: 'pending', progress: 0,
+      await projectCoordinator.run(projectContext, {
+        action: 'commit_dispatch', reservationId, targetAppIds, dispatchRoot,
+        title: title || '子任务', purpose, owners: stringArray(body?.owners), workerAppIds, reviewerAppIds,
       });
+      reservationActive = false;
       projectSynced = true;
     } catch (error) {
-      if (!(error instanceof Error && error.message === 'project_not_found')) {
-        logger.warn(`[project:${ds.chatId}] dispatch projection failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
+      return jsonRes(res, 500, {
+        ok: false, error: 'project_dispatch_commit_failed',
+        detail: error instanceof Error ? error.message : String(error),
+        seedCreated: true, dispatchRoot, access,
+      });
+    }
+    try {
+      await projectCoordinator.run(projectContext, { action: 'refresh' });
+    } catch (error) {
+      logger.warn(`[project:${ds.chatId}] dispatch card refresh failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   // The dispatch root is a real daemon event, but this route has no verified
@@ -6778,7 +6896,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   // SQLite on this IPC response path; a bounded asynchronous queue preserves
   // the observation best-effort and drops it loudly on sidecar pressure.
   taskControlIntegration?.dispatchRequested(dispatchRoot, ds.session.sessionId, issuedAt);
-  return jsonRes(res, 201, { ok: true, dispatchRoot, projectSynced });
+  return jsonRes(res, 201, { ok: true, dispatchRoot, projectSynced, access });
 });
 
 // All new dispatch kickoffs (including --into) go through the source daemon.
@@ -6820,10 +6938,15 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (await lookupMessageChatId(ds.larkAppId, rootId) !== chatId) {
       return jsonRes(res, 403, { ok: false, error: 'dispatch_chat_mismatch' });
     }
+    const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
     const policy = evaluateProjectDispatchPolicy({
-      config: readGroupCollaborationMode(config.session.dataDir, ds.chatId),
+      config: groupMode,
       sourceAppId: ds.larkAppId, sourceChatId: ds.chatId, targetChatId: chatId,
       targetAppIds, hasLegacyBots: body.hasLegacyBots === true, title: '', existingDispatch: true,
+      ...(groupMode?.mode === 'project'
+        ? { assignedAppIds: readProjectGroup(config.session.dataDir, ds.chatId)?.workstreams
+            .find(item => item.dispatchRoot === rootId)?.targetAppIds ?? [] }
+        : {}),
     });
     if (!policy.ok) return jsonRes(res, 403, policy);
     const bot = getBot(ds.larkAppId).config;
@@ -6934,7 +7057,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   };
   const postProjectUpdate = async (
     target: { larkAppId: string; sessionId: string },
-  ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
+  ): Promise<{ projectSynced: boolean; projectSyncError?: string; deliveryRound?: number }> => {
     const projectDaemon = target.larkAppId === decision.target.larkAppId
       ? targetDaemon
       // deliverReportSessionRelay only chooses same-app fallbacks today. Keep
@@ -6951,16 +7074,27 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             action: 'report', dispatchRoot: decision.dispatchRoot, content: decision.content,
+            reporterAppId: decision.reporterAppId,
             ...decision.projectUpdate,
           }),
         },
       );
-      const projectBody = await projectResponse.json().catch(() => ({})) as { ok?: boolean; error?: string };
+      const projectBody = await projectResponse.json().catch(() => ({})) as {
+        ok?: boolean; error?: string;
+        project?: { workstreams?: Array<{ dispatchRoot?: string; delivery?: { round?: number } }> };
+      };
       const projectSynced = projectResponse.ok && projectBody.ok === true;
-      if (!projectSynced && !(projectResponse.status === 404 && projectBody.error === 'project_not_found')) {
+      if (!projectSynced && !(!decision.projectRequired
+        && projectResponse.status === 404 && projectBody.error === 'project_not_found')) {
         return { projectSynced, projectSyncError: projectBody.error ?? `HTTP ${projectResponse.status}` };
       }
-      return { projectSynced };
+      const deliveryRound = projectBody.project?.workstreams
+        ?.find(item => item.dispatchRoot === decision.dispatchRoot)?.delivery?.round;
+      return {
+        projectSynced,
+        ...(Number.isSafeInteger(deliveryRound) && (deliveryRound as number) > 0
+          ? { deliveryRound } : {}),
+      };
     } catch (error) {
       return {
         projectSynced: false,
@@ -6968,10 +7102,18 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       };
     }
   };
+  const reportRequestId = 'report:' + createHash('sha256').update(JSON.stringify({
+    sourceSessionId: decision.source.sessionId,
+    sourceTurnId: decision.source.turnId,
+    dispatchRoot: decision.dispatchRoot,
+    reporterAppId: decision.reporterAppId,
+    content: decision.content,
+    projectUpdate: decision.projectUpdate,
+  })).digest('hex');
   try {
     const delivered = await deliverReportSessionRelay({
       decision,
-      triggerMeta,
+      triggerMeta: { ...triggerMeta, requestId: reportRequestId },
       fetchTarget: (path, init) => fetchDaemonIpc(targetDaemon.ipcPort, path, init),
       postProjectUpdate,
     });

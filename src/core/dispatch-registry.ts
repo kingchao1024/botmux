@@ -4,6 +4,11 @@ import { withFileLock } from '../utils/file-lock.js';
 
 export type DispatchRegistry = Record<string, unknown>;
 
+export interface DispatchOperationMatch {
+  dispatchRoot: string;
+  entry: Record<string, unknown>;
+}
+
 function readDispatchRegistry(path: string): DispatchRegistry {
   if (!existsSync(path)) return {};
   const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
@@ -11,6 +16,21 @@ function readDispatchRegistry(path: string): DispatchRegistry {
     throw new Error('orchestrate-dispatch.json must contain an object');
   }
   return parsed as DispatchRegistry;
+}
+
+export function findDispatchOperation(path: string, operationId: string): DispatchOperationMatch | undefined {
+  if (!operationId) return undefined;
+  const entries = Object.entries(readDispatchRegistry(path));
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const [dispatchRoot, value] = entries[index]!;
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot)
+      || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const entry = value as Record<string, unknown>;
+    if (entry.dispatchOperationId === operationId) {
+      return { dispatchRoot, entry };
+    }
+  }
+  return undefined;
 }
 
 /**

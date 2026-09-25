@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 import {
   collaborationHelp,
+  configuredBotRuntimeFacts,
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
 } from '../src/cli/bots-list-output.js';
@@ -156,6 +157,11 @@ describe('botmux bots list CLI output mapping', () => {
         mentionMode: 'topic',
         replyMode: 'shared',
         transport: true,
+        runtime: {
+          availability: 'busy',
+          busyCount: 2,
+          observedAt: '2026-06-07T04:00:00.000Z',
+        },
       },
     });
 
@@ -165,7 +171,13 @@ describe('botmux bots list CLI output mapping', () => {
       workspace: { requirement: 'required', source: 'oncall' },
       authorization: { talk: 'preflight-required', operate: false },
       session: { mentionMode: 'topic', replyMode: 'shared' },
-      runtime: { transport: true, deployment: 'local', stale: 'unknown' },
+      runtime: {
+        transport: true,
+        deployment: 'local',
+        availability: 'busy',
+        busyCount: 2,
+        observedAt: '2026-06-07T04:00:00.000Z',
+      },
     });
 
     const [defaulted] = formatChatBotsForCli([{
@@ -239,18 +251,18 @@ describe('botmux bots list CLI output mapping', () => {
       workspace: { requirement: 'unknown', source: 'unknown' },
       authorization: { talk: 'unknown', operate: 'unknown' },
       session: { mentionMode: 'unknown', replyMode: 'unknown' },
-      runtime: { transport: 'unknown', deployment: 'unknown', stale: 'unknown' },
+      runtime: { transport: 'unknown', deployment: 'unknown', availability: 'unknown' },
     });
     expect(external.collaboration).toMatchObject({
       workspace: { requirement: 'unknown', source: 'unknown' },
       authorization: { talk: 'unknown', operate: 'unknown' },
       session: { mentionMode: 'unknown', replyMode: 'unknown' },
-      runtime: { transport: 'unknown', deployment: 'unknown', stale: 'unknown' },
+      runtime: { transport: 'unknown', deployment: 'unknown', availability: 'unknown' },
     });
     expect(configuredWithoutFacts.collaboration).toMatchObject({
       workspace: { requirement: 'unknown', source: 'unknown' },
       session: { mentionMode: 'unknown', replyMode: 'unknown' },
-      runtime: { transport: 'unknown', stale: 'unknown' },
+      runtime: { transport: 'unknown', availability: 'unknown' },
     });
 
     const serialized = JSON.stringify({ bots: [fallback, external, configuredWithoutFacts], collaborationHelp });
@@ -304,7 +316,7 @@ describe('botmux bots list CLI output mapping', () => {
       'session.replyMode': ['chat', 'chat-topic', 'new-topic', 'shared', 'unknown'],
       'runtime.transport': ['true', 'false', 'unknown'],
       'runtime.deployment': ['local', 'remote', 'unknown'],
-      'runtime.stale': ['true', 'false', 'unknown'],
+      'runtime.availability': ['idle', 'busy', 'offline', 'unknown'],
     };
 
     expect(Object.keys(collaborationHelp.fields)).toEqual(Object.keys(expectedValues));
@@ -328,10 +340,51 @@ describe('botmux bots list CLI output mapping', () => {
     expect(collaborationHelp.fields['runtime.transport'].description).toContain('不是在线健康状态');
     expect(collaborationHelp.fields['runtime.transport'].values.true).toContain('不证明 daemon');
     expect(collaborationHelp.fields['runtime.transport'].values.false).toContain('apiOnly');
+    expect(collaborationHelp.fields['runtime.availability'].values.busy).toContain('仍可排队');
+    expect(collaborationHelp.fields['runtime.availability'].values.offline).toContain('本机');
+    expect(collaborationHelp.fields['runtime.availability'].values.unknown).toContain('证据不足');
 
     const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
     const outputLines = cliSource.split('\n').filter(line => line.includes('console.log(JSON.stringify({ sessionId: sid') && line.includes('collaborationHelp'));
     expect(outputLines).toHaveLength(2);
     expect(outputLines.every(line => (line.match(/collaborationHelp/g) ?? []).length === 1)).toBe(true);
+  });
+
+  it('maps local registry and heartbeat evidence to runtime availability', () => {
+    const observedAt = '2026-06-07T04:00:00.000Z';
+
+    expect(configuredBotRuntimeFacts({
+      registryReadable: true,
+      online: true,
+      heartbeat: { availability: 'idle', busyCount: 0, observedAt },
+    })).toEqual({ availability: 'idle', busyCount: 0, observedAt });
+    expect(configuredBotRuntimeFacts({
+      registryReadable: true,
+      online: true,
+      heartbeat: { availability: 'busy', busyCount: 3, observedAt },
+    })).toEqual({ availability: 'busy', busyCount: 3, observedAt });
+    expect(configuredBotRuntimeFacts({
+      registryReadable: true,
+      online: true,
+      heartbeat: null,
+    })).toEqual({ availability: 'unknown' });
+    expect(configuredBotRuntimeFacts({
+      registryReadable: true,
+      online: false,
+      heartbeat: null,
+    })).toEqual({ availability: 'offline' });
+    expect(configuredBotRuntimeFacts({
+      registryReadable: false,
+      online: false,
+      heartbeat: null,
+    })).toEqual({ availability: 'unknown' });
+  });
+
+  it('does not treat a missing daemon registry directory as readable offline evidence', () => {
+    const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = cliSource.indexOf('const collaborationFactsFor');
+    const end = cliSource.indexOf('return facts;', start);
+    const block = cliSource.slice(start, end);
+    expect(block).not.toContain("if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err");
   });
 });

@@ -52,6 +52,14 @@ describe('botmux report daemon IPC auth wiring', () => {
     expect(source).not.toContain('findDispatchRegistryEntry({');
   });
 
+  it('validates review options and forwards them only through the exact report relay', () => {
+    const source = reportCommandSource();
+    expect(source).toContain('parseProjectReviewOptions({');
+    expect(source).toContain('reviewVerdict: reviewOptions.reviewVerdict');
+    expect(source).toContain('reviewRound: reviewOptions.reviewRound');
+    expect(source).toContain('explicitDispatchRoot: !!explicitDispatchRoot');
+  });
+
   it('creates the dispatch seed in the authenticated daemon before returning the root id', () => {
     const dispatchSource = dispatchCommandSource();
     const daemonSource = readFileSync(resolve('src/daemon.ts'), 'utf8');

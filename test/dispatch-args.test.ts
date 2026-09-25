@@ -19,6 +19,9 @@ describe('parseDispatchArgs', () => {
       '--session-id=sid',
       '--standby',
       '--steer',
+      '--read-only',
+      '--write-scope', '/repo/src',
+      '--write-scope=/repo/docs',
     ])).toEqual({
       ok: true,
       value: {
@@ -33,6 +36,8 @@ describe('parseDispatchArgs', () => {
         sessionId: 'sid',
         standby: true,
         steer: true,
+        readOnly: true,
+        writeScopes: ['/repo/src', '/repo/docs'],
       },
     });
   });
@@ -95,6 +100,13 @@ describe('parseDispatchArgs', () => {
   it('preserves repeatable bot flags', () => {
     expect(parseDispatchArgs(['--bot-app', 'cli_a', '--bot-app', 'cli_b']))
       .toMatchObject({ ok: true, value: { botApps: ['cli_a', 'cli_b'] } });
+  });
+
+  it('defaults project access flags without changing legacy dispatch arguments', () => {
+    expect(parseDispatchArgs(['--title', 'task', '--bot-app', 'cli_a'])).toMatchObject({
+      ok: true,
+      value: { readOnly: false, writeScopes: [] },
+    });
   });
 
   it('keeps both brief sources so cmdDispatch retains brief-file precedence', () => {

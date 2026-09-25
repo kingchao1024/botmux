@@ -2,11 +2,27 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
+import type { ProjectDispatchAccess } from '../core/dispatch-write-scope.js';
 
 export const PROJECT_GROUP_STORE_FILE = 'project-groups.json';
 
 export type ProjectGroupStatus = 'active' | 'paused' | 'completed';
-export type ProjectWorkstreamStatus = 'pending' | 'in_progress' | 'blocked' | 'completed' | 'failed';
+export type ProjectWorkstreamStatus = 'pending' | 'in_progress' | 'in_review' | 'blocked' | 'completed' | 'failed';
+
+export interface ProjectWorkstreamDelivery {
+  reportedByAppId: string;
+  content: string;
+  reportedAt: string;
+  round: number;
+}
+
+export interface ProjectWorkstreamReview {
+  reviewerAppId: string;
+  verdict: 'pass' | 'fail';
+  content: string;
+  reviewedAt: string;
+  round: number;
+}
 
 export interface ProjectWorkstream {
   dispatchRoot: string;
@@ -14,6 +30,12 @@ export interface ProjectWorkstream {
   title: string;
   purpose: string;
   owners: string[];
+  targetAppIds?: string[];
+  workerAppIds?: string[];
+  reviewerAppIds?: string[];
+  access?: ProjectDispatchAccess;
+  delivery?: ProjectWorkstreamDelivery;
+  review?: ProjectWorkstreamReview;
   status: ProjectWorkstreamStatus;
   progress: number;
   remaining?: string;
@@ -23,13 +45,21 @@ export interface ProjectWorkstream {
   updatedAt: string;
 }
 
+export interface ProjectDispatchReservation {
+  reservationId: string;
+  targetAppIds: string[];
+  access: ProjectDispatchAccess;
+  createdAt: string;
+  expiresAt: string;
+}
+
 export interface ProjectMilestone {
   content: string;
   createdAt: string;
 }
 
 export interface ProjectGroupState {
-  schemaVersion: 1;
+  schemaVersion: 2;
   revision: number;
   chatId: string;
   larkAppId: string;
@@ -43,6 +73,8 @@ export interface ProjectGroupState {
   remaining?: string;
   blockers: string[];
   workstreams: ProjectWorkstream[];
+  /** Optional for backwards-compatible reads of project state written before reservations. */
+  dispatchReservations?: ProjectDispatchReservation[];
   milestones: ProjectMilestone[];
   nextMilestone?: string;
   card?: {
@@ -55,7 +87,7 @@ export interface ProjectGroupState {
 }
 
 interface ProjectGroupRegistry {
-  schemaVersion: 1;
+  schemaVersion: 2;
   projects: Record<string, ProjectGroupState>;
 }
 
@@ -64,7 +96,7 @@ function storePath(dataDir: string): string {
 }
 
 function emptyRegistry(): ProjectGroupRegistry {
-  return { schemaVersion: 1, projects: {} };
+  return { schemaVersion: 2, projects: {} };
 }
 
 function readRegistry(path: string): ProjectGroupRegistry {
@@ -73,11 +105,15 @@ function readRegistry(path: string): ProjectGroupRegistry {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error(`${PROJECT_GROUP_STORE_FILE} must contain an object`);
   }
-  const raw = parsed as Partial<ProjectGroupRegistry>;
-  if (raw.schemaVersion !== 1 || !raw.projects || typeof raw.projects !== 'object' || Array.isArray(raw.projects)) {
+  const raw = parsed as { schemaVersion?: number; projects?: unknown };
+  if ((raw.schemaVersion !== 1 && raw.schemaVersion !== 2)
+    || !raw.projects || typeof raw.projects !== 'object' || Array.isArray(raw.projects)) {
     throw new Error(`${PROJECT_GROUP_STORE_FILE} has an unsupported schema`);
   }
-  return raw as ProjectGroupRegistry;
+  const projects = Object.fromEntries(Object.entries(raw.projects as Record<string, unknown>).map(([chatId, project]) => [
+    chatId, { ...(project as ProjectGroupState), schemaVersion: 2 as const },
+  ]));
+  return { schemaVersion: 2, projects };
 }
 
 function writeRegistry(path: string, registry: ProjectGroupRegistry): void {

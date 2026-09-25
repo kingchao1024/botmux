@@ -306,10 +306,13 @@ describe('report CLI recipient root and authenticated relay', () => {
   it('retains authenticated orchestrator relay without a Lark fallback', async () => {
     const result = await runReport({ recipientRoot: SEED, relayStatus: 200, relayBody: {
       ok: true, triggerId: 'trigger-report', reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+      deliveryRound: 2,
     } });
     if (result.status !== 0) console.error(result.stderr);
     expect(result.status).toBe(0);
-    expect(result.output).toMatchObject({ delivery: 'orchestrator-session', viaRegistry: true, reportedTo: 'orchestrator' });
+    expect(result.output).toMatchObject({
+      delivery: 'orchestrator-session', viaRegistry: true, reportedTo: 'orchestrator', deliveryRound: 2,
+    });
     expect(result.outbound).toBeUndefined();
   });
 

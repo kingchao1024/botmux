@@ -241,6 +241,20 @@ describe('built-in botmux-bots skill (collaboration roster)', () => {
     expect(skill!.content).toContain('unknown');
   });
 
+  it('documents the evidence-backed runtime availability without promising load balancing', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-bots');
+    expect(skill!.content).toContain('idle');
+    expect(skill!.content).toContain('可立即派单');
+    expect(skill!.content).toContain('busy');
+    expect(skill!.content).toContain('执行中 turn');
+    expect(skill!.content).toContain('仍可排队');
+    expect(skill!.content).toContain('offline');
+    expect(skill!.content).toContain('本机权威');
+    expect(skill!.content).toContain('unknown');
+    expect(skill!.content).toContain('证据不足');
+    expect(skill!.content).not.toContain('自动选择最空闲');
+  });
+
   it('documents team-scope discovery + cross-machine group creation and their opt-in gate', () => {
     // Team维度 Agent 互查: --scope team discovery + create-group --team, plus the
     // opt-in (team.bots) gate and the boundary vs the Feishu /invite slash.
@@ -283,6 +297,15 @@ describe('built-in botmux-orchestrate skill', () => {
     expect(skill!.content).toContain('单个专项交给一个 bot');
     expect(skill!.content).toContain('botmux-handoff');
     expect(skill!.content).toContain('留在当前话题');
+  });
+
+  it('documents project dispatch access claims without presenting them as an OS sandbox', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill!.content).toContain('--read-only');
+    expect(skill!.content).toContain('--write-scope');
+    expect(skill!.content).toContain('project');
+    expect(skill!.content).toContain('协调门禁');
+    expect(skill!.content).toContain('不是 OS sandbox');
   });
 });
 
