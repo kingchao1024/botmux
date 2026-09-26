@@ -240,8 +240,9 @@ export class UserTokenMissingError extends Error {
 }
 
 /** Extract Lark error code from AxiosError or SDK error. */
-function getLarkErrorCode(err: any): number | undefined {
-  return err?.response?.data?.code ?? err?.code;
+export function getLarkErrorCode(err: any): number | undefined {
+  const code = err?.response?.data?.code ?? err?.code;
+  return typeof code === 'number' ? code : undefined;
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
@@ -445,6 +446,58 @@ export async function urgentMessage(
     throw new Error(`Failed to urgent message (${mode}): ${res.msg ?? ''} (code: ${res.code})`);
   }
   logger.info(`Urgent ${mode} sent for message ${messageId} to ${recipients.length} user(s)`);
+}
+
+/**
+ * Forward an existing message into another chat (im.v1.message.forward).
+ *
+ * Unlike send/reply this carries the ORIGINAL message over verbatim — sender
+ * name, message type and all — which is the only faithful way to replay a
+ * non-text seed (image / file / 合并转发消息) into a different chat: those
+ * bodies cannot be re-created from an event payload, only pointed at.
+ *
+ * Used by session-group birth to make the freshly-created group
+ * self-explaining: the DM that spawned it is forwarded in as the group's first
+ * message, so the conversation carries its own origin instead of a
+ * "（非文本消息）" placeholder.
+ *
+ * Emits no outbound hook (same as {@link sendUserMessage}): the hook event
+ * union is closed and a forward is not one of its members.
+ */
+export async function forwardMessage(
+  larkAppId: string,
+  messageId: string,
+  chatId: string,
+  uuid?: string,
+): Promise<string> {
+  assertLarkTransport(larkAppId, 'forwardMessage');
+  return executeWithLarkGate(larkAppId, 'forwardMessage', async () => {
+    const c = getBotClient(larkAppId);
+    let res: any;
+    try {
+      res = await (c as any).im.v1.message.forward({
+        path: { message_id: messageId },
+        // NOTE: forward takes `uuid` in params (not data) — unlike create/reply.
+        params: { receive_id_type: 'chat_id', ...(uuid ? { uuid } : {}) },
+        data: { receive_id: chatId },
+      });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      throw err;
+    }
+
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      throw new Error(`Failed to forward message: ${res.msg} (code: ${res.code})`);
+    }
+
+    const forwardedId = res.data?.message_id;
+    if (!forwardedId) throw new Error('No message_id in forward response');
+    logger.info(`Forwarded message ${messageId} to chat ${chatId} as ${forwardedId}`);
+    return forwardedId;
+  });
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
