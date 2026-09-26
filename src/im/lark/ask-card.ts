@@ -10,6 +10,7 @@ import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
+import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
 import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
@@ -24,7 +25,7 @@ export const ASK_SUBMIT_ACTION = 'ask_submit';
 export const ASK_TOGGLE_ACTION = 'ask_toggle';
 
 // One option per row keeps decisions scannable in narrow Feishu clients.
-const MAX_BUTTONS_PER_ACTION_ROW = 1;
+const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
 export interface AskCardActionData {
   event_id?: string;
@@ -420,6 +421,7 @@ function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArme
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
   const locale = localeForBot(ask.larkAppId);
+  const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
@@ -488,7 +490,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
               },
         }],
       }));
-      appendActionRows(elements, optionButtons);
+      appendActionRows(elements, optionButtons, optionLayout);
     }
 
     if (requiresSubmit) {
@@ -700,18 +702,29 @@ function optionLabel(multiSelect: boolean, selected: boolean, label: string): st
   return `${selected ? '◉' : '○'} ${label}`;
 }
 
-function appendActionRows(elements: Array<Record<string, unknown>>, actions: Array<Record<string, unknown>>): void {
+function appendActionRows(
+  elements: Array<Record<string, unknown>>,
+  actions: Array<Record<string, unknown>>,
+  layout: AskOptionLayout,
+): void {
+  if (layout === 'vertical') {
+    // 竖放：一行一按钮。单列 column_set（flex_mode:'none' + weighted 列宽）让按钮
+    // 占满整行宽度，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
+    // 受支持，无需迁移 schema 2.0。
+    for (const action of actions) {
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [action] }],
+      });
+    }
+    return;
+  }
   for (let i = 0; i < actions.length; i += MAX_BUTTONS_PER_ACTION_ROW) {
     elements.push({
-      tag: 'column_set',
-      flex_mode: 'none',
-      horizontal_spacing: 'small',
-      columns: actions.slice(i, i + MAX_BUTTONS_PER_ACTION_ROW).map((action) => ({
-        tag: 'column',
-        width: 'weighted',
-        weight: 1,
-        elements: [action],
-      })),
+      tag: 'action',
+      actions: actions.slice(i, i + MAX_BUTTONS_PER_ACTION_ROW),
     });
   }
 }
