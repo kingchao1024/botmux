@@ -5,7 +5,7 @@ import { config } from '../config.js';
 
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
-export type ConnectorTargetKind = 'turn' | 'workflow';
+export type ConnectorTargetKind = 'turn' | 'workflow' | 'invocation';
 export type ConnectorTopicMessageMode = 'default' | 'custom' | 'template' | 'none';
 export type ConnectorLifecycleGroupNameMode = 'default' | 'fixed' | 'template';
 
@@ -105,6 +105,17 @@ export interface ConnectorDefinition {
   rateLimit?: {
     windowSeconds: number;
     maxRequests: number;
+  };
+  /** Invocation config: required when target.kind === 'invocation'.
+   *  Webhook payload may only supply the prompt; model, tools, provider,
+   *  identity and session fields are fixed by this config and caller-controlled
+   *  values are ignored. */
+  invocation?: {
+    model: string;
+    deadlineMs: number;
+    outputSchema: Record<string, unknown>;
+    reasoningEffort?: string;
+    maxOutputTokens?: number;
   };
   createdAt: string;
   updatedAt: string;

@@ -4990,6 +4990,19 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
       error: `request target botId ${valid.request.target.botId} does not match daemon ${cachedLarkAppId}`,
     });
   }
+  // Hard-deny: apiOnly bots are invocation-only. They must not accept ordinary
+  // /api/trigger turns (webhook, Lark, workflow, task, or device). Their only
+  // entry point is /api/headless/invocations via the constrained runtime.
+  try {
+    const bot = getBot(cachedLarkAppId).config;
+    if (bot.apiOnly === true) {
+      return jsonRes(res, 403, {
+        ok: false,
+        errorCode: 'bad_request',
+        error: 'invocation-only bot: /api/trigger is not supported; use /api/headless/invocations or a dedicated invocation connector',
+      });
+    }
+  } catch { /* unknown bot → not apiOnly */ }
   // Plan B: a VC meeting agent is an ordinary chat-scope session, so the generic
   // trigger endpoint may address it like any session (botmux send / dashboard).
   // Meeting transcript deliveries still flow through their own fenced delivery

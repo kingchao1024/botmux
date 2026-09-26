@@ -31,7 +31,7 @@ export interface TriggerLogRequest {
 }
 
 export interface TriggerLogTarget {
-  kind?: 'turn' | 'workflow';
+  kind?: 'turn' | 'workflow' | 'invocation';
   mode?: 'dynamic' | 'fixed' | 'new-group';
   botId?: string;
   chatId?: string;

@@ -245,10 +245,10 @@ function sameConnectorTarget(
     && sameStringSet(left.allowChats, right.allowChats);
 }
 
-function normalizeConnectorInput(
+async function normalizeConnectorInput(
   raw: unknown,
   opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string },
-): { ok: true; connector: ConnectorDefinition } | { ok: false; error: string } {
+): Promise<{ ok: true; connector: ConnectorDefinition } | { ok: false; error: string }> {
   const body = record(raw);
   const c = record(body.connector ?? body);
   const prior = opts.prior ?? null;
@@ -266,20 +266,62 @@ function normalizeConnectorInput(
   const targetMode = typeof target.mode === 'string' ? target.mode : prior?.target.mode ?? 'dynamic';
   if (!['dynamic', 'fixed', 'new-group'].includes(targetMode)) return { ok: false, error: 'bad_target_mode' };
   const targetKind = typeof target.kind === 'string' ? target.kind : prior?.target.kind ?? 'turn';
-  if (!['turn', 'workflow'].includes(targetKind)) return { ok: false, error: 'bad_target_kind' };
+  if (!['turn', 'workflow', 'invocation'].includes(targetKind)) return { ok: false, error: 'bad_target_kind' };
   const botId = typeof target.botId === 'string' && target.botId.trim() ? target.botId.trim() : prior?.target.botId;
   if (!botId) return { ok: false, error: 'target_bot_required' };
   const botIds = hasOwn(target, 'botIds')
     ? Array.from(new Set(stringList(target.botIds).map(x => x.trim()).filter(Boolean)))
     : prior?.target.botIds;
-  const chatId = targetMode === 'fixed'
+  let chatId = targetMode === 'fixed'
     ? (typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId)
     : undefined;
-  if (targetMode === 'fixed' && !chatId) return { ok: false, error: 'fixed_chat_required' };
+  if (targetMode === 'fixed' && !chatId && targetKind !== 'invocation') return { ok: false, error: 'fixed_chat_required' };
+  // Invocation connectors don't need a chat target — they dispatch to /api/headless/invocations.
+  if (targetKind === 'invocation') {
+    chatId = undefined;
+  }
   const workflowId = targetKind === 'workflow'
     ? (typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId)
     : undefined;
   if (targetKind === 'workflow' && !workflowId) return { ok: false, error: 'workflow_id_required' };
+  // Invocation config: required when kind is 'invocation'. The webhook payload
+  // may only supply the prompt; model, tools, provider, identity and session
+  // fields come from this config and are never caller-controlled.
+  let invocation: ConnectorDefinition['invocation'] = undefined;
+  if (targetKind === 'invocation') {
+    const rawInvocation = record(c.invocation ?? prior?.invocation);
+    const model = typeof rawInvocation.model === 'string' && rawInvocation.model.trim()
+      ? rawInvocation.model.trim()
+      : prior?.invocation?.model;
+    if (!model) return { ok: false, error: 'invocation_model_required' };
+    const deadlineMs = typeof rawInvocation.deadlineMs === 'number' && Number.isFinite(rawInvocation.deadlineMs)
+      ? rawInvocation.deadlineMs
+      : prior?.invocation?.deadlineMs;
+    if (!deadlineMs || deadlineMs < 100 || deadlineMs > 300_000) return { ok: false, error: 'invocation_deadline_invalid' };
+    const outputSchema = record(rawInvocation.outputSchema ?? prior?.invocation?.outputSchema);
+    if (!outputSchema || !outputSchema.type) return { ok: false, error: 'invocation_output_schema_required' };
+    // Validate the output schema against the bounded JSON Schema subset used by
+    // constrained invocations.
+    try {
+      const { checkSchema } = await import('../services/constrained-invocation/contract.js');
+      checkSchema(outputSchema);
+    } catch (e: any) {
+      return { ok: false, error: `invocation_output_schema_invalid: ${e.message}` };
+    }
+    const reasoningEffort = typeof rawInvocation.reasoningEffort === 'string'
+      ? rawInvocation.reasoningEffort
+      : prior?.invocation?.reasoningEffort;
+    const maxOutputTokens = typeof rawInvocation.maxOutputTokens === 'number' && Number.isSafeInteger(rawInvocation.maxOutputTokens)
+      ? rawInvocation.maxOutputTokens
+      : prior?.invocation?.maxOutputTokens;
+    invocation = {
+      model,
+      deadlineMs,
+      outputSchema,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+    };
+  }
   // Dedup is now OPTIONAL for new-group (null = a fresh group per event).
   const lifecycleExtractors = targetMode === 'new-group'
     ? (c.lifecycleExtractors === undefined
@@ -370,6 +412,7 @@ function normalizeConnectorInput(
         maxRequests: positiveInt(rateLimit.maxRequests, prior?.rateLimit?.maxRequests ?? 60, 1, 100_000),
       },
     } : prior?.rateLimit ? { rateLimit: prior.rateLimit } : {}),
+    ...(invocation ? { invocation } : prior?.invocation && !hasOwn(c, 'invocation') ? { invocation: prior.invocation } : {}),
     createdAt: prior?.createdAt ?? now,
     updatedAt: prior?.updatedAt ?? now,
   };
@@ -479,7 +522,7 @@ export async function handleConnectorApi(
       const providedSecret = typeof body.secret === 'string' && body.secret ? body.secret : undefined;
       const generatedSecret = providedSecret ? undefined : generateWebhookSecretPlaintext();
       const record = createWebhookSecret(providedSecret ?? generatedSecret!);
-      const normalized = normalizeConnectorInput(body, { secretRef: record.ref });
+      const normalized = await normalizeConnectorInput(body, { secretRef: record.ref });
       if (!normalized.ok) {
         deleteWebhookSecret(record.ref);
         jsonRes(res, 400, { ok: false, error: normalized.error });
@@ -514,7 +557,7 @@ export async function handleConnectorApi(
         // Validate the complete update before rotating the secret. In
         // particular, a rejected legacy-workflow target mutation must not
         // leave behind an otherwise successful credential side effect.
-        const preflight = normalizeConnectorInput({ ...body, id }, {
+        const preflight = await normalizeConnectorInput({ ...body, id }, {
           id,
           prior,
           secretRef: prior.verify.secretRef,
@@ -536,7 +579,7 @@ export async function handleConnectorApi(
           setWebhookSecret(secretRef, generatedSecret);
           plaintextForUrl = generatedSecret;
         }
-        const normalized = normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
+        const normalized = await normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
         if (!normalized.ok) {
           jsonRes(res, 400, { ok: false, error: normalized.error });
           return true;

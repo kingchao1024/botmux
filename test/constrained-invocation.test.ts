@@ -7,6 +7,8 @@ import { parseInvocation, matchesSchema } from '../src/services/constrained-invo
 import { assertConstrainedRuntime } from '../src/services/constrained-invocation/codex-profile.js';
 import { modelOnlyCapabilities } from '../src/services/constrained-invocation/adapters.js';
 import { nativeUsage, isolatedCatalog, isolatedInvocationEnv } from '../src/services/constrained-invocation/codex-runtime.js';
+import { NativeInvocationError } from '../src/services/constrained-invocation/runtime.js';
+import { sanitizeNativeError } from '../src/services/constrained-invocation/error-sanitize.js';
 import { parseInvokeArgs } from '../src/cli/session-invoke-command.js';
 import { claudeUsage } from '../src/services/constrained-invocation/claude-runtime.js';
 
@@ -27,6 +29,47 @@ const abortable = (_request: unknown, signal: AbortSignal) => new Promise<never>
 });
 
 describe('constrained invocation contract', () => {
+  it('preserves fixed runtime error codes without exposing arbitrary native errors', () => {
+    const stableCodes = [
+      'invocation_aborted',
+      'managed_requirements_unsupported',
+      'native_auth_helper_unsupported',
+      'native_auth_invalid',
+      'native_auth_isolation_unverified',
+      'native_auth_missing',
+      'native_bridge_isolation_unverified',
+      'native_catalog_missing',
+      'native_config_isolation_unproven',
+      'native_feature_isolation_unproven',
+      'native_final_ambiguous',
+      'native_host_request_forbidden',
+      'native_inference_failed',
+      'native_inference_incomplete',
+      'native_invocation_failed',
+      'native_isolation_missing',
+      'native_model_not_found',
+      'native_multiple_responses',
+      'native_output_limit',
+      'native_owner_guard_unsupported',
+      'native_owner_identity_unknown',
+      'native_process_exited',
+      'native_profile_unverified',
+      'native_protocol_invalid',
+      'native_reasoning_effort_unsupported',
+      'native_runtime_unavailable',
+      'native_spawn_failed',
+      'native_thread_isolation_unproven',
+      'native_tool_isolation_unproven',
+      'native_tool_isolation_unverified',
+      'native_transport_closed',
+      'native_turn_identity_missing',
+      'output_schema_mismatch',
+    ];
+    for (const code of stableCodes) expect(sanitizeNativeError(code)).toBe(code);
+    expect(sanitizeNativeError('native_failure /root/private')).toBe('native_inference_failed');
+    expect(sanitizeNativeError('sk_live_SUPERSECRET123')).toBe('native_inference_failed');
+  });
+
   it('rejects unsupported schema keywords and caller-controlled authority', () => {
     expect(() => parseInvocation({ ...request(), ownerOpenId: 'ou_other' })).toThrow();
     expect(() => parseInvocation({ ...request(), outputSchema: { ...schema, $ref: 'https://example.com/schema' } })).toThrow('unsupported_schema_keyword');
@@ -115,13 +158,46 @@ describe('invocation lifecycle', () => {
     expect((await instance.wait('b', 1000))?.output).toEqual({ content: 'secret-b' });
   });
   it('persists failure without retriggering and retains no prompt in result files', async () => {
-    const run = vi.fn(async () => { throw new Error('output_schema_mismatch'); });
+    const run = vi.fn(async () => {
+      throw new NativeInvocationError('native_inference_failed', {
+        output: null, configuredModel: 'gpt-5.5', actualModel: null,
+        reasoningEffort: null, usage: null, usageSource: null, startupMs: 0,
+      });
+    });
     const { instance, directory } = service(run);
     instance.start(request());
-    expect((await instance.wait('first', 1000))?.error).toBe('output_schema_mismatch');
+    expect((await instance.wait('first', 1000))?.error).toBe('native_inference_failed');
     expect(instance.start(request()).state).toBe('failed');
     expect(run).toHaveBeenCalledTimes(1);
     expect(readdirSync(directory)).toEqual(['first.json']);
+  });
+  it('atomically sanitizes a legacy failed result before get or non-wait idempotency return', async () => {
+    const { instance, directory } = service(async () => output);
+    instance.start(request());
+    await instance.wait('first', 1000);
+    const persistedPath = join(directory, 'first.json');
+    const persisted = JSON.parse(readFileSync(persistedPath, 'utf8'));
+    persisted.result.state = 'failed';
+    persisted.result.output = null;
+    persisted.result.error = '/legacy/raw-provider-error';
+    writeFileSync(persistedPath, JSON.stringify(persisted));
+
+    const restarted = new InvocationService({ directory, run: async () => output });
+    expect(restarted.start(request())).toMatchObject({
+      state: 'failed',
+      error: 'native_inference_failed',
+    });
+    expect(JSON.parse(readFileSync(persistedPath, 'utf8')).result.error).toBe('native_inference_failed');
+    expect(restarted.get('first')?.error).toBe('native_inference_failed');
+  });
+  it('preserves stable ordinary runtime errors without exposing arbitrary messages', async () => {
+    const stable = service(async () => { throw new Error('native_model_not_found'); }).instance;
+    stable.start(request('stable-error'));
+    expect((await stable.wait('stable-error', 1000))?.error).toBe('native_model_not_found');
+
+    const arbitrary = service(async () => { throw new Error('native_failure /root/private'); }).instance;
+    arbitrary.start(request('arbitrary-error'));
+    expect((await arbitrary.wait('arbitrary-error', 1000))?.error).toBe('invocation_failed');
   });
   it('never replays an uncertain accepted request after process restart', async () => {
     const { instance, directory } = service(abortable);
