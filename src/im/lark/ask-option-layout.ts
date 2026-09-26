@@ -1,7 +1,8 @@
 /**
  * `botmux ask` 选项按钮的 per-bot 布局：
  *
- *   compact  — 每行最多 4 个按钮的 `action` 行（历史形态，默认）
+ *   compact  — 每行最多 4 个按钮，横排在一个 column_set（flex_mode:'flow'）
+ *              里按内容宽度排列（默认）
  *   vertical — 每行 1 个按钮，各自包在单列 `column_set` 里占满整行宽度，
  *              长选项标签不被挤压换行
  *

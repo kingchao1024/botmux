@@ -170,15 +170,22 @@ describe('buildAskCard', () => {
     expect(text).toContain(ASK_SELECT_ACTION);
   });
 
-  it('单问选项按一项一行纵向排列', () => {
-    const card = JSON.parse(buildAskCard(makePending()));
-    const optionRows = card.body.elements.filter(
-      (element: Record<string, unknown>) => element.tag === 'column_set',
-    );
+  it('单问选项在 vertical 布局下按一项一行纵向排列', () => {
+    // 选项布局成为 per-bot 配置后默认 compact（横排）；这里显式切到 vertical，
+    // 锁定「一项一行」的竖排形态。
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    try {
+      const card = JSON.parse(buildAskCard(makePending()));
+      const optionRows = card.body.elements.filter(
+        (element: Record<string, unknown>) => element.tag === 'column_set',
+      );
 
-    expect(optionRows).toHaveLength(3);
-    for (const row of optionRows) {
-      expect(row.columns).toHaveLength(1);
+      expect(optionRows).toHaveLength(3);
+      for (const row of optionRows) {
+        expect(row.columns).toHaveLength(1);
+      }
+    } finally {
+      setAskOptionLayoutLookup(() => undefined);
     }
   });
 
@@ -1016,7 +1023,7 @@ describe('ask option layout（askOptionLayout per-bot 配置）', () => {
     expect(askOptionLayoutForBot(undefined)).toBe('compact');
   });
 
-  it('默认 compact：action 行每行最多 4 个按钮，无 column_set', () => {
+  it('默认 compact：column_set flow 行每行最多 4 个按钮', () => {
     const ask = makePending({
       questions: [{
         prompt: 'q', multiSelect: false,
@@ -1024,12 +1031,22 @@ describe('ask option layout（askOptionLayout per-bot 配置）', () => {
       }],
     });
     const card = JSON.parse(buildAskCard(ask));
-    expect(card.elements.some((el: any) => el.tag === 'column_set')).toBe(false);
-    const optionRows = card.elements.filter((el: any) =>
-      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION));
+    const optionRows = card.body.elements.filter((el: any) =>
+      el.tag === 'column_set' && el.columns.some((col: any) =>
+        col.elements.some((b: any) => b.tag === 'button'
+          && b.behaviors?.[0]?.value?.action === ASK_SELECT_ACTION)));
     expect(optionRows).toHaveLength(2);
-    expect(optionRows[0].actions).toHaveLength(4);
-    expect(optionRows[1].actions).toHaveLength(2);
+    expect(optionRows[0].columns).toHaveLength(4);
+    expect(optionRows[1].columns).toHaveLength(2);
+    for (const row of optionRows) {
+      expect(row.flex_mode).toBe('flow');
+      for (const col of row.columns) {
+        expect(col).toMatchObject({ tag: 'column', width: 'auto' });
+        expect(col.elements).toHaveLength(1);
+      }
+    }
+    // Card JSON 2.0 不允许旧版 action 行
+    expect(JSON.stringify(card)).not.toContain('"tag":"action"');
   });
 
   it('vertical：每个选项一个 column_set 行，单列 weighted、一按钮', () => {
@@ -1037,7 +1054,7 @@ describe('ask option layout（askOptionLayout per-bot 配置）', () => {
       ? { config: { askOptionLayout: 'vertical' } }
       : undefined);
     const card = JSON.parse(buildAskCard(makePending()));
-    const columnSets = card.elements.filter((el: any) => el.tag === 'column_set');
+    const columnSets = card.body.elements.filter((el: any) => el.tag === 'column_set');
     expect(columnSets).toHaveLength(3);
     for (const row of columnSets) {
       expect(row.flex_mode).toBe('none');
@@ -1046,14 +1063,13 @@ describe('ask option layout（askOptionLayout per-bot 配置）', () => {
       expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
       const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
       expect(buttons).toHaveLength(1);
-      expect(buttons[0].value.action).toBe(ASK_SELECT_ACTION);
+      expect(buttons[0].behaviors[0].value.action).toBe(ASK_SELECT_ACTION);
     }
-    // vertical 下不再有装选项按钮的 action 行
-    expect(card.elements.some((el: any) =>
-      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SELECT_ACTION))).toBe(false);
+    // vertical 同样不得出现旧版 action 行
+    expect(JSON.stringify(card)).not.toContain('"tag":"action"');
   });
 
-  it('vertical 只影响选项按钮：submit 行仍是 action 行，按钮值不变', () => {
+  it('vertical 只影响选项按钮：submit 仍是顶层独立按钮，按钮值不变', () => {
     setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
     const ask = makePending({
       questions: [
@@ -1061,11 +1077,11 @@ describe('ask option layout（askOptionLayout per-bot 配置）', () => {
       ],
     });
     const card = JSON.parse(buildAskCard(ask));
-    const submitRow = card.elements.find((el: any) =>
-      el.tag === 'action' && el.actions.some((a: any) => a.value?.action === ASK_SUBMIT_ACTION));
-    expect(submitRow).toBeDefined();
-    const toggleRows = card.elements.filter((el: any) => el.tag === 'column_set');
+    const submit = card.body.elements.find((el: any) =>
+      el.tag === 'button' && el.behaviors?.[0]?.value?.action === ASK_SUBMIT_ACTION);
+    expect(submit).toBeDefined();
+    const toggleRows = card.body.elements.filter((el: any) => el.tag === 'column_set');
     expect(toggleRows).toHaveLength(2);
-    expect(toggleRows[0].columns[0].elements[0].value.action).toBe(ASK_TOGGLE_ACTION);
+    expect(toggleRows[0].columns[0].elements[0].behaviors[0].value.action).toBe(ASK_TOGGLE_ACTION);
   });
 });
