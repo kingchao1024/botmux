@@ -15,6 +15,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { openSync, closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
+import { rotateLogIfNeeded, logSizeExceedsThreshold, type LogRotationOptions, DEFAULT_LOG_ROTATION } from './log-rotation.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import {
   builtinFleetEntryMatches,
@@ -127,6 +128,10 @@ export interface FleetSupervisorOptions {
    *  can tail a specific bot — mirrors pm2's out_file/error_file. When unset
    *  (tests), children inherit the supervisor's stdio. */
   logDir?: string;
+  /** Rotation policy for per-bot daemon logs under logDir. Applied before each
+   *  openSync('a') so the child fd never pins a stale inode. Defaults to
+   *  10 MB / 3 retained files; set maxSizeBytes <= 0 to disable. */
+  logRotation?: LogRotationOptions;
   /** Injected for tests; defaults to console. */
   log?: (msg: string) => void;
   /** Test seams for the retryable pre-spawn isolation admission. */
@@ -187,6 +192,15 @@ export class FleetSupervisor {
    *  names here, then explicitly re-reads the authoritative roster when a
    *  revision transition is permitted. */
   private readonly knownSpecs = new Map<string, FleetBotSpec>();
+  /** Log base names keyed by child name so the periodic monitor can stat the
+   *  active log files. Populated by spawnBot and removed in onChildExit. */
+  private readonly childLogBases = new Map<string, string>();
+  /** Interval that warns when an active (child-held) log exceeds the rotation
+   *  threshold. This does NOT rotate — active-writer rotation is a documented
+   *  residual risk. The monitor's only job is visibility. */
+  private logMonitorTimer: ReturnType<typeof setInterval> | undefined;
+  /** Interval between active-log size checks (default 5 minutes). */
+  private static readonly LOG_MONITOR_INTERVAL_MS = 300_000;
   private stopping = false;
   private readonly policy: RestartPolicy;
   private readonly killTimeoutMs: number;
@@ -200,6 +214,13 @@ export class FleetSupervisor {
     this.startupAdmissionLockWaitMs = opts.startupAdmissionLockWaitMs ?? 5_000;
     this.startupAdmissionRetryMs = opts.startupAdmissionRetryMs ?? 250;
     this.log = opts.log ?? ((m) => console.error(`[fleet-supervisor] ${m}`));
+    if (this.opts.logDir && (this.opts.logRotation?.maxSizeBytes ?? DEFAULT_LOG_ROTATION.maxSizeBytes) > 0) {
+      const rotation = this.opts.logRotation ?? DEFAULT_LOG_ROTATION;
+      this.logMonitorTimer = setInterval(() => {
+        this.checkActiveLogSizes(rotation);
+      }, FleetSupervisor.LOG_MONITOR_INTERVAL_MS);
+      this.logMonitorTimer.unref?.();
+    }
   }
 
   /** Start (or reconcile) the fleet: spawn every configured bot not already
@@ -527,6 +548,7 @@ export class FleetSupervisor {
     // interpreter flags would be nonsense (or worse, consumed as its args).
     const isStandalone = args.length > 0 && args[0].startsWith('__');
     const nodeArgs = (spec.external || isStandalone) ? [] : (this.opts.daemonNodeArgs ?? []);
+    const logBase = spec.logBaseName ?? `daemon-${spec.botIndex}`;
     // Per-member log files (mirrors pm2 out_file/error_file → `botmux logs`).
     // Bot daemons write daemon-<index>-{out,err}.log; the dashboard writes
     // dashboard-{out,err}.log (spec.logBaseName). Opened in append mode so a
@@ -534,13 +556,15 @@ export class FleetSupervisor {
     // onChildExit). When no logDir is configured (tests), the child inherits
     // our stdio.
     const spawnChild = (): ChildProcess => {
-      const logBase = spec.logBaseName ?? `daemon-${spec.botIndex}`;
       let stdio: Array<'ignore' | 'inherit' | number> = ['ignore', 'inherit', 'inherit'];
       let outFd: number | undefined;
       let errFd: number | undefined;
       if (this.opts.logDir) {
         try {
           mkdirSync(this.opts.logDir, { recursive: true });
+          const rotation = this.opts.logRotation ?? DEFAULT_LOG_ROTATION;
+          rotateLogIfNeeded(join(this.opts.logDir, `${logBase}-out.log`), rotation);
+          rotateLogIfNeeded(join(this.opts.logDir, `${logBase}-err.log`), rotation);
           outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
           errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
           stdio = ['ignore', outFd, errFd];
@@ -769,6 +793,7 @@ export class FleetSupervisor {
 
     this.children.set(spec.name, child);
     this.liveGeneration.set(spec.name, generation);
+    if (this.opts.logDir) this.childLogBases.set(spec.name, logBase);
     this.log(`${isRestart ? 'restarted' : 'started'} ${spec.name} (pid ${child.pid}, gen ${generation})`);
 
     let childSettled = false;
@@ -895,6 +920,7 @@ export class FleetSupervisor {
     // exit must never mutate the newer generation's row or trigger a double spawn.
     if (this.liveGeneration.get(spec.name) !== generation) return;
     this.children.delete(spec.name);
+    this.childLogBases.delete(spec.name);
     if (this.stopping) return;
 
     // Explicit stop-bot: this exit is operator-intended, not a crash. Suppress the
@@ -979,6 +1005,22 @@ export class FleetSupervisor {
       return cur;
     });
     this.liveGeneration.delete(name);
+    this.childLogBases.delete(name);
+  }
+
+  /** Periodic check: log a warning when any active child's log file exceeds the
+   *  rotation threshold. Does NOT rotate — active-writer rotation is a documented
+   *  residual risk. This is visibility-only. */
+  private checkActiveLogSizes(rotation: LogRotationOptions): void {
+    if (!this.opts.logDir) return;
+    for (const [name, logBase] of this.childLogBases) {
+      for (const suffix of ['-out.log', '-err.log']) {
+        const path = join(this.opts.logDir, `${logBase}${suffix}`);
+        if (logSizeExceedsThreshold(path, rotation)) {
+          this.log(`active log ${path} exceeds ${rotation.maxSizeBytes} bytes; next child restart will rotate it`);
+        }
+      }
+    }
   }
 
   /** Graceful stop of the whole fleet: SIGTERM each child, then SIGKILL any that

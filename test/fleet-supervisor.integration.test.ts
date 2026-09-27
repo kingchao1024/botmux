@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, realpathSync, readdirSync, readlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, realpathSync, readdirSync, readlinkSync, statSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1335,5 +1335,189 @@ setInterval(() => {}, 1000);
     killLater(readFleetState(statePath2)?.procs[0]?.pid);
     expect(readFleetState(statePath2)!.procs[0]).not.toHaveProperty('configHash');
     await sup2.stopAll();
+  });
+
+  it('rotates oversized daemon logs before spawn and keeps maxFiles retained backups', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    mkdirSync(logDir, { recursive: true });
+
+    // Seed a 256-byte log that exceeds the 128-byte cap we inject below.
+    writeFileSync(join(logDir, 'daemon-0-out.log'), 'x'.repeat(256));
+    writeFileSync(join(logDir, 'daemon-0-out.log.1'), 'previous');
+    writeFileSync(join(logDir, 'daemon-0-out.log.2'), 'older');
+    writeFileSync(join(logDir, 'daemon-0-err.log'), '');
+
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir,
+      logRotation: { maxSizeBytes: 128, maxFiles: 2 },
+      log: () => {},
+    });
+
+    // Spawn — must rotate BEFORE openSync('a'), so the child fd points at the
+    // NEW (post-rotation) inode.
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    await delay(100);
+
+    // The live out file should be the fresh one, not the 256-byte seed.
+    const liveOut = join(logDir, 'daemon-0-out.log');
+    expect(existsSync(liveOut)).toBe(true);
+    const liveSize = statSync(liveOut).size;
+    expect(liveSize).toBeLessThan(128);
+
+    // The old oversized file rotated to .1; the old .1 → .2; old .2 deleted.
+    expect(existsSync(`${liveOut}.1`)).toBe(true);
+    expect(statSync(`${liveOut}.1`).size).toBe(256); // was the oversized seed
+    expect(existsSync(`${liveOut}.2`)).toBe(true);
+    expect(readFileSync(`${liveOut}.2`, 'utf-8')).toBe('previous');
+    // maxFiles=2 means .3 must not exist.
+    expect(existsSync(`${liveOut}.3`)).toBe(false);
+
+    // Rotation also ran for err, but empty files are skipped.
+    expect(existsSync(join(logDir, 'daemon-0-err.log'))).toBe(true);
+
+    // No open fd leak.
+    expect(processHasOpenFdFor(liveOut)).toBe(false);
+
+    await sup.stopAll();
+  });
+
+  it('does not rotate logs under the maxSizeBytes threshold', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(join(logDir, 'daemon-0-out.log'), 'tiny');
+
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir,
+      logRotation: { maxSizeBytes: 128, maxFiles: 2 },
+      log: () => {},
+    });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    await delay(100);
+
+    const liveOut = join(logDir, 'daemon-0-out.log');
+    expect(existsSync(liveOut)).toBe(true);
+    // tiny file was not rotated — no .1
+    expect(existsSync(`${liveOut}.1`)).toBe(false);
+    const content = readFileSync(liveOut, 'utf-8');
+    expect(content).toContain('idx=0'); // fresh append after 'tiny'
+    expect(content).toContain('tiny');
+
+    await sup.stopAll();
+  });
+
+  it('warns via log monitor when an active child log exceeds the threshold', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    mkdirSync(logDir, { recursive: true });
+
+    const logs: string[] = [];
+    // Use a very low threshold so the freshly-written daemon-0-out.log
+    // is already over it after the daemon writes its startup banner.
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir,
+      logRotation: { maxSizeBytes: 1, maxFiles: 2 },
+      log: message => logs.push(message),
+    });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    await delay(100);
+
+    // Trigger the periodic check manually (simulates timer).
+    (sup as any).checkActiveLogSizes({ maxSizeBytes: 1, maxFiles: 2 });
+    expect(logs.some(m => m.includes('exceeds') && m.includes('daemon-0-out.log'))).toBe(true);
+
+    await sup.stopAll();
+  });
+
+  it('clears childLogBases on exit so the monitor does not warn for stopped members', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    mkdirSync(logDir, { recursive: true });
+
+    const logs: string[] = [];
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir,
+      logRotation: { maxSizeBytes: 1, maxFiles: 1 },
+      log: message => logs.push(message),
+    });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    await sup.stopAll();
+    await delay(50);
+
+    const pre = logs.length;
+    (sup as any).checkActiveLogSizes({ maxSizeBytes: 1, maxFiles: 1 });
+    expect(logs.length).toBe(pre); // no new warnings — child gone
+  });
+
+  it('disabled log rotation (maxSizeBytes=0) never renames', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(join(logDir, 'daemon-0-out.log'), 'x'.repeat(1000));
+
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir,
+      logRotation: { maxSizeBytes: 0, maxFiles: 1 },
+      log: () => {},
+    });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    await delay(100);
+
+    const liveOut = join(logDir, 'daemon-0-out.log');
+    expect(existsSync(`${liveOut}.1`)).toBe(false);
+    const content = readFileSync(liveOut, 'utf-8');
+    // The thousand-x seed is still there; daemon appended on top.
+    expect(content).toContain('idx=0');
+
+    await sup.stopAll();
+  });
+
+  it('renameReplaceSync is a no-op when the source slot is absent (sparse ring)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const logDir = join(root, 'logs');
+    mkdirSync(logDir, { recursive: true });
+
+    // Seed: maxFiles=3, .1 absent, .2 present with valid data. After rotation:
+    //   1) unlink .3 (no-op — doesn't exist)
+    //   2) renameReplaceSync .2 → .3 (.2 exists → shifts successfully)
+    //   3) renameReplaceSync .1 → .2 (.1 absent → no-op, .2 already gone)
+    //   4) renameReplaceSync live → .1
+    // .3 should now hold the old .2 data; .2 should be absent (already shifted).
+    writeFileSync(join(logDir, 'daemon-0-out.log'), 'x'.repeat(256));
+    writeFileSync(join(logDir, 'daemon-0-out.log.2'), 'generation-two-data');
+    // .1 intentionally absent — tests the sparse-slot no-op path
+
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root, logDir,
+      logRotation: { maxSizeBytes: 128, maxFiles: 3 },
+      log: () => {},
+    });
+    sup.start([bots[0]]);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'online');
+    await delay(100);
+
+    const liveOut = join(logDir, 'daemon-0-out.log');
+    // .2 was shifted to .3 safely (renameReplaceSync source existed)
+    expect(existsSync(`${liveOut}.3`)).toBe(true);
+    expect(readFileSync(`${liveOut}.3`, 'utf-8')).toBe('generation-two-data');
+    // .1 now holds the oversized live file that was rotated out
+    expect(existsSync(`${liveOut}.1`)).toBe(true);
+    expect(statSync(`${liveOut}.1`).size).toBe(256);
+    // .2 is absent — it was the source of the shift to .3
+    expect(existsSync(`${liveOut}.2`)).toBe(false);
+
+    await sup.stopAll();
   });
 });
