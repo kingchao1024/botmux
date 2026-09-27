@@ -58,4 +58,12 @@ describe('plugin service restart lifecycle', () => {
     expect(source).toContain('startPluginServices(selectedPluginIds, { autoOnly: options.autoOnly })');
   });
 
+  it('requests supervisor shutdown only for the explicit plugin service stop --all command', () => {
+    expect(cliSource).toContain(
+      "await stopPluginServicesForCli(pluginIds, { shutdownSupervisor: rawId === '--all' });",
+    );
+    expect(cliSource).not.toContain(
+      "await stopPluginServicesForCli(pluginIds, { shutdownSupervisor: !pluginIds });",
+    );
+  });
 });

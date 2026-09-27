@@ -153,6 +153,30 @@ describe('plugin services on the built-in supervisor', () => {
     expect(proc('manual')!.status).toBe('stopped');
   }, 30_000);
 
+  it('stops the supervisor only after an explicit all-services stop leaves no running target', async () => {
+    fixture('one');
+    fixture('two');
+    await startPluginServices(['one', 'two']);
+    await ready('one');
+    await ready('two');
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    const ownerLock = join(home, '.botmux', 'plugin-supervisor', 'owner.lock');
+
+    await stopPluginServices(['one'], { shutdownSupervisor: true });
+    expect(pidAlive(owner)).toBe(true);
+    expect(readPluginSupervisorDesired().services.two.running).toBe(true);
+
+    await stopPluginServices(undefined, { shutdownSupervisor: true });
+    await until(() => !pidAlive(owner), 'idle plugin supervisor shutdown');
+    expect(existsSync(ownerLock)).toBe(false);
+    expect(Object.values(readPluginSupervisorDesired().services).every(item => !item.running)).toBe(true);
+
+    await expect(stopPluginServices(undefined, { shutdownSupervisor: true })).resolves.toEqual([
+      expect.objectContaining({ pluginId: 'one', action: 'not-running' }),
+      expect.objectContaining({ pluginId: 'two', action: 'not-running' }),
+    ]);
+  }, 30_000);
+
   it('restarts a crashed service but never resurrects a deleted member', async () => {
     fixture('crash');
     await startPluginServices(['crash']);

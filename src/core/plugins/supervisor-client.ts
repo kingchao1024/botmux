@@ -7,7 +7,9 @@ import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { readDurableProcessIdentity } from '../../utils/process-identity.js';
 import { scrubExternalMemberEnv } from '../../utils/child-env.js';
+import { runtimeBuildIdentity } from '../../utils/runtime-build-id.js';
 import { pidAlive } from '../fleet-supervisor.js';
+import { signalAttestedFleetProcess } from '../fleet-process-identity.js';
 import { isStandaloneBinary, resolveEntrySpawn } from '../self-spawn.js';
 import { liveGodAt } from '../legacy-pm2-reaper.js';
 import { botmuxHome } from './paths.js';
@@ -72,10 +74,105 @@ export function readPluginProcesses(): PluginProcessInfo[] {
   return [...processes.values()];
 }
 
+function currentRuntimeGeneration(): string {
+  const identity = runtimeBuildIdentity();
+  if (identity.status !== 'known') throw new Error(`plugin_supervisor_runtime_generation_unknown:${identity.reason}`);
+  return identity.id;
+}
+
 function supervisorAlive(): boolean {
   const result = readPluginSupervisorResult();
+  const currentGen = currentRuntimeGeneration();
   return !!result && pidAlive(result.pid) && !!result.processStart
-    && readDurableProcessIdentity(result.pid) === result.processStart;
+    && readDurableProcessIdentity(result.pid) === result.processStart
+    && result.runtimeGeneration === currentGen;
+}
+
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function pluginSupervisorStopTimeoutMs(desired: ReturnType<typeof readPluginSupervisorDesired>): number {
+  const longestChildStop = Math.max(
+    8_000,
+    ...Object.values(desired.services).map(item => item.spec.external.killTimeoutMs ?? 8_000),
+  );
+  return longestChildStop + 6_000;
+}
+
+/** Stop only the exact predecessor process generation before starting a new
+ * runtime. The old supervisor owns child shutdown; its successor then uses the
+ * existing orphan reaper before restoring desired state. */
+async function stopOutdatedSupervisor(timeoutMs: number): Promise<void> {
+  const result = readPluginSupervisorResult();
+  if (!result) return;
+  const currentGeneration = currentRuntimeGeneration();
+  const liveIdentity = readDurableProcessIdentity(result.pid);
+  if (!liveIdentity) {
+    if (processExists(result.pid)) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+    return;
+  }
+  if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  if (liveIdentity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  if (result.runtimeGeneration === currentGeneration) return;
+
+  if (!signalAttestedFleetProcess({ pid: result.pid, processStart: result.processStart }, 'SIGTERM')) {
+    const identity = readDurableProcessIdentity(result.pid);
+    if (!identity && !processExists(result.pid)) return;
+    throw new Error(identity
+      ? `plugin_supervisor_identity_mismatch:${result.pid}`
+      : `plugin_supervisor_identity_unknown:${result.pid}`);
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const identity = readDurableProcessIdentity(result.pid);
+    if (!identity) {
+      if (!processExists(result.pid)) return;
+      throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+    }
+    if (identity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`plugin_supervisor_upgrade_stop_timeout:${result.pid}`);
+}
+
+/** Stop the exact current supervisor after an explicit stop-all has left no
+ * running desired service. Returns false when another desired target still
+ * needs the host; an absent/already-exited host is already stopped. */
+export async function shutdownPluginSupervisorIfIdle(): Promise<boolean> {
+  const desired = readPluginSupervisorDesired();
+  if (Object.values(desired.services).some(item => item.running)) return false;
+  const result = readPluginSupervisorResult();
+  if (!result) return true;
+  const liveIdentity = readDurableProcessIdentity(result.pid);
+  if (!liveIdentity) {
+    if (processExists(result.pid)) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+    return true;
+  }
+  if (!result.processStart) throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+  if (liveIdentity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+  if (!signalAttestedFleetProcess({ pid: result.pid, processStart: result.processStart }, 'SIGTERM')) {
+    const identity = readDurableProcessIdentity(result.pid);
+    if (!identity && !processExists(result.pid)) return true;
+    throw new Error(identity
+      ? `plugin_supervisor_identity_mismatch:${result.pid}`
+      : `plugin_supervisor_identity_unknown:${result.pid}`);
+  }
+
+  const deadline = Date.now() + pluginSupervisorStopTimeoutMs(desired);
+  while (Date.now() < deadline) {
+    const identity = readDurableProcessIdentity(result.pid);
+    if (!identity) {
+      if (!processExists(result.pid)) return true;
+      throw new Error(`plugin_supervisor_identity_unknown:${result.pid}`);
+    }
+    if (identity !== result.processStart) throw new Error(`plugin_supervisor_identity_mismatch:${result.pid}`);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error(`plugin_supervisor_shutdown_timeout:${result.pid}`);
 }
 
 function launchSupervisor(): void {
@@ -111,6 +208,7 @@ export async function changePluginService(
 ): Promise<void> {
   assertNoLegacyPluginPm2();
   const desired = readPluginSupervisorDesired();
+  const supervisorStopTimeoutMs = pluginSupervisorStopTimeoutMs(desired);
   const killTimeoutMs = spec?.external.killTimeoutMs ?? desired.services[pluginId]?.spec.external.killTimeoutMs ?? 8_000;
   const name = pluginServiceName(pluginId);
   if (operation === 'start') {
@@ -127,6 +225,7 @@ export async function changePluginService(
   desired.target = pluginId;
   mkdirSync(pluginSupervisorDir(), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(pluginSupervisorDesiredPath(), JSON.stringify(desired), { mode: 0o600, durable: true, followTargetSymlink: false });
+  await stopOutdatedSupervisor(supervisorStopTimeoutMs);
   if (!supervisorAlive()) launchSupervisor();
   const timeoutMs = Math.max(30_000, killTimeoutMs + 10_000);
   const deadline = Date.now() + timeoutMs;

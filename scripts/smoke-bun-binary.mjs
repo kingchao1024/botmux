@@ -284,13 +284,14 @@ try {
   let parsed;
   try { parsed = JSON.parse(out.trim().split('\n').pop()); }
   catch { parsed = null; }
-  if (!parsed?.ok || !(parsed.tenant > 0) || !(parsed.user > 0)) {
+  if (!parsed?.ok || !(parsed.tenant > 0) || !(parsed.user > 0)
+    || !/^[a-f0-9]{64}$/.test(parsed.runtimeGeneration)) {
     fail('selfcheck', `__selfcheck did not confirm the manifest loaded: ${out.slice(0, 300)}`);
   }
   if (!existsSync(join(home, '.botmux', 'lark-scopes.json'))) {
     fail('selfcheck', 'writeScopesJsonToConfigDir did not produce ~/.botmux/lark-scopes.json');
   }
-  console.log(`smoke: ✅ selfcheck — lark-scopes manifest loads + writes in the binary (tenant=${parsed.tenant}, user=${parsed.user})`);
+  console.log(`smoke: ✅ selfcheck — lark-scopes manifest and runtime generation are embedded (tenant=${parsed.tenant}, user=${parsed.user}, runtime=${parsed.runtimeGeneration.slice(0, 12)})`);
 } catch (err) {
   fail('selfcheck', err instanceof Error ? err.message : String(err));
 }

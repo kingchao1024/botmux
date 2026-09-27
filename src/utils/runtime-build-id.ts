@@ -9,7 +9,7 @@ export interface RuntimeBuildEntry {
 }
 
 export type RuntimeBuildIdentity =
-  | { status: 'known'; id: string; source: 'artifact' | 'source' }
+  | { status: 'known'; id: string; source: 'artifact' | 'source' | 'baked' }
   | { status: 'unknown'; reason: 'artifact_invalid' | 'source_unavailable' | 'read_failed' };
 
 const BUILD_ID_RE = /^[a-f0-9]{64}$/;
@@ -66,7 +66,13 @@ export function collectCompiledRuntimeEntries(
 export function resolveRuntimeBuildIdentity(options: {
   artifactPath: string;
   sourceRoot?: string;
+  bakedId?: string;
 }): RuntimeBuildIdentity {
+  if (options.bakedId !== undefined) {
+    return isRuntimeBuildId(options.bakedId)
+      ? { status: 'known', id: options.bakedId, source: 'baked' }
+      : { status: 'unknown', reason: 'artifact_invalid' };
+  }
   if (existsSync(options.artifactPath)) {
     try {
       const id = readFileSync(options.artifactPath, 'utf8').trim();
@@ -93,9 +99,16 @@ export function resolveRuntimeBuildIdentity(options: {
 export function runtimeBuildIdentity(): RuntimeBuildIdentity {
   if (cachedIdentity) return cachedIdentity;
   const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  // Replaced by Bun.build's define only in a compiled single-file executable.
+  // Normal Node/source runtimes keep using the generated dist artifact or the
+  // source hash fallback; an ambient variable is not accepted as authority.
+  const bunRuntime = (globalThis as { Bun?: { isStandaloneExecutable?: boolean } }).Bun;
+  const standalone = bunRuntime?.isStandaloneExecutable === true
+    || process.argv[1]?.startsWith('/$bunfs/') === true;
   cachedIdentity = resolveRuntimeBuildIdentity({
     artifactPath: join(projectRoot, 'dist', '.runtime-build-id'),
     sourceRoot: join(projectRoot, 'src'),
+    ...(standalone ? { bakedId: process.env.BOTMUX_BAKED_RUNTIME_BUILD_ID } : {}),
   });
   return cachedIdentity;
 }

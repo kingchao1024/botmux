@@ -23,6 +23,8 @@ CLI 持有服务生命周期锁，原子发布目标状态，并等待 superviso
 
 supervisor 的 lifetime lock 防止重复宿主。宿主异常退出后，下次显式服务操作会启动新宿主；新宿主先核对持久化的进程启动身份（Linux 同时绑定 boot ID），回收自己上代的子进程，再恢复目标状态。已显式停止的服务不恢复，被复用的 PID 不发送信号。没有额外的系统启动项；整机重启后的启动仍由现有 botmux 启动流程负责。
 
+升级后的 CLI 会用编译时固化的 runtime generation 识别旧插件 supervisor，只在 `pid + processStart` 仍指向同一旧实例时请求其退出；身份无法确认或旧宿主未在限定时间内退出时，操作明确失败，不启动双实例。**回滚到旧 binary 前必须先用当前 CLI 运行 `botmux plugin service stop --all`；该命令确认所有子服务停止后会关闭 plugin supervisor，并等待其退出。命令成功后再切换旧 binary 并重新启动服务。**旧 binary 不认识未来 generation 字段，不能依赖它自动接管新宿主。
+
 ## 从旧 PM2 服务迁移
 
 若 `~/.botmux/pm2` 仍有活跃 God daemon，插件操作会返回 `plugin_legacy_pm2_running`，不会同时启动第二套服务，也不会擅自终止旧进程。请在维护窗口使用旧安装停止对应 PM2 fleet（例如确认该 HOME 只属于 botmux 后运行 `PM2_HOME="$HOME/.botmux/pm2" pm2 kill`），关闭可能再次拉起它的旧启动项，然后执行 `botmux plugin service start <id>`。

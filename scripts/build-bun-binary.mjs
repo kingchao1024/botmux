@@ -112,6 +112,14 @@ function versionToBake() {
   return '0.0.0';
 }
 
+function runtimeBuildIdToBake() {
+  const id = readFileSync(join(REPO_ROOT, 'dist', '.runtime-build-id'), 'utf8').trim();
+  if (!/^[a-f0-9]{64}$/.test(id)) {
+    throw new Error('dist/.runtime-build-id is missing or invalid — run `bun run build` before compiling');
+  }
+  return id;
+}
+
 /** Resolve node-pty's compiled `pty.node` (+ macOS spawn-helper) for a target.
  *  On linux the local `build/Release/pty.node` is authoritative; darwin ships
  *  prebuilds under `prebuilds/<plat>-<arch>/`. */
@@ -224,6 +232,7 @@ async function buildOne({ target, out }) {
   mkdirSync(dirname(outfile), { recursive: true });
 
   const baked = versionToBake();
+  const runtimeBuildId = runtimeBuildIdToBake();
   const result = await Bun.build({
     entrypoints: [entry],
     compile: { outfile, ...(target ? { target } : {}) },
@@ -233,7 +242,10 @@ async function buildOne({ target, out }) {
     // `bakedBinaryVersion()` (src/utils/install-info.ts), which is written so the
     // identifier is absent under Node — where the disk read still works — and only
     // this compiled path needs the constant.
-    define: { 'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked) },
+    define: {
+      'process.env.BOTMUX_BAKED_VERSION': JSON.stringify(baked),
+      'process.env.BOTMUX_BAKED_RUNTIME_BUILD_ID': JSON.stringify(runtimeBuildId),
+    },
     plugins: [makeNativeEmbedPlugin({ ptyNode, spawnHelper })],
   });
   if (!result.success) {
@@ -241,7 +253,7 @@ async function buildOne({ target, out }) {
     throw new Error(`bun build failed for ${target ?? 'host'}`);
   }
   if (platform === 'darwin') adhocResignDarwin(outfile);
-  console.log(`✅ built ${outfile} (${target ?? 'host'}; version=${baked}; pty.node=${ptyNode}${spawnHelper ? `, spawn-helper=${spawnHelper}` : ''})`);
+  console.log(`✅ built ${outfile} (${target ?? 'host'}; version=${baked}; runtime=${runtimeBuildId.slice(0, 12)}; pty.node=${ptyNode}${spawnHelper ? `, spawn-helper=${spawnHelper}` : ''})`);
   return outfile;
 }
 
