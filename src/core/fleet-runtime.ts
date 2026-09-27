@@ -13,6 +13,7 @@ import { spawn } from 'node:child_process';
 import type { FleetBotSpec } from './fleet-supervisor.js';
 import { pidAlive } from './fleet-supervisor.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { rotateLogIfNeeded, DEFAULT_LOG_ROTATION } from './log-rotation.js';
 import { readFleetState } from './fleet-state-store.js';
 import { resolveBotmuxDataDir } from './data-dir.js';
 import { enqueueFleetCommand } from './fleet-command-queue.js';
@@ -423,6 +424,8 @@ export function startFleetViaSupervisor(
     };
   }
   mkdirSync(LOG_DIR, { recursive: true });
+  rotateLogIfNeeded(join(LOG_DIR, 'supervisor-out.log'), DEFAULT_LOG_ROTATION);
+  rotateLogIfNeeded(join(LOG_DIR, 'supervisor-err.log'), DEFAULT_LOG_ROTATION);
   const out = openSync(join(LOG_DIR, 'supervisor-out.log'), 'a');
   const err = openSync(join(LOG_DIR, 'supervisor-err.log'), 'a');
   const { command, args } = resolveEntrySpawn('supervisor', fleetDistDir());

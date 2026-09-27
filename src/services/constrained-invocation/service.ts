@@ -5,6 +5,7 @@ import { readDurableProcessIdentity } from '../../utils/process-identity.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { parseInvocation, type InvocationRequest, type InvocationResult } from './contract.js';
 import { NativeInvocationError, type NativeInvocationOutput } from './runtime.js';
+import { sanitizeNativeError, SAFE_NATIVE_ERROR_CODES } from './error-sanitize.js';
 
 interface StoredInvocation { fingerprint: string; lease: string; ownerPid: number; ownerIdentity?: string; result: InvocationResult }
 export interface InvocationServiceOptions {
@@ -54,14 +55,26 @@ export class InvocationService {
   private save(record: StoredInvocation): void {
     atomicWriteFileSync(this.path(record.result.requestId), JSON.stringify(record), { mode: 0o600 });
   }
-  get(id: string): InvocationResult | undefined { return this.read(id)?.result; }
+  private sanitizedResult(record: StoredInvocation): InvocationResult {
+    if (record.result.state === 'failed' && record.result.error && !SAFE_NATIVE_ERROR_CODES.has(record.result.error)) {
+      record.result.error = 'native_inference_failed';
+      // A legacy raw error must not remain on disk for the next non-wait retry.
+      this.save(record);
+    }
+    return record.result;
+  }
+  get(id: string): InvocationResult | undefined {
+    const record = this.read(id);
+    if (!record) return undefined;
+    return this.sanitizedResult(record);
+  }
   start(input: unknown): InvocationResult {
     const request = parseInvocation(input);
     const fingerprint = createHash('sha256').update(stable(request)).digest('hex');
     const previous = this.read(request.requestId);
     if (previous) {
       if (previous.fingerprint !== fingerprint) throw new Error('idempotency_conflict');
-      return previous.result;
+      return this.sanitizedResult(previous);
     }
     if (this.active.size >= (this.options.maxConcurrent ?? 4)) throw new Error('invocation_capacity_exceeded');
     const record: StoredInvocation = { fingerprint, lease: this.lease, ownerPid: process.pid, ownerIdentity: this.ownerIdentity, result: {
@@ -79,9 +92,18 @@ export class InvocationService {
         const output = await this.options.run(request, controller.signal);
         if (!controller.signal.aborted) Object.assign(record.result, output, { state: 'completed' });
       } catch (error) {
-        if (error instanceof NativeInvocationError) Object.assign(record.result, error.telemetry);
+        if (error instanceof NativeInvocationError) {
+          Object.assign(record.result, error.telemetry);
+          // Sanitize: only explicit SAFE_NATIVE_ERROR_CODES may appear in
+          // persisted error. Everything else (raw CLI stderr, paths,
+          // API keys, provider error text) is rewritten to a generic code.
+          record.result.error = sanitizeNativeError(error.message);
+        } else {
+          record.result.error = error instanceof Error && SAFE_NATIVE_ERROR_CODES.has(error.message)
+            ? error.message
+            : 'invocation_failed';
+        }
         record.result.state = 'failed';
-        record.result.error = error instanceof Error ? error.message : 'invocation_failed';
       } finally {
         clearTimeout(timer);
         if (controller.signal.aborted) {

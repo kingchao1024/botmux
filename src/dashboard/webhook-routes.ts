@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { getConnector, listConnectors, type ConnectorDefinition } from '../services/connector-store.js';
 import { getWebhookSecret } from '../services/webhook-key.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
@@ -35,6 +35,7 @@ import {
 import { jsonRes } from './http.js';
 import { logger } from '../utils/logger.js';
 import { dispatchTriggerRequest, newTriggerId, queryTriggerResult, type TriggerApiDeps } from './trigger-api.js';
+import { sanitizeDaemonError, sanitizeNativeError, SAFE_DAEMON_ERROR_CODES } from '../services/constrained-invocation/error-sanitize.js';
 
 const replayNonces = new Map<string, number>();
 const rateBuckets = new Map<string, { windowStart: number; count: number }>();
@@ -541,6 +542,53 @@ async function handleWebhookRouteImpl(
       fail(400, 'target_required', 'target botId is required');
       return true;
     }
+    // ── Invocation result polling: proxy GET to daemon /api/headless/invocations/:requestId ──
+    if (connector.target.kind === 'invocation') {
+      const invRequestId = url.searchParams.get('requestId') ?? url.searchParams.get('triggerId');
+      if (!invRequestId) {
+        fail(400, 'bad_request', 'requestId is required for invocation result polling');
+        return true;
+      }
+      const getOptions = parseTriggerResponseOptions(req, url);
+      const maxGetMs = Math.min((connector.invocation?.deadlineMs ?? 30_000) + 5_000, 60_000);
+      const getTimeoutMs = Math.max(1_000, Math.min(getOptions.timeoutMs ?? maxGetMs, maxGetMs));
+      const getAbort = new AbortController();
+      const getTimer = setTimeout(() => getAbort.abort(), getTimeoutMs);
+      try {
+        const result = await deps.proxyToDaemon(
+          botId,
+          `/api/headless/invocations/${encodeURIComponent(invRequestId)}`,
+          { method: 'GET', headers: { 'content-type': 'application/json' }, signal: getAbort.signal },
+        );
+        let resultBody: any;
+        try { resultBody = await result.json(); } catch { resultBody = null; }
+        if (!result.ok || !resultBody) {
+          fail(result.status >= 400 ? result.status : 502, 'trigger_failed', 'failed to query invocation result');
+          return true;
+        }
+        const safeResult = resultBody?.result?.error
+          ? { ...resultBody, result: { ...resultBody.result, error: sanitizeNativeError(resultBody.result.error) } }
+          : resultBody;
+        const state = safeResult?.result?.state;
+        const isFailure = state === 'failed' || state === 'timed_out' || state === 'cancelled';
+        try {
+          appendTriggerLog({
+            triggerId: newTriggerId(), connectorId: connector.id, requestId: invRequestId,
+            action: state === 'completed' ? 'completed' : isFailure ? 'failed' : 'delivered',
+            status: isFailure ? 'error' : 'ok',
+            ...(isFailure && safeResult?.result?.error ? { error: safeResult.result.error } : {}),
+            request: auditRequest, target: auditTarget,
+            response: webhookAuditResponse(200, startedAtMs), createdAt,
+          });
+        } catch { /* best-effort */ }
+        jsonRes(res, 200, safeResult);
+      } catch {
+        fail(502, 'trigger_failed', getAbort.signal.aborted ? 'invocation_poll_timeout' : 'invocation_proxy_error');
+      } finally {
+        clearTimeout(getTimer);
+      }
+      return true;
+    }
     if (connector.target.kind !== 'turn') {
       fail(400, 'bad_request', 'async polling is only supported for turn connectors');
       return true;
@@ -798,6 +846,276 @@ async function handleWebhookRouteImpl(
       'v2 workflow connector targets are retired; migrate the definition and replace this connector with a turn target',
     );
     return true;
+  }
+  // ── Invocation connector: dispatch directly to /api/headless/invocations ──
+  // The webhook payload may only supply the prompt. Model, tools, provider,
+  // identity, outputSchema and session fields are fixed by the connector config
+  // and caller-controlled values are ignored.
+  if (connector.target.kind === 'invocation') {
+    const cfg = connector.invocation;
+    if (!cfg) {
+      if (idempotency.kind === 'first') {
+        guard.release = undefined;
+        settleWebhookIdempotency(connector.id, idempotency.key, idempotency.token, undefined);
+      }
+      fail(500, 'trigger_failed', 'invocation connector is missing invocation config');
+      return true;
+    }
+    const promptField = typeof (parsed.payload as Record<string, unknown>)?.prompt === 'string'
+      ? (parsed.payload as Record<string, unknown>).prompt as string
+      : '';
+    if (!promptField.trim()) {
+      if (idempotency.kind === 'first') {
+        guard.release = undefined;
+        settleWebhookIdempotency(connector.id, idempotency.key, idempotency.token, undefined);
+      }
+      fail(400, 'bad_request', 'invocation requires a prompt field or raw text body');
+      return true;
+    }
+    // ── Parse invocation-specific response options ──
+    const invResponseOptions = parseTriggerResponseOptions(req, url);
+    const maxWaitMs = Math.min((cfg.deadlineMs ?? 30_000) + 5_000, 60_000);
+    const waitTimeoutMs = Math.max(1_000, Math.min(invResponseOptions.timeoutMs ?? maxWaitMs, maxWaitMs));
+    // The caller's wait budget starts at webhook entry, before the initial POST.
+    // POST, each GET and the inter-poll sleep all consume this one deadline.
+    const waitDeadline = invResponseOptions.waitForFinalOutput ? startedAtMs + waitTimeoutMs : undefined;
+    // ── Stable requestId: binds connector + idempotency key + complete body fingerprint.
+    // Body fingerprint = sha256(rawBody) so all webhook fields are captured,
+    // not just the prompt. Same (connector, key, rawBody) → same requestId
+    // (commit-unknown retries dedup). Same key / different body → different
+    // requestId (existing fail-open). Never derives from HMAC nonce. ──
+    const stableKey = idempotencyKey ?? requestId ?? randomUUID().slice(0, 12);
+    const bodyFingerprint = createHash('sha256').update(rawBody).digest('hex').slice(0, 12);
+    const invRequestId = `inv_${createHash('sha256').update(`${connector.id}:${stableKey}:${bodyFingerprint}`).digest('hex').slice(0, 16)}`;
+    const invocationPayload = {
+      requestId: invRequestId,
+      prompt: promptField.slice(0, 512_000),
+      model: cfg.model,
+      ...(cfg.reasoningEffort ? { reasoningEffort: cfg.reasoningEffort } : {}),
+      deadlineMs: cfg.deadlineMs,
+      outputSchema: cfg.outputSchema,
+      ...(cfg.maxOutputTokens !== undefined ? { maxOutputTokens: cfg.maxOutputTokens } : {}),
+    };
+    // ── dryRun: zero daemon call, write dry_run audit, return no-op result ──
+    if (invResponseOptions.dryRun) {
+      if (idempotency.kind === 'first') {
+        guard.release = undefined;
+        settleWebhookIdempotency(connector.id, idempotency.key, idempotency.token, undefined);
+      }
+      const dryRunResult = {
+        ok: true,
+        result: {
+          requestId: invRequestId, state: 'completed' as const,
+          output: null, error: null,
+          startedAt: new Date().toISOString(), durationMs: 0, startupMs: 0,
+          configuredModel: cfg.model, actualModel: null, reasoningEffort: cfg.reasoningEffort ?? null,
+          usage: null, usageSource: null,
+        },
+        idempotency: idempotency.kind !== 'disabled' ? { key: idempotency.key, action: 'accepted' as const } : undefined,
+      };
+      // dry_run audit
+      try {
+        appendTriggerLog({
+          triggerId: newTriggerId(), connectorId: connector.id,
+          ...(invRequestId ? { requestId: invRequestId } : {}),
+          action: 'dry_run', status: 'ok',
+          request: auditRequest, target: auditTarget,
+          response: webhookAuditResponse(200, startedAtMs),
+          createdAt,
+        });
+      } catch { /* best-effort */ }
+      const body = idempotency.kind === 'first'
+        ? { ...dryRunResult, idempotency: { key: idempotency.key, action: 'accepted' as const } }
+        : dryRunResult;
+      jsonRes(res, 200, body);
+      return true;
+    }
+    // ── Real dispatch ──
+    // A non-wait POST keeps the connector deadline buffer. In wait mode it is
+    // bounded by the caller's already-running total budget.
+    const proxyTimeoutMs = waitDeadline === undefined
+      ? (cfg.deadlineMs ?? 30_000) + 5_000
+      : Math.max(0, waitDeadline - Date.now());
+    const proxyAbort = new AbortController();
+    if (proxyTimeoutMs <= 0) proxyAbort.abort();
+    const proxyTimer = setTimeout(() => proxyAbort.abort(), proxyTimeoutMs);
+    try {
+      const upstream = await deps.proxyToDaemon(
+        connector.target.botId,
+        '/api/headless/invocations',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(invocationPayload),
+          signal: proxyAbort.signal,
+        },
+      );
+      // Parse response — handle non-JSON gracefully
+      let upstreamBody: any;
+      try {
+        upstreamBody = await upstream.json();
+      } catch {
+        upstreamBody = { ok: false, error: `unexpected_response_format` };
+      }
+      // Settle idempotency on a successful daemon accept
+      if (idempotency.kind === 'first') {
+        guard.release = undefined;
+        const settled = upstreamBody?.ok ? (upstreamBody?.result?.requestId ?? invRequestId) : undefined;
+        settleWebhookIdempotency(connector.id, idempotency.key, idempotency.token, settled);
+      }
+      // ── wait=1: poll until terminal state or timeout ──
+      if (invResponseOptions.waitForFinalOutput && upstreamBody?.ok && upstreamBody?.result?.requestId) {
+        const waitId = upstreamBody.result.requestId;
+        const pollDeadline = waitDeadline!;
+        while (true) {
+          const remaining = pollDeadline - Date.now();
+          if (remaining <= 0) break;
+          // Each GET poll carries an AbortSignal bound to remaining time
+          const pollAbort = new AbortController();
+          const pollTimer = setTimeout(() => pollAbort.abort(), Math.max(remaining, 0));
+          let pollFailed = false;
+          try {
+            const result = await deps.proxyToDaemon(
+              connector.target.botId,
+              `/api/headless/invocations/${encodeURIComponent(waitId)}`,
+              { method: 'GET', headers: { 'content-type': 'application/json' }, signal: pollAbort.signal },
+            );
+            let resultBody: any;
+            try { resultBody = await result.json(); } catch { resultBody = null; }
+            // Non-2xx or non-JSON response → immediate stable error, don't spin
+            if (!result.ok || !resultBody) {
+              pollFailed = true;
+              break;
+            }
+            const state = resultBody?.result?.state;
+            if (!state || state === 'running') {
+              // Recalculate remaining after GET to avoid over-sleeping
+              const afterGet = pollDeadline - Date.now();
+              if (afterGet <= 0) break;
+              await new Promise(r => setTimeout(r, Math.min(afterGet, 1000)));
+              continue;
+            }
+            // Terminal state reached — sanitize, audit, return
+            const sanitizedError = resultBody?.result?.error
+              ? sanitizeNativeError(resultBody.result.error) : undefined;
+            try {
+              appendTriggerLog({
+                triggerId: newTriggerId(), connectorId: connector.id,
+                ...(invRequestId ? { requestId: invRequestId } : {}),
+                action: state === 'completed' ? 'completed' : 'failed',
+                status: state === 'completed' ? 'ok' : 'error',
+                error: sanitizedError,
+                request: auditRequest, target: auditTarget,
+                response: webhookAuditResponse(200, startedAtMs),
+                createdAt,
+              });
+            } catch { /* best-effort */ }
+            // Sanitize result body before returning
+            const safeResult = resultBody?.result?.error
+              ? { ...resultBody, result: { ...resultBody.result, error: sanitizedError } }
+              : resultBody;
+            const body = idempotency.kind !== 'disabled'
+              ? { ...safeResult, idempotency: { key: idempotency.key, action: 'accepted' as const } }
+              : safeResult;
+            jsonRes(res, 200, body);
+            return true;
+          } catch {
+            pollFailed = true;
+            break;
+          } finally {
+            clearTimeout(pollTimer);
+          }
+          if (pollFailed) break;
+        }
+        // Polling failed or timed out — write failed audit
+        try {
+          appendTriggerLog({
+            triggerId: newTriggerId(), connectorId: connector.id,
+            ...(invRequestId ? { requestId: invRequestId } : {}),
+            action: 'failed', status: 'error',
+            error: 'invocation_poll_timeout',
+            request: auditRequest, target: auditTarget,
+            response: webhookAuditResponse(502, startedAtMs),
+            createdAt,
+          });
+        } catch { /* best-effort */ }
+        jsonRes(res, 502, { ok: false, error: 'invocation_poll_timeout' });
+        return true;
+      }
+      // ── Audit: daemon accept / reject (sanitize before writing) ──
+      const resultState = upstreamBody?.result?.state;
+      const isDaemonOk = upstreamBody?.ok;
+      const isResultFailed = resultState === 'failed' || resultState === 'timed_out' || resultState === 'cancelled';
+      // ok:true/state:failed → account as failed/error, not delivered/ok
+      let auditAction: 'delivered' | 'failed';
+      let auditStatus: 'ok' | 'error';
+      if (isDaemonOk && !isResultFailed) {
+        auditAction = 'delivered';
+        auditStatus = 'ok';
+      } else {
+        auditAction = 'failed';
+        auditStatus = 'error';
+      }
+      const sanitizedUpstreamError = isResultFailed
+        ? sanitizeNativeError(upstreamBody?.result?.error)
+        : isDaemonOk ? undefined
+        : sanitizeDaemonError(upstreamBody?.error);
+      // Audit httpStatus must match the HTTP status we return to the client.
+      const responseStatus = isDaemonOk ? upstream.status
+        : upstreamBody?.error === 'idempotency_conflict' ? 409
+        : upstream.status >= 400 ? upstream.status
+        : 502;
+      try {
+        appendTriggerLog({
+          triggerId: newTriggerId(), connectorId: connector.id,
+          ...(invRequestId ? { requestId: invRequestId } : {}),
+          action: auditAction, status: auditStatus,
+          error: sanitizedUpstreamError,
+          request: auditRequest, target: auditTarget,
+          response: webhookAuditResponse(responseStatus, startedAtMs),
+          createdAt,
+        });
+      } catch { /* best-effort */ }
+      // ── Response: sanitized error codes — never raw err.message ──
+      // Use shared sanitizer — only SAFE_DAEMON_ERROR_CODES pass through.
+      const safeError = isResultFailed
+        ? sanitizeNativeError(upstreamBody?.result?.error)
+        : isDaemonOk ? undefined
+        : sanitizeDaemonError(upstreamBody?.error);
+      const safeErrorCode = safeError;
+      const safeUpstreamBody = isResultFailed && upstreamBody?.result?.error
+        ? { ...upstreamBody, result: { ...upstreamBody.result, error: safeError } }
+        : upstreamBody;
+      const body = isDaemonOk
+        ? (idempotency.kind === 'first'
+          ? { ...safeUpstreamBody, idempotency: { key: idempotency.key, action: 'accepted' as const } }
+          : safeUpstreamBody)
+        : { ok: false, error: safeError, errorCode: safeErrorCode, ...(idempotency.kind !== 'disabled' ? { idempotency: { key: idempotency.key, action: 'failed' as const } } : {}) };
+      jsonRes(res, responseStatus, body);
+      return true;
+    } catch (err: any) {
+      if (idempotency.kind === 'first') {
+        guard.release = undefined;
+        settleWebhookIdempotency(connector.id, idempotency.key, idempotency.token, undefined);
+      }
+      // Never expose raw err.message — map to stable codes
+      const proxyError = proxyAbort.signal.aborted ? 'invocation_timeout' : 'invocation_proxy_error';
+      try {
+        appendTriggerLog({
+          triggerId: newTriggerId(), connectorId: connector.id,
+          ...(invRequestId ? { requestId: invRequestId } : {}),
+          action: 'failed', status: 'error',
+          error: proxyError,
+          request: auditRequest, target: auditTarget,
+          response: webhookAuditResponse(502, startedAtMs),
+          createdAt,
+        });
+      } catch { /* best-effort */ }
+      jsonRes(res, 502, { ok: false, error: proxyError });
+      return true;
+    } finally {
+      clearTimeout(proxyTimer);
+    }
   }
   const presentation = await resolveConnectorTriggerPresentation(
     connector,

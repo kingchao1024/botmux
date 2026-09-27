@@ -18,7 +18,10 @@ import {
   PLUGIN_CARD_ACTION_TOKEN_ENV,
 } from './card-actions/protocol.js';
 import { loadPluginServiceDefinition, type PluginServiceDefinition } from './runtime.js';
-import { changePluginService, readPluginProcesses, type PluginProcessInfo } from './supervisor-client.js';
+import {
+  changePluginService, readPluginProcesses, shutdownPluginSupervisorIfIdle,
+  type PluginProcessInfo,
+} from './supervisor-client.js';
 import { ensurePluginServicePreload, pluginServiceName, type PluginServiceSpec } from './supervisor-store.js';
 import { isStandaloneBinary } from '../self-spawn.js';
 import type { InstalledPluginRecord, PluginServiceMode, PluginServiceState } from './types.js';
@@ -388,7 +391,7 @@ export async function startPluginServices(
 
 export async function stopPluginServices(
   pluginIds?: readonly string[],
-  options: { autoOnly?: boolean } = {},
+  options: { autoOnly?: boolean; shutdownSupervisor?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
   return withPluginServiceLock(async () => {
     const reports: PluginServiceReport[] = [];
@@ -410,6 +413,9 @@ export async function stopPluginServices(
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readPluginServiceState(record.id), err?.message ?? String(err)));
       }
+    }
+    if (options.shutdownSupervisor && !reports.some(report => report.action === 'failed')) {
+      await shutdownPluginSupervisorIfIdle();
     }
     return reports;
   });

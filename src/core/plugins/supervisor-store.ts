@@ -57,6 +57,7 @@ export interface PluginSupervisorResult {
   pid: number;
   processStart?: string;
   error?: string;
+  runtimeGeneration?: string;
 }
 
 /** Corrupt state is uncertainty, never evidence that a service is stopped. */
@@ -84,7 +85,8 @@ export function readPluginSupervisorResult(): PluginSupervisorResult | undefined
   const value = JSON.parse(readFileSync(file, 'utf8')) as PluginSupervisorResult;
   if (!value || typeof value.revision !== 'string' || !Number.isSafeInteger(value.pid) || value.pid <= 1
     || (value.processStart !== undefined && typeof value.processStart !== 'string')
-    || (value.error !== undefined && typeof value.error !== 'string')) {
+    || (value.error !== undefined && typeof value.error !== 'string')
+    || (value.runtimeGeneration !== undefined && typeof value.runtimeGeneration !== 'string')) {
     throw new Error('plugin_supervisor_invalid_result');
   }
   return value;

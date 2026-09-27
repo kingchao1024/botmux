@@ -81,6 +81,174 @@ afterEach(async () => {
 });
 
 describe('connector-api write routes', () => {
+  it.each([
+    ['an overlong model', { model: 'm'.repeat(201) }],
+    ['an unsupported reasoning effort', { reasoningEffort: 'arbitrary' }],
+    ['a non-string reasoning effort', { reasoningEffort: 1 }],
+    ['an out-of-range max output token limit', { maxOutputTokens: 128_001 }],
+    ['a non-integer max output token limit', { maxOutputTokens: 1.5 }],
+    ['an oversized output schema', {
+      outputSchema: {
+        type: 'object', properties: {}, required: [], additionalProperties: false,
+        description: 'x'.repeat(32_001),
+      },
+    }],
+  ])('rejects an invocation connector with %s', async (_name, invocation) => {
+    const res = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Invalid invocation',
+        target: { mode: 'fixed', kind: 'invocation', botId: 'app1' },
+        invocation: {
+          model: 'gpt-5.5',
+          deadlineMs: 30_000,
+          outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+          ...invocation,
+        },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await json(res)).toMatchObject({ ok: false, error: 'invocation_config_invalid' });
+    expect((await json(await fetch(`${baseUrl}/api/connectors`))).connectors).toEqual([]);
+  });
+
+  it('rejects an invalid invocation config update without changing the connector', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Valid invocation',
+        target: { mode: 'fixed', kind: 'invocation', botId: 'app1' },
+        invocation: {
+          model: 'gpt-5.5', deadlineMs: 30_000,
+          outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+        },
+      }),
+    }));
+
+    const update = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ invocation: { maxOutputTokens: 1.5 } }),
+    });
+    expect(update.status).toBe(400);
+    expect(await json(update)).toMatchObject({ ok: false, error: 'invocation_config_invalid' });
+
+    const stored = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`));
+    expect(stored.connector.invocation).toMatchObject({ model: 'gpt-5.5', deadlineMs: 30_000 });
+    expect(stored.connector.invocation.maxOutputTokens).toBeUndefined();
+  });
+
+  it.each([
+    ['model=42', { model: 42 }],
+    ['an empty model', { model: '' }],
+    ['a whitespace-only model', { model: '  ' }],
+    ['a string deadline', { deadlineMs: '30000' }],
+    ['deadlineMs=null', { deadlineMs: null }],
+    ['outputSchema=null', { outputSchema: null }],
+    ['an array outputSchema', { outputSchema: [] }],
+  ])('rejects an explicit invalid invocation PUT field: %s', async (_name, invocation) => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Original invocation',
+        target: { mode: 'fixed', kind: 'invocation', botId: 'app1' },
+        invocation: {
+          model: 'gpt-5.5', deadlineMs: 30_000,
+          outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+        },
+      }),
+    }));
+
+    const update = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Mutated name', invocation }),
+    });
+    expect(update.status).toBe(400);
+    expect(await json(update)).toMatchObject({ ok: false, error: 'invocation_config_invalid' });
+
+    const stored = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`));
+    expect(stored.connector).toEqual(created.connector);
+  });
+
+  it('keeps the prior invocation config when a PUT omits invocation fields', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Original invocation',
+        target: { mode: 'fixed', kind: 'invocation', botId: 'app1' },
+        invocation: {
+          model: 'gpt-5.5', deadlineMs: 30_000,
+          outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+        },
+      }),
+    }));
+
+    const update = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Renamed invocation' }),
+    });
+    expect(update.status).toBe(200);
+    expect((await json(update)).connector).toMatchObject({
+      name: 'Renamed invocation', invocation: created.connector.invocation,
+    });
+  });
+
+  it('keeps the prior invocation config during an unrelated PUT update', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Original invocation',
+        target: { mode: 'fixed', kind: 'invocation', botId: 'app1' },
+        invocation: {
+          model: 'gpt-5.5', deadlineMs: 30_000,
+          outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+        },
+      }),
+    }));
+
+    const update = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ loggingPolicy: { storePayload: false, storeHeaders: true, retentionDays: 14 } }),
+    });
+    expect(update.status).toBe(200);
+    expect((await json(update)).connector).toMatchObject({
+      invocation: created.connector.invocation,
+      loggingPolicy: { storePayload: false, storeHeaders: true, retentionDays: 14 },
+    });
+  });
+
+  it('keeps the prior deadline and schema during a partial invocation PUT', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Original invocation',
+        target: { mode: 'fixed', kind: 'invocation', botId: 'app1' },
+        invocation: {
+          model: 'gpt-5.5', deadlineMs: 30_000,
+          outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+        },
+      }),
+    }));
+
+    const update = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ invocation: { model: 'gpt-5.5' } }),
+    });
+    expect(update.status).toBe(200);
+    expect((await json(update)).connector.invocation).toEqual(created.connector.invocation);
+  });
+
   it('rejects new workflow connectors without retaining a connector or generated secret', async () => {
     const res = await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',

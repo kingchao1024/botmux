@@ -79,9 +79,9 @@ const EMBED_MECHANISMS = [
 const NOT_NEEDED_IN_BINARY = [
   {
     rel: '.runtime-build-id',
-    // src/utils/runtime-build-id.ts falls back to hashing the module graph when
-    // the artifact is absent; the artifact is a dev/source-checkout fast path.
-    reason: 'runtime-build-id.ts treats a missing artifact as "recompute", so absence degrades to a slower path, not a failure',
+    // The compile step validates this artifact and substitutes its bytes as a
+    // literal. The virtual /$bunfs path is never used at runtime.
+    reason: 'build-bun-binary.mjs validates and bakes this value with Bun define; standalone runtime reads the literal',
   },
 ];
 

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
+import { resolveEnabledPluginIds } from '../src/core/plugins/effective.js';
 import {
   startPluginServices, stopPluginServices, listPluginServiceStatus,
   deletePluginServices, assertPluginServiceStopped, resolvePluginServiceSpec,
@@ -130,10 +131,18 @@ describe('plugin services on the built-in supervisor', () => {
 
   it('honours autoOnly and keeps a stopped manual service stopped', async () => {
     fixture('automatic', { auto: true });
+    fixture('disabled-auto', { auto: true });
     fixture('manual');
-    expect((await startPluginServices(undefined, { autoOnly: true })).map(r => r.pluginId)).toEqual(['automatic']);
+    const enabledPluginIds = resolveEnabledPluginIds(
+      [{ plugins: ['automatic'] }],
+      { plugins: [] },
+    );
+    expect((await startPluginServices(enabledPluginIds, { autoOnly: true })).map(r => r.pluginId)).toEqual(['automatic']);
     await ready('automatic');
     expect(proc('manual')).toBeUndefined();
+    expect(proc('disabled-auto')).toBeUndefined();
+    await startPluginServices(['disabled-auto']);
+    await ready('disabled-auto');
     await startPluginServices(['manual']);
     await ready('manual');
     const manualPid = proc('manual')!.pid;
@@ -142,6 +151,30 @@ describe('plugin services on the built-in supervisor', () => {
     await stopPluginServices(['manual']);
     await startPluginServices(undefined, { autoOnly: true });
     expect(proc('manual')!.status).toBe('stopped');
+  }, 30_000);
+
+  it('stops the supervisor only after an explicit all-services stop leaves no running target', async () => {
+    fixture('one');
+    fixture('two');
+    await startPluginServices(['one', 'two']);
+    await ready('one');
+    await ready('two');
+    const owner = readFleetState(pluginSupervisorStatePath())!.supervisorPid;
+    const ownerLock = join(home, '.botmux', 'plugin-supervisor', 'owner.lock');
+
+    await stopPluginServices(['one'], { shutdownSupervisor: true });
+    expect(pidAlive(owner)).toBe(true);
+    expect(readPluginSupervisorDesired().services.two.running).toBe(true);
+
+    await stopPluginServices(undefined, { shutdownSupervisor: true });
+    await until(() => !pidAlive(owner), 'idle plugin supervisor shutdown');
+    expect(existsSync(ownerLock)).toBe(false);
+    expect(Object.values(readPluginSupervisorDesired().services).every(item => !item.running)).toBe(true);
+
+    await expect(stopPluginServices(undefined, { shutdownSupervisor: true })).resolves.toEqual([
+      expect.objectContaining({ pluginId: 'one', action: 'not-running' }),
+      expect.objectContaining({ pluginId: 'two', action: 'not-running' }),
+    ]);
   }, 30_000);
 
   it('restarts a crashed service but never resurrects a deleted member', async () => {

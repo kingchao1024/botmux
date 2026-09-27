@@ -52,6 +52,7 @@ import {
   resolveCurrentTurnProvenance,
 } from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
+import { runtimeBuildIdentity } from './utils/runtime-build-id.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, dispatchChildTopLevelEscape, parseDispatchBotSpec, partitionProjectDispatchRoles, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
@@ -358,7 +359,7 @@ import {
 } from './services/vc-meeting-im-reply.js';
 import { recordVcMeetingListenerMessage } from './services/vc-meeting-listener-message-store.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
-import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import { resolveEffectivePluginIds, selectPluginServiceReconcileIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import type { PluginCardActionRoutingRecord } from './core/plugins/card-actions/gateway.js';
 import {
   assertPluginBindingTransition,
@@ -15762,7 +15763,12 @@ async function reconcilePluginServicesForCli(
   options: { autoOnly?: boolean } = {},
 ): Promise<void> {
   const { startPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await startPluginServices(pluginIds, { autoOnly: options.autoOnly });
+  const selectedPluginIds = selectPluginServiceReconcileIds(pluginIds, options, {
+    resolveConfigPath: lifecycleBotsConfigPath,
+    loadBots: loadBotsJson,
+    global: readGlobalConfig(),
+  });
+  const reports = await startPluginServices(selectedPluginIds, { autoOnly: options.autoOnly });
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
@@ -15771,10 +15777,10 @@ async function reconcilePluginServicesForCli(
 
 async function stopPluginServicesForCli(
   pluginIds?: string[],
-  options: { autoOnly?: boolean } = {},
+  options: { autoOnly?: boolean; shutdownSupervisor?: boolean } = {},
 ): Promise<import('./core/plugins/service-manager.js').PluginServiceReport[]> {
   const { stopPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await stopPluginServices(pluginIds, { autoOnly: options.autoOnly });
+  const reports = await stopPluginServices(pluginIds, options);
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));
@@ -16265,7 +16271,7 @@ async function cmdPlugin(args: string[]): Promise<void> {
       return;
     }
     if (action === 'stop') {
-      await stopPluginServicesForCli(pluginIds);
+      await stopPluginServicesForCli(pluginIds, { shutdownSupervisor: rawId === '--all' });
       return;
     }
     if (action === 'restart') {
@@ -16515,7 +16521,12 @@ switch (command) {
       console.error(`__selfcheck: written manifest mismatch (${wroteTenant}/${wroteUser} vs ${tenant}/${user})`);
       process.exit(1);
     }
-    console.log(JSON.stringify({ ok: true, tenant, user, written }));
+    const runtime = runtimeBuildIdentity();
+    if (runtime.status !== 'known') {
+      console.error(`__selfcheck: runtime generation unknown (${runtime.reason})`);
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ ok: true, tenant, user, written, runtimeGeneration: runtime.id }));
     process.exit(0);
   }
   case 'delete':

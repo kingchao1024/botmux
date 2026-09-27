@@ -22,6 +22,13 @@ source_of_truth: src/core/self-spawn.ts、scripts/claim-botmux-bin.mjs、scripts
 - Linux 主机已启用 `botmux.service` 时，不能从 BotMux/Trae 会话直接运行 `botmux start`、`botmux restart` 或 `bun run daemon:restart`：新 supervisor 会继承临时会话的 systemd scope，会话退出后可能被一并回收，而 oneshot unit 仍显示 `active (exited)`。生产重启必须在会话外执行 `systemctl --user restart botmux.service`，再用 `botmux status` 和 `/proc/<supervisor-pid>/cgroup` 确认进程归属。
 - 上述操作会让全部 bot 使用当前 checkout。测试或合并结束后应切回 canonical checkout，避免 review worktree 删除后全局 shim 失效。
 
+## daemon 日志轮转事实
+
+- 日志轮转在子进程 spawn 边界执行（`openSync` 前 rename），默认单文件 10 MiB、保留 3 份备份（`.1`–`.3`），可通过 `FleetSupervisorOptions.logRotation` 调整或设 `maxSizeBytes <= 0` 禁用。源码：`src/core/log-rotation.ts`。
+- 启动边界轮转只在 child 启动/重启时触发。活跃子进程持有 fd 继续写入超过阈值时，supervisor 每 5 分钟 stat 一次只记录告警，不执行运行时轮转；实际截断发生在下次 child 退出后重新 spawn 时。运维如需加速释放，对目标 bot 执行 `botmux restart` 即可触发重 spawn 轮转。
+- `fleet-runtime` 启动 supervisor 时同样对 `supervisor-{out,err}.log` 执行一次轮转。
+- 跨平台安全：`renameReplaceSync` 先 `unlink` 已有目标再 `rename`（Windows 兼容），源文件缺失时安全跳过，不误删有效备份。
+
 ## 待验证
 
 - build 或 smoke 结果不一定覆盖 daemon 路径、目标平台或真实 IM 投递；明确记录缺失边界。

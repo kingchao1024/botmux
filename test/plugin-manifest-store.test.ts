@@ -7,7 +7,7 @@ import { scanPluginContributions } from '../src/core/plugins/convention-scanner.
 import { normalizePluginIdList } from '../src/core/plugins/ids.js';
 import { pluginHome, pluginMaterializedPath, pluginMcpPrivatePath, pluginRegistryPath, resolvePluginPath } from '../src/core/plugins/paths.js';
 import { readPluginRegistry, upsertInstalledPlugin } from '../src/services/plugin-registry-store.js';
-import { resolveEffectivePluginIds, updateBotPluginOverride } from '../src/core/plugins/effective.js';
+import { resolveEffectivePluginIds, resolveEnabledPluginIds, updateBotPluginOverride } from '../src/core/plugins/effective.js';
 import { assertPluginBindingTransition, enabledPluginDependents } from '../src/core/plugins/dependencies.js';
 import { pluginServiceName } from '../src/core/plugins/supervisor-store.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
@@ -409,6 +409,17 @@ describe('plugin manifest and registry basics', () => {
     expect(resolveEffectivePluginIds({ plugins: [] }, { plugins: ['gitlab'] })).toEqual(['gitlab']);
     expect(updateBotPluginOverride(undefined, 'chrome', true)).toEqual(['chrome']);
     expect(updateBotPluginOverride(undefined, 'gitlab', false)).toEqual([]);
+  });
+
+  it('collects plugins enabled in the global or any Bot scope', () => {
+    expect(resolveEnabledPluginIds(
+      [
+        { plugins: ['bot-one', 'shared'] },
+        { plugins: ['bot-two', 'shared'] },
+        { plugins: [] },
+      ],
+      { plugins: ['global', 'shared'] },
+    )).toEqual(['global', 'shared', 'bot-one', 'bot-two']);
   });
 
   it('installs a local plugin directory into plugin scope without enabling it', () => {

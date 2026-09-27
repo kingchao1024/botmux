@@ -8,6 +8,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { isLinuxZombie, readDurableProcessIdentity } from './utils/process-identity.js';
 import { scrubExternalMemberEnv } from './utils/child-env.js';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
+import { runtimeBuildIdentity } from './utils/runtime-build-id.js';
 import { botmuxHome } from './core/plugins/paths.js';
 import {
   pluginSupervisorDir, pluginSupervisorStatePath, pluginSupervisorResultPath,
@@ -69,6 +70,10 @@ async function reapOrphans(): Promise<void> {
 
 async function main(): Promise<void> {
   mkdirSync(pluginSupervisorDir(), { recursive: true, mode: 0o700 });
+  const runtimeIdentity = runtimeBuildIdentity();
+  if (runtimeIdentity.status !== 'known') {
+    throw new Error(`plugin_supervisor_runtime_generation_unknown:${runtimeIdentity.reason}`);
+  }
   // A lifetime lock prevents concurrent CLI launches from creating two owners.
   // The shared lock implementation verifies process birth identity on recovery.
   await withFileLock(join(pluginSupervisorDir(), 'owner'), async () => {
@@ -85,9 +90,11 @@ async function main(): Promise<void> {
     const applied = new Map<string, { spec: PluginServiceSpec; running: boolean }>();
     const watches = new Map<string, { fingerprint: string; changedAt?: number }>();
     let revision = '';
-    const acknowledge = (value: string, error?: string) => atomicWriteFileSync(pluginSupervisorResultPath(), JSON.stringify({
-      revision: value, pid: process.pid, processStart: readDurableProcessIdentity(process.pid), ...(error ? { error } : {}),
-    }), { mode: 0o600, followTargetSymlink: false });
+    const acknowledge = (value: string, error?: string) => {
+      atomicWriteFileSync(pluginSupervisorResultPath(), JSON.stringify({
+        revision: value, pid: process.pid, processStart: readDurableProcessIdentity(process.pid), runtimeGeneration: runtimeIdentity.id, ...(error ? { error } : {}),
+      }), { mode: 0o600, followTargetSymlink: false });
+    };
     acknowledge('');
     try {
       while (!shuttingDown) {

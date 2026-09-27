@@ -29,4 +29,20 @@ describe('runtime build identity', () => {
       reason: 'artifact_invalid',
     });
   });
+
+  it('uses a validated build-time identity when the compiled filesystem has no artifact', () => {
+    const root = mkdtempSync(join(tmpdir(), 'runtime-id-'));
+    dirs.push(root);
+    const bakedId = 'b'.repeat(64);
+    expect(resolveRuntimeBuildIdentity({
+      artifactPath: join(root, 'missing-runtime-id'),
+      sourceRoot: join(root, 'missing-source'),
+      bakedId,
+    })).toEqual({ status: 'known', id: bakedId, source: 'baked' });
+    expect(resolveRuntimeBuildIdentity({
+      artifactPath: join(root, 'missing-runtime-id'),
+      sourceRoot: join(root, 'missing-source'),
+      bakedId: '',
+    })).toEqual({ status: 'unknown', reason: 'artifact_invalid' });
+  });
 });
