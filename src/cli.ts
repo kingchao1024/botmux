@@ -358,7 +358,7 @@ import {
 } from './services/vc-meeting-im-reply.js';
 import { recordVcMeetingListenerMessage } from './services/vc-meeting-listener-message-store.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
-import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
+import { resolveEffectivePluginIds, selectPluginServiceReconcileIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import type { PluginCardActionRoutingRecord } from './core/plugins/card-actions/gateway.js';
 import {
   assertPluginBindingTransition,
@@ -15762,7 +15762,12 @@ async function reconcilePluginServicesForCli(
   options: { autoOnly?: boolean } = {},
 ): Promise<void> {
   const { startPluginServices } = await import('./core/plugins/service-manager.js');
-  const reports = await startPluginServices(pluginIds, { autoOnly: options.autoOnly });
+  const selectedPluginIds = selectPluginServiceReconcileIds(pluginIds, options, {
+    resolveConfigPath: lifecycleBotsConfigPath,
+    loadBots: loadBotsJson,
+    global: readGlobalConfig(),
+  });
+  const reports = await startPluginServices(selectedPluginIds, { autoOnly: options.autoOnly });
   if (reports.length > 0) {
     console.log('\n插件 host service:');
     console.log(formatPluginServiceReports(reports));

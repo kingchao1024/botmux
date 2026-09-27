@@ -10,6 +10,34 @@ export function resolveEffectivePluginIds(bot: Pick<BotConfig, 'plugins'>, globa
   return [...effective];
 }
 
+/** Plugins enabled in at least one configured scope on this machine. */
+export function resolveEnabledPluginIds(
+  bots: readonly Pick<BotConfig, 'plugins'>[],
+  global: Pick<GlobalConfig, 'plugins'> = {},
+): string[] {
+  const enabled = new Set(normalizePluginIdList(global.plugins) ?? []);
+  for (const bot of bots) {
+    for (const pluginId of normalizePluginIdList(bot.plugins) ?? []) enabled.add(pluginId);
+  }
+  return [...enabled];
+}
+
+export interface PluginServiceReconcileSelectionDeps {
+  resolveConfigPath: () => string;
+  loadBots: (configPath: string) => readonly Pick<BotConfig, 'plugins'>[];
+  global: Pick<GlobalConfig, 'plugins'>;
+}
+
+/** Select auto services from the same bot registry authority as fleet lifecycle commands. */
+export function selectPluginServiceReconcileIds(
+  pluginIds: readonly string[] | undefined,
+  options: { autoOnly?: boolean },
+  deps: PluginServiceReconcileSelectionDeps,
+): readonly string[] | undefined {
+  if (!options.autoOnly) return pluginIds;
+  return resolveEnabledPluginIds(deps.loadBots(deps.resolveConfigPath()), deps.global);
+}
+
 export function updateBotPluginOverride(
   botPlugins: string[] | undefined,
   pluginId: string,

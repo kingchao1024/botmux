@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
+import { resolveEnabledPluginIds } from '../src/core/plugins/effective.js';
 import {
   startPluginServices, stopPluginServices, listPluginServiceStatus,
   deletePluginServices, assertPluginServiceStopped, resolvePluginServiceSpec,
@@ -130,10 +131,18 @@ describe('plugin services on the built-in supervisor', () => {
 
   it('honours autoOnly and keeps a stopped manual service stopped', async () => {
     fixture('automatic', { auto: true });
+    fixture('disabled-auto', { auto: true });
     fixture('manual');
-    expect((await startPluginServices(undefined, { autoOnly: true })).map(r => r.pluginId)).toEqual(['automatic']);
+    const enabledPluginIds = resolveEnabledPluginIds(
+      [{ plugins: ['automatic'] }],
+      { plugins: [] },
+    );
+    expect((await startPluginServices(enabledPluginIds, { autoOnly: true })).map(r => r.pluginId)).toEqual(['automatic']);
     await ready('automatic');
     expect(proc('manual')).toBeUndefined();
+    expect(proc('disabled-auto')).toBeUndefined();
+    await startPluginServices(['disabled-auto']);
+    await ready('disabled-auto');
     await startPluginServices(['manual']);
     await ready('manual');
     const manualPid = proc('manual')!.pid;

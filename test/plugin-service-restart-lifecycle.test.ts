@@ -13,6 +13,14 @@ function restartFunctionSource(): string {
   return cliSource.slice(start, end);
 }
 
+function reconcileFunctionSource(): string {
+  const start = cliSource.indexOf('async function reconcilePluginServicesForCli(');
+  const end = cliSource.indexOf('\nasync function stopPluginServicesForCli(', start);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(end).toBeGreaterThan(start);
+  return cliSource.slice(start, end);
+}
+
 describe('plugin service restart lifecycle', () => {
   it('preserves auto services by default and always ensures them after core starts', () => {
     const source = restartFunctionSource();
@@ -39,4 +47,15 @@ describe('plugin service restart lifecycle', () => {
     expect(pluginPage).toContain('默认 restart 不先停止');
     expect(pluginPage).toContain("if (service.mode === 'auto') return '启动后确保运行'");
   });
+
+  it('wires auto reconciliation to the lifecycle config authority', () => {
+    const source = reconcileFunctionSource();
+
+    expect(source).toContain('selectPluginServiceReconcileIds(pluginIds, options, {');
+    expect(source).toContain('resolveConfigPath: lifecycleBotsConfigPath');
+    expect(source).toContain('loadBots: loadBotsJson');
+    expect(source).toContain('global: readGlobalConfig()');
+    expect(source).toContain('startPluginServices(selectedPluginIds, { autoOnly: options.autoOnly })');
+  });
+
 });
