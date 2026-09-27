@@ -1083,10 +1083,13 @@ async function handleWebhookRouteImpl(
         : isDaemonOk ? undefined
         : sanitizeDaemonError(upstreamBody?.error);
       const safeErrorCode = safeError;
+      const safeUpstreamBody = isResultFailed && upstreamBody?.result?.error
+        ? { ...upstreamBody, result: { ...upstreamBody.result, error: safeError } }
+        : upstreamBody;
       const body = isDaemonOk
         ? (idempotency.kind === 'first'
-          ? { ...upstreamBody, idempotency: { key: idempotency.key, action: 'accepted' as const } }
-          : upstreamBody)
+          ? { ...safeUpstreamBody, idempotency: { key: idempotency.key, action: 'accepted' as const } }
+          : safeUpstreamBody)
         : { ok: false, error: safeError, errorCode: safeErrorCode, ...(idempotency.kind !== 'disabled' ? { idempotency: { key: idempotency.key, action: 'failed' as const } } : {}) };
       jsonRes(res, responseStatus, body);
       return true;

@@ -581,6 +581,34 @@ describe('invocation connector raw-body identity and public polling', () => {
 
 // ── P1-2: error sanitization — no raw err.message ──
 describe('invocation proxy error sanitization', () => {
+  it.each([
+    ['failed', 'sk_live_EXECUTED_REPRO_SECRET', 'native_inference_failed'],
+    ['failed', 'native_process_exited', 'native_process_exited'],
+    ['cancelled', 'sk_live_CANCELLED_REPRO_SECRET', 'native_inference_failed'],
+  ])('sanitizes an immediate ok:true %s result: %s', async (state, nativeError, expectedError) => {
+    await seedInvocationConnector();
+
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      const body = JSON.parse(typeof init.body === 'string' ? init.body : '{}');
+      return mockProxyResponse(200, {
+        ok: true,
+        result: {
+          requestId: body.requestId, state, output: null, error: nativeError,
+          startedAt: new Date().toISOString(), durationMs: 1, startupMs: 1,
+          configuredModel: 'gpt-5.5', actualModel: null, reasoningEffort: null,
+          usage: null, usageSource: null,
+        },
+      });
+    });
+    await startWebhookServer({ proxyToDaemon });
+
+    const res = await postWebhook('conn_invocation', `nonce_immediate_failed_${Date.now()}`, { prompt: 'test' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, result: { state, error: expectedError } });
+    expect(JSON.stringify(res.body)).not.toContain('REPRO_SECRET');
+  });
+
   it('returns stable error code, not raw exception text when proxy fails', async () => {
     await seedInvocationConnector();
 
@@ -746,9 +774,7 @@ describe('InvocationService error sanitization', () => {
         ...(undefined as any),
       });
 
-      // Wait for completion
-      await new Promise(r => setTimeout(r, 100));
-      const result = svc.get(id);
+      const result = await svc.wait(id, 5_000);
 
       expect(result).toBeDefined();
       if (result) {
@@ -792,8 +818,7 @@ describe('InvocationService error sanitization', () => {
         ...(undefined as any),
       });
 
-      await new Promise(r => setTimeout(r, 100));
-      const result = svc.get(id);
+      const result = await svc.wait(id, 5_000);
 
       expect(result).toBeDefined();
       if (result) {
@@ -827,8 +852,7 @@ describe('InvocationService error sanitization', () => {
         ...(undefined as any),
       });
 
-      await new Promise(r => setTimeout(r, 100));
-      const result = svc.get(id);
+      const result = await svc.wait(id, 5_000);
 
       expect(result).toBeDefined();
       if (result) {
@@ -859,8 +883,7 @@ it('sanitizes "native_failure /root/private" — startsWith native_ is NOT a whi
 
       const id = `inv_nativefake_${Date.now()}`;
       svc.start({ requestId: id, prompt: 'test', model: 'gpt-5.5', deadlineMs: 5_000, outputSchema, ...(undefined as any) });
-      await new Promise(r => setTimeout(r, 100));
-      const result = svc.get(id);
+      const result = await svc.wait(id, 5_000);
 
       expect(result).toBeDefined();
       if (result) {
@@ -892,8 +915,7 @@ it('sanitizes "native_failure /root/private" — startsWith native_ is NOT a whi
 
       const id = `inv_apikey_${Date.now()}`;
       svc.start({ requestId: id, prompt: 'test', model: 'gpt-5.5', deadlineMs: 5_000, outputSchema, ...(undefined as any) });
-      await new Promise(r => setTimeout(r, 100));
-      const result = svc.get(id);
+      const result = await svc.wait(id, 5_000);
 
       expect(result).toBeDefined();
       if (result) {
@@ -907,9 +929,8 @@ it('sanitizes "native_failure /root/private" — startsWith native_ is NOT a whi
   });
 });
 
-// ── Hard-deny at /api/trigger ──
-// (Kept from previous iteration — daemon IPC 403 for apiOnly bots)
-describe('invocation hard-deny at /api/trigger', () => {
+// ── apiOnly request-shape gate at /api/trigger ──
+describe('apiOnly request-shape gate at /api/trigger', () => {
   let ipcServerPort = 0;
   let ipcServerHandle: any = null;
 
@@ -941,7 +962,7 @@ describe('invocation hard-deny at /api/trigger', () => {
     ipcServerPort = ipcServerHandle.port;
   }
 
-  it('returns 403 when an apiOnly bot receives a /api/trigger POST', async () => {
+  it('accepts an apiOnly HTTP async request without a real chat target', async () => {
     await startTriggerServer({ apiOnly: true });
 
     const res = await fetch(`http://127.0.0.1:${ipcServerPort}/api/trigger`, {
@@ -949,19 +970,47 @@ describe('invocation hard-deny at /api/trigger', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         source: { type: 'webhook', connectorId: 'conn_test', requestId: 'req_hd' },
-        target: { kind: 'turn', botId: 'app_hard_deny', chatId: 'oc_test' },
+        target: { kind: 'turn', botId: 'app_hard_deny' },
         envelope: {
           format: 'botmux.webhook.v1',
           sourceName: 'test',
           trusted: false,
           payload: { hello: 'world' },
         },
+        options: { asyncReturnSessionId: true, dryRun: true },
       }),
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.ok).toBe(false);
-    expect(body.error).toContain('invocation-only bot');
+    expect(body).toMatchObject({ ok: true, action: 'dry_run' });
+    expect(body.target.chatId).toMatch(/^http_async_/);
+  });
+
+  it.each([
+    ['real chatId', { chatId: 'oc_test' }, 'real Feishu chatId'],
+    ['rootMessageId', { chatId: 'oc_test', rootMessageId: 'om_test' }, 'Feishu rootMessageId'],
+  ])('rejects an apiOnly request with a %s', async (_name, target, expectedError) => {
+    await startTriggerServer({ apiOnly: true });
+
+    const res = await fetch(`http://127.0.0.1:${ipcServerPort}/api/trigger`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: { type: 'webhook', connectorId: 'conn_test', requestId: `req_hd_${_name}` },
+        target: { kind: 'turn', botId: 'app_hard_deny', ...target },
+        envelope: {
+          format: 'botmux.webhook.v1',
+          sourceName: 'test',
+          trusted: false,
+          payload: { hello: 'world' },
+        },
+        options: { asyncReturnSessionId: true, dryRun: true },
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(body.error).toContain(expectedError);
   });
 
   it('accepts /api/trigger for a non-apiOnly bot (gate opens for normal bots)', async () => {

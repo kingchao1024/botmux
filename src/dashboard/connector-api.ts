@@ -290,23 +290,47 @@ async function normalizeConnectorInput(
   let invocation: ConnectorDefinition['invocation'] = undefined;
   if (targetKind === 'invocation') {
     const rawInvocation = record(c.invocation ?? prior?.invocation);
-    const model = typeof rawInvocation.model === 'string' && rawInvocation.model.trim()
-      ? rawInvocation.model.trim()
-      : prior?.invocation?.model;
+    const hasModel = hasOwn(rawInvocation, 'model');
+    let model: string | undefined;
+    if (hasModel) {
+      const rawModel = rawInvocation.model;
+      if (typeof rawModel !== 'string' || !rawModel.trim()) {
+        return { ok: false, error: 'invocation_config_invalid' };
+      }
+      model = rawModel.trim();
+    } else {
+      model = prior?.invocation?.model;
+    }
     if (!model) return { ok: false, error: 'invocation_model_required' };
-    const deadlineMs = typeof rawInvocation.deadlineMs === 'number' && Number.isFinite(rawInvocation.deadlineMs)
-      ? rawInvocation.deadlineMs
-      : prior?.invocation?.deadlineMs;
+    const hasDeadlineMs = hasOwn(rawInvocation, 'deadlineMs');
+    let deadlineMs: number | undefined;
+    if (hasDeadlineMs) {
+      const rawDeadlineMs = rawInvocation.deadlineMs;
+      if (typeof rawDeadlineMs !== 'number' || !Number.isFinite(rawDeadlineMs)) {
+        return { ok: false, error: 'invocation_config_invalid' };
+      }
+      deadlineMs = rawDeadlineMs;
+    } else {
+      deadlineMs = prior?.invocation?.deadlineMs;
+    }
     if (!deadlineMs || deadlineMs < 100 || deadlineMs > 300_000) return { ok: false, error: 'invocation_deadline_invalid' };
-    const outputSchema = record(rawInvocation.outputSchema ?? prior?.invocation?.outputSchema);
+    const hasOutputSchema = hasOwn(rawInvocation, 'outputSchema');
+    if (hasOutputSchema && (!rawInvocation.outputSchema || typeof rawInvocation.outputSchema !== 'object' || Array.isArray(rawInvocation.outputSchema))) {
+      return { ok: false, error: 'invocation_config_invalid' };
+    }
+    let outputSchema: Record<string, unknown>;
+    if (hasOutputSchema) {
+      outputSchema = record(rawInvocation.outputSchema);
+    } else {
+      outputSchema = record(prior?.invocation?.outputSchema);
+    }
     if (!outputSchema || !outputSchema.type) return { ok: false, error: 'invocation_output_schema_required' };
-    // Validate the output schema against the bounded JSON Schema subset used by
-    // constrained invocations.
-    try {
-      const { checkSchema } = await import('../services/constrained-invocation/contract.js');
-      checkSchema(outputSchema);
-    } catch (e: any) {
-      return { ok: false, error: `invocation_output_schema_invalid: ${e.message}` };
+    if (hasOwn(rawInvocation, 'reasoningEffort') && typeof rawInvocation.reasoningEffort !== 'string') {
+      return { ok: false, error: 'invocation_config_invalid' };
+    }
+    if (hasOwn(rawInvocation, 'maxOutputTokens')
+      && (typeof rawInvocation.maxOutputTokens !== 'number' || !Number.isSafeInteger(rawInvocation.maxOutputTokens))) {
+      return { ok: false, error: 'invocation_config_invalid' };
     }
     const reasoningEffort = typeof rawInvocation.reasoningEffort === 'string'
       ? rawInvocation.reasoningEffort
@@ -314,6 +338,22 @@ async function normalizeConnectorInput(
     const maxOutputTokens = typeof rawInvocation.maxOutputTokens === 'number' && Number.isSafeInteger(rawInvocation.maxOutputTokens)
       ? rawInvocation.maxOutputTokens
       : prior?.invocation?.maxOutputTokens;
+    // Connector configuration is the source of every constrained invocation
+    // field, so validate it with the same bounded contract before saving.
+    try {
+      const { parseInvocation } = await import('../services/constrained-invocation/contract.js');
+      parseInvocation({
+        requestId: 'connector_config_validation',
+        prompt: 'connector configuration validation',
+        model,
+        deadlineMs,
+        outputSchema,
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+        ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+      });
+    } catch {
+      return { ok: false, error: 'invocation_config_invalid' };
+    }
     invocation = {
       model,
       deadlineMs,
