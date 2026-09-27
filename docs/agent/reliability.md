@@ -31,7 +31,7 @@ source_of_truth: src/core/self-spawn.ts、scripts/claim-botmux-bin.mjs、scripts
 
 - 只有明确授权才能创建并 push `v*` annotated tag；日常 commit/push 不构成发版授权。
 - 不得手动修改 `package.json` 的 `version`；tag message 使用中文，CI 从 tag 提取版本并生成 Release 内容。
-- `latest` 正式版只能来自 master；灰度使用 `-canary.N`、`-beta.N` 或 `-rc.N`，不能污染 latest。
+- `latest` 正式版只能来自 master；灰度使用 `-canary.N`、`-beta.N` 或 `-rc.N`，不能污染 latest。验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）。
 
 ## 建议
 

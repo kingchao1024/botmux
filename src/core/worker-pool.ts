@@ -4793,18 +4793,23 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
   if (report.warning) logger.warn(`[mcp-gateway] ${cliId}: ${report.warning}`);
 }
 
-/** The user's global skills dir that botmux must NOT pollute (Claude now injects
- *  its skills per-session via `--plugin-dir`). Single source of truth for the
- *  path so the early once-pass and the post-restore re-sweep stay in sync. */
+/** Global skills dirs that botmux must NOT pollute because those CLIs now inject
+ *  skills dynamically per-session (Claude via `--plugin-dir`, Pi via `--skill`).
+ *  Single source of truth for the paths so the early once-pass and the
+ *  post-restore re-sweep stay in sync. */
 const GLOBAL_CLAUDE_SKILLS_DIR = '~/.claude/skills';
+const GLOBAL_PI_SKILLS_DIR = '~/.pi/agent/skills';
+const GLOBAL_OMP_SKILLS_DIR = '~/.omp/agent/skills';
 
 /** Unconditionally sweep botmux-owned skills out of the user's global
- *  `~/.claude/skills`. botmux owns the `botmux-` namespace there and injects its
- *  skills per-session via `--plugin-dir`, so anything matching is a leak that
- *  would otherwise surface (and mis-fire) in the user's standalone `claude`.
+ *  `~/.claude/skills`, `~/.pi/agent/skills`, and `~/.omp/agent/skills`. botmux owns the `botmux-` namespace
+ *  there and injects its skills per-session dynamically, so anything matching is a
+ *  leak that would otherwise surface (and mis-fire) in the user's standalone CLI.
  *  Idempotent & best-effort — safe to call repeatedly. */
 export function sweepGlobalBotmuxSkills(): void {
   removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
+  removeGlobalBotmuxSkills(GLOBAL_PI_SKILLS_DIR);
+  removeGlobalBotmuxSkills(GLOBAL_OMP_SKILLS_DIR);
 }
 
 let globalBotmuxSkillsCleaned = false;
@@ -8303,6 +8308,7 @@ const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 // is only a delayed/ambiguous state because the child may still execute later.
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
 const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
+const ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS = 90_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -8606,11 +8612,15 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
-    // Native Codex now commits after history confirms submission, rather than
-    // on enqueue. Its normal two-second screen settle already exceeds the IPC
-    // receipt budget; keep that budget for transport, not for CLI startup.
-    const commitWaitMs = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput
-      ? 90_000 : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
+    // Cold start (worker not ready yet) must await web server bind, plugin prep,
+    // and spawnCli before any turn can commit. Native Codex also commits after
+    // history confirms submission rather than on enqueue. Keep the short
+    // settlement budget for steady-state IPC enqueue, not for multi-second process startup.
+    const isColdStart = ds.workerReady !== true;
+    const isNativeCodex = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput;
+    const commitWaitMs = (isColdStart || isNativeCodex)
+      ? ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS
+      : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
     record.timer = setTimeout(() => {
       delayOrdinaryImDelivery(record);
     }, commitWaitMs);
@@ -9570,6 +9580,14 @@ export async function forkSession(
     turnId?: string;
     senderOpenId?: string;
     senderIsBot?: boolean;
+    /** Owner to stamp on the CHILD session. Defaults to the source's owner
+     *  (the common case: forker === source owner, so this is a no-op).
+     *  Set it when an admin forks someone else's session — otherwise the child
+     *  is owned by a user who may not even be in the destination chat
+     *  (`/fork --create` builds a group containing only the forker), leaving
+     *  owner-only replies and `/fork`/`/relay` on the child addressed to
+     *  someone who can't see it. */
+    childOwnerOpenId?: string;
   },
 ): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
@@ -9646,7 +9664,7 @@ export async function forkSession(
   childSession.cliSessionId = srcCliSessionId;
   childSession.cliId = ds.session.cliId;
   childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
-  childSession.ownerOpenId = ds.session.ownerOpenId;
+  childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
   childSession.backendType = ds.session.backendType;
   // Bot identity on the PERSISTED row. Every other createSession caller sets
   // this immediately after minting (trigger-session / session-manager /
@@ -9730,7 +9748,7 @@ export async function forkSession(
     lastMessageAt: Date.now(),
     hasHistory: true,           // forked child resumes (forks) prior history on first spawn
     workingDir: ds.workingDir ?? ds.session.workingDir,
-    ownerOpenId: ds.session.ownerOpenId,
+    ownerOpenId: childSession.ownerOpenId,
     // Fresh card in the target anchor — never inherit the source's card id.
     streamCardId: undefined,
     streamCardNonce: undefined,

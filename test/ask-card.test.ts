@@ -30,6 +30,11 @@ import {
   parseFormSelections,
 } from '../src/im/lark/ask-card.js';
 import { createAskAnswerProvenanceAuthority, createAskReceiptSigner } from '../src/daemon/ask-receipt-authority.js';
+import {
+  askOptionLayoutForBot,
+  normalizeAskOptionLayout,
+  setAskOptionLayoutLookup,
+} from '../src/im/lark/ask-option-layout.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
 
@@ -165,15 +170,22 @@ describe('buildAskCard', () => {
     expect(text).toContain(ASK_SELECT_ACTION);
   });
 
-  it('单问选项按一项一行纵向排列', () => {
-    const card = JSON.parse(buildAskCard(makePending()));
-    const optionRows = card.body.elements.filter(
-      (element: Record<string, unknown>) => element.tag === 'column_set',
-    );
+  it('单问选项在 vertical 布局下按一项一行纵向排列', () => {
+    // 选项布局成为 per-bot 配置后默认 compact（横排）；这里显式切到 vertical，
+    // 锁定「一项一行」的竖排形态。
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    try {
+      const card = JSON.parse(buildAskCard(makePending()));
+      const optionRows = card.body.elements.filter(
+        (element: Record<string, unknown>) => element.tag === 'column_set',
+      );
 
-    expect(optionRows).toHaveLength(3);
-    for (const row of optionRows) {
-      expect(row.columns).toHaveLength(1);
+      expect(optionRows).toHaveLength(3);
+      for (const row of optionRows) {
+        expect(row.columns).toHaveLength(1);
+      }
+    } finally {
+      setAskOptionLayoutLookup(() => undefined);
     }
   });
 
@@ -977,5 +989,99 @@ describe('createLarkAskCardDispatcher', () => {
       timedOut: true,
     });
     expect(update).toHaveBeenCalledWith('cli_ask', 'om_card', expect.stringContaining('超时'));
+  });
+});
+
+describe('ask option layout（askOptionLayout per-bot 配置）', () => {
+  afterEach(() => {
+    // 还原为「无配置」lookup，避免污染同文件其它用例（未配置即 compact）。
+    setAskOptionLayoutLookup(() => undefined);
+  });
+
+  it('normalizeAskOptionLayout：合法值原样通过，非法值给 warning 并丢弃', () => {
+    expect(normalizeAskOptionLayout(undefined)).toEqual({ warnings: [] });
+    expect(normalizeAskOptionLayout(null)).toEqual({ warnings: [] });
+    expect(normalizeAskOptionLayout('compact')).toEqual({ layout: 'compact', warnings: [] });
+    expect(normalizeAskOptionLayout('vertical')).toEqual({ layout: 'vertical', warnings: [] });
+    for (const bad of ['sideways', 42, true, [], {}]) {
+      const r = normalizeAskOptionLayout(bad);
+      expect(r.layout, JSON.stringify(bad)).toBeUndefined();
+      expect(r.warnings).toHaveLength(1);
+    }
+  });
+
+  it('askOptionLayoutForBot：lookup 未注册 / bot 未知 / 值非法 / 抛错一律回退 compact', () => {
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => undefined);
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'sideways' } }));
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => { throw new Error('boom'); });
+    expect(askOptionLayoutForBot('cli_ask')).toBe('compact');
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    expect(askOptionLayoutForBot('cli_ask')).toBe('vertical');
+    expect(askOptionLayoutForBot(undefined)).toBe('compact');
+  });
+
+  it('默认 compact：column_set flow 行每行最多 4 个按钮', () => {
+    const ask = makePending({
+      questions: [{
+        prompt: 'q', multiSelect: false,
+        options: Array.from({ length: 6 }, (_, i) => ({ key: `k${i}`, label: `L${i}` })),
+      }],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    const optionRows = card.body.elements.filter((el: any) =>
+      el.tag === 'column_set' && el.columns.some((col: any) =>
+        col.elements.some((b: any) => b.tag === 'button'
+          && b.behaviors?.[0]?.value?.action === ASK_SELECT_ACTION)));
+    expect(optionRows).toHaveLength(2);
+    expect(optionRows[0].columns).toHaveLength(4);
+    expect(optionRows[1].columns).toHaveLength(2);
+    for (const row of optionRows) {
+      expect(row.flex_mode).toBe('flow');
+      for (const col of row.columns) {
+        expect(col).toMatchObject({ tag: 'column', width: 'auto' });
+        expect(col.elements).toHaveLength(1);
+      }
+    }
+    // Card JSON 2.0 不允许旧版 action 行
+    expect(JSON.stringify(card)).not.toContain('"tag":"action"');
+  });
+
+  it('vertical：每个选项一个 column_set 行，单列 weighted、一按钮', () => {
+    setAskOptionLayoutLookup((id) => id === 'cli_ask'
+      ? { config: { askOptionLayout: 'vertical' } }
+      : undefined);
+    const card = JSON.parse(buildAskCard(makePending()));
+    const columnSets = card.body.elements.filter((el: any) => el.tag === 'column_set');
+    expect(columnSets).toHaveLength(3);
+    for (const row of columnSets) {
+      expect(row.flex_mode).toBe('none');
+      expect(row.horizontal_spacing).toBe('small');
+      expect(row.columns).toHaveLength(1);
+      expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
+      const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
+      expect(buttons).toHaveLength(1);
+      expect(buttons[0].behaviors[0].value.action).toBe(ASK_SELECT_ACTION);
+    }
+    // vertical 同样不得出现旧版 action 行
+    expect(JSON.stringify(card)).not.toContain('"tag":"action"');
+  });
+
+  it('vertical 只影响选项按钮：submit 仍是顶层独立按钮，按钮值不变', () => {
+    setAskOptionLayoutLookup(() => ({ config: { askOptionLayout: 'vertical' } }));
+    const ask = makePending({
+      questions: [
+        { prompt: 'q1', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    const submit = card.body.elements.find((el: any) =>
+      el.tag === 'button' && el.behaviors?.[0]?.value?.action === ASK_SUBMIT_ACTION);
+    expect(submit).toBeDefined();
+    const toggleRows = card.body.elements.filter((el: any) => el.tag === 'column_set');
+    expect(toggleRows).toHaveLength(2);
+    expect(toggleRows[0].columns[0].elements[0].behaviors[0].value.action).toBe(ASK_TOGGLE_ACTION);
   });
 });
