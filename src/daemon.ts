@@ -56,6 +56,7 @@ import {
   type SupervisorShutdownProtocol,
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
+import { readLinuxBootIdentity } from './utils/process-identity.js';
 import { statSync } from 'node:fs';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, larkGet, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
@@ -98,6 +99,23 @@ import { createV3TaskControlApprovalSource } from './services/task-control-plane
 import { TaskControlMappingTrust, createTaskControlProductionMappingVerifier, parseKeyIdSet } from './services/task-control-plane-mapping-trust.js';
 import { resolveTaskControlMappingRegistration } from './services/task-control-plane-mapping-source.js';
 import {
+  projectGroupRootSnapshotFromLarkDetail,
+  projectGroupTaskGuid,
+  resolveProjectGroupMappingFacts,
+  type ProjectDispatchReservationFactsV1,
+} from './services/task-control-plane-project-group-mapping-source.js';
+import {
+  PROJECT_WORKER_EVIDENCE_MAX_BYTES,
+  PROJECT_WORKER_EVIDENCE_ROUTE,
+  ProjectWorkerEvidenceRelay,
+  ProjectWorkerEvidenceTrust,
+  isProjectWorkerEvidenceLiveTurn,
+  projectWorkerEvidenceAttemptedEventType,
+  projectWorkerEvidenceKindForReport,
+  type ProjectWorkerEvidenceFactsV1,
+  type ProjectWorkerEvidenceV1,
+} from './services/task-control-plane-project-worker-evidence.js';
+import {
   createTaskControlRouteHandlers,
   TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE,
   TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE,
@@ -108,7 +126,11 @@ import {
   TASK_CONTROL_REVIEWER_SOURCE_ROUTE,
   TASK_CONTROL_REVIEWER_VERDICT_ROUTE,
 } from './services/task-control-plane-route-authority.js';
-import { productionTaskControlPlaneConfig, scopedTaskControlPlaneConfig, startTaskControlPlaneRuntime, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
+import {
+  createDaemonReviewerVerdictVerifier,
+  reviewerDesignationRef,
+} from './services/task-control-plane-reviewer-verdict.js';
+import { productionTaskControlPlaneConfig, scopedTaskControlPlaneConfig, startTaskControlPlaneRuntime, type TaskControlPlaneFlags, type TaskControlPlaneLifecycle } from './services/task-control-plane-runtime.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
@@ -314,7 +336,7 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setTaskControlCanaryPhaseASendHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
   awaitAskReceiptAuthorityBootstrapInventory,
@@ -345,15 +367,62 @@ import {
   DISPATCH_REPORT_REGISTER_ROUTE,
 } from './core/dispatch-report-binding.js';
 
-import { findDispatchOperation, recordDispatchRegistryEntry } from './core/dispatch-registry.js';
+import {
+  activateTaskControlTurnAdmissionSync,
+  beginTaskControlKickoffOperationSync,
+  beginTaskControlSeedOperationSync,
+  claimTaskControlTurnAdmissionPendingSync,
+  completeTaskControlKickoffOperationSync,
+  completeTaskControlSeedOperationSync,
+  createDispatchOperationId,
+  findDispatchOperation,
+  listDispatchOperations,
+  markTaskControlKickoffOperationAmbiguousSync,
+  openTaskControlTurnAdmissions,
+  readTaskControlSeedOperation,
+  readTaskControlKickoffOperation,
+  readTaskControlPhaseAFailedReport,
+  readTaskControlPhaseAOperation,
+  readTaskControlSuccessCertificate,
+  readTaskControlTurnAdmission,
+  recordDispatchRegistryEntry,
+  terminalizeTaskControlTurnAdmissionSync,
+  type TaskControlPhaseAAttemptCoordinates,
+  type TaskControlPhaseAOperation,
+  type TaskControlProviderAttemptCoordinates,
+} from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { normalizeDispatchWriteScopes, type ProjectDispatchAccess } from './core/dispatch-write-scope.js';
-import { partitionProjectDispatchRoles } from './core/dispatch.js';
+import { buildTaskControlKickoffContent, partitionProjectDispatchRoles } from './core/dispatch.js';
 import { projectCoordinator } from './services/project-coordinator-runtime.js';
-import { readProjectGroup } from './services/project-group-store.js';
+import {
+  PROJECT_DISPATCH_RESERVATION_TTL_MS,
+  type ProjectCoordinatorContext,
+} from './services/project-coordinator.js';
+import {
+  canonicalProjectTaskControlCanaryFence,
+  listProjectGroups,
+  projectTaskControlCanaryAbandonmentFromRecord,
+  projectTaskControlCanaryAbandonmentRejectsRoot,
+  projectTaskControlCanaryFenceFingerprint,
+  projectTaskControlCanaryFenceRecord,
+  readProjectGroup,
+  TASK_CONTROL_CANARY_ABANDONED_CODE,
+  TASK_CONTROL_CANARY_QUARANTINE_CODE,
+  withProjectTaskControlChatLockSync,
+} from './services/project-group-store.js';
+import {
+  auditProjectGroupTaskControl,
+  planProjectGroupTaskControlReconciliation,
+} from './services/task-control-plane-project-group-audit.js';
+import {
+  evaluateProjectCompletionGate,
+  syncProjectCompletionGates,
+} from './services/project-group-completion-gate.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
+  evaluateProjectTaskControlEvidencePolicy,
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -609,6 +678,14 @@ let selfV3BootInstanceId: string | undefined;
 let selfDaemonLarkAppId: string | undefined;
 let taskControlPlane: TaskControlPlaneLifecycle | undefined;
 let taskControlIntegration: DaemonTaskControlIntegration | undefined;
+let projectWorkerEvidenceRelay: ProjectWorkerEvidenceRelay | undefined;
+let projectTaskControlAuditTimer: NodeJS.Timeout | undefined;
+let projectTaskControlAuditRunning = false;
+let activeTaskControlAllowedKeyIds: readonly string[] | undefined;
+let activeTaskControlRevokedKeyIds: readonly string[] | undefined;
+let activeTaskControlPlaneFlags: TaskControlPlaneFlags = {
+  ledgerEnabled: false, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false,
+};
 const taskControlRouteHandlers = createTaskControlRouteHandlers({
   dataDir: () => config.session.dataDir,
   selfLarkAppId: () => selfDaemonLarkAppId,
@@ -6631,7 +6708,654 @@ ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_ROUTE, taskControlRouteHandler
 ipcRoute('POST', TASK_CONTROL_DESIGNATED_REVIEWER_RESOLVE_ROUTE, taskControlRouteHandlers.designatedReviewerResolve);
 ipcRoute('POST', TASK_CONTROL_REVIEWER_SOURCE_ROUTE, taskControlRouteHandlers.reviewerSource);
 ipcRoute('POST', TASK_CONTROL_REVIEWER_INGRESS_ROUTE, taskControlRouteHandlers.reviewerIngress);
+
+ipcRoute('POST', PROJECT_WORKER_EVIDENCE_ROUTE, async (req, res) => {
+  if (!isTrustedHostIpcRequest(req) || !taskControlIntegration || !selfDaemonLarkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'project_worker_evidence_unavailable' });
+  }
+  const integration = taskControlIntegration;
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req, PROJECT_WORKER_EVIDENCE_MAX_BYTES); }
+  catch (error) {
+    return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, { ok: false, error: 'bad_json' });
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+    || Object.keys(raw as Record<string, unknown>).length !== 1
+    || !Object.hasOwn(raw as Record<string, unknown>, 'evidence')) {
+    return jsonRes(res, 400, { ok: false, error: 'project_worker_evidence_invalid' });
+  }
+  const evidence = (raw as { evidence?: unknown }).evidence as ProjectWorkerEvidenceV1 | undefined;
+  if (!evidence || typeof evidence !== 'object' || evidence.controllerAppId !== selfDaemonLarkAppId
+    || !findOnlineDaemon(evidence.sourceAppId)) {
+    return jsonRes(res, 403, { ok: false, error: 'project_worker_evidence_source_unproven' });
+  }
+  const mapping = integration.mapping(evidence.dispatchRoot);
+  const mappingAuthority = mapping?.mappingAuthority;
+  let acceptedEvidence = false;
+  const ingest = () => {
+    let evidencePolicy: ReturnType<typeof evaluateProjectTaskControlEvidencePolicy> = {
+      ok: false, error: 'project_task_control_evidence_not_configured',
+    };
+    if (mapping && mappingAuthority?.kind === 'project_group') {
+      const project = readProjectGroup(config.session.dataDir, mappingAuthority.chatId);
+      if (project && daemonAbandonedTaskControlCanaryRejectsRoot(
+        project,
+        join(config.session.dataDir, 'orchestrate-dispatch.json'),
+        evidence.dispatchRoot,
+      )) {
+        return jsonRes(res, 409, { ok: false, error: 'project_task_control_canary_abandoned' });
+      }
+    }
+    if (mapping && mappingAuthority?.kind === 'project_group') {
+      let policyEventKind: 'accepted' | 'execution_started' | 'terminal' | 'submitted' | 'failed_report' | 'reviewed';
+      if (evidence.eventKind === 'reviewed'
+        || (evidence.eventKind === 'project_sync_failed' && evidence.reviewVerdict !== undefined)) {
+        policyEventKind = 'reviewed';
+      } else if (evidence.eventKind === 'submitted' || evidence.eventKind === 'project_sync_failed') {
+        policyEventKind = 'submitted';
+      } else {
+        policyEventKind = evidence.eventKind;
+      }
+      evidencePolicy = evaluateProjectTaskControlEvidencePolicy({
+        config: readGroupCollaborationMode(config.session.dataDir, mappingAuthority.chatId),
+        chatId: mappingAuthority.chatId, sourceAppId: evidence.sourceAppId,
+        eventKind: policyEventKind,
+        taskControl: {
+          mode: mappingAuthority.mode, controllerAppId: mapping.controllerId, workerAppId: mapping.ownerId,
+          reviewerAppId: mapping.reviewerId, acceptorAppId: mapping.acceptorId,
+        },
+      });
+    }
+    if (!evidencePolicy.ok) {
+      return jsonRes(res, 403, { ok: false, error: 'project_worker_evidence_scope_unproven' });
+    }
+    let trust: ProjectWorkerEvidenceTrust;
+    try {
+      trust = new ProjectWorkerEvidenceTrust({
+        hostSecret: loadDaemonIpcSecret(), previousHostSecret: process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+        sourceAppId: evidence.sourceAppId,
+      });
+    } catch {
+      return jsonRes(res, 503, { ok: false, error: 'project_worker_evidence_trust_unavailable' });
+    }
+    const result = integration.ingestProjectWorkerEvidence(evidence, value => trust.verify(value, {
+      allowedKeyIds: activeTaskControlAllowedKeyIds,
+      revokedKeyIds: activeTaskControlRevokedKeyIds,
+    }));
+    acceptedEvidence = result.ok;
+    return result.ok
+      ? jsonRes(res, 201, { ok: true, receiptRef: result.receiptRef })
+      : jsonRes(res, 409, { ok: false, error: result.reason });
+  };
+  const response = mappingAuthority?.kind === 'project_group'
+    ? withProjectTaskControlChatLockSync(
+      config.session.dataDir,
+      mappingAuthority.chatId,
+      ingest,
+    )
+    : ingest();
+  if (acceptedEvidence && mappingAuthority?.kind === 'project_group') {
+    try {
+      await persistProjectTaskControlSuccessCertificateIfReady({
+        dataDir: config.session.dataDir,
+        chatId: mappingAuthority.chatId,
+        dispatchRoot: evidence.dispatchRoot,
+      });
+    } catch (error) {
+      logger.warn(
+        `[task-control] automatic success certificate failed root=${evidence.dispatchRoot}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return response;
+});
 ipcRoute('POST', TASK_CONTROL_REVIEWER_VERDICT_ROUTE, taskControlRouteHandlers.reviewerVerdict);
+
+function daemonProjectTaskControlCanaryFence(
+  project: NonNullable<ReturnType<typeof readProjectGroup>>,
+) {
+  const record = project.blockerRecords.find(
+    candidate => candidate.code === TASK_CONTROL_CANARY_QUARANTINE_CODE,
+  );
+  if (!record) {
+    const abandonedRecord = project.blockerRecords.find(
+      candidate => candidate.code === TASK_CONTROL_CANARY_ABANDONED_CODE,
+    );
+    if (abandonedRecord) {
+      projectTaskControlCanaryAbandonmentFromRecord(abandonedRecord);
+      throw new Error('project_task_control_canary_abandoned');
+    }
+    return undefined;
+  }
+  try {
+    const { fingerprint, ...rawFence } = JSON.parse(record.summary) as Record<string, unknown>;
+    const fence = canonicalProjectTaskControlCanaryFence(rawFence as any);
+    const canonicalFingerprint = projectTaskControlCanaryFenceFingerprint(fence);
+    const expectedRecord = projectTaskControlCanaryFenceRecord(fence, record.openedAt);
+    if (fingerprint !== canonicalFingerprint
+      || record.blockerId !== expectedRecord.blockerId
+      || record.source !== expectedRecord.source
+      || record.code !== expectedRecord.code
+      || record.eventId !== expectedRecord.eventId
+      || record.taskGuid !== expectedRecord.taskGuid
+      || record.summary !== expectedRecord.summary) {
+      throw new Error('project_task_control_canary_fence_conflict');
+    }
+    return { fence, fingerprint: canonicalFingerprint };
+  } catch {
+    throw new Error('project_task_control_canary_fence_conflict');
+  }
+}
+
+const TASK_CONTROL_SUCCESS_CERTIFICATE_PENDING_ERRORS = new Set([
+  'project_task_control_success_certificate_kickoff_missing',
+  'project_task_control_success_certificate_turn_claim_open',
+  'project_task_control_success_certificate_phase_a_invalid',
+  'project_task_control_success_certificate_phase_a_project_invalid',
+  'project_task_control_success_certificate_phase_b_registry_invalid',
+  'project_task_control_success_certificate_phase_b_project_invalid',
+  'project_task_control_success_certificate_reservation_open',
+  'project_task_control_success_certificate_scope_not_empty',
+  'project_task_control_success_certificate_phase_b_evidence_invalid',
+  'project_task_control_success_certificate_evidence_unsettled',
+  'project_task_control_success_certificate_phase_b_turn_invalid',
+]);
+
+async function persistProjectTaskControlSuccessCertificateIfReady(input: {
+  dataDir: string;
+  chatId: string;
+  dispatchRoot?: string;
+}): Promise<
+  | { state: 'persisted'; certificateHash: string }
+  | { state: 'pending' | 'not_applicable'; reason: string }
+> {
+  const project = readProjectGroup(input.dataDir, input.chatId);
+  if (!project) return { state: 'not_applicable', reason: 'project_not_found' };
+  let binding: ReturnType<typeof daemonProjectTaskControlCanaryFence>;
+  try {
+    binding = daemonProjectTaskControlCanaryFence(project);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'project_task_control_canary_abandoned') {
+      return { state: 'not_applicable', reason: error.message };
+    }
+    throw error;
+  }
+  if (!binding) return { state: 'not_applicable', reason: 'project_task_control_canary_fence_missing' };
+  if (input.dispatchRoot) {
+    const boundRoot = project.workstreams.find(
+      item => item.taskControl?.taskGuid === binding!.fence.taskGuid,
+    )?.dispatchRoot;
+    if (input.dispatchRoot !== binding.fence.phaseA.historicalDispatchRoot
+      && input.dispatchRoot !== boundRoot) {
+      return { state: 'not_applicable', reason: 'project_task_control_success_certificate_root_mismatch' };
+    }
+  }
+  try {
+    await projectCoordinator.run({
+      dataDir: input.dataDir,
+      chatId: input.chatId,
+      larkAppId: project.larkAppId,
+      coordinatorSessionId: project.coordinatorSessionId,
+    }, {
+      action: 'persist_task_control_success_certificate',
+      fence: binding.fence,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (TASK_CONTROL_SUCCESS_CERTIFICATE_PENDING_ERRORS.has(reason)) {
+      return { state: 'pending', reason };
+    }
+    throw error;
+  }
+  const certificate = readTaskControlSuccessCertificate(
+    join(input.dataDir, 'orchestrate-dispatch.json'),
+    binding.fence.dispatchOperationId,
+  );
+  if (!certificate) throw new Error('project_task_control_success_certificate_persist_missing');
+  return { state: 'persisted', certificateHash: certificate.certificateHash };
+}
+
+export const __testOnly_persistProjectTaskControlSuccessCertificateIfReady
+  = persistProjectTaskControlSuccessCertificateIfReady;
+
+function daemonProjectTaskControlCanaryAbandonment(
+  project: NonNullable<ReturnType<typeof readProjectGroup>>,
+) {
+  const record = project.blockerRecords.find(
+    candidate => candidate.code === TASK_CONTROL_CANARY_ABANDONED_CODE,
+  );
+  return record ? projectTaskControlCanaryAbandonmentFromRecord(record) : undefined;
+}
+
+function daemonAbandonedTaskControlCanaryRejectsRoot(
+  project: NonNullable<ReturnType<typeof readProjectGroup>>,
+  registryPath: string,
+  dispatchRoot: string,
+): boolean {
+  const abandoned = daemonProjectTaskControlCanaryAbandonment(project);
+  if (!abandoned) return false;
+  const registered = listDispatchOperations(registryPath, abandoned.fence.dispatchOperationId);
+  const workstreamRoots = project.workstreams.filter(workstream => (
+    workstream.taskControl?.reservationId === abandoned.fence.dispatchOperationId
+    || workstream.taskControl?.taskGuid === abandoned.fence.taskGuid
+  )).map(workstream => workstream.dispatchRoot);
+  return projectTaskControlCanaryAbandonmentRejectsRoot(
+    abandoned,
+    dispatchRoot,
+    [...registered.map(operation => operation.dispatchRoot), ...workstreamRoots],
+  );
+}
+
+const taskControlPhaseAProcessStartedAt = new Date().toISOString();
+
+export async function deliverProjectTaskControlPhaseAInstruction(input: {
+  context: ProjectCoordinatorContext;
+  fenceFingerprint: string;
+  instructionTemplateSha256: string;
+  attempt: TaskControlPhaseAAttemptCoordinates;
+}): Promise<TaskControlPhaseAOperation> {
+  await projectCoordinator.run(input.context, {
+    action: 'begin_task_control_phase_a_instruction',
+    fenceFingerprint: input.fenceFingerprint,
+    instructionTemplateSha256: input.instructionTemplateSha256,
+    attempt: input.attempt,
+  });
+  const project = readProjectGroup(input.context.dataDir, input.context.chatId);
+  if (!project) throw new Error('project_not_found');
+  const binding = daemonProjectTaskControlCanaryFence(project);
+  if (!binding) throw new Error('project_task_control_canary_fence_missing');
+  const { fence, fingerprint: canonicalFingerprint } = binding;
+  if (canonicalFingerprint !== input.fenceFingerprint.trim().toLowerCase()) {
+    throw new Error('project_task_control_canary_fence_conflict');
+  }
+  let operation = readTaskControlPhaseAOperation(
+    join(input.context.dataDir, 'orchestrate-dispatch.json'),
+    fence.dispatchOperationId,
+  );
+  if (!operation) throw new Error('project_task_control_phase_a_operation_missing');
+  if (operation.state !== 'pending') return operation;
+  const providerUuid = operation.providerUuid;
+  let messageId: string;
+  try {
+    messageId = await runWithAbortDeadline(
+      'project_task_control_phase_a_delivery', 5_000,
+      signal => replyMessage(
+        fence.controllerAppId,
+        fence.phaseA.historicalDispatchRoot,
+        fence.phaseA.instructionTemplate,
+        'text',
+        true,
+        providerUuid,
+        undefined,
+        { timeoutMs: 5_000, signal },
+      ),
+    );
+  } catch {
+    return operation;
+  }
+  await projectCoordinator.run(input.context, {
+    action: 'complete_task_control_phase_a_instruction',
+    fenceFingerprint: canonicalFingerprint,
+    messageId,
+  });
+  operation = readTaskControlPhaseAOperation(
+    join(input.context.dataDir, 'orchestrate-dispatch.json'),
+    fence.dispatchOperationId,
+  );
+  if (!operation) throw new Error('project_task_control_phase_a_operation_missing');
+  return operation;
+}
+
+export async function awaitProjectTaskControlPhaseAInstruction(input: {
+  dataDir: string;
+  chatId: string;
+  dispatchRoot: string;
+  targetAppId: string;
+  messageId: string;
+}): Promise<'unfenced' | 'allowed' | 'rejected'> {
+  const project = readProjectGroup(input.dataDir, input.chatId);
+  if (!project) return 'unfenced';
+  if (daemonAbandonedTaskControlCanaryRejectsRoot(
+    project,
+    join(input.dataDir, 'orchestrate-dispatch.json'),
+    input.dispatchRoot,
+  )) return 'rejected';
+  const binding = daemonProjectTaskControlCanaryFence(project);
+  if (!binding || input.dispatchRoot !== binding.fence.phaseA.historicalDispatchRoot
+    || input.targetAppId !== binding.fence.phaseA.mappedWorkerAppId) {
+    return 'unfenced';
+  }
+  const registryPath = join(input.dataDir, 'orchestrate-dispatch.json');
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    const operation = readTaskControlPhaseAOperation(
+      registryPath,
+      binding.fence.dispatchOperationId,
+    );
+    const exactOperation = operation
+      && operation.chatId === input.chatId
+      && operation.fenceFingerprint === binding.fingerprint
+      && operation.historicalDispatchRoot === input.dispatchRoot
+      && operation.historicalTaskGuid === binding.fence.phaseA.historicalTaskGuid
+      && operation.targetAppId === input.targetAppId
+      && operation.payloadHash === binding.fence.phaseA.instructionTemplateSha256;
+    if (!exactOperation || operation.state !== 'pending') {
+      return exactOperation && operation.state === 'delivered' && operation.messageId === input.messageId
+        ? 'allowed'
+        : 'rejected';
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return 'rejected';
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(25, remainingMs)));
+  }
+}
+
+export async function awaitProjectTaskControlInboundAdmission(input: {
+  dataDir: string;
+  chatId: string;
+  dispatchRoot: string;
+  targetAppId: string;
+  messageId: string;
+}): Promise<'unfenced' | 'allowed' | 'rejected'> {
+  const project = readProjectGroup(input.dataDir, input.chatId);
+  if (!project) return 'unfenced';
+  if (daemonAbandonedTaskControlCanaryRejectsRoot(
+    project,
+    join(input.dataDir, 'orchestrate-dispatch.json'),
+    input.dispatchRoot,
+  )) return 'rejected';
+  if (daemonProjectTaskControlCanaryAbandonment(project)) return 'unfenced';
+  const binding = daemonProjectTaskControlCanaryFence(project);
+  if (!binding) return 'unfenced';
+  if (input.dispatchRoot === binding.fence.phaseA.historicalDispatchRoot
+    && input.targetAppId === binding.fence.phaseA.mappedWorkerAppId) {
+    const phaseA = await awaitProjectTaskControlPhaseAInstruction(input);
+    if (phaseA !== 'allowed') return phaseA;
+    return readTaskControlTurnAdmission(
+      join(input.dataDir, 'orchestrate-dispatch.json'),
+      input.messageId,
+      input.targetAppId,
+    ) ? 'rejected' : 'allowed';
+  }
+  const { fence, fingerprint } = binding;
+  const workstream = project.workstreams.find(item => item.dispatchRoot === input.dispatchRoot);
+  const mapping = workstream?.taskControl;
+  if (!workstream || !mapping) return 'unfenced';
+  if (!fence.kickoff
+    || mapping.sourceKind !== 'project_group'
+    || mapping.mappingStatus !== 'registered'
+    || mapping.taskGuid !== fence.taskGuid
+    || mapping.reservationId !== fence.dispatchOperationId
+    || mapping.mappingRef !== `topic-message:${input.dispatchRoot}`
+    || (input.targetAppId !== fence.workerAppId && input.targetAppId !== fence.reviewerAppId)) {
+    return 'rejected';
+  }
+  const kickoff = buildTaskControlKickoffContent({
+    title: fence.title,
+    brief: fence.kickoff.brief,
+    dispatchRoot: input.dispatchRoot,
+    bots: fence.kickoff.bots,
+  });
+  const expectedPayloadHash = createHash('sha256').update(kickoff.content).digest('hex');
+  const registryPath = join(input.dataDir, 'orchestrate-dispatch.json');
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    let operation;
+    try {
+      operation = readTaskControlKickoffOperation(registryPath, fence.dispatchOperationId);
+    } catch {
+      return 'rejected';
+    }
+    const registered = findDispatchOperation(registryPath, fence.dispatchOperationId);
+    const exactOperation = operation
+      && registered?.dispatchRoot === input.dispatchRoot
+      && operation.chatId === input.chatId
+      && operation.dispatchRoot === input.dispatchRoot
+      && operation.fenceFingerprint === fingerprint
+      && JSON.stringify(operation.targetAppIds) === JSON.stringify(kickoff.targetAppIds)
+      && operation.payloadHash === expectedPayloadHash;
+    if (!operation || !exactOperation || operation.state !== 'pending') {
+      if (!operation || !exactOperation
+        || operation.state !== 'delivered' || operation.messageId !== input.messageId) {
+        return 'rejected';
+      }
+      return readTaskControlTurnAdmission(registryPath, input.messageId, input.targetAppId)
+        ? 'rejected'
+        : 'allowed';
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return 'rejected';
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(25, remainingMs)));
+  }
+}
+
+function taskControlProviderAttemptCoordinates(): TaskControlProviderAttemptCoordinates {
+  const bootId = readLinuxBootIdentity();
+  const processStartIdentity = readSupervisorProcessStartIdentity(process.pid);
+  if (!bootId || !processStartIdentity) {
+    throw new Error('project_task_control_provider_identity_unavailable');
+  }
+  return {
+    wallTime: new Date().toISOString(),
+    bootId,
+    processStartIdentity,
+    monotonicMs: performance.now(),
+  };
+}
+
+async function recoverProjectTaskControlSeed(input: {
+  registryPath: string;
+  operationId: string;
+  sourceAppId: string;
+  targetChatId: string;
+  seedText: string;
+  attempt: TaskControlProviderAttemptCoordinates;
+}): Promise<
+  { state: 'delivered'; dispatchRoot: string }
+  | { state: 'ambiguous' }
+> {
+  const payloadHash = createHash('sha256').update(input.seedText).digest('hex');
+  const existing = readTaskControlSeedOperation(input.registryPath, input.operationId);
+  if (!existing) throw new Error('project_task_control_seed_operation_missing');
+  if (existing.sourceAppId !== input.sourceAppId
+    || existing.targetChatId !== input.targetChatId
+    || existing.messageType !== 'text'
+    || existing.payloadHash !== payloadHash) {
+    throw new Error('project_task_control_seed_operation_conflict');
+  }
+  if (existing.state === 'delivered') {
+    return { state: 'delivered', dispatchRoot: existing.dispatchRoot! };
+  }
+  if (existing.state === 'ambiguous') return { state: 'ambiguous' };
+
+  const operation = beginTaskControlSeedOperationSync(input.registryPath, {
+    operationId: input.operationId,
+    sourceAppId: input.sourceAppId,
+    targetChatId: input.targetChatId,
+    messageType: 'text',
+    payloadHash,
+    attempt: input.attempt,
+  });
+  if (operation.state === 'delivered') {
+    return { state: 'delivered', dispatchRoot: operation.dispatchRoot! };
+  }
+  if (operation.state === 'ambiguous') return { state: 'ambiguous' };
+
+  const dispatchRoot = await runWithAbortDeadline(
+    'project_task_control_seed_recovery',
+    5_000,
+    signal => sendMessage(
+      input.sourceAppId,
+      input.targetChatId,
+      input.seedText,
+      'text',
+      operation.providerUuid,
+      undefined,
+      { timeoutMs: 5_000, signal },
+    ),
+  );
+  completeTaskControlSeedOperationSync(input.registryPath, {
+    operationId: input.operationId,
+    dispatchRoot,
+  });
+  return { state: 'delivered', dispatchRoot };
+}
+
+export const __testOnly_recoverProjectTaskControlSeed = recoverProjectTaskControlSeed;
+
+export async function deliverProjectTaskControlKickoff(input: {
+  context: ProjectCoordinatorContext;
+  dispatchRoot: string;
+  operationId: string;
+  attempt: TaskControlProviderAttemptCoordinates;
+}): Promise<{
+  state: 'delivered' | 'pending' | 'ambiguous' | 'permanent_reject_before_send';
+  messageId?: string;
+}> {
+  const registryPath = join(input.context.dataDir, 'orchestrate-dispatch.json');
+  const assertExactBinding = () => {
+    const project = readProjectGroup(input.context.dataDir, input.context.chatId);
+    if (!project) throw new Error('project_not_found');
+    const binding = daemonProjectTaskControlCanaryFence(project);
+    if (!binding) throw new Error('project_task_control_canary_fence_missing');
+    const { fence, fingerprint } = binding;
+    if (project.larkAppId !== input.context.larkAppId
+      || project.coordinatorSessionId !== input.context.coordinatorSessionId
+      || fence.targetChatId !== input.context.chatId
+      || fence.controllerAppId !== input.context.larkAppId
+      || fence.coordinatorSessionId !== input.context.coordinatorSessionId
+      || fence.dispatchOperationId !== input.operationId
+      || !fence.kickoff) {
+      throw new Error('project_task_control_kickoff_binding_conflict');
+    }
+    const workstream = project.workstreams.find(item => item.dispatchRoot === input.dispatchRoot);
+    const taskControl = workstream?.taskControl;
+    const expectedTargetAppIds = [...fence.targetAppIds].sort();
+    if (!workstream || !taskControl
+      || taskControl.sourceKind !== 'project_group'
+      || taskControl.mappingStatus !== 'registered'
+      || taskControl.reservationId !== input.operationId
+      || taskControl.taskGuid !== fence.taskGuid
+      || taskControl.mappingRef !== `topic-message:${input.dispatchRoot}`
+      || taskControl.controllerAppId !== fence.controllerAppId
+      || taskControl.workerAppId !== fence.workerAppId
+      || taskControl.reviewerAppId !== fence.reviewerAppId
+      || taskControl.acceptorAppId !== fence.acceptorAppId
+      || taskControl.coordinatorSessionId !== fence.coordinatorSessionId
+      || JSON.stringify([...(workstream.targetAppIds ?? [])].sort()) !== JSON.stringify(expectedTargetAppIds)) {
+      throw new Error('project_task_control_kickoff_mapping_conflict');
+    }
+    const registered = findDispatchOperation(registryPath, input.operationId);
+    const registeredTaskControl = registered?.entry.taskControl;
+    if (!registered || registered.dispatchRoot !== input.dispatchRoot
+      || JSON.stringify([...(Array.isArray(registered.entry.targetAppIds)
+        ? registered.entry.targetAppIds.filter((value): value is string => typeof value === 'string')
+        : [])].sort()) !== JSON.stringify(expectedTargetAppIds)
+      || !registeredTaskControl || typeof registeredTaskControl !== 'object'
+      || Array.isArray(registeredTaskControl)
+      || (registeredTaskControl as Record<string, unknown>).mode !== 'audit_only'
+      || (registeredTaskControl as Record<string, unknown>).taskGuid !== fence.taskGuid) {
+      throw new Error('project_task_control_kickoff_registry_conflict');
+    }
+    const built = buildTaskControlKickoffContent({
+      title: fence.title,
+      brief: fence.kickoff.brief,
+      dispatchRoot: input.dispatchRoot,
+      bots: fence.kickoff.bots,
+    });
+    if (JSON.stringify(built.targetAppIds) !== JSON.stringify(expectedTargetAppIds)) {
+      throw new Error('project_task_control_kickoff_payload_conflict');
+    }
+    return {
+      fenceFingerprint: fingerprint,
+      content: built.content,
+      targetAppIds: built.targetAppIds,
+      payloadHash: createHash('sha256').update(built.content).digest('hex'),
+      controllerAppId: fence.controllerAppId,
+    };
+  };
+
+  const prepared = withProjectTaskControlChatLockSync(
+    input.context.dataDir,
+    input.context.chatId,
+    () => {
+      const exact = assertExactBinding();
+      const operation = beginTaskControlKickoffOperationSync(registryPath, {
+        operationId: input.operationId,
+        sourceAppId: exact.controllerAppId,
+        chatId: input.context.chatId,
+        dispatchRoot: input.dispatchRoot,
+        fenceFingerprint: exact.fenceFingerprint,
+        targetAppIds: exact.targetAppIds,
+        messageType: 'post',
+        payloadHash: exact.payloadHash,
+        attempt: input.attempt,
+      });
+      return { ...exact, operation };
+    },
+  );
+  if (prepared.operation.state !== 'pending') {
+    return prepared.operation.messageId
+      ? { state: prepared.operation.state, messageId: prepared.operation.messageId }
+      : { state: prepared.operation.state };
+  }
+
+  let messageId: string;
+  try {
+    messageId = await runWithAbortDeadline(
+      'project_task_control_kickoff_delivery', 5_000,
+      signal => replyMessage(
+        prepared.controllerAppId,
+        input.dispatchRoot,
+        prepared.content,
+        'post',
+        true,
+        prepared.operation.providerUuid,
+        undefined,
+        { timeoutMs: 5_000, signal },
+      ),
+    );
+  } catch {
+    return { state: 'pending' };
+  }
+
+  let completed;
+  try {
+    completed = withProjectTaskControlChatLockSync(
+      input.context.dataDir,
+      input.context.chatId,
+      () => {
+        const exact = assertExactBinding();
+        const operation = readTaskControlKickoffOperation(registryPath, input.operationId);
+        if (!operation
+          || operation.fenceFingerprint !== exact.fenceFingerprint
+          || operation.payloadHash !== exact.payloadHash
+          || JSON.stringify(operation.targetAppIds) !== JSON.stringify(exact.targetAppIds)) {
+          throw new Error('project_task_control_kickoff_operation_conflict');
+        }
+        return completeTaskControlKickoffOperationSync(
+          registryPath,
+          { operationId: input.operationId, messageId },
+        );
+      },
+    );
+  } catch {
+    try {
+      const quarantined = withProjectTaskControlChatLockSync(
+        input.context.dataDir,
+        input.context.chatId,
+        () => markTaskControlKickoffOperationAmbiguousSync(registryPath, input.operationId),
+      );
+      return quarantined.state === 'delivered' && quarantined.messageId
+        ? { state: 'delivered', messageId: quarantined.messageId }
+        : { state: 'ambiguous' };
+    } catch {
+      return { state: 'ambiguous' };
+    }
+  }
+  return { state: completed.state, messageId: completed.messageId };
+}
 
 // Linux credential-only bwrap / macOS read isolation 都
 // 不允许 CLI 读取 `.dashboard-secret`。这里验证 source session 当前轮换的
@@ -6654,11 +7378,15 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   const seedText = typeof body?.seedText === 'string' ? body.seedText.trim() : '';
   const targetChatId = typeof body?.targetChatId === 'string' ? body.targetChatId.trim() : '';
   const acceptanceRequested = body?.acceptanceRequested === true;
+  const taskControlMode = body?.taskControlMode === 'audit_only' ? 'audit_only' : undefined;
   const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 200) : '';
   const purpose = typeof body?.purpose === 'string' ? body.purpose.trim().slice(0, 500) : '';
   if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_session_id' });
   if (!seedText) {
     return jsonRes(res, 400, { ok: false, error: 'missing_seed_text' });
+  }
+  if (body?.taskControlMode !== undefined && taskControlMode === undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_task_control_mode' });
   }
   if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
     return jsonRes(res, 400, { ok: false, error: 'bad_target_chat_id' });
@@ -6730,6 +7458,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     existingDispatch: false,
     readOnly: access?.mode === 'read_only',
     writeScopes: access?.mode === 'write' ? access.scopes : [],
+    taskControlMode,
   });
   if (!dispatchPolicy.ok) return jsonRes(res, 403, dispatchPolicy);
   if (dispatchPolicy.projectMode && !access) {
@@ -6759,35 +7488,130 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       });
     }
   }
+  if (dispatchPolicy.taskControlMode === 'audit_only'
+    && (workerAppIds?.length !== 1 || reviewerAppIds?.length !== 1 || !dispatchPolicy.acceptorAppId
+      || workerAppIds[0] === reviewerAppIds[0]
+      || workerAppIds[0] === dispatchPolicy.acceptorAppId
+      || reviewerAppIds[0] === dispatchPolicy.acceptorAppId
+      || ds.larkAppId === dispatchPolicy.acceptorAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_project_task_control_roles' });
+  }
+  if (dispatchPolicy.taskControlMode === 'audit_only'
+    && (!activeTaskControlPlaneFlags.ledgerEnabled || activeTaskControlPlaneFlags.shadowEnabled
+      || activeTaskControlPlaneFlags.pumpEnabled || activeTaskControlPlaneFlags.freezeEnforcement)) {
+    return jsonRes(res, 503, { ok: false, error: 'project_task_control_audit_runtime_not_ready' });
+  }
 
   const origin = ds.managedTurnOrigin;
   const dispatchOperationId = dispatchPolicy.projectMode && origin?.turnId
-    ? createHash('sha256').update(JSON.stringify({
+    ? createDispatchOperationId({
         sessionId, turnId: origin.turnId, dispatchAttempt: origin.dispatchAttempt,
         seedText, targetChatId, targetAppIds: [...targetAppIds].sort(), acceptanceRequested,
         title, purpose, access, workerAppIds, reviewerAppIds,
-      })).digest('hex')
+        taskControlMode,
+      })
     : undefined;
-  const registryPath = join(config.session.dataDir, 'orchestrate-dispatch.json');
-  const prior = dispatchOperationId ? findDispatchOperation(registryPath, dispatchOperationId) : undefined;
-  if (prior) {
-    const priorWorkstream = readProjectGroup(config.session.dataDir, ds.chatId)?.workstreams
-      .find(item => item.dispatchRoot === prior.dispatchRoot);
-    if (priorWorkstream && priorWorkstream.status !== 'completed' && priorWorkstream.status !== 'failed') {
-      return jsonRes(res, 200, {
-        ok: true, dispatchRoot: prior.dispatchRoot, projectSynced: true, access, replayed: true,
-      });
-    }
-  }
-
   const projectContext = {
     dataDir: config.session.dataDir, chatId: ds.chatId, larkAppId: ds.larkAppId,
     coordinatorSessionId: ds.session.sessionId,
   };
-  const reservationId = dispatchPolicy.projectMode ? randomUUID() : undefined;
+  const registryPath = join(config.session.dataDir, 'orchestrate-dispatch.json');
+  const prior = dispatchOperationId ? findDispatchOperation(registryPath, dispatchOperationId) : undefined;
+  if (prior) {
+    const priorProject = readProjectGroup(config.session.dataDir, ds.chatId);
+    const priorWorkstream = priorProject?.workstreams
+      .find(item => item.dispatchRoot === prior.dispatchRoot);
+    if (priorWorkstream && priorWorkstream.status !== 'completed' && priorWorkstream.status !== 'failed') {
+      if (taskControlMode === 'audit_only' && priorWorkstream.taskControl?.mappingStatus === 'pending') {
+        const binding = priorWorkstream.taskControl;
+        const root = projectGroupRootSnapshotFromLarkDetail(await getMessageDetail(ds.larkAppId, prior.dispatchRoot));
+        const botOpenId = getBot(ds.larkAppId).botOpenId;
+        const hostSecret = (() => { try { return loadDaemonIpcSecret(); } catch { return undefined; } })();
+        if (!priorProject || !root || !botOpenId || !hostSecret || !taskControlIntegration
+          || !priorWorkstream.access || !binding.recovery) {
+          return jsonRes(res, 503, {
+            ok: false, error: 'project_task_control_recovery_unavailable', seedCreated: true,
+            dispatchRoot: prior.dispatchRoot, stage: 'mapping_pending', retryableWithSameReservation: true,
+          });
+        }
+        const trust = new TaskControlMappingTrust({
+          hostSecret, previousHostSecret: process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+          larkAppId: ds.larkAppId,
+        });
+        const resolved = resolveProjectGroupMappingFacts({
+          selfLarkAppId: ds.larkAppId, controllerBotOpenId: botOpenId, now: new Date().toISOString(), recovery: true,
+          liveSession: {
+            larkAppId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId,
+            workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+            turnCapability: origin?.capability ?? '',
+          },
+          project: {
+            chatId: priorProject.chatId, larkAppId: priorProject.larkAppId,
+            coordinatorSessionId: priorProject.coordinatorSessionId, revision: binding.projectRevision,
+          },
+          reservation: {
+            schemaVersion: 'ProjectDispatchReservation.v1', larkAppId: ds.larkAppId, chatId: ds.chatId,
+            coordinatorSessionId: binding.coordinatorSessionId, originTurnId: binding.originTurnId,
+            reservationId: binding.reservationId, taskGuid: binding.taskGuid, phaseId: binding.phaseId,
+            workerAppId: binding.workerAppId, reviewerAppId: binding.reviewerAppId, acceptorAppId: binding.acceptorAppId,
+            access: priorWorkstream.access, createdAt: binding.reservationCreatedAt, expiresAt: binding.reservationExpiresAt,
+            dispatch: binding.recovery,
+            taskControlMode: 'audit_only', stage: 'root_created', targetAppIds: priorWorkstream.targetAppIds ?? [],
+            dispatchRoot: prior.dispatchRoot, rootCreateTime: binding.rootCreateTime, proof: binding.reservationProof,
+          },
+          root,
+          allowedWorkerAppIds: groupMode?.workerAppIds ?? [],
+          verifyReservationProof: (facts, proof) => trust.verifyProjectDispatchReservation(proof, facts, {
+            allowedKeyIds: activeTaskControlAllowedKeyIds,
+            revokedKeyIds: activeTaskControlRevokedKeyIds,
+          }),
+        });
+        if (!resolved.ok) {
+          return jsonRes(res, 409, {
+            ok: false, error: resolved.error, seedCreated: true,
+            dispatchRoot: prior.dispatchRoot, stage: 'mapping_pending', retryableWithSameReservation: true,
+          });
+        }
+        if (!taskControlIntegration.registerMapping(prior.dispatchRoot, {
+          projectId: resolved.facts.projectId, phaseId: resolved.facts.phaseId,
+          phaseTaskGuids: [resolved.facts.taskGuid], taskGuid: resolved.facts.taskGuid,
+          topicRootId: prior.dispatchRoot, ownerId: resolved.facts.workerAppId,
+          reviewerId: resolved.facts.reviewerAppId, acceptorId: resolved.facts.acceptorAppId,
+          registrationRef: `topic-message:${prior.dispatchRoot}`,
+          mappingAuthority: {
+            kind: 'project_group', chatId: resolved.facts.chatId, reservationId: resolved.facts.reservationId,
+            projectRevision: resolved.facts.projectRevision, acceptorAppId: resolved.facts.acceptorAppId, mode: 'audit_only',
+          },
+        }, ds.larkAppId)) {
+          return jsonRes(res, 409, {
+            ok: false, error: 'project_task_control_mapping_rejected',
+            seedCreated: true, dispatchRoot: prior.dispatchRoot, stage: 'mapping_pending', retryableWithSameReservation: true,
+          });
+        }
+        await projectCoordinator.run(projectContext, {
+          action: 'mark_task_control_mapping', dispatchRoot: prior.dispatchRoot, taskGuid: resolved.facts.taskGuid,
+          mappingRef: `topic-message:${prior.dispatchRoot}`, status: 'registered', registeredAt: new Date().toISOString(),
+        });
+        await projectCoordinator.run(projectContext, { action: 'refresh' });
+        taskControlIntegration.dispatchRequested(prior.dispatchRoot, ds.session.sessionId, new Date().toISOString());
+        return jsonRes(res, 200, {
+          ok: true, dispatchRoot: prior.dispatchRoot, projectSynced: true, access,
+          replayed: true, taskControlReconciled: true, dispatchOperationId,
+        });
+      }
+      return jsonRes(res, 200, {
+        ok: true, dispatchRoot: prior.dispatchRoot, projectSynced: true, access, replayed: true,
+        dispatchOperationId,
+      });
+    }
+  }
+
+  const reservationId = dispatchPolicy.projectMode ? (dispatchOperationId ?? randomUUID()) : undefined;
+  let taskControlReservation: import('./services/project-group-store.js').ProjectDispatchReservation | undefined;
   let reservationActive = false;
   const abortReservation = async (): Promise<void> => {
     if (!reservationId || !reservationActive) return;
+    if (taskControlReservation?.taskControl) return;
     try {
       await projectCoordinator.run(projectContext, { action: 'abort_dispatch', reservationId, targetAppIds });
       reservationActive = false;
@@ -6797,9 +7621,63 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   };
   if (reservationId) {
     try {
-      await projectCoordinator.run(projectContext, {
-        action: 'reserve_dispatch', reservationId, targetAppIds, access: access!,
+      const reservationNow = Date.now();
+      const currentReservation = readProjectGroup(config.session.dataDir, ds.chatId)?.dispatchReservations
+        ?.find(item => item.reservationId === reservationId);
+      let taskControl: import('./services/project-group-store.js').ProjectDispatchReservation['taskControl'];
+      if (dispatchPolicy.taskControlMode === 'audit_only') {
+        if (!origin?.turnId || !workerAppIds?.[0] || !reviewerAppIds?.[0] || !dispatchPolicy.acceptorAppId) {
+          return jsonRes(res, 409, { ok: false, error: 'project_task_control_origin_unproven' });
+        }
+        if (currentReservation?.taskControl) {
+          taskControl = currentReservation.taskControl;
+        } else {
+          const taskGuid = projectGroupTaskGuid({ larkAppId: ds.larkAppId, chatId: ds.chatId, reservationId });
+          const createdAt = new Date(reservationNow).toISOString();
+          const expiresAt = new Date(reservationNow + PROJECT_DISPATCH_RESERVATION_TTL_MS).toISOString();
+          const dispatchRecovery = {
+            title, purpose, owners: stringArray(body?.owners), botOpenIds: stringArray(body?.bots),
+            acceptanceRequested, seedText,
+          };
+          const reservationFacts: ProjectDispatchReservationFactsV1 = {
+            schemaVersion: 'ProjectDispatchReservation.v1', larkAppId: ds.larkAppId, chatId: ds.chatId,
+            coordinatorSessionId: ds.session.sessionId, originTurnId: origin.turnId, reservationId,
+            taskGuid, phaseId: `workstream:${taskGuid}`, workerAppId: workerAppIds[0], reviewerAppId: reviewerAppIds[0],
+            acceptorAppId: dispatchPolicy.acceptorAppId, access: access!, createdAt, expiresAt,
+            dispatch: dispatchRecovery,
+          };
+          const trust = new TaskControlMappingTrust({
+            hostSecret: loadDaemonIpcSecret(), previousHostSecret: process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+            larkAppId: ds.larkAppId,
+          });
+          const proof = trust.issueProjectDispatchReservation(reservationFacts, createdAt);
+          if (!trust.verifyProjectDispatchReservation(proof, reservationFacts, {
+            allowedKeyIds: activeTaskControlAllowedKeyIds,
+            revokedKeyIds: activeTaskControlRevokedKeyIds,
+          })) {
+            throw new Error('project_task_control_reservation_key_rejected');
+          }
+          taskControl = {
+            mode: 'audit_only', taskGuid, phaseId: reservationFacts.phaseId,
+            workerAppId: workerAppIds[0], reviewerAppId: reviewerAppIds[0], acceptorAppId: dispatchPolicy.acceptorAppId,
+            coordinatorSessionId: ds.session.sessionId, originTurnId: origin.turnId,
+            proof,
+            recovery: dispatchRecovery,
+          };
+        }
+      }
+      const reservedProject = await projectCoordinator.run(projectContext, {
+        action: 'reserve_dispatch', reservationId, targetAppIds, access: access!, now: new Date(reservationNow).toISOString(),
+        ...(taskControl ? { taskControl } : {}),
+        ...(taskControl ? {
+          maxActiveTaskControlMappings: dispatchPolicy.maxActiveMappings,
+          getTaskControlMappingDecision: ({ dispatchRoot, taskGuid }: { dispatchRoot: string; taskGuid: string }) => (
+            taskControlIntegration?.getProjectGroupTaskControlDecision(dispatchRoot, taskGuid)
+            ?? { capacityReleased: false, admissionSafe: false, admissionBlockers: [] }
+          ),
+        } : {}),
       });
+      taskControlReservation = reservedProject.dispatchReservations?.find(item => item.reservationId === reservationId);
       reservationActive = true;
     } catch (error) {
       return jsonRes(res, 409, {
@@ -6808,16 +7686,107 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     }
   }
 
-  let dispatchRoot: string;
+  let dispatchRoot = taskControlReservation?.stage === 'root_created' && taskControlReservation.dispatchRoot
+    ? taskControlReservation.dispatchRoot
+    : '';
+  let seedCreated = !!dispatchRoot;
+  let taskControlSeedAttempted = false;
+  let taskControlRoot: ReturnType<typeof projectGroupRootSnapshotFromLarkDetail>;
   try {
-    dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text');
+    if (!dispatchRoot) {
+      if (taskControlReservation?.taskControl && dispatchOperationId) {
+        const assertExactSeedFence = (expectedFingerprint?: string): string => {
+          const project = readProjectGroup(config.session.dataDir, ds.chatId);
+          if (!project) throw new Error('project_not_found');
+          const binding = daemonProjectTaskControlCanaryFence(project);
+          if (!binding) throw new Error('project_task_control_canary_fence_missing');
+          if (binding.fence.dispatchOperationId !== dispatchOperationId
+            || (expectedFingerprint !== undefined && binding.fingerprint !== expectedFingerprint)) {
+            throw new Error('project_task_control_seed_binding_conflict');
+          }
+          return binding.fingerprint;
+        };
+        const preparedSeed = withProjectTaskControlChatLockSync(
+          config.session.dataDir,
+          ds.chatId,
+          () => {
+            const fenceFingerprint = assertExactSeedFence();
+            const operation = beginTaskControlSeedOperationSync(registryPath, {
+              operationId: dispatchOperationId,
+              sourceAppId: ds.larkAppId,
+              targetChatId,
+              messageType: 'text',
+              payloadHash: createHash('sha256').update(seedText).digest('hex'),
+              attempt: taskControlProviderAttemptCoordinates(),
+            });
+            return { fenceFingerprint, operation };
+          },
+        );
+        const seedOperation = preparedSeed.operation;
+        taskControlSeedAttempted = true;
+        if (seedOperation.state === 'ambiguous') {
+          return jsonRes(res, 409, {
+            ok: false, error: 'dispatch_seed_ambiguous', seedCreated: false,
+            stage: taskControlReservation.stage ?? 'reserved', retryableWithSameReservation: false,
+          });
+        }
+        if (seedOperation.state === 'delivered') {
+          dispatchRoot = seedOperation.dispatchRoot!;
+        } else {
+          dispatchRoot = await runWithAbortDeadline(
+            'project_task_control_seed_delivery', 5_000,
+            signal => sendMessage(
+              ds.larkAppId, targetChatId, seedText, 'text', seedOperation.providerUuid,
+              undefined, { timeoutMs: 5_000, signal },
+            ),
+          );
+          seedCreated = true;
+          withProjectTaskControlChatLockSync(
+            config.session.dataDir,
+            ds.chatId,
+            () => {
+              assertExactSeedFence(preparedSeed.fenceFingerprint);
+              completeTaskControlSeedOperationSync(registryPath, { operationId: dispatchOperationId, dispatchRoot });
+            },
+          );
+        }
+      } else {
+        dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text', dispatchOperationId);
+      }
+      seedCreated = true;
+    }
+    if (taskControlReservation?.taskControl) {
+      taskControlRoot = projectGroupRootSnapshotFromLarkDetail(await getMessageDetail(ds.larkAppId, dispatchRoot));
+      if (!taskControlRoot) throw new Error('project_task_control_root_unreadable');
+    }
   } catch (error) {
-    await abortReservation();
+    if (!taskControlSeedAttempted) await abortReservation();
     return jsonRes(res, 502, {
       ok: false,
       error: 'dispatch_seed_send_failed',
       detail: error instanceof Error ? error.message : String(error),
+      ...(taskControlReservation?.taskControl ? {
+        seedCreated,
+        ...(dispatchRoot ? { dispatchRoot } : {}),
+        stage: taskControlReservation.stage ?? 'reserved',
+        retryableWithSameReservation: true,
+      } : {}),
     });
+  }
+  if (taskControlReservation?.taskControl && taskControlReservation.stage !== 'root_created') {
+    try {
+      const rootedProject = await projectCoordinator.run(projectContext, {
+        action: 'bind_dispatch_root', reservationId: reservationId!, targetAppIds,
+        dispatchRoot, rootCreateTime: taskControlRoot!.createTime,
+      });
+      taskControlReservation = rootedProject.dispatchReservations?.find(item => item.reservationId === reservationId);
+    } catch (error) {
+      return jsonRes(res, 500, {
+        ok: false, error: 'project_dispatch_root_bind_failed',
+        detail: error instanceof Error ? error.message : String(error),
+        seedCreated: true, dispatchRoot, stage: 'reserved', retryableWithSameReservation: true, access,
+      });
+    }
   }
 
   const bindingSecret = loadOrCreateDashboardSecret(
@@ -6835,29 +7804,45 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   });
   const botOpenIds = stringArray(body?.bots);
   try {
-    await recordDispatchRegistryEntry(
-      registryPath,
-      dispatchRoot,
-      {
-        orchRoot: ds.session.rootMessageId ?? '',
-        orchChatId: ds.session.chatId,
-        orchScope: ds.scope ?? ds.session.scope ?? 'thread',
-        orchAppId: ds.larkAppId,
-        orchSessionId: ds.session.sessionId,
-        targetChatId,
-        targetAppIds,
-        ...(access ? { access } : {}),
-        ...(workerAppIds ? { workerAppIds } : {}),
-        ...(reviewerAppIds ? { reviewerAppIds } : {}),
-        title,
-        bots: botOpenIds,
-        ...initialDispatchLifecycle(acceptanceRequested),
-        createdAt: issuedAt,
-        updatedAt: issuedAt,
-        reportBinding,
-        ...(dispatchOperationId ? { dispatchOperationId } : {}),
-      },
-    );
+    if (prior && prior.dispatchRoot !== dispatchRoot) throw new Error('dispatch_operation_root_conflict');
+    if (!prior) {
+      await recordDispatchRegistryEntry(
+        registryPath,
+        dispatchRoot,
+        {
+          orchRoot: ds.session.rootMessageId ?? '',
+          orchChatId: ds.session.chatId,
+          orchScope: ds.scope ?? ds.session.scope ?? 'thread',
+          orchAppId: ds.larkAppId,
+          orchSessionId: ds.session.sessionId,
+          targetChatId,
+          targetAppIds,
+          ...(access ? { access } : {}),
+          ...(workerAppIds ? { workerAppIds } : {}),
+          ...(reviewerAppIds ? { reviewerAppIds } : {}),
+          ...(taskControlReservation?.taskControl ? {
+            taskControl: {
+              mode: 'audit_only',
+              taskGuid: taskControlReservation.taskControl.taskGuid,
+              phaseId: taskControlReservation.taskControl.phaseId,
+              controllerAppId: ds.larkAppId,
+              workerAppId: taskControlReservation.taskControl.workerAppId,
+              reviewerAppId: taskControlReservation.taskControl.reviewerAppId,
+              acceptorAppId: taskControlReservation.taskControl.acceptorAppId,
+            },
+          } : {}),
+          title,
+          purpose,
+          owners: stringArray(body?.owners),
+          bots: botOpenIds,
+          ...initialDispatchLifecycle(acceptanceRequested),
+          createdAt: issuedAt,
+          updatedAt: issuedAt,
+          reportBinding,
+          ...(dispatchOperationId ? { dispatchOperationId } : {}),
+        },
+      );
+    }
   } catch (error) {
     await abortReservation();
     return jsonRes(res, 500, {
@@ -6869,12 +7854,91 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   let projectSynced = false;
   if (reservationId) {
     try {
-      await projectCoordinator.run(projectContext, {
+      let committedProject = await projectCoordinator.run(projectContext, {
         action: 'commit_dispatch', reservationId, targetAppIds, dispatchRoot,
         title: title || '子任务', purpose, owners: stringArray(body?.owners), workerAppIds, reviewerAppIds,
       });
       reservationActive = false;
       projectSynced = true;
+      if (taskControlReservation?.taskControl) {
+        const taskControl = taskControlReservation.taskControl;
+        const workstream = committedProject.workstreams.find(item => item.dispatchRoot === dispatchRoot);
+        const botOpenId = getBot(ds.larkAppId).botOpenId;
+        const hostSecret = (() => { try { return loadDaemonIpcSecret(); } catch { return undefined; } })();
+        if (!workstream?.taskControl || !taskControlRoot || !botOpenId || !hostSecret || !taskControlIntegration) {
+          return jsonRes(res, 503, {
+            ok: false, error: 'project_task_control_runtime_unavailable', seedCreated: true,
+            dispatchRoot, stage: 'mapping_pending', retryableWithSameReservation: true, access,
+          });
+        }
+        const trust = new TaskControlMappingTrust({
+          hostSecret, previousHostSecret: process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+          larkAppId: ds.larkAppId,
+        });
+        const resolved = resolveProjectGroupMappingFacts({
+          selfLarkAppId: ds.larkAppId,
+          controllerBotOpenId: botOpenId,
+          now: new Date().toISOString(),
+          liveSession: {
+            larkAppId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId,
+            workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+            turnCapability: origin?.capability ?? '',
+          },
+          project: {
+            chatId: committedProject.chatId, larkAppId: committedProject.larkAppId,
+            coordinatorSessionId: committedProject.coordinatorSessionId, revision: workstream.taskControl.projectRevision,
+          },
+          reservation: {
+            schemaVersion: 'ProjectDispatchReservation.v1', larkAppId: ds.larkAppId, chatId: ds.chatId,
+            coordinatorSessionId: ds.session.sessionId, originTurnId: taskControl.originTurnId,
+            reservationId, taskGuid: taskControl.taskGuid, phaseId: taskControl.phaseId,
+            workerAppId: taskControl.workerAppId, reviewerAppId: taskControl.reviewerAppId,
+            acceptorAppId: taskControl.acceptorAppId, access: taskControlReservation.access,
+            createdAt: taskControlReservation.createdAt, expiresAt: taskControlReservation.expiresAt,
+            dispatch: taskControl.recovery!,
+            taskControlMode: taskControl.mode, stage: taskControlReservation.stage ?? 'reserved',
+            targetAppIds: taskControlReservation.targetAppIds, dispatchRoot: taskControlReservation.dispatchRoot,
+            rootCreateTime: taskControlReservation.rootCreateTime, proof: taskControl.proof,
+          },
+          root: taskControlRoot,
+          allowedWorkerAppIds: groupMode?.workerAppIds ?? [],
+          verifyReservationProof: (facts, proof) => trust.verifyProjectDispatchReservation(proof, facts, {
+            allowedKeyIds: activeTaskControlAllowedKeyIds,
+            revokedKeyIds: activeTaskControlRevokedKeyIds,
+          }),
+        });
+        if (!resolved.ok) {
+          return jsonRes(res, 409, {
+            ok: false, error: resolved.error, seedCreated: true,
+            dispatchRoot, stage: 'mapping_pending', retryableWithSameReservation: true, access,
+          });
+        }
+        if (!taskControlIntegration.registerMapping(dispatchRoot, {
+          projectId: resolved.facts.projectId,
+          phaseId: resolved.facts.phaseId,
+          phaseTaskGuids: [resolved.facts.taskGuid],
+          taskGuid: resolved.facts.taskGuid,
+          topicRootId: dispatchRoot,
+          ownerId: resolved.facts.workerAppId,
+          reviewerId: resolved.facts.reviewerAppId,
+          acceptorId: resolved.facts.acceptorAppId,
+          registrationRef: `topic-message:${dispatchRoot}`,
+          mappingAuthority: {
+            kind: 'project_group', chatId: resolved.facts.chatId, reservationId: resolved.facts.reservationId,
+            projectRevision: resolved.facts.projectRevision, acceptorAppId: resolved.facts.acceptorAppId, mode: 'audit_only',
+          },
+        }, ds.larkAppId)) {
+          return jsonRes(res, 409, {
+            ok: false, error: 'project_task_control_mapping_rejected',
+            seedCreated: true, dispatchRoot, stage: 'mapping_pending', retryableWithSameReservation: true, access,
+          });
+        }
+        committedProject = await projectCoordinator.run(projectContext, {
+          action: 'mark_task_control_mapping', dispatchRoot, taskGuid: resolved.facts.taskGuid,
+          mappingRef: `topic-message:${dispatchRoot}`, status: 'registered', registeredAt: new Date().toISOString(),
+        });
+        projectSynced = !!committedProject;
+      }
     } catch (error) {
       return jsonRes(res, 500, {
         ok: false, error: 'project_dispatch_commit_failed',
@@ -6896,7 +7960,10 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   // SQLite on this IPC response path; a bounded asynchronous queue preserves
   // the observation best-effort and drops it loudly on sidecar pressure.
   taskControlIntegration?.dispatchRequested(dispatchRoot, ds.session.sessionId, issuedAt);
-  return jsonRes(res, 201, { ok: true, dispatchRoot, projectSynced, access });
+  return jsonRes(res, 201, {
+    ok: true, dispatchRoot, projectSynced, access,
+    ...(dispatchOperationId ? { dispatchOperationId } : {}),
+  });
 });
 
 // All new dispatch kickoffs (including --into) go through the source daemon.
@@ -6925,6 +7992,40 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
   }
   const rootId = body?.rootId;
   const chatId = body?.chatId;
+  if (body?.dispatchOperationId !== undefined) {
+    const operationId = typeof body.dispatchOperationId === 'string'
+      ? body.dispatchOperationId.trim()
+      : '';
+    if (typeof rootId !== 'string' || !/^om_[A-Za-z0-9_-]{1,128}$/.test(rootId)
+      || typeof chatId !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)
+      || !/^[a-f0-9]{50}$/.test(operationId)
+      || body.content !== undefined || body.targetAppIds !== undefined
+      || body.hasLegacyBots !== undefined) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_task_control_kickoff_delivery' });
+    }
+    try {
+      const result = await deliverProjectTaskControlKickoff({
+        context: {
+          dataDir: config.session.dataDir,
+          chatId: ds.chatId,
+          larkAppId: ds.larkAppId,
+          coordinatorSessionId: ds.session.sessionId,
+        },
+        dispatchRoot: rootId,
+        operationId,
+        attempt: taskControlProviderAttemptCoordinates(),
+      });
+      return result.state === 'delivered' && result.messageId
+        ? jsonRes(res, 200, { ok: true, state: result.state, messageId: result.messageId })
+        : jsonRes(res, 409, { ok: false, state: result.state, error: `dispatch_kickoff_${result.state}` });
+    } catch (error) {
+      return jsonRes(res, 409, {
+        ok: false, state: 'permanent_reject_before_send',
+        error: 'dispatch_kickoff_permanent_reject_before_send',
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
   const targetAppIds = body?.targetAppIds;
   if (typeof rootId !== 'string' || !/^om_[A-Za-z0-9_-]{1,128}$/.test(rootId)
     || typeof chatId !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)
@@ -6937,6 +8038,14 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // Never trust a caller-supplied chat/root pair to scope delegated access.
     if (await lookupMessageChatId(ds.larkAppId, rootId) !== chatId) {
       return jsonRes(res, 403, { ok: false, error: 'dispatch_chat_mismatch' });
+    }
+    const project = readProjectGroup(config.session.dataDir, ds.chatId);
+    const taskControlFence = project ? daemonProjectTaskControlCanaryFence(project) : undefined;
+    const fencedWorkstream = project?.workstreams.find(item => item.dispatchRoot === rootId);
+    if (taskControlFence
+      && (rootId === taskControlFence.fence.phaseA?.historicalDispatchRoot
+        || fencedWorkstream?.taskControl?.reservationId === taskControlFence.fence.dispatchOperationId)) {
+      return jsonRes(res, 409, { ok: false, error: 'project_task_control_canary_fence_rejects_turn' });
     }
     const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
     const policy = evaluateProjectDispatchPolicy({
@@ -7015,6 +8124,50 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     }
   } catch { /* missing/malformed registry fails closed below */ }
 
+  let phaseAReportContext: import('./core/report-session-relay.js').ReportSessionRelayPhaseAContext | undefined;
+  if (ds) {
+    const project = readProjectGroup(config.session.dataDir, ds.chatId);
+    const fenceRecord = project?.blockerRecords.find(
+      candidate => candidate.code === TASK_CONTROL_CANARY_QUARANTINE_CODE,
+    );
+    if (fenceRecord) {
+      let binding: ReturnType<typeof daemonProjectTaskControlCanaryFence>;
+      try {
+        binding = daemonProjectTaskControlCanaryFence(project!);
+      } catch {
+        return jsonRes(res, 403, { ok: false, error: 'project_task_control_phase_a_report_rejected' });
+      }
+      const requestedRoot = raw && typeof raw === 'object' && !Array.isArray(raw)
+        && typeof (raw as Record<string, unknown>).dispatchRoot === 'string'
+        ? (raw as Record<string, unknown>).dispatchRoot as string
+        : '';
+      if (binding && requestedRoot.trim() === binding.fence.phaseA.historicalDispatchRoot) {
+        const registryPath = join(config.session.dataDir, 'orchestrate-dispatch.json');
+        const liveTurnId = ds.managedTurnOrigin?.turnId;
+        let turnAdmission: ReturnType<typeof openTaskControlTurnAdmissions>[number] | undefined;
+        try {
+          turnAdmission = liveTurnId
+            ? openTaskControlTurnAdmissions(registryPath, ds.chatId)
+              .find(claim => claim.messageId === liveTurnId)
+            : undefined;
+          phaseAReportContext = {
+            fence: binding.fence,
+            fenceFingerprint: binding.fingerprint,
+            operation: readTaskControlPhaseAOperation(
+              registryPath, binding.fence.dispatchOperationId,
+            ),
+            turnAdmission,
+            existingReport: readTaskControlPhaseAFailedReport(
+              registryPath, binding.fence.dispatchOperationId,
+            ),
+          };
+        } catch {
+          return jsonRes(res, 403, { ok: false, error: 'project_task_control_phase_a_report_rejected' });
+        }
+      }
+    }
+  }
+
   const decision = authorizeReportSessionRelayRequest({
     raw,
     trustedHost: isTrustedHostIpcRequest(req),
@@ -7038,6 +8191,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     bindingSecret: loadOrCreateDashboardSecret(
       dispatchReportBindingSecretPath(config.session.dataDir),
     ),
+    ...(phaseAReportContext ? { phaseA: phaseAReportContext } : {}),
   });
   if (!decision.ok) {
     return jsonRes(res, decision.status, { ok: false, error: decision.error });
@@ -7057,7 +8211,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   };
   const postProjectUpdate = async (
     target: { larkAppId: string; sessionId: string },
-  ): Promise<{ projectSynced: boolean; projectSyncError?: string; deliveryRound?: number }> => {
+  ): Promise<{ projectSynced: boolean; projectSyncError?: string; deliveryRound?: number; projectRevision?: number }> => {
     const projectDaemon = target.larkAppId === decision.target.larkAppId
       ? targetDaemon
       // deliverReportSessionRelay only chooses same-app fallbacks today. Keep
@@ -7076,12 +8230,13 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
             action: 'report', dispatchRoot: decision.dispatchRoot, content: decision.content,
             reporterAppId: decision.reporterAppId,
             ...decision.projectUpdate,
+            ...(decision.phaseAReport ? { phaseAReport: decision.phaseAReport } : {}),
           }),
         },
       );
       const projectBody = await projectResponse.json().catch(() => ({})) as {
         ok?: boolean; error?: string;
-        project?: { workstreams?: Array<{ dispatchRoot?: string; delivery?: { round?: number } }> };
+        project?: { revision?: number; workstreams?: Array<{ dispatchRoot?: string; delivery?: { round?: number } }> };
       };
       const projectSynced = projectResponse.ok && projectBody.ok === true;
       if (!projectSynced && !(!decision.projectRequired
@@ -7094,6 +8249,8 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
         projectSynced,
         ...(Number.isSafeInteger(deliveryRound) && (deliveryRound as number) > 0
           ? { deliveryRound } : {}),
+        ...(Number.isSafeInteger(projectBody.project?.revision) && (projectBody.project?.revision as number) > 0
+          ? { projectRevision: projectBody.project!.revision } : {}),
       };
     } catch (error) {
       return {
@@ -7103,13 +8260,13 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     }
   };
   const reportRequestId = 'report:' + createHash('sha256').update(JSON.stringify({
-    sourceSessionId: decision.source.sessionId,
-    sourceTurnId: decision.source.turnId,
-    dispatchRoot: decision.dispatchRoot,
-    reporterAppId: decision.reporterAppId,
-    content: decision.content,
-    projectUpdate: decision.projectUpdate,
-  })).digest('hex');
+      sourceSessionId: decision.source.sessionId,
+      sourceTurnId: decision.source.turnId,
+      dispatchRoot: decision.dispatchRoot,
+      reporterAppId: decision.reporterAppId,
+      content: decision.content,
+      projectUpdate: decision.projectUpdate,
+    })).digest('hex');
   try {
     const delivered = await deliverReportSessionRelay({
       decision,
@@ -7117,6 +8274,120 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       fetchTarget: (path, init) => fetchDaemonIpc(targetDaemon.ipcPort, path, init),
       postProjectUpdate,
     });
+    const registryEntry = registry[decision.dispatchRoot];
+    const taskControl = registryEntry && typeof registryEntry === 'object' && !Array.isArray(registryEntry)
+      && (registryEntry as Record<string, unknown>).taskControl
+      && typeof (registryEntry as Record<string, unknown>).taskControl === 'object'
+      && !Array.isArray((registryEntry as Record<string, unknown>).taskControl)
+      ? (registryEntry as Record<string, unknown>).taskControl as Record<string, unknown>
+      : undefined;
+    const triggerAccepted = (delivered.status >= 200 && delivered.status < 300)
+      || delivered.body.triggerAccepted === true;
+    if (taskControl?.mode === 'audit_only' && triggerAccepted) {
+      const evidencePolicy = evaluateProjectTaskControlEvidencePolicy({
+        config: readGroupCollaborationMode(config.session.dataDir, ds?.chatId ?? ''),
+        chatId: ds?.chatId ?? '', sourceAppId: decision.reporterAppId,
+        eventKind: decision.projectUpdate.reviewVerdict
+          ? 'reviewed'
+          : decision.projectUpdate.status === 'failed' ? 'failed_report' : 'submitted',
+        taskControl,
+      });
+      const triggerId = typeof delivered.body.triggerId === 'string' ? delivered.body.triggerId : '';
+      const projectSynced = delivered.body.projectSynced === true;
+      const projectRevision = typeof delivered.body.projectRevision === 'number' && delivered.body.projectRevision > 0
+        ? delivered.body.projectRevision
+        : undefined;
+      const projectSyncError = typeof delivered.body.projectSyncError === 'string' && delivered.body.projectSyncError.trim()
+        ? delivered.body.projectSyncError.trim()
+        : undefined;
+      const dispatchAttempt = ds?.managedTurnOrigin?.dispatchAttempt ?? 1;
+      const expectedReporter = decision.projectUpdate.reviewVerdict
+        ? taskControl.reviewerAppId
+        : taskControl.workerAppId;
+      if (!evidencePolicy.ok || !projectWorkerEvidenceRelay || !triggerId
+        || (projectSynced ? projectRevision === undefined : projectSyncError === undefined)
+        || !Number.isSafeInteger(dispatchAttempt) || dispatchAttempt! < 1
+        || decision.reporterAppId !== expectedReporter
+        || evidencePolicy.controllerAppId !== decision.target.larkAppId) {
+        taskControlIntegration?.reportFallbackUnknown(
+          `report:${decision.source.sessionId}:${decision.source.turnId}:${reportRequestId}`,
+          'project_task_control_report_evidence_unavailable',
+        );
+        return jsonRes(res, 409, {
+          ...delivered.body, ok: false, error: 'project_task_control_report_evidence_unavailable',
+          triggerAccepted: true, taskControlEvidenceQueued: false,
+        });
+      }
+      try {
+        const eventKind = projectWorkerEvidenceKindForReport({
+          projectSynced,
+          projectStatus: decision.projectUpdate.status,
+          reviewVerdict: decision.projectUpdate.reviewVerdict,
+        });
+        const contentHash = `sha256:${createHash('sha256').update(decision.content).digest('hex')}`;
+        let reviewerVerdict: import('./services/task-control-plane-reviewer-verdict.js').ReviewerVerdictV1 | undefined;
+        if (eventKind === 'reviewed') {
+          const taskGuid = typeof taskControl.taskGuid === 'string' ? taskControl.taskGuid : '';
+          const phaseId = typeof taskControl.phaseId === 'string' ? taskControl.phaseId : '';
+          const reviewerAppId = typeof taskControl.reviewerAppId === 'string' ? taskControl.reviewerAppId : '';
+          const sourceCapability = ds?.managedTurnOrigin?.capability;
+          const reviewerTrust = createDaemonReviewerVerdictVerifier({
+            hostSecret: loadDaemonIpcSecret(), previousHostSecret: process.env.TASK_CONTROL_PLANE_PREVIOUS_HOST_SECRET,
+            controllerBotAppId: decision.target.larkAppId,
+            allowedKeyIds: activeTaskControlAllowedKeyIds, revokedKeyIds: activeTaskControlRevokedKeyIds,
+          });
+          const signer = reviewerTrust.providerForApp(reviewerAppId);
+          if (!taskGuid || !phaseId || !reviewerAppId || !sourceCapability || !signer || projectRevision === undefined) {
+            throw new Error('project_reviewer_verdict_signer_unavailable');
+          }
+          const artifactEvidence = {
+            kind: 'project_report' as const, reportRequestId, triggerId, dispatchRoot: decision.dispatchRoot,
+            sourceSessionId: decision.source.sessionId, sourceTurnId: decision.source.turnId,
+            reporterAppId: decision.source.larkAppId, targetSessionId: decision.target.sessionId,
+            projectRevision, contentHash,
+          };
+          reviewerVerdict = signer.issueVerdict({
+            verdictId: `rv_${createHash('sha256').update(reportRequestId).digest('hex').slice(0, 48)}`,
+            projectId: `project-group:${ds!.chatId}`, phaseId, taskGuid, topicRootId: decision.dispatchRoot,
+            taskSetSnapshot: [taskGuid], reviewRound: decision.projectUpdate.reviewRound!,
+            designatedReviewerRef: reviewerDesignationRef(
+              decision.dispatchRoot, reviewerAppId, decision.projectUpdate.reviewRound!, ds!.workerGeneration!,
+            ),
+            reviewerId: reviewerAppId, reviewerBotAppId: reviewerAppId,
+            sessionId: decision.source.sessionId, workerGeneration: ds!.workerGeneration!, capability: sourceCapability,
+            sourceMessageId: triggerId, sourceVersionHash: contentHash, kind: 'verdict',
+            verdict: decision.projectUpdate.reviewVerdict!, conditionIds: [], resolvedConditionEvidence: {},
+            artifactEvidence, issuedAt: triggerMeta.receivedAt,
+            expiresAt: new Date(Date.parse(triggerMeta.receivedAt) + 60 * 60_000).toISOString(),
+          });
+        }
+        projectWorkerEvidenceRelay.capture({
+          schemaVersion: 'ProjectWorkerEvidence.v1', eventKind,
+          sourceAppId: decision.source.larkAppId, controllerAppId: decision.target.larkAppId,
+          sourceSessionId: decision.source.sessionId, sourceTurnId: decision.source.turnId,
+          workerGeneration: ds!.workerGeneration!, dispatchAttempt: dispatchAttempt!,
+          dispatchRoot: decision.dispatchRoot, occurredAt: triggerMeta.receivedAt,
+          reportRequestId, triggerId, targetSessionId: decision.target.sessionId,
+          contentHash,
+          ...(projectRevision !== undefined ? { projectRevision } : {}),
+          ...(projectSyncError ? { projectSyncError } : {}),
+          ...(decision.projectUpdate.reviewVerdict ? {
+            reviewVerdict: decision.projectUpdate.reviewVerdict!, reviewRound: decision.projectUpdate.reviewRound!,
+            ...(reviewerVerdict ? { reviewerVerdict } : {}),
+          } : {}),
+        });
+        void projectWorkerEvidenceRelay.flushOnce().catch(error => {
+          logger.warn(`[task-control] project report evidence flush failed: ${String(error)}`);
+        });
+        delivered.body.taskControlEvidenceQueued = true;
+      } catch (error) {
+        return jsonRes(res, 409, {
+          ...delivered.body, ok: false, error: 'project_task_control_report_evidence_rejected',
+          detail: error instanceof Error ? error.message : String(error),
+          triggerAccepted: true, taskControlEvidenceQueued: false,
+        });
+      }
+    }
     return jsonRes(res, delivered.status, delivered.body);
   } catch (error) {
     taskControlIntegration?.reportFallbackUnknown(
@@ -19293,7 +20564,7 @@ async function driveNextXpiSharedCwdTurn(
     // already accepted the turn: SQLITE_BUSY at that boundary could leave the
     // record durable, let this retry settle behind the live lease, and dispatch
     // the same turn again after the lease is later released.
-    setActiveInteractiveTurn(ds, next.record.turnId, next.record.caller);
+    setActiveInteractiveTurn(ds, next.record.turnId, next.record.caller, next.record.userPrompt);
     beginNewTurn(ds, next.record.userPrompt, next.record.turnId);
     rememberLastCliInput(ds, next.record.userPrompt, next.record.cliInput);
     return true;
@@ -19321,6 +20592,48 @@ async function driveNextXpiSharedCwdTurn(
 
 export const __testOnly_driveNextXpiSharedCwdTurn = driveNextXpiSharedCwdTurn;
 export const __testOnly_forkReservedInitialSession = forkReservedInitialSession;
+
+function terminalizeProjectTaskControlTurnAdmission(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+  terminalAt = new Date().toISOString(),
+): boolean {
+  const dispatchRoot = ds.scope === 'thread' ? ds.session.rootMessageId : undefined;
+  if (!dispatchRoot) return false;
+  const terminalized = withProjectTaskControlChatLockSync(config.session.dataDir, ds.chatId, () => {
+    const project = readProjectGroup(config.session.dataDir, ds.chatId);
+    const workstream = project?.workstreams.find(item => item.dispatchRoot === dispatchRoot);
+    const binding = workstream?.taskControl;
+    if (binding?.sourceKind !== 'project_group' || binding.mappingStatus !== 'registered'
+      || (binding.workerAppId !== ds.larkAppId && binding.reviewerAppId !== ds.larkAppId)) {
+      return false;
+    }
+    return terminalizeTaskControlTurnAdmissionSync(
+      join(config.session.dataDir, 'orchestrate-dispatch.json'),
+      {
+        messageId: turnId, chatId: ds.chatId, dispatchRoot, targetAppId: ds.larkAppId,
+        sessionId: ds.session.sessionId, workerGeneration,
+      },
+      terminalAt,
+    ) !== undefined;
+  });
+  if (terminalized) {
+    void persistProjectTaskControlSuccessCertificateIfReady({
+      dataDir: config.session.dataDir,
+      chatId: ds.chatId,
+      dispatchRoot,
+    }).catch(error => {
+      logger.warn(
+        `[task-control] automatic success certificate after turn terminal failed root=${dispatchRoot}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
+  return terminalized;
+}
+
+export const __testOnly_terminalizeProjectTaskControlTurnAdmission = terminalizeProjectTaskControlTurnAdmission;
 
 /** Fork an ordinary opening turn and release its route reservation. There is
  * deliberately no await between the final buffered-input snapshot, fork, and
@@ -19354,14 +20667,16 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   }
   let accepted = false;
   const admissionOpts: ForkWorkerOptions = {};
-  try {
-    accepted = forkWorker(ds, input, turnId ? {
-      turnId,
-      trustedCaller,
-      ...(ds.session.xpiSharedCwdAdmissionGroupId
-        ? {
-            atMostOnce: true,
-            onWorkerGenerationReserved(workerGeneration: number) {
+  const forkAtReservedBoundary = (
+    activateTaskControlClaim?: (workerGeneration: number) => void,
+  ): boolean => forkWorker(ds, input, turnId ? {
+    turnId,
+    trustedCaller,
+    ...(ds.session.xpiSharedCwdAdmissionGroupId || activateTaskControlClaim
+      ? {
+          atMostOnce: true,
+          onWorkerGenerationReserved(workerGeneration: number) {
+            if (ds.session.xpiSharedCwdAdmissionGroupId) {
               admission = claimExactXpiSharedCwdAdmission({
                 ds,
                 turnId,
@@ -19375,10 +20690,105 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
                 throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
               }
               xpiAdmissionAcquired = true;
-            },
+            }
+            activateTaskControlClaim?.(workerGeneration);
+          },
+        }
+      : {}),
+  } : false, admissionOpts);
+  try {
+    const dispatchRoot = ds.scope === 'thread' ? ds.session.rootMessageId : undefined;
+    if (turnId && dispatchRoot) {
+      accepted = withProjectTaskControlChatLockSync(config.session.dataDir, ds.chatId, () => {
+        const project = readProjectGroup(config.session.dataDir, ds.chatId);
+        if (project && daemonAbandonedTaskControlCanaryRejectsRoot(
+          project,
+          join(config.session.dataDir, 'orchestrate-dispatch.json'),
+          dispatchRoot,
+        )) {
+          throw new Error('project_task_control_canary_abandoned');
+        }
+        const workstream = project?.workstreams.find(item => item.dispatchRoot === dispatchRoot);
+        const binding = workstream?.taskControl;
+        const mappedTarget = binding?.sourceKind === 'project_group' && binding.mappingStatus === 'registered'
+          && (binding.workerAppId === ds.larkAppId || binding.reviewerAppId === ds.larkAppId);
+        if (!mappedTarget) return forkAtReservedBoundary();
+        const fenceRecord = project!.blockerRecords.find(
+          record => record.code === TASK_CONTROL_CANARY_QUARANTINE_CODE,
+        );
+        let exactPhaseAInstruction = false;
+        let exactKickoff = false;
+        if (fenceRecord) {
+          try {
+            const { fingerprint, ...rawFence } = JSON.parse(fenceRecord.summary) as Record<string, unknown>;
+            const fence = canonicalProjectTaskControlCanaryFence(rawFence as any);
+            const canonicalFingerprint = projectTaskControlCanaryFenceFingerprint(fence);
+            const phaseAOperation = readTaskControlPhaseAOperation(
+              join(config.session.dataDir, 'orchestrate-dispatch.json'),
+              fence.dispatchOperationId,
+            );
+            exactPhaseAInstruction = fingerprint === canonicalFingerprint
+              && dispatchRoot === fence.phaseA.historicalDispatchRoot
+              && binding.taskGuid === fence.phaseA.historicalTaskGuid
+              && ds.larkAppId === fence.phaseA.mappedWorkerAppId
+              && phaseAOperation?.state === 'delivered'
+              && phaseAOperation.chatId === ds.chatId
+              && phaseAOperation.fenceFingerprint === canonicalFingerprint
+              && phaseAOperation.historicalDispatchRoot === dispatchRoot
+              && phaseAOperation.historicalTaskGuid === binding.taskGuid
+              && phaseAOperation.targetAppId === ds.larkAppId
+              && phaseAOperation.payloadHash === fence.phaseA.instructionTemplateSha256
+              && phaseAOperation.messageId === turnId;
+            if (fence.kickoff) {
+              const kickoff = buildTaskControlKickoffContent({
+                title: fence.title,
+                brief: fence.kickoff.brief,
+                dispatchRoot,
+                bots: fence.kickoff.bots,
+              });
+              const kickoffOperation = readTaskControlKickoffOperation(
+                join(config.session.dataDir, 'orchestrate-dispatch.json'),
+                fence.dispatchOperationId,
+              );
+              const registered = findDispatchOperation(
+                join(config.session.dataDir, 'orchestrate-dispatch.json'),
+                fence.dispatchOperationId,
+              );
+              exactKickoff = fingerprint === canonicalFingerprint
+                && dispatchRoot !== fence.phaseA.historicalDispatchRoot
+                && registered?.dispatchRoot === dispatchRoot
+                && binding.taskGuid === fence.taskGuid
+                && (ds.larkAppId === fence.workerAppId || ds.larkAppId === fence.reviewerAppId)
+                && kickoffOperation?.state === 'delivered'
+                && kickoffOperation.chatId === ds.chatId
+                && kickoffOperation.dispatchRoot === dispatchRoot
+                && kickoffOperation.fenceFingerprint === canonicalFingerprint
+                && JSON.stringify(kickoffOperation.targetAppIds) === JSON.stringify(kickoff.targetAppIds)
+                && kickoffOperation.payloadHash === createHash('sha256').update(kickoff.content).digest('hex')
+                && kickoffOperation.messageId === turnId;
+            }
+          } catch {
+            exactPhaseAInstruction = false;
+            exactKickoff = false;
           }
-        : {}),
-    } : false, admissionOpts);
+        }
+        if (fenceRecord && !exactPhaseAInstruction && !exactKickoff) {
+          throw new Error('project_task_control_canary_fence_rejects_turn');
+        }
+        const registryPath = join(config.session.dataDir, 'orchestrate-dispatch.json');
+        const claim = {
+          messageId: turnId, chatId: ds.chatId, dispatchRoot, targetAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+        };
+        const durableClaim = claimTaskControlTurnAdmissionPendingSync(registryPath, claim);
+        if (durableClaim.state !== 'pending') return false;
+        return forkAtReservedBoundary(workerGeneration => {
+          activateTaskControlTurnAdmissionSync(registryPath, { ...claim, workerGeneration });
+        });
+      });
+    } else {
+      accepted = forkAtReservedBoundary();
+    }
   } catch (error) {
     if (turnId) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
     throw error;
@@ -19414,7 +20824,7 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   }
   rememberLastCliInput(ds, userPrompt, input);
   if (turnId && trustedCaller) {
-    setActiveInteractiveTurn(ds, turnId, trustedCaller);
+    setActiveInteractiveTurn(ds, turnId, trustedCaller, userPrompt);
   }
   ds.pendingTurnId = undefined;
   // A no-project pendingRepo fallback enters forkWorker with `session.queued`
@@ -23133,7 +24543,11 @@ async function handleBotAdded(
   },
 ): Promise<void> {
   try {
-    const projectConfig = await addProjectWorkerIfNeeded(config.session.dataDir, chatId, larkAppId);
+    const projectConfig = await addProjectWorkerIfNeeded(config.session.dataDir, chatId, larkAppId, {
+      onFencedNoop: () => logger.info(
+        `[project:${chatId.substring(0, 12)}] joined bot enrollment deferred by TaskControl canary fence: ${larkAppId}`,
+      ),
+    });
     if (projectConfig) {
       logger.info(`[project:${chatId.substring(0, 12)}] joined bot enrolled as worker: ${larkAppId}`);
     }
@@ -23981,6 +25395,16 @@ async function handleThreadReplyAdmitted(
   prepared?: PreparedThreadReply,
 ): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
+  const taskControlInboundAdmission = await awaitProjectTaskControlInboundAdmission({
+    dataDir: config.session.dataDir,
+    chatId: ctxChatId,
+    dispatchRoot: anchor,
+    targetAppId: larkAppId,
+    messageId: ctx.messageId,
+  });
+  if (taskControlInboundAdmission === 'rejected') {
+    throw new Error('project_task_control_canary_fence_rejects_turn');
+  }
   const runtimeSessionKey = sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId);
   await waitForAutoStartJoinReady(larkAppId, anchor);
   if (!prepared) await resolveNonsupportMessage(data, larkAppId);
@@ -27243,10 +28667,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     ? productionConfig
     : scopedTaskControlPlaneConfig(cfg.larkAppId);
   const taskControlFlags = taskControlConfig.flags;
+  activeTaskControlPlaneFlags = { ...taskControlFlags };
+  activeTaskControlAllowedKeyIds = productionRequested ? productionConfig.allowedKeyIds : undefined;
+  activeTaskControlRevokedKeyIds = productionRequested ? productionConfig.revokedKeyIds : undefined;
   if (taskControlConfig.disabledReason && taskControlConfig.disabledReason !== 'target_app_mismatch') {
     logger.warn(`[task-control] scope disabled: ${taskControlConfig.disabledReason}`);
   }
   taskControlIntegration = undefined;
+  projectWorkerEvidenceRelay = undefined;
+  projectCoordinator.setCompletionGateEvaluator(undefined);
+  projectCoordinator.setTaskControlSuccessEvidenceReader(undefined);
+  if (projectTaskControlAuditTimer) clearInterval(projectTaskControlAuditTimer);
+  projectTaskControlAuditTimer = undefined;
+  projectTaskControlAuditRunning = false;
   if (!taskControlFlags.ledgerEnabled) {
     // Do not create keys, databases, timers or files while the feature is off.
     // A deliberately empty verifier keeps the disabled lifecycle inert.
@@ -27277,18 +28710,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, flags: taskControlFlags,
         authority: taskControlBridge?.authority ?? new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
         logger, deferStart: true,
-        deliver: production ? row => productionIntegration?.deliver(row) ?? Promise.resolve({ kind: 'retry' as const, error: 'integration_unavailable' }) : undefined,
+        deliver: production && taskControlFlags.pumpEnabled
+          ? row => productionIntegration?.deliver(row) ?? Promise.resolve({ kind: 'retry' as const, error: 'integration_unavailable' })
+          : undefined,
         collect: () => shadowCollector?.collectAll() ?? productionIntegration?.collectAll() ?? Promise.resolve(),
       });
       const taskControlStore = taskControlPlane.getStore();
       if (!taskControlStore) throw new Error('task_control_store_unavailable');
       if (production) {
+        const projectReviewerTrust = createDaemonReviewerVerdictVerifier({
+          hostSecret: hostSecret!, previousHostSecret, controllerBotAppId: cfg.larkAppId,
+          allowedKeyIds: productionConfig.allowedKeyIds, revokedKeyIds: productionConfig.revokedKeyIds,
+        });
         productionIntegration = new DaemonTaskControlIntegration({
           dataDir: config.session.dataDir, larkAppId: cfg.larkAppId, lifecycle: taskControlPlane, store: taskControlStore,
           bridge: taskControlBridge!, logger,
           mappingTrust: new TaskControlMappingTrust({ hostSecret: hostSecret!, previousHostSecret, larkAppId: cfg.larkAppId }),
           receiptAllowedKeyIds: productionConfig.allowedKeyIds,
           receiptRevokedKeyIds: productionConfig.revokedKeyIds,
+          projectReviewerTrust,
           controlledWriteback: taskControlFlags.pumpEnabled,
           isLiveReceiptOwner: ({ sessionId, workerGeneration }) => {
             const live = findActiveBySessionId(sessionId);
@@ -27297,7 +28737,334 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               && live.session.workerGeneration === workerGeneration;
           },
         });
+        productionIntegration.setReviewerVerdictVerifier(projectReviewerTrust);
+        projectCoordinator.setTaskControlSuccessEvidenceReader(
+          input => taskControlStore.readTaskControlSuccessEvidence(input),
+        );
+        projectCoordinator.setCompletionGateEvaluator(({ parentProject, gate, sourceProject, checkedAt }) => (
+          evaluateProjectCompletionGate({
+            parentLarkAppId: parentProject.larkAppId,
+            gate,
+            sourceProject,
+            reader: taskControlStore,
+            checkedAt,
+            staleExecutionMs: 30 * 60_000,
+          })
+        ));
         taskControlIntegration = productionIntegration;
+        const projectIntegration = productionIntegration;
+        const evidenceTrust = new ProjectWorkerEvidenceTrust({
+          hostSecret: hostSecret!, previousHostSecret, sourceAppId: cfg.larkAppId,
+        });
+        projectWorkerEvidenceRelay = new ProjectWorkerEvidenceRelay({
+          store: taskControlStore,
+          trust: evidenceTrust,
+          allowedKeyIds: productionConfig.allowedKeyIds,
+          revokedKeyIds: productionConfig.revokedKeyIds,
+          onOverflow: evidence => {
+            taskControlPlane?.enqueueUnknownObservation({
+              eventId: `tcp-project-evidence-overflow:${evidence.evidenceId}`,
+              attemptedEventType: projectWorkerEvidenceAttemptedEventType(evidence),
+              sourceRef: `project-worker-evidence:${evidence.evidenceId}`,
+              idempotencyKey: `tcp-project-evidence-overflow:${evidence.evidenceId}`,
+              occurredAt: evidence.occurredAt,
+              payload: {
+                source: 'project_worker_evidence_backlog', dispatchRoot: evidence.dispatchRoot,
+                eventKind: evidence.eventKind, referenceOnly: true,
+              },
+            });
+            logger.warn(`[task-control] project evidence backlog full root=${evidence.dispatchRoot}`);
+          },
+          deliver: async (evidence, signal) => {
+            const target = findOnlineDaemon(evidence.controllerAppId);
+            if (!target) throw new Error('controller_daemon_offline');
+            const response = await fetchDaemonIpc(target.ipcPort, PROJECT_WORKER_EVIDENCE_ROUTE, {
+              signal,
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ evidence }),
+            });
+            const body = await response.json().catch(() => ({})) as { ok?: boolean; receiptRef?: string; error?: string };
+            if (!response.ok || body.ok !== true || !body.receiptRef) {
+              throw new Error(body.error ?? `controller_http_${response.status}`);
+            }
+            return body.receiptRef;
+          },
+        });
+        projectWorkerEvidenceRelay.start();
+        if (!taskControlFlags.shadowEnabled && !taskControlFlags.pumpEnabled && !taskControlFlags.freezeEnforcement) {
+          const auditProjectGroups = async (): Promise<void> => {
+            if (projectTaskControlAuditRunning) return;
+            projectTaskControlAuditRunning = true;
+            try {
+              for (const project of listProjectGroups(config.session.dataDir)) {
+                if (project.larkAppId !== cfg.larkAppId
+                  || readGroupCollaborationMode(config.session.dataDir, project.chatId)?.taskControlPlane?.mode !== 'audit_only') continue;
+                const reconciliation = planProjectGroupTaskControlReconciliation({
+                  project, reader: taskControlStore, now: Date.now(),
+                  acceptanceTimeoutMs: 30 * 60_000, staleExecutionMs: 30 * 60_000,
+                  findDispatchOperation: operationId => findDispatchOperation(
+                    join(config.session.dataDir, 'orchestrate-dispatch.json'), operationId,
+                  ),
+                });
+                for (const action of reconciliation.actions) {
+                  if (action.kind === 'recover_dispatch') {
+                    const reservation = project.dispatchReservations?.find(item => item.reservationId === action.reservationId);
+                    if (!reservation?.taskControl?.recovery) continue;
+                    const recoveryTrust = new TaskControlMappingTrust({
+                      hostSecret: hostSecret!, previousHostSecret, larkAppId: project.larkAppId,
+                    });
+                    const recoveryFacts: ProjectDispatchReservationFactsV1 = {
+                      schemaVersion: 'ProjectDispatchReservation.v1', larkAppId: project.larkAppId,
+                      chatId: project.chatId, coordinatorSessionId: reservation.taskControl.coordinatorSessionId ?? project.coordinatorSessionId,
+                      originTurnId: reservation.taskControl.originTurnId, reservationId: reservation.reservationId,
+                      taskGuid: reservation.taskControl.taskGuid, phaseId: reservation.taskControl.phaseId,
+                      workerAppId: reservation.taskControl.workerAppId, reviewerAppId: reservation.taskControl.reviewerAppId,
+                      acceptorAppId: reservation.taskControl.acceptorAppId, access: reservation.access,
+                      createdAt: reservation.createdAt, expiresAt: reservation.expiresAt,
+                      dispatch: reservation.taskControl.recovery,
+                    };
+                    if (!recoveryTrust.verifyProjectDispatchReservation(reservation.taskControl.proof, recoveryFacts, {
+                      allowedKeyIds: activeTaskControlAllowedKeyIds,
+                      revokedKeyIds: activeTaskControlRevokedKeyIds,
+                    })) {
+                      logger.warn(`[task-control] project seed recovery proof rejected chat=${project.chatId} reservation=${action.reservationId}`);
+                      continue;
+                    }
+                    let dispatchRoot = action.dispatchRoot;
+                    if (action.discoverRoot) {
+                      if (!action.seedText || Date.now() >= Date.parse(reservation.expiresAt)) {
+                        logger.warn(`[task-control] project seed recovery expired chat=${project.chatId} reservation=${action.reservationId}`);
+                        continue;
+                      }
+                      const recoveredSeed = await recoverProjectTaskControlSeed({
+                        registryPath: join(config.session.dataDir, 'orchestrate-dispatch.json'),
+                        operationId: action.reservationId,
+                        sourceAppId: project.larkAppId,
+                        targetChatId: project.chatId,
+                        seedText: action.seedText,
+                        attempt: taskControlProviderAttemptCoordinates(),
+                      });
+                      if (recoveredSeed.state === 'ambiguous') {
+                        logger.warn(
+                          `[task-control] project seed recovery ambiguous chat=${project.chatId} `
+                          + `reservation=${action.reservationId}`,
+                        );
+                        continue;
+                      }
+                      dispatchRoot = recoveredSeed.dispatchRoot;
+                    }
+                    const root = projectGroupRootSnapshotFromLarkDetail(
+                      await getMessageDetail(project.larkAppId, dispatchRoot),
+                    );
+                    const controllerBotOpenId = getBot(project.larkAppId).botOpenId;
+                    if (!root || root.chatId !== project.chatId
+                      || root.senderId !== controllerBotOpenId
+                      || (reservation.stage === 'root_created' && reservation.rootCreateTime !== root.createTime)) {
+                      logger.warn(`[task-control] project reconcile root unproven chat=${project.chatId} root=${dispatchRoot}`);
+                      continue;
+                    }
+                    if (action.registryMissing) {
+                      const issuedAt = new Date().toISOString();
+                      const reportBinding = createDispatchReportBinding(
+                        loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+                        {
+                          dispatchRoot, targetLarkAppId: project.larkAppId,
+                          targetSessionId: project.coordinatorSessionId, targetChatId: project.chatId,
+                          targetScope: 'chat', sourceName: action.title, issuedAt,
+                        },
+                      );
+                      await recordDispatchRegistryEntry(
+                        join(config.session.dataDir, 'orchestrate-dispatch.json'),
+                        dispatchRoot,
+                        {
+                          orchRoot: '', orchChatId: project.chatId, orchScope: 'chat',
+                          orchAppId: project.larkAppId, orchSessionId: reservation.taskControl.coordinatorSessionId,
+                          targetChatId: project.chatId, targetAppIds: action.targetAppIds,
+                          access: reservation.access, workerAppIds: action.workerAppIds,
+                          reviewerAppIds: action.reviewerAppIds,
+                          taskControl: {
+                            mode: 'audit_only', taskGuid: reservation.taskControl.taskGuid,
+                            phaseId: reservation.taskControl.phaseId, controllerAppId: project.larkAppId,
+                            workerAppId: reservation.taskControl.workerAppId,
+                            reviewerAppId: reservation.taskControl.reviewerAppId,
+                            acceptorAppId: reservation.taskControl.acceptorAppId,
+                          },
+                          title: action.title, purpose: action.purpose, owners: action.owners,
+                          bots: action.botOpenIds, ...initialDispatchLifecycle(action.acceptanceRequested),
+                          createdAt: issuedAt, updatedAt: issuedAt, reportBinding,
+                          dispatchOperationId: action.reservationId,
+                        },
+                      );
+                    }
+                    if (action.bindRoot) {
+                      await projectCoordinator.run({
+                        dataDir: config.session.dataDir, chatId: project.chatId, larkAppId: project.larkAppId,
+                        coordinatorSessionId: project.coordinatorSessionId,
+                      }, {
+                        action: 'bind_dispatch_root', reservationId: action.reservationId,
+                        targetAppIds: action.targetAppIds, dispatchRoot,
+                        rootCreateTime: root.createTime,
+                      });
+                    }
+                    await projectCoordinator.run({
+                      dataDir: config.session.dataDir, chatId: project.chatId, larkAppId: project.larkAppId,
+                      coordinatorSessionId: project.coordinatorSessionId,
+                    }, {
+                      action: 'commit_dispatch', reservationId: action.reservationId,
+                      targetAppIds: action.targetAppIds, dispatchRoot,
+                      title: action.title, purpose: action.purpose, owners: action.owners,
+                      workerAppIds: action.workerAppIds, reviewerAppIds: action.reviewerAppIds,
+                    });
+                  } else if (action.kind === 'recover_mapping') {
+                    const latestProject = readProjectGroup(config.session.dataDir, project.chatId);
+                    const workstream = latestProject?.workstreams.find(item => item.dispatchRoot === action.dispatchRoot);
+                    const binding = workstream?.taskControl;
+                    const access = workstream?.access;
+                    const root = projectGroupRootSnapshotFromLarkDetail(
+                      await getMessageDetail(project.larkAppId, action.dispatchRoot),
+                    );
+                    const controllerBotOpenId = getBot(project.larkAppId).botOpenId;
+                    if (!latestProject || !workstream || !binding || !binding.recovery
+                      || !access || !root || !controllerBotOpenId) {
+                      logger.warn(`[task-control] project mapping recovery unavailable chat=${project.chatId} root=${action.dispatchRoot}`);
+                      continue;
+                    }
+                    const mappingTrust = new TaskControlMappingTrust({
+                      hostSecret: hostSecret!, previousHostSecret, larkAppId: project.larkAppId,
+                    });
+                    const resolved = resolveProjectGroupMappingFacts({
+                      selfLarkAppId: project.larkAppId, controllerBotOpenId, now: new Date().toISOString(), recovery: true,
+                      liveSession: {
+                        larkAppId: project.larkAppId, chatId: project.chatId,
+                        sessionId: latestProject.coordinatorSessionId, workerGeneration: 0, turnCapability: '',
+                      },
+                      project: {
+                        chatId: latestProject.chatId, larkAppId: latestProject.larkAppId,
+                        coordinatorSessionId: latestProject.coordinatorSessionId, revision: binding.projectRevision,
+                      },
+                      reservation: {
+                        schemaVersion: 'ProjectDispatchReservation.v1', larkAppId: project.larkAppId,
+                        chatId: project.chatId, coordinatorSessionId: binding.coordinatorSessionId,
+                        originTurnId: binding.originTurnId, reservationId: binding.reservationId,
+                        taskGuid: binding.taskGuid, phaseId: binding.phaseId,
+                        workerAppId: binding.workerAppId, reviewerAppId: binding.reviewerAppId,
+                        acceptorAppId: binding.acceptorAppId, access,
+                        createdAt: binding.reservationCreatedAt, expiresAt: binding.reservationExpiresAt,
+                        dispatch: binding.recovery,
+                        taskControlMode: 'audit_only', stage: 'root_created',
+                        targetAppIds: workstream.targetAppIds ?? [], dispatchRoot: action.dispatchRoot,
+                        rootCreateTime: binding.rootCreateTime, proof: binding.reservationProof,
+                      },
+                      root,
+                      allowedWorkerAppIds: readGroupCollaborationMode(config.session.dataDir, project.chatId)?.workerAppIds ?? [],
+                      verifyReservationProof: (facts, proof) => mappingTrust.verifyProjectDispatchReservation(proof, facts, {
+                        allowedKeyIds: activeTaskControlAllowedKeyIds,
+                        revokedKeyIds: activeTaskControlRevokedKeyIds,
+                      }),
+                    });
+                    if (!resolved.ok || !projectIntegration.registerMapping(action.dispatchRoot, {
+                      projectId: resolved.ok ? resolved.facts.projectId : '',
+                      phaseId: resolved.ok ? resolved.facts.phaseId : '',
+                      phaseTaskGuids: resolved.ok ? [resolved.facts.taskGuid] : [],
+                      taskGuid: resolved.ok ? resolved.facts.taskGuid : '',
+                      topicRootId: action.dispatchRoot,
+                      ownerId: resolved.ok ? resolved.facts.workerAppId : '',
+                      reviewerId: resolved.ok ? resolved.facts.reviewerAppId : '',
+                      acceptorId: resolved.ok ? resolved.facts.acceptorAppId : '',
+                      registrationRef: `topic-message:${action.dispatchRoot}`,
+                      mappingAuthority: {
+                        kind: 'project_group', chatId: project.chatId, reservationId: binding.reservationId,
+                        projectRevision: binding.projectRevision, acceptorAppId: binding.acceptorAppId, mode: 'audit_only',
+                      },
+                    }, project.larkAppId)) {
+                      logger.warn(`[task-control] project mapping recovery rejected chat=${project.chatId} root=${action.dispatchRoot} reason=${resolved.ok ? 'mapping_rejected' : resolved.error}`);
+                      continue;
+                    }
+                    await projectCoordinator.run({
+                      dataDir: config.session.dataDir, chatId: project.chatId, larkAppId: project.larkAppId,
+                      coordinatorSessionId: latestProject.coordinatorSessionId,
+                    }, {
+                      action: 'mark_task_control_mapping', dispatchRoot: action.dispatchRoot,
+                      taskGuid: binding.taskGuid, mappingRef: binding.mappingRef,
+                      status: 'registered', registeredAt: new Date().toISOString(),
+                    });
+                    projectIntegration.dispatchRequested(
+                      action.dispatchRoot, latestProject.coordinatorSessionId, new Date().toISOString(),
+                    );
+                  } else if (action.kind === 'mark_mapping_registered') {
+                    await projectCoordinator.run({
+                      dataDir: config.session.dataDir, chatId: project.chatId, larkAppId: project.larkAppId,
+                      coordinatorSessionId: project.coordinatorSessionId,
+                    }, {
+                      action: 'mark_task_control_mapping', dispatchRoot: action.dispatchRoot,
+                      taskGuid: action.taskGuid, mappingRef: action.mappingRef, status: 'registered',
+                      registeredAt: new Date().toISOString(),
+                    });
+                    projectIntegration.dispatchRequested(
+                      action.dispatchRoot, project.coordinatorSessionId, new Date().toISOString(),
+                    );
+                  } else if (action.kind === 'dispatch_requested') {
+                    projectIntegration.dispatchRequested(
+                      action.dispatchRoot, action.sourceSessionId, action.occurredAt,
+                    );
+                  } else if (!projectIntegration.applyProjectReconcileAction(action)) {
+                    logger.warn(`[task-control] project reconcile rejected chat=${project.chatId} action=${action.kind} root=${action.dispatchRoot}`);
+                  }
+                }
+                const certificate = await persistProjectTaskControlSuccessCertificateIfReady({
+                  dataDir: config.session.dataDir,
+                  chatId: project.chatId,
+                });
+                if (certificate.state === 'persisted') {
+                  logger.info(
+                    `[task-control] success certificate persisted chat=${project.chatId} `
+                    + `hash=${certificate.certificateHash}`,
+                  );
+                }
+                const audit = auditProjectGroupTaskControl({
+                  project, reader: taskControlStore, now: Date.now(), staleExecutionMs: 30 * 60_000,
+                });
+                if (audit.diffs.length > 0) {
+                  logger.warn(`[task-control] project audit chat=${project.chatId} ${JSON.stringify(audit.diffs)}`);
+                }
+              }
+              const checkedAt = new Date().toISOString();
+              await syncProjectCompletionGates({
+                projects: listProjectGroups(config.session.dataDir),
+                larkAppId: cfg.larkAppId,
+                reader: taskControlStore,
+                checkedAt,
+                staleExecutionMs: 30 * 60_000,
+                apply: async (parent, evaluation) => {
+                  const current = parent.completionGates?.find(gate => gate.gateId === evaluation.gateId);
+                  const materialChange = current?.status !== evaluation.status
+                    || current.reason !== evaluation.reason
+                    || JSON.stringify(current.evidence ?? null) !== JSON.stringify(evaluation.evidence ?? null);
+                  const context = {
+                    dataDir: config.session.dataDir, chatId: parent.chatId,
+                    larkAppId: parent.larkAppId, coordinatorSessionId: parent.coordinatorSessionId,
+                  };
+                  try {
+                    await projectCoordinator.run(context, { action: 'sync_completion_gate', ...evaluation });
+                    if (materialChange) await projectCoordinator.run(context, { action: 'refresh' });
+                  } catch (error) {
+                    logger.warn(
+                      `[task-control] completion gate sync rejected chat=${parent.chatId} gate=${evaluation.gateId}: `
+                      + `${error instanceof Error ? error.message : String(error)}`,
+                    );
+                  }
+                },
+              });
+            } catch (error) {
+              logger.warn(`[task-control] project audit failed: ${String(error)}`);
+            } finally {
+              projectTaskControlAuditRunning = false;
+            }
+          };
+          void auditProjectGroups();
+          projectTaskControlAuditTimer = setInterval(() => { void auditProjectGroups(); }, 15_000);
+          projectTaskControlAuditTimer.unref?.();
+        }
       } else {
         shadowCollector = new DaemonTaskControlShadowCollector({
           larkAppId: cfg.larkAppId, taskGuid: shadowTaskGuid!, lifecycle: taskControlPlane, logger,
@@ -27310,10 +29077,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       taskControlPlane.activate();
     } catch (error) {
       logger.warn(`[task-control] trust bootstrap failed; continuing with ledger disabled: ${String(error)}`);
+      projectCoordinator.setCompletionGateEvaluator(undefined);
+      projectCoordinator.setTaskControlSuccessEvidenceReader(undefined);
+      activeTaskControlPlaneFlags = { ledgerEnabled: false, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false };
+      activeTaskControlAllowedKeyIds = undefined;
+      activeTaskControlRevokedKeyIds = undefined;
       taskControlPlane = await startTaskControlPlaneRuntime({
         dataDir: config.session.dataDir, flags: { ...taskControlFlags, ledgerEnabled: false }, logger,
         authority: new DaemonTaskControlAuthority({ resolvePrincipal: () => undefined }),
       });
+      projectWorkerEvidenceRelay = undefined;
     }
   }
   // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
@@ -27772,6 +29545,75 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
     },
   );
+  const captureProjectWorkerEvidence = (
+    ds: DaemonSession,
+    input: { eventKind: 'accepted' | 'execution_started' | 'terminal'; sourceTurnId: string }
+      & Partial<Pick<ProjectWorkerEvidenceFactsV1, 'terminalStatus' | 'finalOutputPresent'>>
+      & { terminalTurnOrigin?: NonNullable<DaemonSession['terminalTurnOrigin']> }
+      & { workerGeneration: number },
+  ): boolean => {
+    const dispatchRoot = ds.session.rootMessageId;
+    if (!dispatchRoot) return false;
+    let entry: Record<string, unknown> | undefined;
+    try {
+      const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8')) as Record<string, unknown>;
+      const candidate = registry[dispatchRoot];
+      entry = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+        ? candidate as Record<string, unknown>
+        : undefined;
+    } catch { return false; }
+    const taskControl = entry?.taskControl && typeof entry.taskControl === 'object' && !Array.isArray(entry.taskControl)
+      ? entry.taskControl as Record<string, unknown>
+      : undefined;
+    if (!taskControl || taskControl.mode !== 'audit_only') return false;
+    const evidencePolicy = evaluateProjectTaskControlEvidencePolicy({
+      config: readGroupCollaborationMode(config.session.dataDir, ds.chatId),
+      chatId: ds.chatId, sourceAppId: ds.larkAppId, eventKind: input.eventKind, taskControl,
+    });
+    if (!evidencePolicy.ok) return false;
+    const controllerAppId = evidencePolicy.controllerAppId;
+    const liveTurnOrigin = ds.managedTurnOrigin
+      ? {
+          turnId: ds.managedTurnOrigin.turnId,
+          dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt,
+          workerGeneration: ds.workerGeneration,
+        }
+      : undefined;
+    const turnOrigin = input.eventKind === 'terminal'
+      ? input.terminalTurnOrigin
+      : liveTurnOrigin;
+    const dispatchAttempt = turnOrigin?.dispatchAttempt ?? 1;
+    if (!projectWorkerEvidenceRelay || !controllerAppId || !isProjectWorkerEvidenceLiveTurn({
+      liveTurnId: turnOrigin?.turnId,
+      liveDispatchAttempt: turnOrigin?.dispatchAttempt,
+      liveWorkerGeneration: turnOrigin?.workerGeneration,
+      persistedWorkerGeneration: ds.session.workerGeneration,
+      sourceTurnId: input.sourceTurnId,
+      dispatchAttempt,
+      workerGeneration: input.workerGeneration,
+    })) {
+      logger.warn(`[task-control] project evidence unavailable root=${dispatchRoot}`);
+      return false;
+    }
+    try {
+      projectWorkerEvidenceRelay.capture({
+        schemaVersion: 'ProjectWorkerEvidence.v1', eventKind: input.eventKind,
+        sourceAppId: ds.larkAppId, controllerAppId,
+        sourceSessionId: ds.session.sessionId, sourceTurnId: input.sourceTurnId,
+        workerGeneration: input.workerGeneration, dispatchAttempt, dispatchRoot,
+        occurredAt: new Date().toISOString(),
+        ...(input.terminalStatus ? { terminalStatus: input.terminalStatus } : {}),
+        ...(input.finalOutputPresent !== undefined ? { finalOutputPresent: input.finalOutputPresent } : {}),
+      });
+      void projectWorkerEvidenceRelay.flushOnce().catch(error => {
+        logger.warn(`[task-control] project evidence flush failed: ${String(error)}`);
+      });
+    } catch (error) {
+      logger.warn(`[task-control] project evidence capture failed: ${String(error)}`);
+    }
+    return true;
+  };
+
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -27812,12 +29654,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }).then(() => undefined);
     },
     onTurnInputCommitted(ds, context) {
+      if (captureProjectWorkerEvidence(ds, { eventKind: 'accepted', ...context, sourceTurnId: context.turnId })) return;
       taskControlIntegration?.workerAccepted(
         ds.session.rootMessageId ?? '',
         `input-commit:${ds.session.sessionId}:${context.workerGeneration}:${context.turnId}`,
       );
     },
     onTurnExecutionStarted(ds, context) {
+      if (captureProjectWorkerEvidence(ds, { eventKind: 'execution_started', ...context, sourceTurnId: context.turnId })) return;
       taskControlIntegration?.workerExecutionStarted(
         ds.session.rootMessageId ?? '',
         `execution:${ds.session.sessionId}:${context.workerGeneration}:${context.turnId}`,
@@ -27894,11 +29738,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     },
     async onTurnTerminal(ds, terminal, context) {
-      taskControlIntegration?.terminalWithoutRevision(
-        ds.session.rootMessageId ?? '',
-        `terminal:${ds.session.sessionId}:${context.workerGeneration}:${terminal.turnId}`,
-        { sessionId: ds.session.sessionId, workerGeneration: context.workerGeneration, reason: 'terminal_doc_revision_unavailable' },
-      );
+      try {
+        terminalizeProjectTaskControlTurnAdmission(
+          ds, terminal.turnId, context.workerGeneration,
+          new Date(terminal.completedAtMs ?? Date.now()).toISOString(),
+        );
+      } catch (error) {
+        logger.error(
+          `[task-control] failed to terminalize turn admission ${terminal.turnId.slice(0, 12)}: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      const projectEvidenceCaptured = captureProjectWorkerEvidence(ds, {
+        eventKind: 'terminal', sourceTurnId: terminal.turnId, workerGeneration: context.workerGeneration,
+        terminalTurnOrigin: context.terminalTurnOrigin,
+        terminalStatus: terminal.status === 'completed'
+          ? 'completed'
+          : terminal.status === 'failed'
+            ? 'failed'
+            : 'interrupted',
+        finalOutputPresent: false,
+      });
+      if (!projectEvidenceCaptured) {
+        taskControlIntegration?.terminalWithoutRevision(
+          ds.session.rootMessageId ?? '',
+          `terminal:${ds.session.sessionId}:${context.workerGeneration}:${terminal.turnId}`,
+          { sessionId: ds.session.sessionId, workerGeneration: context.workerGeneration, reason: 'terminal_doc_revision_unavailable' },
+        );
+      }
       // Release only the exact XPI shared-cwd admission. Route/principal
       // authority below has its own lifecycle and is deliberately independent.
       onXpiSharedCwdTurnTerminal(ds, terminal, context);
@@ -28171,6 +30038,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // connection already sees the not-ready gate.
   if (coreOnly) armCoreOnlyReadinessGate();
   setCrossPrincipalInterruptionDisableHandler(() => cancelAllCrossPrincipalInterruptionsForFeatureDisable());
+  setTaskControlCanaryPhaseASendHandler(input => {
+    const bootId = readLinuxBootIdentity();
+    if (!bootId) throw new Error('project_task_control_phase_a_identity_unavailable');
+    return deliverProjectTaskControlPhaseAInstruction({
+      context: {
+        dataDir: input.dataDir,
+        chatId: input.chatId,
+        larkAppId: input.larkAppId,
+        coordinatorSessionId: input.coordinatorSessionId,
+      },
+      fenceFingerprint: input.fenceFingerprint,
+      instructionTemplateSha256: input.instructionTemplateSha256,
+      attempt: {
+        wallTime: new Date().toISOString(),
+        bootId,
+        processStartedAt: taskControlPhaseAProcessStartedAt,
+        monotonicMs: performance.now(),
+      },
+    });
+  });
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
@@ -29619,9 +31506,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
+    if (projectTaskControlAuditTimer) clearInterval(projectTaskControlAuditTimer);
+    projectTaskControlAuditTimer = undefined;
+    projectTaskControlAuditRunning = false;
     // The task-control ledger is an optional sidecar.  It drains/owns only its
     // own outbox; failure is contained so existing daemon shutdown semantics do
     // not depend on this default-off feature.
+    try { await projectWorkerEvidenceRelay?.close(remainingBudget()); }
+    catch (error) { logger.warn(`[task-control] project evidence relay close failed: ${String(error)}`); }
     try { await taskControlPlane?.close(remainingBudget()); }
     catch (error) { logger.warn(`[task-control] shutdown close failed: ${String(error)}`); }
 
@@ -29668,9 +31560,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   process.on('exit', () => {
     setSupervisorShutdownHandler(null);
     setCrossPrincipalInterruptionDisableHandler(null);
+    setTaskControlCanaryPhaseASendHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
+    if (projectTaskControlAuditTimer) clearInterval(projectTaskControlAuditTimer);
+    projectTaskControlAuditRunning = false;
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }

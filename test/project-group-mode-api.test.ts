@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getProjectGroupMode, putProjectGroupMode } from '../src/dashboard/project-group-mode-api.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
+  evaluateProjectTaskControlEvidencePolicy,
   readGroupCollaborationMode,
   writeGroupCollaborationMode,
   writeProjectOnboardingCard,
@@ -29,6 +30,8 @@ function fixture() {
       memberBots: [
         { larkAppId: 'cli_coordinator', botName: 'nodex', inChat: true },
         { larkAppId: 'cli_worker', botName: 'Seed Bot', inChat: true },
+        { larkAppId: 'cli_reviewer', botName: 'Reviewer Bot', inChat: true },
+        { larkAppId: 'cli_acceptor', botName: 'Acceptor Bot', inChat: true },
         { larkAppId: 'cli_elsewhere', inChat: false },
       ],
     }],
@@ -37,6 +40,19 @@ function fixture() {
 }
 
 describe('project group mode dashboard API', () => {
+  it('fails closed when the public API attempts an audit-only enable without the internal CAS', async () => {
+    const f = fixture();
+    expect(await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator',
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'],
+      taskControlPlane: { mode: 'audit_only', acceptorAppId: 'cli_acceptor', maxActiveMappings: 1 },
+    }, f)).toMatchObject({
+      status: 409,
+      body: { ok: false, error: 'project_task_control_config_cas_required' },
+    });
+    expect(readGroupCollaborationMode(f.dataDir, 'oc_project')).toBeUndefined();
+  });
+
   it('creates the waiting-to-start guide for a configured group without project content', async () => {
     const f = fixture();
     const ensureOnboardingCard = vi.fn(async (chatId: string, coordinatorAppId: string) => {
@@ -79,6 +95,86 @@ describe('project group mode dashboard API', () => {
       schemaVersion: 1, templateId: 'compact-list', sections: ['goal', 'workstreams'], milestonesExpanded: false,
     });
     expect(statSync(join(f.dataDir, 'group-collaboration-modes.json')).mode & 0o777).toBe(0o600);
+  });
+
+  it('validates an exact audit-only policy but requires the internal fenced CAS to persist it', async () => {
+    const f = fixture();
+    const result = await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator',
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'],
+      taskControlPlane: { mode: 'audit_only', acceptorAppId: 'cli_acceptor', maxActiveMappings: 1 },
+    }, f);
+    expect(result).toMatchObject({
+      status: 409, body: { ok: false, error: 'project_task_control_config_cas_required' },
+    });
+    expect(readGroupCollaborationMode(f.dataDir, 'oc_project')).toBeUndefined();
+
+    expect(await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker', 'cli_reviewer'],
+      taskControlPlane: { mode: 'audit_only', acceptorAppId: 'cli_missing', maxActiveMappings: 1 },
+    }, f)).toMatchObject({ status: 409, body: { error: 'task_control_acceptor_not_in_workers' } });
+    expect(await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker', 'cli_reviewer'],
+      taskControlPlane: { mode: 'audit_only', acceptorAppId: 'cli_worker', maxActiveMappings: 2 },
+    }, f)).toMatchObject({ status: 400, body: { error: 'invalid_task_control_plane_config' } });
+  });
+
+  it('fails closed when a directly edited TaskControl policy contains unknown fields', () => {
+    const f = fixture();
+    writeFileSync(join(f.dataDir, 'group-collaboration-modes.json'), JSON.stringify({
+      schemaVersion: 1,
+      configs: {
+        oc_project: {
+          schemaVersion: 1, chatId: 'oc_project', mode: 'project', coordinatorAppId: 'cli_coordinator',
+          workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'],
+          taskControlPlane: {
+            mode: 'audit_only', acceptorAppId: 'cli_acceptor', maxActiveMappings: 1, writeback: true,
+          },
+          createdAt: '2026-09-29T00:00:00.000Z', updatedAt: '2026-09-29T00:00:00.000Z',
+        },
+      },
+    }));
+    expect(() => readGroupCollaborationMode(f.dataDir, 'oc_project'))
+      .toThrow('group-collaboration-modes.json has invalid taskControlPlane config');
+
+    writeFileSync(join(f.dataDir, 'group-collaboration-modes.json'), JSON.stringify({
+      schemaVersion: 1,
+      configs: {
+        oc_project: {
+          schemaVersion: 1, chatId: 'oc_project', mode: 'project', coordinatorAppId: 'cli_coordinator',
+          workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'],
+          taskControlPlane: { mode: 'audit_only', acceptorAppId: 'cli_acceptor', maxActiveMappings: 1 },
+          createdAt: '2026-09-29T00:00:00.000Z', updatedAt: '2026-09-29T00:00:00.000Z',
+          unexpectedTopLevel: true,
+        },
+      },
+    }));
+    expect(() => readGroupCollaborationMode(f.dataDir, 'oc_project'))
+      .toThrow('group-collaboration-modes.json has invalid taskControlPlane config');
+  });
+
+  it.each([
+    { coordinatorAppId: 'cli_coordinator', acceptorAppId: 'cli_ghost' },
+    { coordinatorAppId: 'cli_acceptor', acceptorAppId: 'cli_acceptor' },
+  ])('fails closed for an invalid directly edited acceptor relation: %o', relation => {
+    const f = fixture();
+    const config = {
+      schemaVersion: 1 as const, chatId: 'oc_project', mode: 'project' as const,
+      coordinatorAppId: relation.coordinatorAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'],
+      taskControlPlane: { mode: 'audit_only' as const, acceptorAppId: relation.acceptorAppId, maxActiveMappings: 1 as const },
+      createdAt: '2026-09-29T00:00:00.000Z', updatedAt: '2026-09-29T00:00:00.000Z',
+    };
+    writeFileSync(join(f.dataDir, 'group-collaboration-modes.json'), JSON.stringify({
+      schemaVersion: 1, configs: { oc_project: config },
+    }));
+    expect(() => readGroupCollaborationMode(f.dataDir, 'oc_project'))
+      .toThrow('group-collaboration-modes.json has invalid taskControlPlane config');
+    expect(evaluateProjectDispatchPolicy({
+      config, sourceAppId: relation.coordinatorAppId, sourceChatId: 'oc_project', targetChatId: 'oc_project',
+      targetAppIds: ['cli_worker', 'cli_reviewer'], hasLegacyBots: false, title: '任务',
+      writeScopes: ['/repo/src'], taskControlMode: 'audit_only',
+    })).toEqual({ ok: false, error: 'project_task_control_not_configured' });
   });
 
   it('rejects project content fields and bots outside the group', async () => {
@@ -177,6 +273,69 @@ describe('project dispatch policy', () => {
     updatedAt: '2026-09-07T00:00:00.000Z',
   };
 
+  it('requires an explicit configured audit-only intent without widening legacy dispatch', () => {
+    const auditConfig = {
+      ...config,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'],
+      taskControlPlane: { mode: 'audit_only' as const, acceptorAppId: 'cli_acceptor', maxActiveMappings: 1 as const },
+    };
+    const base = {
+      config: auditConfig, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
+      targetAppIds: ['cli_worker', 'cli_reviewer'], hasLegacyBots: false, title: '任务', writeScopes: ['/repo/src'],
+      assignedAppIds: ['cli_worker', 'cli_reviewer'],
+    };
+    expect(evaluateProjectDispatchPolicy({ ...base, taskControlMode: 'audit_only' })).toEqual({
+      ok: true, projectMode: true, taskControlMode: 'audit_only', acceptorAppId: 'cli_acceptor', maxActiveMappings: 1,
+    });
+    expect(evaluateProjectDispatchPolicy({
+      ...base, config: { ...config, workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'] },
+      taskControlMode: 'audit_only',
+    })).toEqual({
+      ok: false, error: 'project_task_control_not_configured',
+    });
+    expect(evaluateProjectDispatchPolicy({ ...base, taskControlMode: undefined })).toEqual({ ok: true, projectMode: true });
+  });
+
+  it('accepts project evidence only for the exact chat and configured role partition', () => {
+    const configWithTaskControl = {
+      ...config,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'],
+      taskControlPlane: { mode: 'audit_only' as const, acceptorAppId: 'cli_acceptor', maxActiveMappings: 1 as const },
+    };
+    const taskControl = {
+      mode: 'audit_only' as const, controllerAppId: 'cli_coordinator', workerAppId: 'cli_worker',
+      reviewerAppId: 'cli_reviewer', acceptorAppId: 'cli_acceptor',
+    };
+    expect(evaluateProjectTaskControlEvidencePolicy({
+      config: configWithTaskControl, chatId: 'oc_project', sourceAppId: 'cli_worker',
+      eventKind: 'accepted', taskControl,
+    })).toEqual({ ok: true, controllerAppId: 'cli_coordinator' });
+    expect(evaluateProjectTaskControlEvidencePolicy({
+      config: configWithTaskControl, chatId: 'oc_project', sourceAppId: 'cli_worker',
+      eventKind: 'failed_report', taskControl,
+    })).toEqual({ ok: true, controllerAppId: 'cli_coordinator' });
+    expect(evaluateProjectTaskControlEvidencePolicy({
+      config: configWithTaskControl, chatId: 'oc_project', sourceAppId: 'cli_reviewer',
+      eventKind: 'failed_report', taskControl,
+    })).toMatchObject({ ok: false, error: 'project_task_control_evidence_identity_mismatch' });
+    expect(evaluateProjectTaskControlEvidencePolicy({
+      config: configWithTaskControl, chatId: 'oc_other', sourceAppId: 'cli_worker',
+      eventKind: 'accepted', taskControl,
+    })).toMatchObject({ ok: false });
+    expect(evaluateProjectTaskControlEvidencePolicy({
+      config: configWithTaskControl, chatId: 'oc_project', sourceAppId: 'cli_worker',
+      eventKind: 'reviewed', taskControl,
+    })).toMatchObject({ ok: false });
+    expect(evaluateProjectTaskControlEvidencePolicy({
+      config: { ...configWithTaskControl, taskControlPlane: undefined }, chatId: 'oc_project',
+      sourceAppId: 'cli_worker', eventKind: 'accepted', taskControl,
+    })).toMatchObject({ ok: false });
+    expect(evaluateProjectTaskControlEvidencePolicy({
+      config: configWithTaskControl, chatId: 'oc_project', sourceAppId: 'cli_worker',
+      eventKind: 'accepted', taskControl: { ...taskControl, acceptorAppId: 'cli_other' },
+    })).toMatchObject({ ok: false });
+  });
+
   it('allows only the configured coordinator and worker set', () => {
     expect(evaluateProjectDispatchPolicy({
       config, sourceAppId: 'cli_coordinator', sourceChatId: 'oc_project', targetChatId: 'oc_project',
@@ -217,6 +376,11 @@ describe('project dispatch policy', () => {
       config: undefined, sourceAppId: 'cli_any', sourceChatId: 'oc_project', targetChatId: 'oc_elsewhere',
       targetAppIds: [], hasLegacyBots: true,
     })).toEqual({ ok: true, projectMode: false });
+    expect(evaluateProjectDispatchPolicy({
+      config: undefined, sourceAppId: 'cli_any', sourceChatId: 'oc_project', targetChatId: 'oc_project',
+      targetAppIds: ['cli_any'], hasLegacyBots: false, title: '错误审计', existingDispatch: false,
+      writeScopes: ['/repo/src'], taskControlMode: 'audit_only',
+    })).toEqual({ ok: false, error: 'project_task_control_not_configured' });
   });
 
   it('requires exactly one access mode for new project workstreams and forbids access on --into', () => {
@@ -276,6 +440,56 @@ describe('project dispatch policy', () => {
     })).toBeUndefined();
     expect(parseProjectCoordinatorAction({
       action: 'report', dispatchRoot: 'om_work', content: '孤立轮次', reporterAppId: 'cli_worker', reviewRound: 1,
+    })).toBeUndefined();
+  });
+
+  it('keeps completion-gate evaluation internal to the daemon', () => {
+    const base = {
+      action: 'sync_completion_gate', gateId: 'child', definitionFingerprint: 'pcg1:fingerprint',
+      reason: 'verified', checkedAt: '2026-09-29T12:00:00.000Z',
+    };
+    expect(parseProjectCoordinatorAction({ ...base, status: 'satisfied' })).toBeUndefined();
+    expect(parseProjectCoordinatorAction({
+      ...base, status: 'pending', evidence: {
+        sourceProjectRevision: 7, reviewerVerdictId: 'rv_1',
+        terminalEventId: 'evt-delivered', deliveryReceiptId: 'rcpt-1',
+      },
+    })).toBeUndefined();
+    expect(parseProjectCoordinatorAction({
+      ...base, status: 'satisfied', evidence: {
+        sourceProjectRevision: 7, reviewerVerdictId: 'rv_1',
+        terminalEventId: 'evt-delivered', deliveryReceiptId: 'rcpt-1',
+      },
+    })).toBeUndefined();
+  });
+
+  it('accepts public completion-gate lifecycle actions with explicit compare-and-swap identity', () => {
+    expect(parseProjectCoordinatorAction({
+      action: 'retire_completion_gate', gateId: 'child',
+      expectedDefinitionFingerprint: 'pcg1:old', authorizationRef: 'om_authorization',
+      authorizedByOpenId: 'ou_forged', reason: '失败终态已归档',
+    })).toEqual({
+      action: 'retire_completion_gate', gateId: 'child',
+      expectedDefinitionFingerprint: 'pcg1:old', authorizationRef: 'om_authorization', reason: '失败终态已归档',
+    });
+    expect(parseProjectCoordinatorAction({
+      action: 'replace_completion_gate', gateId: 'child', expectedDefinitionFingerprint: 'pcg1:old',
+      newGateId: 'child-v2', sourceChatId: 'oc_child', dispatchRoot: 'om_child_v2',
+      taskGuid: '22222222-2222-4222-8222-222222222222', label: '子群验收 v2',
+      authorizationRef: 'om_authorization', reason: '改用新一轮验收',
+    })).toEqual({
+      action: 'replace_completion_gate', gateId: 'child', expectedDefinitionFingerprint: 'pcg1:old',
+      newGateId: 'child-v2', sourceChatId: 'oc_child', dispatchRoot: 'om_child_v2',
+      taskGuid: '22222222-2222-4222-8222-222222222222', label: '子群验收 v2',
+      authorizationRef: 'om_authorization', reason: '改用新一轮验收',
+    });
+    expect(parseProjectCoordinatorAction({
+      action: 'retire_completion_gate', gateId: 'child', reason: '缺 fingerprint',
+    })).toBeUndefined();
+    expect(parseProjectCoordinatorAction({
+      action: 'replace_completion_gate', gateId: 'child', expectedDefinitionFingerprint: 'pcg1:old',
+      newGateId: 'child-v2', sourceChatId: 'oc_child', dispatchRoot: 'om_child_v2',
+      taskGuid: '22222222-2222-4222-8222-222222222222', label: '子群验收 v2',
     })).toBeUndefined();
   });
 });
@@ -343,6 +557,13 @@ describe('project coordinator prompt context', () => {
     expect(coordinator).toContain('discussion is a valid project phase');
     expect(coordinator).toContain('worker_app_ids="cli_worker"');
     expect(coordinator).toContain('specific title of at most 24 characters');
+    expect(coordinator).toContain('Project state is chat-scoped');
+    expect(coordinator).toContain('completion gate');
+    expect(coordinator).toContain('gate add/status/retire/replace');
+    expect(coordinator).toContain('exact current human turn');
+    expect(coordinator).toContain('canonical action summary');
+    expect(coordinator).toContain('session owner or pass `canOperate`');
+    expect(coordinator).toContain('Ending the current turn does not complete the project');
     expect(renderProjectGroupModeBlock('cli_worker', 'oc_project', f.dataDir)).toBe('');
   });
 });

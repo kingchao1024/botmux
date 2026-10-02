@@ -8,20 +8,39 @@ import {
 } from './task-control-plane-daemon-bridge.js';
 import { TaskControlEventAdapters, taskControlEventIdempotencyKey } from './task-control-plane-events.js';
 import { matchesTaskControlPlaneCanaryMapping, type TaskControlPlaneCanaryScope, type TaskControlPlaneDeliveryResult, type TaskControlPlaneLifecycle } from './task-control-plane-runtime.js';
-import { TaskControlPlaneStore, type DeliveryOutboxRow, type ReviewerVerdictHead } from './task-control-plane-store.js';
+import { TaskControlPlaneStore, type DeliveryOutboxRow, type ReviewerVerdictHead, type TaskControlMappingDecision } from './task-control-plane-store.js';
 import type {
   DesignatedReviewerMapping,
   ReviewerConditionEvidence,
   ReviewerVerdictAttestation,
   ReviewerVerdictV1,
 } from './task-control-plane-reviewer-verdict.js';
+import {
+  reviewerDesignationRef,
+} from './task-control-plane-reviewer-verdict.js';
 import { TaskControlMappingTrust, taskControlMappingFacts } from './task-control-plane-mapping-trust.js';
+import {
+  projectWorkerEvidenceFacts,
+  projectWorkerEvidenceId,
+  type ProjectWorkerEvidenceV1,
+} from './task-control-plane-project-worker-evidence.js';
+import type { ProjectGroupTaskControlReconcileAction } from './task-control-plane-project-group-audit.js';
 
 const MAX_REFERENCE_POLL = 100;
+const PROJECT_EVIDENCE_MAX_FUTURE_SKEW_MS = 5 * 60_000;
 
 type ReviewerVerdictVerifier = {
   verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean;
   verifyVerdict(value: ReviewerVerdictV1): boolean;
+};
+
+type ProjectReviewerTrust = ReviewerVerdictVerifier & {
+  providerForApp(reviewerBotAppId: string): {
+    issueVerdict(input: Parameters<import('./task-control-plane-reviewer-verdict.js').DaemonReviewerVerdictProvider['issueVerdict']>[0]): ReviewerVerdictV1;
+  } | undefined;
+  designationProvider(): {
+    issueDesignatedReviewer(input: Parameters<import('./task-control-plane-reviewer-verdict.js').DaemonReviewerVerdictProvider['issueDesignatedReviewer']>[0]): DesignatedReviewerMapping;
+  } | undefined;
 };
 
 type TaskControlDeliveryClient = {
@@ -111,6 +130,7 @@ export class DaemonTaskControlIntegration {
       mappingTrust?: TaskControlMappingTrust;
       receiptAllowedKeyIds?: readonly string[];
       receiptRevokedKeyIds?: readonly string[];
+      projectReviewerTrust?: ProjectReviewerTrust;
       /** Enable only when Pump is live; tests and Shadow keep receipt projection inert. */
       controlledWriteback?: boolean;
       /** Narrow test seam; production defaults to the existing Lark client. */
@@ -149,16 +169,21 @@ export class DaemonTaskControlIntegration {
         controllerId: prior.controllerId, projectId: prior.projectId, phaseId: prior.phaseId, phaseTaskGuids: [...prior.phaseTaskGuids].sort(),
         taskGuid: prior.taskGuid, topicRootId: prior.topicRootId, ownerId: prior.ownerId, reviewerId: prior.reviewerId, acceptorId: prior.acceptorId,
         registrationRef: prior.registrationRef, registrationVersion: prior.registrationVersion, phaseRegistrationRefs: prior.phaseRegistrationRefs,
-        approvalGate: prior.approvalGate, docToken: prior.docToken, docRevision: prior.docRevision,
+        approvalGate: prior.approvalGate, mappingAuthority: prior.mappingAuthority,
+        docToken: prior.docToken, docRevision: prior.docRevision,
       }) === JSON.stringify({
         controllerId, projectId: mapping.projectId, phaseId: mapping.phaseId, phaseTaskGuids: [...mapping.phaseTaskGuids].sort(),
         taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId, acceptorId: mapping.acceptorId,
         registrationRef: mapping.registrationRef, registrationVersion: mapping.registrationVersion, phaseRegistrationRefs: mapping.phaseRegistrationRefs,
-        approvalGate: DaemonTaskControlBridge.bindApprovalGate(mapping.approvalGate), docToken: mapping.docToken, docRevision: mapping.docRevision,
+        approvalGate: mapping.approvalGate ? DaemonTaskControlBridge.bindApprovalGate(mapping.approvalGate) : undefined,
+        mappingAuthority: mapping.mappingAuthority, docToken: mapping.docToken, docRevision: mapping.docRevision,
       });
     }
+    if (!mapping.mappingAuthority && !mapping.approvalGate) return false;
+    const { approvalGate, ...mappingWithoutGate } = mapping;
     let controllerMapping: DaemonTaskControlMapping = {
-      ...mapping, controllerId, approvalGate: DaemonTaskControlBridge.bindApprovalGate(mapping.approvalGate),
+      ...mappingWithoutGate, controllerId,
+      ...(approvalGate ? { approvalGate: DaemonTaskControlBridge.bindApprovalGate(approvalGate) } : {}),
     };
     if (this.input.mappingTrust) {
       controllerMapping = {
@@ -167,7 +192,10 @@ export class DaemonTaskControlIntegration {
           dispatchRoot, projectId: controllerMapping.projectId, phaseId: controllerMapping.phaseId, phaseTaskGuids: controllerMapping.phaseTaskGuids,
           taskGuid: controllerMapping.taskGuid, topicRootId: controllerMapping.topicRootId, ownerId: controllerMapping.ownerId,
           reviewerId: controllerMapping.reviewerId, acceptorId: controllerMapping.acceptorId, registrationRef: controllerMapping.registrationRef, registrationVersion: controllerMapping.registrationVersion,
-          phaseRegistrationRefs: controllerMapping.phaseRegistrationRefs, controllerId, approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken, docRevision: controllerMapping.docRevision,
+          phaseRegistrationRefs: controllerMapping.phaseRegistrationRefs, controllerId,
+          ...(controllerMapping.approvalGate ? { approvalGate: controllerMapping.approvalGate } : {}),
+          ...(controllerMapping.mappingAuthority ? { mappingAuthority: controllerMapping.mappingAuthority } : {}),
+          docToken: controllerMapping.docToken, docRevision: controllerMapping.docRevision,
         })),
       };
     }
@@ -179,7 +207,9 @@ export class DaemonTaskControlIntegration {
         dispatchRoot, projectId: controllerMapping.projectId, phaseId: controllerMapping.phaseId, phaseTaskGuids: controllerMapping.phaseTaskGuids,
         taskGuid: mapping.taskGuid, topicRootId: mapping.topicRootId, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId,
         acceptorId: mapping.acceptorId, registrationRef: mapping.registrationRef, registrationVersion: mapping.registrationVersion, phaseRegistrationRefs: mapping.phaseRegistrationRefs, controllerId,
-        approvalGate: controllerMapping.approvalGate, docToken: controllerMapping.docToken, docRevision: controllerMapping.docRevision, authentication,
+        ...(controllerMapping.approvalGate ? { approvalGate: controllerMapping.approvalGate } : {}),
+        ...(controllerMapping.mappingAuthority ? { mappingAuthority: controllerMapping.mappingAuthority } : {}),
+        docToken: controllerMapping.docToken, docRevision: controllerMapping.docRevision, authentication,
         ...(controllerMapping.mappingProof ? { mappingProof: controllerMapping.mappingProof } : {}),
       });
       return registered.kind === 'registered' || registered.kind === 'duplicate';
@@ -194,6 +224,478 @@ export class DaemonTaskControlIntegration {
   mapping(dispatchRoot: string): DaemonTaskControlMapping | undefined {
     const mapping = this.input.bridge.mapping(dispatchRoot);
     return mapping && this.mappingInScope(mapping) ? mapping : undefined;
+  }
+
+  isProjectGroupTaskTerminal(dispatchRoot: string, taskGuid: string): boolean {
+    const mapping = this.mapping(dispatchRoot);
+    if (!mapping || mapping.taskGuid !== taskGuid || mapping.mappingAuthority?.kind !== 'project_group') return false;
+    return this.input.store.getTaskTrustedTerminalDecision(dispatchRoot, taskGuid).released;
+  }
+
+  getProjectGroupTaskControlDecision(dispatchRoot: string, taskGuid: string): TaskControlMappingDecision {
+    const mapping = this.mapping(dispatchRoot);
+    if (!mapping || mapping.taskGuid !== taskGuid || mapping.mappingAuthority?.kind !== 'project_group') {
+      return { capacityReleased: false, admissionSafe: false, admissionBlockers: [] };
+    }
+    return this.input.store.getTaskControlMappingDecision(dispatchRoot, taskGuid);
+  }
+
+  /** Reject a reviewer evidence permanently when its verdict identity, signature, mapping,
+   *  review round, or artifact does not match the immutable contract. Used at the controller
+   *  first-ingress boundary so a forged verdict never becomes a holdback observation. */
+  private verifyReviewerEvidenceContract(
+    evidence: ProjectWorkerEvidenceV1,
+    mapping: DaemonTaskControlMapping,
+  ): boolean {
+    const trust = this.input.projectReviewerTrust;
+    const verdict = evidence.reviewerVerdict;
+    if (!trust || !verdict) return false;
+    const artifact = evidence.eventKind === 'reviewed' || evidence.eventKind === 'submitted'
+      || evidence.eventKind === 'failed_report'
+      ? {
+          kind: 'project_report' as const,
+          reportRequestId: evidence.reportRequestId!, triggerId: evidence.triggerId!,
+          dispatchRoot: evidence.dispatchRoot, sourceSessionId: evidence.sourceSessionId,
+          sourceTurnId: evidence.sourceTurnId, reporterAppId: evidence.sourceAppId,
+          targetSessionId: evidence.targetSessionId!, projectRevision: evidence.projectRevision!,
+          contentHash: evidence.contentHash!,
+        }
+      : undefined;
+    if (!artifact) return false;
+    if (verdict.designatedReviewerRef !== reviewerDesignationRef(
+      evidence.dispatchRoot, mapping.reviewerId, evidence.reviewRound!, evidence.workerGeneration,
+    )) return false;
+    if (verdict.projectId !== mapping.projectId || verdict.phaseId !== mapping.phaseId
+      || verdict.taskGuid !== mapping.taskGuid || verdict.topicRootId !== mapping.topicRootId) return false;
+    if (!sameTaskSet(verdict.taskSetSnapshot, mapping.phaseTaskGuids)) return false;
+    if (verdict.reviewRound !== evidence.reviewRound || verdict.verdict !== evidence.reviewVerdict) return false;
+    if (verdict.reviewerId !== mapping.reviewerId || verdict.reviewerBotAppId !== mapping.reviewerId) return false;
+    if (verdict.sessionId !== evidence.sourceSessionId || verdict.workerGeneration !== evidence.workerGeneration) return false;
+    if (verdict.sourceMessageId !== evidence.triggerId || verdict.sourceVersionHash !== evidence.contentHash) return false;
+    if (JSON.stringify(verdict.artifactEvidence) !== JSON.stringify(artifact)) return false;
+    return trust.verifyVerdict(verdict);
+  }
+
+  private resolvePriorProjectReportUnknowns(
+    mapping: DaemonTaskControlMapping,
+    evidence: ProjectWorkerEvidenceV1,
+    principal: 'worker' | 'reviewer',
+    sourceRef: string,
+  ): boolean {
+    const events = this.input.store.listEvents({ taskGuid: mapping.taskGuid });
+    const unresolvedKeys = new Set(this.input.store.getTaskProjection(mapping.taskGuid).unknowns
+      .filter(item => item.required && !item.resolved && item.key.startsWith('project-sync:'))
+      .map(item => item.key));
+    let index = 0;
+    for (const required of events) {
+      const unknownKey = nonBlank(required.payload.unknownKey);
+      if (required.eventType !== 'unknown.required'
+        || required.actorRole !== principal
+        || required.payload.source !== 'project_report'
+        || !unknownKey
+        || !unresolvedKeys.has(unknownKey)) continue;
+      const resolved = this.input.bridge.event({
+        dispatchRoot: evidence.dispatchRoot, principal,
+        eventId: `tcp-unknown.resolved:${evidence.evidenceId}:${index++}`,
+        idempotencyKey: taskControlEventIdempotencyKey('unknown.resolved', unknownKey), sourceRef,
+        payload: { unknownKey, reportEvidenceId: evidence.evidenceId },
+      });
+      if (!resolved) return false;
+      const result = this.input.store.appendEvent({
+        ...resolved, eventType: 'unknown.resolved', occurredAt: evidence.occurredAt,
+        attempt: evidence.dispatchAttempt,
+      });
+      if (result.kind === 'conflict') return false;
+    }
+    return true;
+  }
+
+  private resolveTerminalReportUnknown(
+    mapping: DaemonTaskControlMapping,
+    evidence: ProjectWorkerEvidenceV1,
+    sourceRef: string,
+  ): boolean {
+    const unknownKey = `terminal-report:${evidence.sourceSessionId}:${evidence.workerGeneration}:${evidence.sourceTurnId}:${evidence.dispatchAttempt}`;
+    const required = this.input.store.getTaskProjection(mapping.taskGuid).unknowns
+      .find(item => item.key === unknownKey && item.required && !item.resolved);
+    if (!required) return true;
+    const resolved = this.input.bridge.event({
+      dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+      eventId: `tcp-unknown.resolved:${evidence.evidenceId}`,
+      idempotencyKey: taskControlEventIdempotencyKey('unknown.resolved', unknownKey), sourceRef,
+      payload: { unknownKey, reportEvidenceId: evidence.evidenceId },
+    });
+    if (!resolved) return false;
+    const result = this.input.store.appendEvent({
+      ...resolved, eventType: 'unknown.resolved', occurredAt: evidence.occurredAt,
+      attempt: evidence.dispatchAttempt,
+    });
+    return result.kind === 'appended' || result.kind === 'duplicate';
+  }
+
+  ingestProjectWorkerEvidence(
+    evidence: ProjectWorkerEvidenceV1,
+    verify: (value: ProjectWorkerEvidenceV1) => boolean,
+  ): { ok: true; receiptRef: string } | { ok: false; reason: string } {
+    const mapping = this.mapping(evidence.dispatchRoot);
+    let expectedId: string;
+    try { expectedId = projectWorkerEvidenceId(projectWorkerEvidenceFacts(evidence)); }
+    catch { return { ok: false, reason: 'project_worker_evidence_identity_invalid' }; }
+    const reviewerEvidence = evidence.eventKind === 'reviewed'
+      || (evidence.eventKind === 'project_sync_failed' && evidence.reviewVerdict !== undefined)
+      || (evidence.eventKind === 'terminal' && evidence.sourceAppId === mapping?.reviewerId);
+    let reviewerReceivedAt: string | undefined;
+    if (!mapping || mapping.mappingAuthority?.kind !== 'project_group'
+      || evidence.evidenceId !== expectedId || !verify(evidence)
+      || evidence.controllerAppId !== this.input.larkAppId
+      || evidence.sourceAppId !== (reviewerEvidence ? mapping.reviewerId : mapping.ownerId)) {
+      return { ok: false, reason: 'project_worker_evidence_identity_invalid' };
+    }
+    // Controller first-ingress holdback: reviewer evidence (verdict-bearing) must wait for the
+    // Nth valid worker task.first_submitted event before creating any lifecycle/verdict side
+    // effect. The first-ingress row lives in the immutable observations ledger and its
+    // occurred_at is the sole controller receivedAt. Repeat retries reuse the winning row.
+    // Verify the immutable evidence/mapping/signature/round/artifact contract BEFORE creating
+    // any holdback row: a forged verdict is rejected permanently and never becomes a
+    // controller first-ingress fact.
+    if (evidence.eventKind === 'reviewed' && evidence.reviewRound !== undefined) {
+      if (!this.verifyReviewerEvidenceContract(evidence, mapping)) {
+        return { ok: false, reason: 'reviewer_verdict_unverified' };
+      }
+      const holdback = this.input.store.recordEvidenceFirstIngress({
+        evidenceId: evidence.evidenceId,
+        canonicalHash: `sha256:${evidence.evidenceId.slice(5)}`,
+        dispatchRoot: evidence.dispatchRoot,
+        reviewRound: evidence.reviewRound,
+        occurredAt: new Date().toISOString(),
+      });
+      if (holdback.kind === 'conflict') return { ok: false, reason: 'project_worker_evidence_conflict' };
+      reviewerReceivedAt = holdback.receivedAt;
+      if (Date.parse(evidence.occurredAt) > Date.parse(holdback.receivedAt) + PROJECT_EVIDENCE_MAX_FUTURE_SKEW_MS) {
+        return { ok: false, reason: 'project_worker_evidence_future_skew' };
+      }
+      if (Date.parse(evidence.reviewerVerdict!.expiresAt) <= Date.parse(holdback.receivedAt)) {
+        return { ok: false, reason: 'reviewer_verdict_expired' };
+      }
+      const requiredRound = evidence.reviewRound;
+      const workerSubmitCount = this.input.store.listEvents({ taskGuid: mapping.taskGuid })
+        .filter(event => event.eventType === 'task.first_submitted' && event.actorId === mapping.ownerId).length;
+      if (workerSubmitCount < requiredRound) {
+        return { ok: false, reason: 'dependency_pending' };
+      }
+    }
+    const sourceRef = `project-worker-evidence:${evidence.evidenceId}`;
+    const receiptRef = `project-worker-evidence:${evidence.evidenceId}`;
+    const terminalReportUnknownKey = `terminal-report:${evidence.sourceSessionId}:${evidence.workerGeneration}:${evidence.sourceTurnId}:${evidence.dispatchAttempt}`;
+    if (evidence.eventKind === 'terminal') {
+      const reportEvents = this.input.store.listEvents({ taskGuid: mapping.taskGuid }).filter(event => (
+        (event.eventType === 'task.first_submitted' || event.eventType === 'task.failed')
+        && event.payload.sourceSessionId === evidence.sourceSessionId
+        && event.payload.sourceTurnId === evidence.sourceTurnId
+        && event.payload.workerGeneration === evidence.workerGeneration
+        && event.attempt === evidence.dispatchAttempt
+      ));
+      if (reviewerEvidence) {
+        const reviewed = this.input.store.listEvents({ taskGuid: mapping.taskGuid }).some(event => {
+          if (event.eventType !== 'task.reviewed') return false;
+          const artifact = event.payload.artifactEvidence;
+          if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) return false;
+          const facts = artifact as Record<string, unknown>;
+          return facts.sourceSessionId === evidence.sourceSessionId
+            && facts.sourceTurnId === evidence.sourceTurnId
+            && facts.reporterAppId === evidence.sourceAppId
+            && event.attempt === evidence.dispatchAttempt;
+        });
+        return reviewed
+          ? { ok: true, receiptRef }
+          : { ok: false, reason: 'dependency_pending' };
+      }
+      if (reportEvents.some(event => event.eventType === 'task.failed')
+        || (evidence.terminalStatus === 'completed'
+          && reportEvents.some(event => event.eventType === 'task.first_submitted'))) {
+        return { ok: true, receiptRef };
+      }
+      if (evidence.terminalStatus !== 'failed') {
+        const unknown = this.input.bridge.event({
+          dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+          eventId: `tcp-unknown.required:${evidence.evidenceId}`,
+          idempotencyKey: taskControlEventIdempotencyKey('unknown.required', terminalReportUnknownKey), sourceRef,
+          payload: {
+            unknownKey: terminalReportUnknownKey, source: 'project_worker_terminal',
+            terminalStatus: evidence.terminalStatus, finalOutputPresent: evidence.finalOutputPresent,
+            dispatchAttempt: evidence.dispatchAttempt,
+          },
+        });
+        if (!unknown) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+        const result = this.input.store.appendEvent({
+          ...unknown, eventType: 'unknown.required', occurredAt: evidence.occurredAt, attempt: evidence.dispatchAttempt,
+        });
+        if (result.kind === 'conflict') return { ok: false, reason: 'project_worker_evidence_conflict' };
+        return { ok: true, receiptRef };
+      }
+      const failed = this.input.bridge.event({
+        dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+        eventId: `tcp-task.failed:${evidence.evidenceId}`,
+        idempotencyKey: taskControlEventIdempotencyKey('task.failed', sourceRef), sourceRef,
+        payload: {
+          sourceSessionId: evidence.sourceSessionId, sourceTurnId: evidence.sourceTurnId,
+          workerGeneration: evidence.workerGeneration, dispatchAttempt: evidence.dispatchAttempt,
+        },
+      });
+      if (!failed) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+      const result = this.input.store.appendEvent({
+        ...failed, eventType: 'task.failed', occurredAt: evidence.occurredAt, attempt: evidence.dispatchAttempt,
+      });
+      return result.kind === 'conflict'
+        ? { ok: false, reason: 'project_worker_evidence_conflict' }
+        : { ok: true, receiptRef };
+    }
+    if (evidence.eventKind === 'project_sync_failed') {
+      const artifactEvidence = {
+        kind: 'project_report' as const,
+        reportRequestId: evidence.reportRequestId!, triggerId: evidence.triggerId!, dispatchRoot: evidence.dispatchRoot,
+        sourceSessionId: evidence.sourceSessionId, sourceTurnId: evidence.sourceTurnId,
+        reporterAppId: evidence.sourceAppId, targetSessionId: evidence.targetSessionId!,
+        contentHash: evidence.contentHash!,
+      };
+      if (!reviewerEvidence) {
+        const submitted = this.input.bridge.event({
+          dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+          eventId: `tcp-task.first_submitted:${evidence.evidenceId}`,
+          idempotencyKey: taskControlEventIdempotencyKey('task.first_submitted', sourceRef), sourceRef,
+          payload: { artifactEvidence },
+        });
+        if (!submitted) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+        const submittedResult = this.input.store.appendEvent({
+          ...submitted, eventType: 'task.first_submitted', occurredAt: evidence.occurredAt,
+          attempt: evidence.dispatchAttempt,
+        });
+        if (submittedResult.kind === 'conflict') return { ok: false, reason: 'project_worker_evidence_conflict' };
+      }
+      const unknownKey = `project-sync:${evidence.reportRequestId}`;
+      const unknown = this.input.bridge.event({
+        dispatchRoot: evidence.dispatchRoot, principal: reviewerEvidence ? 'reviewer' : 'worker',
+        eventId: `tcp-unknown.required:${evidence.evidenceId}`,
+        idempotencyKey: taskControlEventIdempotencyKey('unknown.required', unknownKey), sourceRef,
+        payload: {
+          unknownKey, source: 'project_report', reportRequestId: evidence.reportRequestId,
+          triggerId: evidence.triggerId, projectSyncError: evidence.projectSyncError,
+        },
+      });
+      if (!unknown) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+      const result = this.input.store.appendEvent({
+        ...unknown, eventType: 'unknown.required', occurredAt: evidence.occurredAt,
+        attempt: evidence.dispatchAttempt, errorClass: 'project_sync_failed',
+      });
+      return result.kind === 'conflict'
+        ? { ok: false, reason: 'project_worker_evidence_conflict' }
+        : { ok: true, receiptRef };
+    }
+    const artifactEvidence = evidence.eventKind === 'submitted' || evidence.eventKind === 'failed_report'
+      || evidence.eventKind === 'reviewed'
+      ? {
+          kind: 'project_report' as const,
+          reportRequestId: evidence.reportRequestId!, triggerId: evidence.triggerId!, dispatchRoot: evidence.dispatchRoot,
+          sourceSessionId: evidence.sourceSessionId, sourceTurnId: evidence.sourceTurnId,
+          reporterAppId: evidence.sourceAppId, targetSessionId: evidence.targetSessionId!,
+          projectRevision: evidence.projectRevision!, contentHash: evidence.contentHash!,
+        }
+      : undefined;
+    if (evidence.eventKind === 'failed_report') {
+      if (evidence.projectSyncError) {
+        const unknownKey = `project-sync:${evidence.reportRequestId}`;
+        const unknown = this.input.bridge.event({
+          dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+          eventId: `tcp-unknown.required:${evidence.evidenceId}`,
+          idempotencyKey: taskControlEventIdempotencyKey('unknown.required', unknownKey), sourceRef,
+          payload: {
+            unknownKey, source: 'project_report', reportRequestId: evidence.reportRequestId,
+            triggerId: evidence.triggerId, projectSyncError: evidence.projectSyncError,
+            intendedStatus: 'failed',
+          },
+        });
+        if (!unknown) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+        const result = this.input.store.appendEvent({
+          ...unknown, eventType: 'unknown.required', occurredAt: evidence.occurredAt,
+          attempt: evidence.dispatchAttempt, errorClass: 'project_sync_failed',
+        });
+        return result.kind === 'conflict'
+          ? { ok: false, reason: 'project_worker_evidence_conflict' }
+          : { ok: true, receiptRef };
+      }
+      if (!artifactEvidence) return { ok: false, reason: 'project_worker_evidence_identity_invalid' };
+      const currentState = this.input.store.getTaskProjection(mapping.taskGuid).state;
+      if (currentState === 'failed') return { ok: true, receiptRef };
+      if (currentState === 'delivered' || currentState === 'task_done_pending_freeze' || currentState === 'cancelled') {
+        return { ok: false, reason: 'project_worker_evidence_terminal_conflict' };
+      }
+      const failed = this.input.bridge.event({
+        dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+        eventId: `tcp-task.failed:${evidence.evidenceId}`,
+        idempotencyKey: taskControlEventIdempotencyKey('task.failed', sourceRef), sourceRef,
+        payload: {
+          sourceSessionId: evidence.sourceSessionId, sourceTurnId: evidence.sourceTurnId,
+          workerGeneration: evidence.workerGeneration, dispatchAttempt: evidence.dispatchAttempt,
+          artifactEvidence,
+        },
+      });
+      if (!failed) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+      const result = this.input.store.appendEvent({
+        ...failed, eventType: 'task.failed', occurredAt: evidence.occurredAt,
+        attempt: evidence.dispatchAttempt, errorClass: 'project_report_failed',
+      });
+      if (result.kind === 'conflict') return { ok: false, reason: 'project_worker_evidence_conflict' };
+      if (!this.resolveTerminalReportUnknown(mapping, evidence, sourceRef)
+        || !this.resolvePriorProjectReportUnknowns(mapping, evidence, 'worker', sourceRef)) {
+        return { ok: false, reason: 'project_worker_evidence_conflict' };
+      }
+      return { ok: true, receiptRef };
+    }
+    if (evidence.eventKind === 'reviewed') {
+      if (!reviewerReceivedAt) return { ok: false, reason: 'project_worker_evidence_first_ingress_missing' };
+      const reviewerTrust = this.input.projectReviewerTrust;
+      const verdict = evidence.reviewerVerdict;
+      if (!reviewerTrust || !verdict || !artifactEvidence
+        || verdict.designatedReviewerRef !== reviewerDesignationRef(
+          evidence.dispatchRoot, mapping.reviewerId, evidence.reviewRound!, evidence.workerGeneration,
+        )
+        || verdict.projectId !== mapping.projectId || verdict.phaseId !== mapping.phaseId
+        || verdict.taskGuid !== mapping.taskGuid || verdict.topicRootId !== mapping.topicRootId
+        || !sameTaskSet(verdict.taskSetSnapshot, mapping.phaseTaskGuids)
+        || verdict.reviewRound !== evidence.reviewRound || verdict.verdict !== evidence.reviewVerdict
+        || verdict.reviewerId !== mapping.reviewerId || verdict.reviewerBotAppId !== mapping.reviewerId
+        || verdict.sessionId !== evidence.sourceSessionId || verdict.workerGeneration !== evidence.workerGeneration
+        || verdict.sourceMessageId !== evidence.triggerId || verdict.sourceVersionHash !== evidence.contentHash
+        || JSON.stringify(verdict.artifactEvidence) !== JSON.stringify(artifactEvidence)) {
+        return { ok: false, reason: 'project_reviewer_verdict_unproven' };
+      }
+      const designationProvider = reviewerTrust.designationProvider();
+      if (!designationProvider) return { ok: false, reason: 'project_reviewer_designation_unavailable' };
+      const designation = designationProvider.issueDesignatedReviewer({
+        designatedReviewerRef: verdict.designatedReviewerRef,
+        projectId: mapping.projectId, phaseId: mapping.phaseId, taskGuid: mapping.taskGuid,
+        topicRootId: mapping.topicRootId, taskSetSnapshot: mapping.phaseTaskGuids,
+        reviewRound: evidence.reviewRound!, reviewerId: mapping.reviewerId, reviewerBotAppId: mapping.reviewerId,
+        controllerId: mapping.controllerId, controllerBotAppId: this.input.larkAppId,
+        effectiveAt: reviewerReceivedAt!, expiresAt: verdict.expiresAt, issuedAt: reviewerReceivedAt!,
+      });
+      if (!this.registerVerifiedDesignatedReviewer({ mapping: designation, verifier: reviewerTrust })) {
+        return { ok: false, reason: 'project_reviewer_designation_unproven' };
+      }
+      const reviewed = this.submitVerifiedReviewerVerdict({
+        dispatchRoot: evidence.dispatchRoot, verdict,
+        attestation: {
+          reviewerId: mapping.reviewerId, reviewerBotAppId: mapping.reviewerId,
+          sessionId: evidence.sourceSessionId, workerGeneration: evidence.workerGeneration,
+          capabilityHash: verdict.capabilityHash,
+        },
+        verifier: reviewerTrust,
+        expectedReviewerBotAppId: mapping.reviewerId,
+        expectedReviewerId: mapping.reviewerId,
+        now: reviewerReceivedAt,
+      });
+      if (reviewed.status !== 'active') return { ok: false, reason: reviewed.reason ?? 'project_reviewer_verdict_unproven' };
+      if (evidence.reviewVerdict !== 'pass') return { ok: true, receiptRef };
+      const destinationId = `project-session:${evidence.targetSessionId}`;
+      const delivered = this.input.bridge.event({
+        dispatchRoot: evidence.dispatchRoot, principal: 'controller',
+        eventId: `tcp-task.delivered:${evidence.evidenceId}`,
+        idempotencyKey: taskControlEventIdempotencyKey('task.delivered', sourceRef), sourceRef,
+        payload: { artifactEvidence }, evidenceRef: receiptRef, terminal: true, deliverTo: [destinationId],
+      });
+      if (!delivered) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+      const deliveredResult = this.input.store.appendEvent({
+        ...delivered, eventType: 'task.delivered', occurredAt: reviewerReceivedAt,
+        attempt: evidence.dispatchAttempt, terminal: true, deliverTo: [destinationId],
+      });
+      if (deliveredResult.kind === 'conflict') return { ok: false, reason: 'project_worker_evidence_conflict' };
+      const expectedProviderReceipt = TaskControlPlaneStore.providerReceiptRef(
+        delivered.eventId, destinationId, evidence.triggerId!,
+      );
+      const existingOutbox = this.input.store.listOutbox({ eventId: delivered.eventId })
+        .find(row => row.destinationId === destinationId);
+      if (existingOutbox?.status === 'delivered') {
+        const existingReceipt = this.input.store.listReceipts(delivered.eventId)
+          .find(item => item.outboxId === existingOutbox.outboxId
+            && item.destinationId === destinationId
+            && item.state === 'delivered'
+            && item.receiptRef === expectedProviderReceipt);
+        if (!existingReceipt) return { ok: false, reason: 'project_worker_evidence_delivery_receipt_unproven' };
+      } else {
+        const claimToken = `project-report:${evidence.evidenceId}`;
+        const claim = this.input.store.claimOutboxForEventDestination({
+          eventId: delivered.eventId, destinationId, now: Date.parse(evidence.occurredAt), claimToken,
+        });
+        if (!claim) return { ok: false, reason: 'project_worker_evidence_delivery_claim_failed' };
+        this.input.store.settleOutboxDelivered(claim.outboxId, claimToken, {
+          receiptRef: expectedProviderReceipt,
+        });
+      }
+      const done = this.input.bridge.event({
+        dispatchRoot: evidence.dispatchRoot, principal: 'controller',
+        eventId: `tcp-task.done_marked:${evidence.evidenceId}`,
+        idempotencyKey: taskControlEventIdempotencyKey('task.done_marked', sourceRef), sourceRef,
+        payload: { projectRevision: evidence.projectRevision },
+      });
+      if (!done) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+      const doneResult = this.input.store.appendEvent({
+        ...done, eventType: 'task.done_marked', occurredAt: reviewerReceivedAt, attempt: evidence.dispatchAttempt,
+      });
+      if (!this.resolvePriorProjectReportUnknowns(mapping, evidence, 'reviewer', sourceRef)) {
+        return { ok: false, reason: 'project_worker_evidence_conflict' };
+      }
+      return doneResult.kind === 'conflict'
+        ? { ok: false, reason: 'project_worker_evidence_conflict' }
+        : { ok: true, receiptRef };
+    }
+    if (evidence.eventKind === 'execution_started'
+      && !this.input.store.listEvents({ taskGuid: mapping.taskGuid })
+        .some(item => item.eventType === 'task.accepted')) {
+      const accepted = this.input.bridge.event({
+        dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+        eventId: `tcp-task.accepted:${evidence.evidenceId}`,
+        idempotencyKey: taskControlEventIdempotencyKey('task.accepted', sourceRef), sourceRef,
+        payload: {
+          sourceSessionId: evidence.sourceSessionId, sourceTurnId: evidence.sourceTurnId,
+          workerGeneration: evidence.workerGeneration, dispatchAttempt: evidence.dispatchAttempt,
+          inferredFrom: 'execution_started',
+        },
+      });
+      if (!accepted) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+      const acceptedResult = this.input.store.appendEvent({
+        ...accepted, eventType: 'task.accepted', occurredAt: evidence.occurredAt, attempt: evidence.dispatchAttempt,
+      });
+      if (acceptedResult.kind === 'conflict') {
+        return { ok: false, reason: 'project_worker_evidence_conflict' };
+      }
+    }
+    const eventType = evidence.eventKind === 'accepted'
+      ? 'task.accepted'
+      : evidence.eventKind === 'execution_started'
+        ? 'task.execution_started'
+        : 'task.first_submitted';
+    const event = this.input.bridge.event({
+      dispatchRoot: evidence.dispatchRoot, principal: 'worker',
+      eventId: `tcp-${eventType}:${evidence.evidenceId}`,
+      idempotencyKey: taskControlEventIdempotencyKey(eventType, sourceRef), sourceRef,
+      payload: {
+        sourceSessionId: evidence.sourceSessionId, sourceTurnId: evidence.sourceTurnId,
+        workerGeneration: evidence.workerGeneration, dispatchAttempt: evidence.dispatchAttempt,
+        ...(artifactEvidence ? { artifactEvidence } : {}),
+      },
+    });
+    if (!event) return { ok: false, reason: 'project_worker_evidence_mapping_unproven' };
+    const result = this.input.store.appendEvent({
+      ...event, eventType, occurredAt: evidence.occurredAt, attempt: evidence.dispatchAttempt,
+    });
+    if (result.kind === 'conflict') return { ok: false, reason: 'project_worker_evidence_conflict' };
+    if (eventType === 'task.first_submitted') {
+      if (!this.resolveTerminalReportUnknown(mapping, evidence, sourceRef)
+        || !this.resolvePriorProjectReportUnknowns(mapping, evidence, 'worker', sourceRef)) {
+        return { ok: false, reason: 'project_worker_evidence_conflict' };
+      }
+    }
+    return { ok: true, receiptRef };
   }
 
   canaryRole(): TaskControlPlaneCanaryScope['role'] | undefined {
@@ -282,6 +784,11 @@ export class DaemonTaskControlIntegration {
       verdict: input.verdict, attestation: input.attestation, authentication: input.authentication, verifyVerdict: input.verifyVerdict, now: input.now,
     });
     if (head.status === 'revoked' && input.verdict.kind === 'revocation') return head;
+    if (head.status === 'revoked') return { ...head, reason: 'reviewer_verdict_revoked' };
+    if (head.status === 'superseded'
+      || (head.status === 'active' && head.verdict?.verdictId !== input.verdict.verdictId)) {
+      return { status: 'superseded', verdict: head.verdict, reason: 'reviewer_verdict_superseded' };
+    }
     if (head.status !== 'active' || !head.verdict || head.verdict.kind !== 'verdict' || !head.verdict.verdict) {
       this.reviewerVerdictUnknown(input.dispatchRoot, input.verdict.verdictId, head.reason ?? 'reviewer_verdict_unverified');
       return head;
@@ -291,7 +798,12 @@ export class DaemonTaskControlIntegration {
       reviewRound: verdict.reviewRound, reviewCommentId: verdict.sourceCommentId ?? verdict.sourceMessageId ?? '',
       verdict: verdict.verdict as 'pass' | 'conditional' | 'fail', conditionIds: [...verdict.conditionIds],
       resolvedConditionEvidence: { ...verdict.resolvedConditionEvidence },
-      docToken: verdict.docToken, docRevision: verdict.docRevision,
+      ...(verdict.docToken ? { docToken: verdict.docToken } : {}),
+      ...(verdict.docRevision !== undefined ? { docRevision: verdict.docRevision } : {}),
+      ...(verdict.artifactEvidence ? {
+        artifactEvidence: verdict.artifactEvidence,
+        projectReportEvidenceId: verdict.artifactEvidence.triggerId,
+      } : {}),
       reviewerVerdictId: verdict.verdictId,
       evidenceRef: verdict.sourceCommentId ? `task-comment:${verdict.sourceCommentId}` : `topic-message:${verdict.sourceMessageId}`,
     }, input.now, verdict.supersedesVerdictId ? 'task.review_corrected' : 'task.reviewed');
@@ -404,6 +916,40 @@ export class DaemonTaskControlIntegration {
     this.adapters.enqueue('task.dispatch_requested', { ...event, payload: { dispatchRoot, sourceSessionId } });
   }
 
+  applyProjectReconcileAction(
+    action: Extract<ProjectGroupTaskControlReconcileAction, {
+      kind: 'acceptance_timed_out' | 'execution_timeout_unknown';
+    }>,
+  ): boolean {
+    if (!this.canPerformControllerLifecycle()) return false;
+    const mapping = this.mapping(action.dispatchRoot);
+    if (!mapping || mapping.taskGuid !== action.taskGuid) return false;
+    const eventType = action.kind === 'acceptance_timed_out'
+      ? 'task.acceptance_timed_out' as const
+      : 'unknown.required' as const;
+    const eventId = action.kind === 'acceptance_timed_out'
+      ? `tcp-task.acceptance_timed_out:${action.sourceEventId}`
+      : `tcp-unknown.required:${action.unknownKey}`;
+    const event = this.input.bridge.event({
+      dispatchRoot: action.dispatchRoot, principal: 'controller', eventId,
+      idempotencyKey: taskControlEventIdempotencyKey(eventType, action.sourceRef),
+      sourceRef: action.sourceRef,
+      payload: action.kind === 'acceptance_timed_out'
+        ? { sourceEventId: action.sourceEventId }
+        : { unknownKey: action.unknownKey, sourceEventId: action.sourceEventId, source: 'execution_timeout' },
+    });
+    if (!event) return false;
+    try {
+      const result = this.input.store.appendEvent({
+        ...event, eventType, occurredAt: action.occurredAt,
+        errorClass: action.kind === 'acceptance_timed_out' ? 'acceptance_timeout' : 'execution_timeout',
+      });
+      return result.kind === 'appended' || result.kind === 'duplicate';
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Explicit, structured daemon ingress for a write task. The normal dispatch
    * path has no trusted candidate/action/attempt tuple and therefore cannot
@@ -482,7 +1028,10 @@ export class DaemonTaskControlIntegration {
   private appendVerifiedReviewed(dispatchRoot: string, sourceRef: string, input: {
     reviewRound: number; reviewCommentId: string; verdict: 'pass' | 'conditional' | 'fail';
     conditionIds: string[]; resolvedConditionEvidence: Record<string, ReviewerConditionEvidence>;
-    docToken: string; docRevision: number; evidenceRef: string; reviewerVerdictId: string;
+    docToken?: string; docRevision?: number;
+    artifactEvidence?: import('./task-control-plane-reviewer-verdict.js').ReviewerProjectReportEvidence;
+    projectReportEvidenceId?: string;
+    evidenceRef: string; reviewerVerdictId: string;
   }, occurredAt?: string, eventType: 'task.reviewed' | 'task.review_corrected' = 'task.reviewed'): { ok: true } | { ok: false; reason: string } {
     const bound = this.bridgeEvent(eventType, dispatchRoot, 'reviewer', sourceRef, { ...input, independent: true }, input.evidenceRef);
     if (!bound) {
@@ -1048,6 +1597,7 @@ export class DaemonTaskControlIntegration {
     const records: Array<{ kind: TaskControlCollectionKind; sourceRef: string; eventId: string; idempotencyKey: string; occurredAt?: string }> = [];
     for (const { dispatchRoot, mapping } of this.input.bridge.listMappings().filter(({ mapping }) => this.mappingInScope(mapping)).slice(0, MAX_REFERENCE_POLL)) {
       try {
+        if (mapping.mappingAuthority?.kind === 'project_group' && kind !== 'topic') continue;
         if (kind === 'topic') {
           await getMessageDetail(this.input.larkAppId, dispatchRoot, { userCardContent: false });
           const sourceRef = reference('topic-message', dispatchRoot);

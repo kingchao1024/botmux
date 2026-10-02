@@ -35,6 +35,7 @@ function harness(mode: Mode, options: {
   access?: 'read_only' | 'write';
   projectMode?: boolean;
   registrationFailure?: 'commit';
+  taskControlKickoffState?: 'delivered' | 'pending' | 'ambiguous' | 'permanent_reject_before_send';
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
   const stdout: string[] = [];
@@ -69,8 +70,19 @@ function harness(mode: Mode, options: {
   });
   const postCurrentSessionDaemonRoute = vi.fn(async (input: { path: string; body: any }) => {
     if (input.path === '/api/dispatch-user/deliver') {
+      const taskControlState = options.taskControlKickoffState ?? 'delivered';
+      if (input.body.dispatchOperationId && taskControlState !== 'delivered') {
+        return {
+          ok: false, status: 409,
+          json: async () => ({
+            ok: false, state: taskControlState, error: `dispatch_kickoff_${taskControlState}`,
+          }),
+        };
+      }
       const messageId = await replyMessage('cli_source', input.body.rootId, input.body.content, 'post', true);
-      return { ok: true, json: async () => ({ ok: true, messageId }) };
+      return { ok: true, json: async () => ({
+        ok: true, ...(input.body.dispatchOperationId ? { state: taskControlState } : {}), messageId,
+      }) };
     }
     steps.push('seed');
     if (options.registrationFailure === 'commit') {
@@ -79,7 +91,8 @@ function harness(mode: Mode, options: {
       }) };
     }
     return { ok: true, json: async () => ({
-      ok: true, dispatchRoot: root, projectSynced: options.projectMode === true,
+      ok: true, dispatchRoot: root, dispatchOperationId: 'a'.repeat(50),
+      projectSynced: options.projectMode === true,
     }) };
   });
   const persistDispatchLifecycle = vi.fn(async (input: Record<string, unknown>) => ({
@@ -103,7 +116,7 @@ function harness(mode: Mode, options: {
     assertTurnTransportOrExit: vi.fn(), assertSessionTransportOrExit: vi.fn(),
     loadSessions: () => new Map([['source', { chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     envPinnedRiffBot: undefined,
-    assertProjectDispatchPolicy: vi.fn(async () => options.projectMode === true),
+    assertProjectDispatchPolicy: vi.fn(async () => ({ projectMode: options.projectMode === true })),
     ensureLocalBotCollaboration: vi.fn(async () => {}),
     resolveDataDir: () => '/isolated/data', join: (...parts: string[]) => parts.join('/'),
     readFileSync: () => '[]',
@@ -285,4 +298,48 @@ it('does not send a kickoff after a durable commit failure', async () => {
   expect(JSON.parse(h.stderr[0])).toMatchObject({
     success: false, threadRootId: null, detail: expect.stringContaining('project_dispatch_commit_failed'),
   });
+});
+
+it('sends only the operation and root references for an audit-only kickoff', async () => {
+  const h = harness('dispatch', { access: 'write', projectMode: true });
+  await h.runArgs(['--task-control', 'audit-only']);
+  const delivery = h.postCurrentSessionDaemonRoute.mock.calls
+    .map(([input]) => input)
+    .find(input => input.path === '/api/dispatch-user/deliver');
+  expect(delivery?.body).toEqual({
+    rootId: h.root,
+    chatId: 'oc_chat',
+    dispatchOperationId: 'a'.repeat(50),
+  });
+  expect(delivery?.body).not.toHaveProperty('content');
+  expect(delivery?.body).not.toHaveProperty('targetAppIds');
+  expect(delivery?.body).not.toHaveProperty('hasLegacyBots');
+});
+
+it.each(['pending', 'ambiguous'] as const)(
+  'preserves an audit-only %s kickoff without failing the committed project dispatch',
+  async taskControlKickoffState => {
+    const h = harness('dispatch', {
+      access: 'write', projectMode: true, taskControlKickoffState,
+    });
+    await expect(h.runArgs(['--task-control', 'audit-only'])).rejects.toThrow('exit:1');
+    expect(h.state.trySyncProjectDispatch).not.toHaveBeenCalled();
+    expect(h.persistDispatchLifecycle).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }));
+    expect(JSON.parse(h.stderr[0])).toMatchObject({
+      success: false,
+      threadRootId: h.root,
+      taskControlDeliveryState: taskControlKickoffState,
+    });
+  },
+);
+
+it('fails a committed audit-only dispatch only on a permanent pre-send rejection', async () => {
+  const h = harness('dispatch', {
+    access: 'write', projectMode: true, taskControlKickoffState: 'permanent_reject_before_send',
+  });
+  await expect(h.runArgs(['--task-control', 'audit-only'])).rejects.toThrow('exit:1');
+  expect(h.persistDispatchLifecycle).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }));
+  expect(h.state.trySyncProjectDispatch).toHaveBeenCalledWith(expect.objectContaining({
+    action: { action: 'fail_dispatch', dispatchRoot: h.root, reason: 'dispatch delivery failed' },
+  }));
 });

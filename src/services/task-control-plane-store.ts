@@ -13,15 +13,23 @@
  * UNKNOWN rather than being inferred from daemon/report state.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import { openDatabaseSync, openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 import {
   reviewerCapabilityHash, reviewerVerdictPayloadHash, type DesignatedReviewerMapping, type ReviewerConditionEvidence, type ReviewerVerdictAttestation, type ReviewerVerdictV1,
 } from './task-control-plane-reviewer-verdict.js';
 import type { VerifiedWriteExecutionGrant } from './task-control-plane-authority.js';
+import type { ProjectWorkerEvidenceV1 } from './task-control-plane-project-worker-evidence.js';
+import {
+  PROJECT_WORKER_EVIDENCE_QUARANTINE_LANE_CAP,
+  PROJECT_WORKER_EVIDENCE_ROW_CAP,
+  projectWorkerEvidenceFacts,
+  projectWorkerEvidenceLogicalKey,
+  projectWorkerEvidenceSemanticHash,
+} from './task-control-plane-project-worker-evidence.js';
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const DATABASE_NAME = 'botmux-task-control-plane.sqlite';
 
 export type TaskControlEventType =
@@ -213,9 +221,25 @@ export interface UnknownProjection {
 export interface TerminalBodyProjection {
   eventId: string;
   seq: number;
-  docToken: string;
-  docRevision: number;
+  docToken?: string;
+  docRevision?: number;
+  artifactEvidence?: TaskControlArtifactEvidence;
 }
+
+export type TaskControlArtifactEvidence =
+  | { kind: 'document'; docToken: string; docRevision: number }
+  | {
+      kind: 'project_report';
+      reportRequestId: string;
+      triggerId: string;
+      dispatchRoot: string;
+      sourceSessionId: string;
+      sourceTurnId: string;
+      reporterAppId: string;
+      targetSessionId: string;
+      projectRevision?: number;
+      contentHash: string;
+    };
 
 export interface ReviewProjection {
   eventId: string;
@@ -229,6 +253,8 @@ export interface ReviewProjection {
   resolvedConditionEvidence: Record<string, ReviewerConditionEvidence>;
   docToken?: string;
   docRevision?: number;
+  artifactEvidence?: TaskControlArtifactEvidence;
+  projectReportEvidenceId?: string;
   reviewerVerdictId?: string;
 }
 
@@ -276,6 +302,189 @@ export type DeliveryOutboxStatus = 'pending' | 'inflight' | 'delivered' | 'degra
 export type DeliveryReceiptState = 'retry_scheduled' | 'claim_recovered' | 'delivered' | 'degraded' | 'fallback_verified';
 type DeliveryAttemptReceiptState = Exclude<DeliveryReceiptState, 'claim_recovered' | 'fallback_verified'>;
 export type DeliveryFallbackMethod = 'task_comment' | 'topic_message' | 'active_collection';
+
+export type ProjectWorkerEvidenceOutboxStatus = 'pending' | 'inflight' | 'delivered';
+
+export interface ProjectWorkerEvidenceOutboxRow {
+  outboxId: string;
+  evidenceId: string;
+  sourceAppId: string;
+  controllerAppId: string;
+  status: ProjectWorkerEvidenceOutboxStatus;
+  attempts: number;
+  nextAttemptAt: number;
+  claimToken?: string;
+  claimedAt?: number;
+  receiptRef?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskControlPhaseAEvidenceSettlementInput {
+  sourceAppId: string;
+  controllerAppId: string;
+  dispatchRoot: string;
+  sourceSessionId: string;
+  sourceTurnId: string;
+  workerGeneration: number;
+  reportRequestId: string;
+  contentHash: string;
+}
+
+export interface TaskControlSuccessEvidenceInput {
+  controllerAppId: string;
+  phaseA: TaskControlPhaseAEvidenceSettlementInput & { taskGuid: string };
+  phaseB: {
+    dispatchRoot: string;
+    taskGuid: string;
+    workerAppId: string;
+    reviewerAppId: string;
+    sourceTurnId: string;
+    deliveryContentHash: string;
+    reviewContentHash: string;
+    projectRevision: number;
+  };
+}
+
+export interface TaskControlSuccessEvidenceSnapshot {
+  phaseA: {
+    evidenceIds: string[];
+    controllerEventIds: string[];
+    taskFailedEventId: string;
+  };
+  phaseB: {
+    workerEvidenceIds: string[];
+    reviewerEvidenceIds: string[];
+    controllerEventIds: string[];
+    workerSourceSessionId: string;
+    workerGeneration: number;
+    reviewerSourceSessionId: string;
+    reviewerGeneration: number;
+    acceptedEventId: string;
+    executionEventId: string;
+    submittedEventId: string;
+    reviewedEventId: string;
+    deliveredEventId: string;
+    deliveryOutboxId: string;
+    deliveryReceiptId: string;
+    doneEventId: string;
+  };
+}
+
+/** Fail-closed synchronous snapshot used while the project chat outer lock is held. */
+export function hasSettledTaskControlPhaseAEvidenceSync(
+  dataDir: string,
+  input: TaskControlPhaseAEvidenceSettlementInput,
+): boolean {
+  const path = join(dataDir, DATABASE_NAME);
+  if (!existsSync(path)) return false;
+  let db: DatabaseSyncLike | undefined;
+  try {
+    db = openDatabaseSyncOrThrow(path, { readOnly: true });
+    db.exec('PRAGMA busy_timeout=5000;');
+    const rows = db.prepare(`SELECT e.evidence_json,o.status,o.receipt_ref
+      FROM control_project_worker_evidence AS e
+      LEFT JOIN control_project_worker_evidence_outbox AS o
+        ON o.source_app_id=e.source_app_id AND o.evidence_id=e.evidence_id
+      WHERE e.source_app_id=? AND e.controller_app_id=?`).all(
+      input.sourceAppId, input.controllerAppId,
+    ) as Array<{ evidence_json: string; status?: string; receipt_ref?: string | null }>;
+    const associated = rows.map(row => ({
+      evidence: JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1,
+      status: row.status,
+      receiptRef: row.receipt_ref,
+    })).filter(row => row.evidence.dispatchRoot === input.dispatchRoot
+      && row.evidence.sourceSessionId === input.sourceSessionId
+      && row.evidence.sourceTurnId === input.sourceTurnId
+      && row.evidence.workerGeneration === input.workerGeneration);
+    if (associated.length === 0
+      || associated.some(row => row.status !== 'delivered' || !row.receiptRef)) return false;
+    const failedReports = associated.filter(row => row.evidence.eventKind === 'failed_report'
+      && row.evidence.reportRequestId === input.reportRequestId
+      && row.evidence.contentHash === input.contentHash);
+    const terminals = associated.filter(row => row.evidence.eventKind === 'terminal');
+    return failedReports.length === 1 && terminals.length === 1;
+  } catch {
+    return false;
+  } finally {
+    db?.close();
+  }
+}
+
+/** Revalidates the persisted certificate's append-only evidence set immediately
+ *  before fence removal, rejecting late rows or unsettled delivery. */
+export function hasExactTaskControlSuccessEvidenceSync(
+  dataDir: string,
+  input: {
+    controllerAppId: string;
+    phaseA: { dispatchRoot: string; taskGuid: string; evidenceIds: unknown; controllerEventIds: unknown };
+    phaseB: { dispatchRoot: string; taskGuid: string; workerEvidenceIds: unknown; reviewerEvidenceIds: unknown; controllerEventIds: unknown };
+  },
+): boolean {
+  const stringList = (value: unknown): string[] | undefined => Array.isArray(value)
+    && value.every(item => typeof item === 'string' && item.length > 0)
+    ? [...value].sort()
+    : undefined;
+  const expectedPhaseAEvidence = stringList(input.phaseA.evidenceIds);
+  const expectedWorkerEvidence = stringList(input.phaseB.workerEvidenceIds);
+  const expectedReviewerEvidence = stringList(input.phaseB.reviewerEvidenceIds);
+  const expectedPhaseAEvents = stringList(input.phaseA.controllerEventIds);
+  const expectedPhaseBEvents = stringList(input.phaseB.controllerEventIds);
+  if (!expectedPhaseAEvidence || !expectedWorkerEvidence || !expectedReviewerEvidence
+    || !expectedPhaseAEvents || !expectedPhaseBEvents) return false;
+  const path = join(dataDir, DATABASE_NAME);
+  if (!existsSync(path)) return false;
+  let db: DatabaseSyncLike | undefined;
+  try {
+    db = openDatabaseSyncOrThrow(path, { readOnly: true });
+    db.exec('PRAGMA busy_timeout=5000;');
+    const evidenceRows = (db.prepare(`SELECT e.evidence_json,o.status,o.receipt_ref,o.last_error
+      FROM control_project_worker_evidence AS e
+      LEFT JOIN control_project_worker_evidence_outbox AS o
+        ON o.source_app_id=e.source_app_id AND o.evidence_id=e.evidence_id
+      WHERE e.controller_app_id=? ORDER BY e.created_at,e.evidence_id`).all(input.controllerAppId) as Array<{
+        evidence_json: string;
+        status?: string;
+        receipt_ref?: string | null;
+        last_error?: string | null;
+      }>).map(row => ({
+        evidence: JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1,
+        status: row.status,
+        receiptRef: row.receipt_ref,
+        lastError: row.last_error,
+      })).filter(row => row.evidence.dispatchRoot === input.phaseA.dispatchRoot
+        || row.evidence.dispatchRoot === input.phaseB.dispatchRoot);
+    if (evidenceRows.some(row => row.status !== 'delivered' || !row.receiptRef
+      || row.lastError?.startsWith('permanent:'))) return false;
+    const actualPhaseAEvidence = evidenceRows.filter(row => row.evidence.dispatchRoot === input.phaseA.dispatchRoot)
+      .map(row => row.evidence.evidenceId).sort();
+    const phaseBRows = evidenceRows.filter(row => row.evidence.dispatchRoot === input.phaseB.dispatchRoot);
+    const expectedPhaseBEvidence = [...expectedWorkerEvidence, ...expectedReviewerEvidence].sort();
+    const actualPhaseBEvidence = phaseBRows.map(row => row.evidence.evidenceId).sort();
+    if (JSON.stringify(actualPhaseAEvidence) !== JSON.stringify(expectedPhaseAEvidence)
+      || JSON.stringify(actualPhaseBEvidence) !== JSON.stringify(expectedPhaseBEvidence)) return false;
+    const eventRows = db.prepare(`SELECT task_guid,event_id FROM control_events
+      WHERE lark_app_id=? AND (task_guid=? OR task_guid=?) ORDER BY seq`).all(
+      input.controllerAppId, input.phaseA.taskGuid, input.phaseB.taskGuid,
+    ) as Array<{ task_guid: string; event_id: string }>;
+    const actualPhaseAEvents = eventRows.filter(row => row.task_guid === input.phaseA.taskGuid)
+      .map(row => row.event_id).sort();
+    const actualPhaseBEvents = eventRows.filter(row => row.task_guid === input.phaseB.taskGuid)
+      .map(row => row.event_id).sort();
+    return JSON.stringify(actualPhaseAEvents) === JSON.stringify(expectedPhaseAEvents)
+      && JSON.stringify(actualPhaseBEvents) === JSON.stringify(expectedPhaseBEvents);
+  } catch {
+    return false;
+  } finally {
+    db?.close();
+  }
+}
+
+export type AppendProjectWorkerEvidenceResult =
+  | { kind: 'appended'; evidence: ProjectWorkerEvidenceV1 }
+  | { kind: 'duplicate'; evidence: ProjectWorkerEvidenceV1 }
+  | { kind: 'overflow'; evidence: ProjectWorkerEvidenceV1 };
 
 export interface DeliveryFallbackEvidence {
   deliveryEventId: string;
@@ -417,6 +626,28 @@ export interface WriteExecutionConsumption {
   consumedAt: string;
 }
 
+export interface TaskControlApprovalGateRecord {
+  approvalRef: string;
+  runId: string;
+  nodeId: string;
+  instanceId: string;
+  waitId: string;
+  operatorId: string;
+  approverPolicy: readonly string[];
+}
+
+export type TaskControlMappingAuthorityRecord =
+  | { kind: 'v3_gate'; approvalGate: TaskControlApprovalGateRecord }
+  | {
+      kind: 'project_group';
+      chatId: string;
+      reservationId: string;
+      projectRevision: number;
+      acceptorAppId: string;
+      mode: 'audit_only';
+    }
+  | { kind: 'legacy_untrusted'; reason: string };
+
 /** Durable, host-authenticated control identity. This is a reference record, not a task body. */
 export interface TrustedTaskControlMappingRecord {
   dispatchRoot: string;
@@ -432,15 +663,8 @@ export interface TrustedTaskControlMappingRecord {
   registrationVersion?: string;
   phaseRegistrationRefs?: Record<string, string>;
   controllerId: string;
-  approvalGate: {
-    approvalRef: string;
-    runId: string;
-    nodeId: string;
-    instanceId: string;
-    waitId: string;
-    operatorId: string;
-    approverPolicy: readonly string[];
-  };
+  approvalGate?: TaskControlApprovalGateRecord;
+  mappingAuthority: TaskControlMappingAuthorityRecord;
   docToken?: string;
   docRevision?: number;
   mappingProof?: import('./task-control-plane-mapping-trust.js').TaskControlMappingProof;
@@ -461,7 +685,8 @@ export interface RegisterTrustedTaskControlMappingInput {
   registrationVersion?: string;
   phaseRegistrationRefs?: Record<string, string>;
   controllerId: string;
-  approvalGate: TrustedTaskControlMappingRecord['approvalGate'];
+  approvalGate?: TaskControlApprovalGateRecord;
+  mappingAuthority?: Exclude<TaskControlMappingAuthorityRecord, { kind: 'legacy_untrusted' }>;
   docToken?: string;
   docRevision?: number;
   mappingProof?: import('./task-control-plane-mapping-trust.js').TaskControlMappingProof;
@@ -691,6 +916,7 @@ const SCHEMA = `
     phase_registration_refs_json TEXT,
     controller_id TEXT NOT NULL,
     approval_gate_json TEXT NOT NULL,
+    mapping_authority_json TEXT NOT NULL,
     doc_token TEXT,
     doc_revision INTEGER,
     mapping_proof_json TEXT,
@@ -766,6 +992,40 @@ const SCHEMA = `
     PRIMARY KEY(lark_app_id,verdict_id)
   );
   CREATE UNIQUE INDEX IF NOT EXISTS control_reviewer_verdict_payload_unique ON control_reviewer_verdicts(lark_app_id,verdict_id,canonical_hash);
+
+  CREATE TABLE IF NOT EXISTS control_project_worker_evidence(
+    source_app_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    controller_app_id TEXT NOT NULL,
+    canonical_hash TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(source_app_id,evidence_id)
+  );
+  CREATE TABLE IF NOT EXISTS control_project_worker_evidence_outbox(
+    source_app_id TEXT NOT NULL,
+    outbox_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    controller_app_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','inflight','delivered')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    claim_token TEXT,
+    claimed_at INTEGER,
+    receipt_ref TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(source_app_id,outbox_id),
+    UNIQUE(source_app_id,evidence_id),
+    FOREIGN KEY(source_app_id,evidence_id) REFERENCES control_project_worker_evidence(source_app_id,evidence_id)
+  );
+  CREATE INDEX IF NOT EXISTS control_project_worker_evidence_due
+    ON control_project_worker_evidence_outbox(source_app_id,status,next_attempt_at,outbox_id);
+  CREATE TRIGGER IF NOT EXISTS control_project_worker_evidence_no_update BEFORE UPDATE ON control_project_worker_evidence
+  BEGIN SELECT RAISE(ABORT,'control_project_worker_evidence_immutable'); END;
+  CREATE TRIGGER IF NOT EXISTS control_project_worker_evidence_no_delete BEFORE DELETE ON control_project_worker_evidence
+  BEGIN SELECT RAISE(ABORT,'control_project_worker_evidence_immutable'); END;
   CREATE TRIGGER IF NOT EXISTS control_reviewer_verdicts_no_update BEFORE UPDATE ON control_reviewer_verdicts
   BEGIN SELECT RAISE(ABORT,'control_reviewer_verdict_immutable'); END;
   CREATE TRIGGER IF NOT EXISTS control_reviewer_verdicts_no_delete BEFORE DELETE ON control_reviewer_verdicts
@@ -883,6 +1143,45 @@ function conditionEvidenceRefs(value: unknown): Record<string, ReviewerCondition
   return result;
 }
 
+function taskControlArtifactEvidence(payload: Record<string, unknown>): TaskControlArtifactEvidence {
+  const raw = payload.artifactEvidence;
+  if (raw === undefined) {
+    return {
+      kind: 'document',
+      docToken: nonEmpty(payload.docToken, 'payload.docToken'),
+      docRevision: positiveInteger(payload.docRevision, 'payload.docRevision'),
+    };
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('task_control_invalid:payload.artifactEvidence');
+  }
+  const evidence = raw as Record<string, unknown>;
+  if (evidence.kind === 'document') {
+    return {
+      kind: 'document', docToken: nonEmpty(evidence.docToken, 'payload.artifactEvidence.docToken'),
+      docRevision: positiveInteger(evidence.docRevision, 'payload.artifactEvidence.docRevision'),
+    };
+  }
+  if (evidence.kind !== 'project_report') throw new Error('task_control_invalid:payload.artifactEvidence.kind');
+  const contentHash = nonEmpty(evidence.contentHash, 'payload.artifactEvidence.contentHash');
+  if (!/^sha256:[a-f0-9]{64}$/i.test(contentHash)) throw new Error('task_control_invalid:payload.artifactEvidence.contentHash');
+  const projectRevision = evidence.projectRevision === undefined
+    ? undefined
+    : positiveInteger(evidence.projectRevision, 'payload.artifactEvidence.projectRevision');
+  return {
+    kind: 'project_report',
+    reportRequestId: nonEmpty(evidence.reportRequestId, 'payload.artifactEvidence.reportRequestId'),
+    triggerId: nonEmpty(evidence.triggerId, 'payload.artifactEvidence.triggerId'),
+    dispatchRoot: nonEmpty(evidence.dispatchRoot, 'payload.artifactEvidence.dispatchRoot'),
+    sourceSessionId: nonEmpty(evidence.sourceSessionId, 'payload.artifactEvidence.sourceSessionId'),
+    sourceTurnId: nonEmpty(evidence.sourceTurnId, 'payload.artifactEvidence.sourceTurnId'),
+    reporterAppId: nonEmpty(evidence.reporterAppId, 'payload.artifactEvidence.reporterAppId'),
+    targetSessionId: nonEmpty(evidence.targetSessionId, 'payload.artifactEvidence.targetSessionId'),
+    ...(projectRevision !== undefined ? { projectRevision } : {}),
+    contentHash,
+  };
+}
+
 function exactTaskSetSnapshot(value: unknown, field: string): string[] {
   return uniqueStrings(value, field).sort();
 }
@@ -954,6 +1253,28 @@ function parseApprovalGate(value: unknown): TrustedTaskControlMappingRecord['app
     operatorId: nonEmpty(gate.operatorId, 'approvalGate.operatorId'),
     approverPolicy: exactTaskSetSnapshot(gate.approverPolicy, 'approvalGate.approverPolicy'),
   };
+}
+
+function parseMappingAuthority(value: unknown): TaskControlMappingAuthorityRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('task_control_invalid:mappingAuthority');
+  }
+  const authority = value as Record<string, unknown>;
+  if (authority.kind === 'v3_gate') {
+    return { kind: 'v3_gate', approvalGate: parseApprovalGate(authority.approvalGate)! };
+  }
+  if (authority.kind === 'project_group') {
+    const chatId = nonEmpty(authority.chatId, 'mappingAuthority.chatId');
+    const reservationId = nonEmpty(authority.reservationId, 'mappingAuthority.reservationId');
+    const projectRevision = positiveInteger(authority.projectRevision, 'mappingAuthority.projectRevision');
+    const acceptorAppId = nonEmpty(authority.acceptorAppId, 'mappingAuthority.acceptorAppId');
+    if (authority.mode !== 'audit_only') throw new Error('task_control_invalid:mappingAuthority.mode');
+    return { kind: 'project_group', chatId, reservationId, projectRevision, acceptorAppId, mode: 'audit_only' };
+  }
+  if (authority.kind === 'legacy_untrusted') {
+    return { kind: 'legacy_untrusted', reason: nonEmpty(authority.reason, 'mappingAuthority.reason') };
+  }
+  throw new Error('task_control_invalid:mappingAuthority.kind');
 }
 
 function tableColumns(db: DatabaseSyncLike, table: string): Set<string> {
@@ -1245,6 +1566,31 @@ function migrateSchema(db: DatabaseSyncLike, fromVersion: number): void {
       BEGIN SELECT RAISE(ABORT,'control_write_execution_consumption_immutable'); END;
     `);
   }
+  if (fromVersion < 14) {
+    add('control_trusted_mappings', 'mapping_authority_json', 'mapping_authority_json TEXT');
+    db.exec('DROP TRIGGER IF EXISTS control_trusted_mappings_no_update;');
+    const rows = db.prepare('SELECT rowid,approval_gate_json FROM control_trusted_mappings WHERE mapping_authority_json IS NULL').all() as Array<{
+      rowid: number | bigint;
+      approval_gate_json: unknown;
+    }>;
+    const update = db.prepare('UPDATE control_trusted_mappings SET mapping_authority_json=? WHERE rowid=?');
+    for (const row of rows) {
+      let authority: TaskControlMappingAuthorityRecord;
+      try {
+        authority = { kind: 'v3_gate', approvalGate: parseApprovalGate(JSON.parse(String(row.approval_gate_json)))! };
+      } catch {
+        if (fromVersion >= 5) throw new Error('task_control_schema_mapping_authority_invalid');
+        authority = { kind: 'legacy_untrusted', reason: 'approval_gate_missing_before_v14' };
+      }
+      update.run(JSON.stringify(authority), row.rowid);
+    }
+    const missing = db.prepare('SELECT COUNT(*) AS n FROM control_trusted_mappings WHERE mapping_authority_json IS NULL').get() as { n?: number | bigint } | undefined;
+    if (Number(missing?.n ?? 0) !== 0) throw new Error('task_control_mapping_authority_migration_incomplete');
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS control_trusted_mappings_no_update BEFORE UPDATE ON control_trusted_mappings
+      BEGIN SELECT RAISE(ABORT,'control_mapping_immutable'); END;
+    `);
+  }
 }
 
 function taskEvent(type: TaskControlEventType): boolean {
@@ -1290,8 +1636,12 @@ function validateInput(input: AuthenticatedAppendTaskControlEventInput, allowFro
   }
   if (input.eventType === 'mapping.registered') nonEmpty(payload.ownerId, 'payload.ownerId');
   if (input.eventType === 'task.first_submitted' || input.eventType === 'task.delivered') {
-    nonEmpty(payload.docToken, 'payload.docToken');
-    positiveInteger(payload.docRevision, 'payload.docRevision');
+    const artifactEvidence = taskControlArtifactEvidence(payload);
+    if (input.eventType === 'task.delivered'
+      && artifactEvidence.kind === 'project_report'
+      && artifactEvidence.projectRevision === undefined) {
+      throw new Error('task_control_invalid:payload.artifactEvidence.projectRevision');
+    }
   }
   if (input.eventType === 'task.reviewed' || input.eventType === 'task.review_corrected') {
     if (input.actorRole !== 'reviewer') throw new Error('task_control_invalid:reviewer_role');
@@ -1314,6 +1664,7 @@ function validateInput(input: AuthenticatedAppendTaskControlEventInput, allowFro
       throw new Error('task_control_invalid:payload.resolvedConditionEvidence_unknown_condition');
     }
     nonEmpty(payload.reviewerVerdictId, 'payload.reviewerVerdictId');
+    if (payload.artifactEvidence !== undefined) taskControlArtifactEvidence(payload);
   }
   if (input.eventType === 'task.rework_started') {
     if (input.actorRole !== 'worker') throw new Error('task_control_invalid:rework_worker_role');
@@ -1509,6 +1860,12 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
             ...(optionalString(event.payload.reviewerVerdictId) ? { reviewerVerdictId: optionalString(event.payload.reviewerVerdictId)! } : {}),
             ...(optionalString(event.payload.docToken) ? { docToken: optionalString(event.payload.docToken)! } : {}),
             ...(typeof event.payload.docRevision === 'number' ? { docRevision: event.payload.docRevision } : {}),
+            ...(event.payload.artifactEvidence !== undefined
+              ? { artifactEvidence: taskControlArtifactEvidence(event.payload) }
+              : {}),
+            ...(optionalString(event.payload.projectReportEvidenceId)
+              ? { projectReportEvidenceId: optionalString(event.payload.projectReportEvidenceId)! }
+              : {}),
           };
           if (verdict === 'conditional') {
             for (const conditionId of conditionIds) unresolvedReviewConditions.add(conditionId);
@@ -1523,8 +1880,9 @@ function reduceTask(events: readonly TaskControlEvent[]): TaskReduction {
         if (event.terminal) {
           terminalBody = {
             eventId: event.eventId, seq: event.seq,
-            docToken: nonEmpty(event.payload.docToken, 'payload.docToken'),
-            docRevision: positiveInteger(event.payload.docRevision, 'payload.docRevision'),
+            ...(optionalString(event.payload.docToken) ? { docToken: optionalString(event.payload.docToken)! } : {}),
+            ...(typeof event.payload.docRevision === 'number' ? { docRevision: positiveInteger(event.payload.docRevision, 'payload.docRevision') } : {}),
+            artifactEvidence: taskControlArtifactEvidence(event.payload),
           };
         }
         break;
@@ -1619,6 +1977,111 @@ function taskTransitionAllowed(type: TaskControlEventType, current: TaskControlT
 function phaseTransitionAllowed(type: TaskControlEventType, current: TaskControlPhaseState): boolean {
   const rule = PHASE_TRANSITIONS[type];
   return !rule || rule.from.includes(current);
+}
+
+/**
+ * A capacity-terminal fact must be provable from the immutable event prefix through the first
+ * fully valid terminal chain. Invalid historical non-terminal transitions before that chain stay
+ * visible in the public audit projection but must not erase or hide the terminal fact. An invalid
+ * terminal-shaped prefix makes the candidate untrusted. See the frozen design (2026-09-30) for
+ * the exact contract; cancellation is deliberately NOT terminal here.
+ */
+export interface TaskControlTrustedTerminalDecision {
+  readonly released: boolean;
+  readonly releaseEventId?: string;
+  readonly releaseKind?: 'valid_failed' | 'valid_delivered_done';
+}
+
+/** Independent admission gate for a new project-group reservation. Later audit defects on the same
+ *  task must block admission even after a valid terminal released capacity. */
+export type TaskControlAdmissionBlocker =
+  | { kind: 'transition_violation'; eventId: string }
+  | { kind: 'unresolved_conflict'; eventId: string }
+  | { kind: 'unresolved_unknown'; key: string }
+  | { kind: 'reviewer_verdict_issue'; message: string };
+
+export interface TaskControlAdmissionDecision {
+  readonly safe: boolean;
+  readonly blockers: readonly TaskControlAdmissionBlocker[];
+}
+
+export interface TaskControlMappingDecision {
+  readonly capacityReleased: boolean;
+  readonly admissionSafe: boolean;
+  readonly releaseEventId?: string;
+  readonly releaseKind?: TaskControlTrustedTerminalDecision['releaseKind'];
+  readonly admissionBlockers: readonly TaskControlAdmissionBlocker[];
+}
+
+function isValidMappedWorkerProjectReportFailure(
+  event: TaskControlEvent,
+  mapping: { dispatchRoot: string; ownerId: string },
+): boolean {
+  let artifact: TaskControlArtifactEvidence;
+  try { artifact = taskControlArtifactEvidence(event.payload); } catch { return false; }
+  return artifact.kind === 'project_report'
+    && event.eventType === 'task.failed'
+    && event.actorRole === 'worker'
+    && event.actorId === mapping.ownerId
+    && event.errorClass === 'project_report_failed'
+    && /^project-worker-evidence:[^\s]+$/.test(event.sourceRef ?? '')
+    && artifact.dispatchRoot === mapping.dispatchRoot
+    && artifact.reporterAppId === mapping.ownerId
+    && artifact.projectRevision !== undefined
+    && event.payload.sourceSessionId === artifact.sourceSessionId
+    && event.payload.sourceTurnId === artifact.sourceTurnId
+    && event.payload.dispatchAttempt === event.attempt
+    && Number.isSafeInteger(event.payload.workerGeneration)
+    && Number(event.payload.workerGeneration) > 0;
+}
+
+function reduceTrustedTerminalCapacity(
+  events: readonly TaskControlEvent[],
+  mapping: { dispatchRoot: string; ownerId: string; reviewerId: string; controllerId: string },
+  hasExactSuccessfulChain: (input: {
+    review: TaskControlEvent;
+    delivered: TaskControlEvent;
+    done: TaskControlEvent;
+  }) => boolean,
+): TaskControlTrustedTerminalDecision {
+  let current: TaskControlTaskState = 'planned';
+  let validReviewBoundary: TaskControlEvent | undefined;
+  let deliveredValidBoundary: TaskControlEvent | undefined;
+  let terminalPrefixContaminated = false;
+  const terminalShaped = new Set<TaskControlEventType>([
+    'task.failed', 'task.cancelled', 'task.delivered', 'task.done_marked',
+  ]);
+  for (const event of events) {
+    if (!taskTransitionAllowed(event.eventType, current)) {
+      if (terminalShaped.has(event.eventType)) terminalPrefixContaminated = true;
+      continue;
+    }
+    if (isValidMappedWorkerProjectReportFailure(event, mapping)) {
+      if (terminalPrefixContaminated) return { released: false };
+      return { released: true, releaseEventId: event.eventId, releaseKind: 'valid_failed' };
+    }
+    const next = taskStateAfter(event.eventType, event.payload, current);
+    if ((event.eventType === 'task.reviewed' || event.eventType === 'task.review_corrected')
+      && event.actorRole === 'reviewer' && event.actorId === mapping.reviewerId
+      && event.payload.independent === true && event.payload.verdict === 'pass'
+      && Array.isArray(event.payload.conditionIds) && event.payload.conditionIds.length === 0) {
+      validReviewBoundary = event;
+    }
+    if (event.eventType === 'task.delivered' && event.terminal === true
+      && event.actorRole === 'controller' && event.actorId === mapping.controllerId
+      && next === 'delivered') {
+      deliveredValidBoundary = event;
+    }
+    if (event.eventType === 'task.done_marked' && validReviewBoundary && deliveredValidBoundary
+      && event.actorRole === 'controller' && event.actorId === mapping.controllerId
+      && hasExactSuccessfulChain({ review: validReviewBoundary, delivered: deliveredValidBoundary, done: event })
+      && next === 'task_done_pending_freeze') {
+      if (terminalPrefixContaminated) return { released: false };
+      return { released: true, releaseEventId: event.eventId, releaseKind: 'valid_delivered_done' };
+    }
+    current = next;
+  }
+  return { released: false };
 }
 
 export class TaskControlPlaneStore {
@@ -1766,21 +2229,448 @@ export class TaskControlPlaneStore {
       .map(rowToObservation);
   }
 
+  listProjectWorkerEvidence(): ProjectWorkerEvidenceV1[] {
+    return (this.db.prepare(`SELECT evidence_json FROM control_project_worker_evidence
+      WHERE source_app_id=? ORDER BY created_at,evidence_id`).all(this.larkAppId) as Array<{ evidence_json: string }>)
+      .map(row => JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1);
+  }
+
+  /** Logical get-or-create lookup for the evidence FIFO contract. See
+   *  {@link projectWorkerEvidenceLogicalKey}. Returns the existing evidence
+   *  when its semantic hash matches, throws `task_control_project_evidence_logical_conflict`
+   *  when the same logical key already has a different-semantic evidence,
+   *  and returns undefined when no evidence has been captured for this key. */
+  findProjectWorkerEvidenceByLogicalKey(logicalKey: string, semanticHash: string): ProjectWorkerEvidenceV1 | undefined {
+    for (const evidence of this.listProjectWorkerEvidence()) {
+      const facts = projectWorkerEvidenceFacts(evidence);
+      if (projectWorkerEvidenceLogicalKey(facts) !== logicalKey) continue;
+      if (projectWorkerEvidenceSemanticHash(facts) !== semanticHash) {
+        throw new Error('task_control_project_evidence_logical_conflict');
+      }
+      return evidence;
+    }
+    return undefined;
+  }
+
+  listProjectWorkerEvidenceOutbox(): ProjectWorkerEvidenceOutboxRow[] {
+    return (this.db.prepare(`SELECT * FROM control_project_worker_evidence_outbox
+      WHERE source_app_id=? ORDER BY created_at,outbox_id`).all(this.larkAppId) as Record<string, unknown>[])
+      .map(row => ({
+        outboxId: String(row.outbox_id), evidenceId: String(row.evidence_id), sourceAppId: String(row.source_app_id),
+        controllerAppId: String(row.controller_app_id), status: String(row.status) as ProjectWorkerEvidenceOutboxStatus,
+        attempts: Number(row.attempts), nextAttemptAt: Number(row.next_attempt_at),
+        ...(row.claim_token ? { claimToken: String(row.claim_token) } : {}),
+        ...(row.claimed_at !== null && row.claimed_at !== undefined ? { claimedAt: Number(row.claimed_at) } : {}),
+        ...(row.receipt_ref ? { receiptRef: String(row.receipt_ref) } : {}),
+        ...(row.last_error ? { lastError: String(row.last_error) } : {}),
+        createdAt: String(row.created_at), updatedAt: String(row.updated_at),
+      }));
+  }
+
+  /** Authoritative, cross-partition evidence snapshot for the one fenced
+   *  TaskControl success certificate. All reads use this store's single SQLite
+   *  connection; caller-supplied success claims are never accepted. */
+  readTaskControlSuccessEvidence(input: TaskControlSuccessEvidenceInput): TaskControlSuccessEvidenceSnapshot {
+    const controllerAppId = nonEmpty(input.controllerAppId, 'controllerAppId');
+    if (controllerAppId !== this.larkAppId) {
+      throw new Error('project_task_control_success_certificate_controller_mismatch');
+    }
+    const rows = (this.db.prepare(`SELECT e.evidence_json,o.status,o.receipt_ref,o.last_error
+      FROM control_project_worker_evidence AS e
+      LEFT JOIN control_project_worker_evidence_outbox AS o
+        ON o.source_app_id=e.source_app_id AND o.evidence_id=e.evidence_id
+      WHERE e.controller_app_id=? ORDER BY e.created_at,e.evidence_id`).all(controllerAppId) as Array<{
+        evidence_json: string;
+        status?: string;
+        receipt_ref?: string | null;
+        last_error?: string | null;
+      }>).map(row => ({
+        evidence: JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1,
+        status: row.status,
+        receiptRef: row.receipt_ref ?? undefined,
+        lastError: row.last_error ?? undefined,
+      }));
+    const relevant = rows.filter(row => row.evidence.dispatchRoot === input.phaseA.dispatchRoot
+      || row.evidence.dispatchRoot === input.phaseB.dispatchRoot);
+    if (relevant.some(row => row.status !== 'delivered' || !row.receiptRef
+      || row.lastError?.startsWith('permanent:'))) {
+      throw new Error('project_task_control_success_certificate_evidence_unsettled');
+    }
+    const phaseARows = relevant.filter(row => row.evidence.dispatchRoot === input.phaseA.dispatchRoot);
+    const phaseAFailed = phaseARows.filter(row => row.evidence.eventKind === 'failed_report'
+      && row.evidence.sourceAppId === input.phaseA.sourceAppId
+      && row.evidence.sourceSessionId === input.phaseA.sourceSessionId
+      && row.evidence.sourceTurnId === input.phaseA.sourceTurnId
+      && row.evidence.workerGeneration === input.phaseA.workerGeneration
+      && row.evidence.reportRequestId === input.phaseA.reportRequestId
+      && row.evidence.contentHash === input.phaseA.contentHash);
+    const phaseATerminal = phaseARows.filter(row => row.evidence.eventKind === 'terminal'
+      && row.evidence.sourceAppId === input.phaseA.sourceAppId
+      && row.evidence.sourceSessionId === input.phaseA.sourceSessionId
+      && row.evidence.sourceTurnId === input.phaseA.sourceTurnId
+      && row.evidence.workerGeneration === input.phaseA.workerGeneration);
+    if (phaseARows.length !== 2 || phaseAFailed.length !== 1 || phaseATerminal.length !== 1) {
+      throw new Error('project_task_control_success_certificate_phase_a_evidence_invalid');
+    }
+    const failedEvent = this.listEvents({ taskGuid: input.phaseA.taskGuid }).filter(event => (
+      event.eventType === 'task.failed'
+      && event.sourceRef === `project-worker-evidence:${phaseAFailed[0]!.evidence.evidenceId}`
+    ));
+    const phaseATerminalDecision = this.getTaskTrustedTerminalDecision(
+      input.phaseA.dispatchRoot,
+      input.phaseA.taskGuid,
+    );
+    if (failedEvent.length !== 1 || !phaseATerminalDecision.released
+      || phaseATerminalDecision.releaseKind !== 'valid_failed'
+      || phaseATerminalDecision.releaseEventId !== failedEvent[0]!.eventId) {
+      throw new Error('project_task_control_success_certificate_phase_a_terminal_invalid');
+    }
+
+    const phaseBRows = relevant.filter(row => row.evidence.dispatchRoot === input.phaseB.dispatchRoot);
+    const workerRows = phaseBRows.filter(row => row.evidence.sourceAppId === input.phaseB.workerAppId);
+    const reviewerRows = phaseBRows.filter(row => row.evidence.sourceAppId === input.phaseB.reviewerAppId);
+    const exactKinds = (values: typeof phaseBRows, expected: string[]): boolean => (
+      JSON.stringify(values.map(row => row.evidence.eventKind).sort()) === JSON.stringify([...expected].sort())
+    );
+    if (phaseBRows.length !== 6 || workerRows.length !== 4 || reviewerRows.length !== 2
+      || !exactKinds(workerRows, ['accepted', 'execution_started', 'submitted', 'terminal'])
+      || !exactKinds(reviewerRows, ['reviewed', 'terminal'])
+      || phaseBRows.some(row => row.evidence.sourceTurnId !== input.phaseB.sourceTurnId)
+      || new Set(workerRows.map(row => row.evidence.sourceSessionId)).size !== 1
+      || new Set(workerRows.map(row => row.evidence.workerGeneration)).size !== 1
+      || new Set(reviewerRows.map(row => row.evidence.sourceSessionId)).size !== 1
+      || new Set(reviewerRows.map(row => row.evidence.workerGeneration)).size !== 1) {
+      throw new Error('project_task_control_success_certificate_phase_b_evidence_invalid');
+    }
+    const workerTerminal = workerRows.find(row => row.evidence.eventKind === 'terminal')!;
+    const reviewerTerminal = reviewerRows.find(row => row.evidence.eventKind === 'terminal')!;
+    const reviewerEvidence = reviewerRows.find(row => row.evidence.eventKind === 'reviewed')!;
+    const submittedEvidence = workerRows.find(row => row.evidence.eventKind === 'submitted')!;
+    if (workerTerminal.evidence.terminalStatus !== 'completed'
+      || reviewerTerminal.evidence.terminalStatus !== 'completed'
+      || phaseBRows.some(row => row.evidence.dispatchAttempt !== 1)
+      || submittedEvidence.evidence.contentHash !== input.phaseB.deliveryContentHash
+      || reviewerEvidence.evidence.reviewVerdict !== 'pass'
+      || reviewerEvidence.evidence.reviewRound !== 1
+      || reviewerEvidence.evidence.contentHash !== input.phaseB.reviewContentHash
+      || reviewerEvidence.evidence.projectRevision !== input.phaseB.projectRevision) {
+      throw new Error('project_task_control_success_certificate_phase_b_evidence_invalid');
+    }
+    const mapping = this.listTrustedMappings().find(item => item.dispatchRoot === input.phaseB.dispatchRoot
+      && item.taskGuid === input.phaseB.taskGuid);
+    if (!mapping || mapping.controllerId !== controllerAppId
+      || mapping.ownerId !== input.phaseB.workerAppId
+      || mapping.reviewerId !== input.phaseB.reviewerAppId) {
+      throw new Error('project_task_control_success_certificate_mapping_invalid');
+    }
+    const events = this.listEvents({ taskGuid: input.phaseB.taskGuid });
+    const eventFor = (eventType: TaskControlEventType, evidenceId: string): TaskControlEvent => {
+      const matches = events.filter(event => event.eventType === eventType
+        && event.sourceRef === `project-worker-evidence:${evidenceId}`);
+      if (matches.length !== 1) {
+        throw new Error('project_task_control_success_certificate_event_chain_invalid');
+      }
+      return matches[0]!;
+    };
+    const acceptedEvidence = workerRows.find(row => row.evidence.eventKind === 'accepted')!.evidence;
+    const executionEvidence = workerRows.find(row => row.evidence.eventKind === 'execution_started')!.evidence;
+    const submittedEvidenceRecord = submittedEvidence.evidence;
+    const accepted = eventFor('task.accepted', acceptedEvidence.evidenceId);
+    const execution = eventFor('task.execution_started', executionEvidence.evidenceId);
+    const submitted = eventFor('task.first_submitted', submittedEvidenceRecord.evidenceId);
+    const reviewedEvents = events.filter(event => event.eventType === 'task.reviewed'
+      && event.payload.reviewerVerdictId === reviewerEvidence.evidence.reviewerVerdict?.verdictId);
+    if (reviewedEvents.length !== 1) {
+      throw new Error('project_task_control_success_certificate_event_chain_invalid');
+    }
+    const reviewed = reviewedEvents[0]!;
+    const delivered = eventFor('task.delivered', reviewerEvidence.evidence.evidenceId);
+    const done = eventFor('task.done_marked', reviewerEvidence.evidence.evidenceId);
+    if (!(accepted.seq < execution.seq && execution.seq < submitted.seq
+      && submitted.seq < reviewed.seq && reviewed.seq < delivered.seq && delivered.seq < done.seq)) {
+      throw new Error('project_task_control_success_certificate_event_chain_invalid');
+    }
+    const terminalDecision = this.getTaskTrustedTerminalDecision(
+      input.phaseB.dispatchRoot,
+      input.phaseB.taskGuid,
+    );
+    const projection = this.getTaskProjection(input.phaseB.taskGuid);
+    if (!terminalDecision.released || terminalDecision.releaseKind !== 'valid_delivered_done'
+      || terminalDecision.releaseEventId !== done.eventId) {
+      throw new Error('project_task_control_success_certificate_terminal_invalid');
+    }
+    if (projection.transitionViolations.length > 0
+      || projection.unresolvedConflictEventIds.length > 0
+      || projection.unknowns.some(item => item.required && !item.resolved)) {
+      throw new Error('project_task_control_success_certificate_admission_invalid');
+    }
+    const deliveryRows = this.listOutbox({ eventId: delivered.eventId });
+    if (deliveryRows.length !== 1 || deliveryRows[0]!.status !== 'delivered') {
+      throw new Error('project_task_control_success_certificate_delivery_invalid');
+    }
+    const deliveryReceipts = this.listReceipts(delivered.eventId).filter(receipt => (
+      receipt.outboxId === deliveryRows[0]!.outboxId
+      && receipt.destinationId === deliveryRows[0]!.destinationId
+      && receipt.state === 'delivered'
+      && !!receipt.receiptRef
+    ));
+    if (deliveryReceipts.length !== 1) {
+      throw new Error('project_task_control_success_certificate_delivery_invalid');
+    }
+    return {
+      phaseA: {
+        evidenceIds: phaseARows.map(row => row.evidence.evidenceId).sort(),
+        controllerEventIds: this.listEvents({ taskGuid: input.phaseA.taskGuid }).map(event => event.eventId),
+        taskFailedEventId: failedEvent[0]!.eventId,
+      },
+      phaseB: {
+        workerEvidenceIds: workerRows.map(row => row.evidence.evidenceId).sort(),
+        reviewerEvidenceIds: reviewerRows.map(row => row.evidence.evidenceId).sort(),
+        controllerEventIds: events.map(event => event.eventId),
+        workerSourceSessionId: workerRows[0]!.evidence.sourceSessionId,
+        workerGeneration: workerRows[0]!.evidence.workerGeneration,
+        reviewerSourceSessionId: reviewerRows[0]!.evidence.sourceSessionId,
+        reviewerGeneration: reviewerRows[0]!.evidence.workerGeneration,
+        acceptedEventId: accepted.eventId,
+        executionEventId: execution.eventId,
+        submittedEventId: submitted.eventId,
+        reviewedEventId: reviewed.eventId,
+        deliveredEventId: delivered.eventId,
+        deliveryOutboxId: deliveryRows[0]!.outboxId,
+        deliveryReceiptId: deliveryReceipts[0]!.receiptId,
+        doneEventId: done.eventId,
+      },
+    };
+  }
+
+  enqueueProjectWorkerEvidence(
+    evidence: ProjectWorkerEvidenceV1,
+    verify: (value: ProjectWorkerEvidenceV1) => boolean,
+    maxPending = 1_024,
+    limits: { quarantineCap: number; evidenceRowCap: number } = {
+      quarantineCap: PROJECT_WORKER_EVIDENCE_QUARANTINE_LANE_CAP,
+      evidenceRowCap: PROJECT_WORKER_EVIDENCE_ROW_CAP,
+    },
+  ): AppendProjectWorkerEvidenceResult {
+    this.assertWritable();
+    if (evidence.sourceAppId !== this.larkAppId || !verify(evidence)) {
+      throw new Error('task_control_project_evidence_unverified');
+    }
+    if (!Number.isSafeInteger(maxPending) || maxPending < 1) {
+      throw new Error('task_control_project_evidence_max_pending_invalid');
+    }
+    if (!Number.isSafeInteger(limits.quarantineCap) || limits.quarantineCap < 1
+      || !Number.isSafeInteger(limits.evidenceRowCap) || limits.evidenceRowCap < 1) {
+      throw new Error('task_control_project_evidence_cap_invalid');
+    }
+    const canonicalHash = payloadHash(evidence);
+    const facts = projectWorkerEvidenceFacts(evidence);
+    const logicalKey = projectWorkerEvidenceLogicalKey(facts);
+    const semanticHash = projectWorkerEvidenceSemanticHash(facts);
+    const result = this.withImmediateWrite<AppendProjectWorkerEvidenceResult | {
+      kind: 'cap';
+      errorCode: 'task_control_project_evidence_row_cap' | 'task_control_project_evidence_quarantine_cap';
+      overflowObservationCreated: boolean;
+    }>(() => {
+      const existing = this.db.prepare(`SELECT canonical_hash,evidence_json FROM control_project_worker_evidence
+        WHERE source_app_id=? AND evidence_id=?`).get(this.larkAppId, evidence.evidenceId) as {
+          canonical_hash: string; evidence_json: string;
+        } | undefined;
+      if (existing) {
+        if (existing.canonical_hash !== canonicalHash) throw new Error('task_control_project_evidence_conflict');
+        return { kind: 'duplicate', evidence: JSON.parse(existing.evidence_json) as ProjectWorkerEvidenceV1 };
+      }
+      const logicalRows = this.db.prepare(`SELECT evidence_json FROM control_project_worker_evidence
+        WHERE source_app_id=? ORDER BY created_at,evidence_id`).all(this.larkAppId) as Array<{
+          evidence_json: string;
+        }>;
+      for (const row of logicalRows) {
+        const existingEvidence = JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1;
+        const existingFacts = projectWorkerEvidenceFacts(existingEvidence);
+        if (projectWorkerEvidenceLogicalKey(existingFacts) !== logicalKey) continue;
+        if (projectWorkerEvidenceSemanticHash(existingFacts) !== semanticHash) {
+          throw new Error('task_control_project_evidence_logical_conflict');
+        }
+        return { kind: 'duplicate', evidence: existingEvidence };
+      }
+      const outboxRows = this.db.prepare(`SELECT ev.evidence_json,o.status,o.last_error
+        FROM control_project_worker_evidence_outbox AS o
+        JOIN control_project_worker_evidence AS ev
+          ON ev.source_app_id=o.source_app_id AND ev.evidence_id=o.evidence_id
+        WHERE o.source_app_id=? ORDER BY o.rowid`).all(this.larkAppId) as Array<{
+          evidence_json: string; status: string; last_error?: string | null;
+        }>;
+      const laneKey = (value: ProjectWorkerEvidenceV1): string => `${value.controllerAppId}\0${value.dispatchRoot}`;
+      const quarantinedLanes = new Set(outboxRows.filter(row => row.last_error?.startsWith('permanent:'))
+        .map(row => laneKey(JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1)));
+      const candidateLane = laneKey(evidence);
+      if (logicalRows.length >= limits.evidenceRowCap) {
+        return {
+          kind: 'cap',
+          errorCode: 'task_control_project_evidence_row_cap',
+          overflowObservationCreated: this.recordProjectWorkerEvidenceOverflowLocked('row_cap', limits.evidenceRowCap),
+        };
+      }
+      if (quarantinedLanes.size >= limits.quarantineCap && !quarantinedLanes.has(candidateLane)) {
+        return {
+          kind: 'cap',
+          errorCode: 'task_control_project_evidence_quarantine_cap',
+          overflowObservationCreated: this.recordProjectWorkerEvidenceOverflowLocked('quarantine_cap', limits.quarantineCap),
+        };
+      }
+      const active = outboxRows.filter(row => row.status === 'pending' || row.status === 'inflight')
+        .filter(row => !quarantinedLanes.has(laneKey(JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1))).length;
+      if (active >= maxPending) return { kind: 'overflow', evidence: structuredClone(evidence) };
+      const createdAt = new Date(Date.parse(evidence.occurredAt)).toISOString();
+      const outboxId = stableId('tcpe_outbox', this.larkAppId, evidence.evidenceId);
+      this.db.prepare(`INSERT INTO control_project_worker_evidence(
+        source_app_id,evidence_id,controller_app_id,canonical_hash,evidence_json,created_at
+      ) VALUES(?,?,?,?,?,?)`).run(
+        this.larkAppId, evidence.evidenceId, evidence.controllerAppId, canonicalHash, JSON.stringify(evidence), createdAt,
+      );
+      this.db.prepare(`INSERT INTO control_project_worker_evidence_outbox(
+        source_app_id,outbox_id,evidence_id,controller_app_id,status,attempts,next_attempt_at,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+        this.larkAppId, outboxId, evidence.evidenceId, evidence.controllerAppId, 'pending', 0,
+        Date.parse(createdAt), createdAt, createdAt,
+      );
+      return { kind: 'appended', evidence: structuredClone(evidence) };
+    });
+    if (result.kind === 'cap') {
+      const error = new Error(result.errorCode) as Error & { overflowObservationCreated: boolean };
+      error.overflowObservationCreated = result.overflowObservationCreated;
+      throw error;
+    }
+    return result;
+  }
+
+  private recordProjectWorkerEvidenceOverflowLocked(kind: 'row_cap' | 'quarantine_cap', cap: number): boolean {
+    const idempotencyKey = `project-worker-evidence-overflow:${kind}`;
+    const existing = this.db.prepare(`SELECT event_id FROM control_observations
+      WHERE lark_app_id=? AND idempotency_key=?`).get(this.larkAppId, idempotencyKey);
+    if (existing) return false;
+    const sourceRef = `project-worker-evidence-overflow:${kind}`;
+    const payload = { source: 'project_worker_evidence', kind, cap, referenceOnly: true };
+    this.db.prepare(`INSERT INTO control_observations(
+      event_id,lark_app_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+    ) VALUES(?,?,?,?,?,?,'unknown',?,?)`).run(
+      stableId('obs_project_evidence_overflow', this.larkAppId, kind), this.larkAppId, 'unknown.required',
+      sourceRef, idempotencyKey, new Date().toISOString(),
+      payloadHash({ attemptedEventType: 'unknown.required', sourceRef, payload }), JSON.stringify(payload),
+    );
+    return true;
+  }
+
+  claimProjectWorkerEvidence(input: {
+    now: number;
+    claimToken: string;
+    staleClaimMs: number;
+  }): ProjectWorkerEvidenceOutboxRow | undefined {
+    this.assertWritable();
+    nonEmpty(input.claimToken, 'projectWorkerEvidence.claimToken');
+    if (!Number.isSafeInteger(input.now) || input.now < 0
+      || !Number.isSafeInteger(input.staleClaimMs) || input.staleClaimMs < 0) {
+      throw new Error('task_control_invalid:projectWorkerEvidence.claimTime');
+    }
+    return this.withImmediateWrite(() => {
+      // Per-lane FIFO: within a lane keyed by
+      // (sourceAppId, controllerAppId, dispatchRoot) a later active row must not pass
+      // an earlier pending/inflight row. Claim order between lanes uses SQLite `rowid`,
+      // which is persistent across normal close/reopen (VACUUM is not run).
+      const rows = this.db.prepare(`SELECT o.rowid AS row_id, o.outbox_id, o.status, o.next_attempt_at, o.claimed_at,
+          o.controller_app_id, ev.evidence_json
+        FROM control_project_worker_evidence_outbox AS o
+        JOIN control_project_worker_evidence AS ev
+          ON ev.source_app_id=o.source_app_id AND ev.evidence_id=o.evidence_id
+        WHERE o.source_app_id=? AND o.status IN ('pending','inflight')
+        ORDER BY o.rowid`).all(this.larkAppId) as Array<{
+          row_id: number | bigint; outbox_id: string; status: string;
+          next_attempt_at: number | bigint; claimed_at: number | bigint | null;
+          controller_app_id: string; evidence_json: string;
+        }>;
+      const laneHead = new Map<string, string>();
+      let candidate: { outbox_id: string } | undefined;
+      for (const row of rows) {
+        const evidence = JSON.parse(row.evidence_json) as ProjectWorkerEvidenceV1;
+        const laneKey = `${row.controller_app_id}\0${evidence.dispatchRoot}`;
+        if (!laneHead.has(laneKey)) laneHead.set(laneKey, row.outbox_id);
+        if (laneHead.get(laneKey) !== row.outbox_id) continue;
+        const dueNow = row.status === 'pending' && Number(row.next_attempt_at) <= input.now;
+        const staleInflight = row.status === 'inflight'
+          && Number(row.claimed_at ?? 0) <= input.now - input.staleClaimMs;
+        if (dueNow || staleInflight) { candidate = { outbox_id: row.outbox_id }; break; }
+      }
+      if (!candidate) return undefined;
+      const changed = this.db.prepare(`UPDATE control_project_worker_evidence_outbox
+        SET status='inflight',attempts=attempts+1,claim_token=?,claimed_at=?,updated_at=?
+        WHERE source_app_id=? AND outbox_id=? AND (
+          (status='pending' AND next_attempt_at<=?)
+          OR (status='inflight' AND claimed_at<=?)
+        )`).run(
+          input.claimToken, input.now, new Date(input.now).toISOString(), this.larkAppId, candidate.outbox_id,
+          input.now, input.now - input.staleClaimMs,
+        );
+      if (Number(changed.changes ?? 0) !== 1) return undefined;
+      return this.listProjectWorkerEvidenceOutbox().find(row => row.outboxId === candidate!.outbox_id);
+    });
+  }
+
+  settleProjectWorkerEvidenceDelivered(
+    outboxId: string,
+    claimToken: string,
+    receiptRef: string,
+    now: number,
+  ): void {
+    this.assertWritable();
+    const changed = this.withImmediateWrite(() => this.db.prepare(`UPDATE control_project_worker_evidence_outbox
+      SET status='delivered',receipt_ref=?,claim_token=NULL,claimed_at=NULL,last_error=NULL,updated_at=?
+      WHERE source_app_id=? AND outbox_id=? AND status='inflight' AND claim_token=?`).run(
+        nonEmpty(receiptRef, 'projectWorkerEvidence.receiptRef'), new Date(now).toISOString(),
+        this.larkAppId, nonEmpty(outboxId, 'projectWorkerEvidence.outboxId'), nonEmpty(claimToken, 'projectWorkerEvidence.claimToken'),
+      ));
+    if (Number(changed.changes ?? 0) !== 1) throw new Error('task_control_project_evidence_claim_lost');
+  }
+
+  settleProjectWorkerEvidenceRetry(
+    outboxId: string,
+    claimToken: string,
+    error: string,
+    nextAttemptAt: number,
+    now: number,
+  ): void {
+    this.assertWritable();
+    if (!Number.isSafeInteger(nextAttemptAt) || !Number.isSafeInteger(now) || nextAttemptAt < now) {
+      throw new Error('task_control_invalid:projectWorkerEvidence.retryTime');
+    }
+    const changed = this.withImmediateWrite(() => this.db.prepare(`UPDATE control_project_worker_evidence_outbox
+      SET status='pending',next_attempt_at=?,claim_token=NULL,claimed_at=NULL,last_error=?,updated_at=?
+      WHERE source_app_id=? AND outbox_id=? AND status='inflight' AND claim_token=?`).run(
+        nextAttemptAt, nonEmpty(error, 'projectWorkerEvidence.error'), new Date(now).toISOString(),
+        this.larkAppId, nonEmpty(outboxId, 'projectWorkerEvidence.outboxId'), nonEmpty(claimToken, 'projectWorkerEvidence.claimToken'),
+      ));
+    if (Number(changed.changes ?? 0) !== 1) throw new Error('task_control_project_evidence_claim_lost');
+  }
+
+
   listTrustedMappings(): TrustedTaskControlMappingRecord[] {
     return (this.db.prepare('SELECT * FROM control_trusted_mappings WHERE lark_app_id=? ORDER BY created_at,dispatch_root').all(this.larkAppId) as Record<string, unknown>[])
-      .map(row => ({
-        larkAppId: String(row.lark_app_id), dispatchRoot: String(row.dispatch_root), projectId: String(row.project_id), phaseId: String(row.phase_id),
-        phaseTaskGuids: exactTaskSetSnapshot(JSON.parse(String(row.phase_task_guids_json)), 'phaseTaskGuids'),
-        taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id), ownerId: String(row.owner_id),
-        reviewerId: String(row.reviewer_id), acceptorId: String(row.acceptor_id), registrationRef: String(row.registration_ref),
-        ...(row.registration_version ? { registrationVersion: String(row.registration_version) } : {}),
-        ...(row.phase_registration_refs_json ? { phaseRegistrationRefs: JSON.parse(String(row.phase_registration_refs_json)) as Record<string, string> } : {}),
-        controllerId: String(row.controller_id), approvalGate: parseApprovalGate(JSON.parse(String(row.approval_gate_json))),
-        ...(row.doc_token ? { docToken: String(row.doc_token) } : {}),
-        ...(row.doc_revision !== null && row.doc_revision !== undefined ? { docRevision: Number(row.doc_revision) } : {}),
-        ...(row.mapping_proof_json ? { mappingProof: JSON.parse(String(row.mapping_proof_json)) } : {}),
-        createdAt: String(row.created_at),
-      }));
+      .map(row => {
+        const mappingAuthority = parseMappingAuthority(JSON.parse(String(row.mapping_authority_json)));
+        return {
+          larkAppId: String(row.lark_app_id), dispatchRoot: String(row.dispatch_root), projectId: String(row.project_id), phaseId: String(row.phase_id),
+          phaseTaskGuids: exactTaskSetSnapshot(JSON.parse(String(row.phase_task_guids_json)), 'phaseTaskGuids'),
+          taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id), ownerId: String(row.owner_id),
+          reviewerId: String(row.reviewer_id), acceptorId: String(row.acceptor_id), registrationRef: String(row.registration_ref),
+          ...(row.registration_version ? { registrationVersion: String(row.registration_version) } : {}),
+          ...(row.phase_registration_refs_json ? { phaseRegistrationRefs: JSON.parse(String(row.phase_registration_refs_json)) as Record<string, string> } : {}),
+          controllerId: String(row.controller_id), mappingAuthority,
+          ...(mappingAuthority.kind === 'v3_gate' ? { approvalGate: mappingAuthority.approvalGate } : {}),
+          ...(row.doc_token ? { docToken: String(row.doc_token) } : {}),
+          ...(row.doc_revision !== null && row.doc_revision !== undefined ? { docRevision: Number(row.doc_revision) } : {}),
+          ...(row.mapping_proof_json ? { mappingProof: JSON.parse(String(row.mapping_proof_json)) } : {}),
+          createdAt: String(row.created_at),
+        };
+      });
   }
 
   appendDesignatedReviewer(mapping: DesignatedReviewerMapping, authentication: unknown, verify: (value: DesignatedReviewerMapping) => boolean): void {
@@ -1906,8 +2796,26 @@ export class TaskControlPlaneStore {
     } catch { return undefined; }
   }
 
-  private reviewerVerdictHeadById(verdictId: string, now: string): ReviewerVerdictHead {
-    const raw = this.db.prepare('SELECT canonical_json FROM control_reviewer_verdicts WHERE verdict_id=? AND lark_app_id=?')
+  private designatedReviewerFromRow(row: Record<string, unknown>): DesignatedReviewerMapping {
+    return {
+      schemaVersion: 'DesignatedReviewer.v1', designatedReviewerRef: String(row.designated_reviewer_ref),
+      projectId: String(row.project_id), phaseId: String(row.phase_id), taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id ?? ''),
+      taskSetSnapshot: exactTaskSetSnapshot(JSON.parse(String(row.task_set_json)), 'mapping.taskSetSnapshot'), reviewRound: Number(row.review_round),
+      reviewerId: String(row.reviewer_id), reviewerBotAppId: String(row.reviewer_bot_app_id), controllerId: String(row.controller_id), controllerBotAppId: String(row.controller_bot_app_id),
+      effectiveAt: String(row.effective_at), expiresAt: String(row.expires_at), issuedAt: String(row.issued_at),
+      keyId: String(row.key_id), signature: String(row.signature),
+      ...(row.supersedes_ref ? { supersedesDesignatedReviewerRef: String(row.supersedes_ref) } : {}),
+    };
+  }
+
+  private designatedReviewerByRef(designatedReviewerRef: string): DesignatedReviewerMapping | undefined {
+    const row = this.db.prepare('SELECT * FROM control_designated_reviewers WHERE lark_app_id=? AND designated_reviewer_ref=?')
+      .get(this.larkAppId, designatedReviewerRef) as Record<string, unknown> | undefined;
+    return row ? this.designatedReviewerFromRow(row) : undefined;
+  }
+
+  private reviewerVerdictHeadById(verdictId: string, now: string, asOf = false): ReviewerVerdictHead {
+    const raw = this.db.prepare('SELECT rowid AS ingress_order,canonical_json FROM control_reviewer_verdicts WHERE verdict_id=? AND lark_app_id=?')
       .get(verdictId, this.larkAppId) as Record<string, unknown> | undefined;
     if (!raw) return { status: 'unknown', reason: 'reviewer_verdict_missing' };
     try {
@@ -1915,6 +2823,7 @@ export class TaskControlPlaneStore {
       const head = this.recomputeReviewerVerdictHead(
         verdict.projectId, verdict.phaseId, verdict.taskGuid, verdict.topicRootId,
         exactTaskSetSnapshot(verdict.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot'), verdict.reviewRound, now,
+        asOf ? Number(raw.ingress_order) : undefined,
       );
       return head.status === 'active' && head.verdict?.verdictId === verdictId
         ? head
@@ -1922,21 +2831,14 @@ export class TaskControlPlaneStore {
     } catch { return { status: 'unknown', reason: 'reviewer_verdict_malformed' }; }
   }
 
-  private recomputeDesignatedReviewerHead(projectId: string, phaseId: string, taskGuid: string, topicRootId: string, taskSetSnapshot: readonly string[], reviewRound: number, now: string): DesignatedReviewerMapping | undefined {
+  private recomputeDesignatedReviewerHead(projectId: string, phaseId: string, taskGuid: string, topicRootId: string, taskSetSnapshot: readonly string[], reviewRound: number, now: string, asOf = false): DesignatedReviewerMapping | undefined {
     const rows = this.db.prepare(`SELECT * FROM control_designated_reviewers
       WHERE lark_app_id=? AND project_id=? AND phase_id=? AND task_guid=? AND topic_root_id=? AND review_round=?`)
       .all(this.larkAppId, projectId, phaseId, taskGuid, topicRootId, reviewRound) as Record<string, unknown>[];
     if (!this.reviewerVerifier) return undefined;
-    const mappings = rows.map(row => ({
-      schemaVersion: 'DesignatedReviewer.v1' as const, designatedReviewerRef: String(row.designated_reviewer_ref),
-      projectId: String(row.project_id), phaseId: String(row.phase_id), taskGuid: String(row.task_guid), topicRootId: String(row.topic_root_id ?? ''),
-      taskSetSnapshot: exactTaskSetSnapshot(JSON.parse(String(row.task_set_json)), 'mapping.taskSetSnapshot'), reviewRound: Number(row.review_round),
-      reviewerId: String(row.reviewer_id), reviewerBotAppId: String(row.reviewer_bot_app_id), controllerId: String(row.controller_id), controllerBotAppId: String(row.controller_bot_app_id),
-      effectiveAt: String(row.effective_at), expiresAt: String(row.expires_at), issuedAt: String(row.issued_at),
-      keyId: String(row.key_id), signature: String(row.signature),
-      ...(row.supersedes_ref ? { supersedesDesignatedReviewerRef: String(row.supersedes_ref) } : {}),
-    })).filter(mapping => JSON.stringify(mapping.taskSetSnapshot) === JSON.stringify(taskSetSnapshot)
-      && this.reviewerVerifier!.verifyDesignatedReviewer(mapping));
+    const mappings = rows.map(row => this.designatedReviewerFromRow(row))
+      .filter(mapping => (!asOf || timestampMs(mapping.issuedAt, 'designatedReviewer.issuedAt') <= timestampMs(now, 'designatedReviewer.now'))
+        && JSON.stringify(mapping.taskSetSnapshot) === JSON.stringify(taskSetSnapshot));
     if (mappings.length === 0) return undefined;
     const byRef = new Map(mappings.map(mapping => [mapping.designatedReviewerRef, mapping]));
     const superseded = new Set<string>();
@@ -1947,6 +2849,7 @@ export class TaskControlPlaneStore {
     }
     const heads = mappings.filter(mapping => !superseded.has(mapping.designatedReviewerRef));
     if (heads.length !== 1) return undefined;
+    if (mappings.some(mapping => !this.reviewerVerifier!.verifyDesignatedReviewer(mapping))) return undefined;
     const head = heads[0]!;
     // Supersession is historical: a new head permanently retires the old one.
     // Apply its temporal validity only after the chain is resolved so an expired
@@ -1957,15 +2860,18 @@ export class TaskControlPlaneStore {
       : undefined;
   }
 
-  private recomputeReviewerVerdictHead(projectId: string, phaseId: string, taskGuid: string, topicRootId: string, taskSetSnapshot: readonly string[], reviewRound: number, now: string): ReviewerVerdictHead {
-    const rows = this.db.prepare(`SELECT canonical_json FROM control_reviewer_verdicts
-      WHERE lark_app_id=? AND project_id=? AND phase_id=? AND task_guid=? AND review_round=? ORDER BY issued_at,verdict_id`)
+  private recomputeReviewerVerdictHead(projectId: string, phaseId: string, taskGuid: string, topicRootId: string, taskSetSnapshot: readonly string[], reviewRound: number, now: string, maxIngressOrder?: number): ReviewerVerdictHead {
+    const rows = this.db.prepare(`SELECT rowid AS ingress_order,canonical_json FROM control_reviewer_verdicts
+      WHERE lark_app_id=? AND project_id=? AND phase_id=? AND task_guid=? AND review_round=? ORDER BY rowid`)
       .all(this.larkAppId, projectId, phaseId, taskGuid, reviewRound) as Record<string, unknown>[];
-    if (!this.reviewerVerifier) return { status: 'unknown', reason: 'reviewer_verdict_verifier_missing' };
-    const records = rows.map(row => JSON.parse(String(row.canonical_json)) as ReviewerVerdictV1)
-      .filter(record => record.topicRootId === topicRootId
-        && JSON.stringify(exactTaskSetSnapshot(record.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot')) === JSON.stringify(taskSetSnapshot)
-        && this.reviewerVerifier!.verifyVerdict(record));
+    if (maxIngressOrder === undefined && !this.reviewerVerifier) return { status: 'unknown', reason: 'reviewer_verdict_verifier_missing' };
+    const records = rows.map(row => ({
+      ingressOrder: Number(row.ingress_order),
+      record: JSON.parse(String(row.canonical_json)) as ReviewerVerdictV1,
+    })).filter(({ ingressOrder, record }) => (maxIngressOrder === undefined || ingressOrder <= maxIngressOrder)
+      && record.topicRootId === topicRootId
+      && JSON.stringify(exactTaskSetSnapshot(record.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot')) === JSON.stringify(taskSetSnapshot))
+      .map(({ record }) => record);
     if (records.length === 0) return { status: 'unknown', reason: 'reviewer_verdict_missing' };
     const byId = new Map(records.map(record => [record.verdictId, record]));
     const children = new Map<string, ReviewerVerdictV1[]>();
@@ -1990,6 +2896,9 @@ export class TaskControlPlaneStore {
     const revoked = new Set(records.filter(record => !!record.revokesVerdictId).map(record => record.revokesVerdictId!));
     const heads = records.filter(record => !children.has(record.verdictId));
     if (heads.length !== 1) return { status: 'unknown', reason: 'reviewer_verdict_head_ambiguous' };
+    if (maxIngressOrder === undefined && records.some(record => !this.reviewerVerifier!.verifyVerdict(record))) {
+      return { status: 'unknown', reason: 'reviewer_verdict_current_policy_unverified' };
+    }
     const head = heads[0]!;
     if (timestampMs(head.expiresAt, 'reviewerVerdict.expiresAt') <= timestampMs(now, 'reviewerVerdict.now')) return { status: 'unknown', reason: 'reviewer_verdict_expired' };
     if (head.kind === 'revocation' || revoked.has(head.verdictId)) return { status: 'revoked', verdict: head };
@@ -2021,6 +2930,7 @@ export class TaskControlPlaneStore {
       && verdict.verdict === review.verdict
       && verdict.docToken === review.docToken
       && verdict.docRevision === review.docRevision
+      && JSON.stringify(verdict.artifactEvidence ?? null) === JSON.stringify(review.artifactEvidence ?? null)
       && JSON.stringify([...verdict.conditionIds].sort()) === JSON.stringify([...review.conditionIds].sort())
       && JSON.stringify(verdict.resolvedConditionEvidence) === JSON.stringify(review.resolvedConditionEvidence);
   }
@@ -2099,6 +3009,10 @@ export class TaskControlPlaneStore {
       reviewerVerdictId: nonEmpty(payload.reviewerVerdictId, 'payload.reviewerVerdictId'),
       ...(optionalString(payload.docToken) ? { docToken: optionalString(payload.docToken)! } : {}),
       ...(typeof payload.docRevision === 'number' ? { docRevision: payload.docRevision } : {}),
+      ...(payload.artifactEvidence !== undefined ? { artifactEvidence: taskControlArtifactEvidence(payload) } : {}),
+      ...(optionalString(payload.projectReportEvidenceId)
+        ? { projectReportEvidenceId: optionalString(payload.projectReportEvidenceId)! }
+        : {}),
     };
     const task: TaskProjection = {
       taskGuid, mapping, state: 'submitted', explicitlyAccepted: true, unresolvedReviewConditionIds: [],
@@ -2152,11 +3066,18 @@ export class TaskControlPlaneStore {
     const phaseRegistrationRefs = input.phaseRegistrationRefs;
     const docRevision = input.docRevision === undefined ? undefined : positiveInteger(input.docRevision, 'docRevision');
     const controllerId = nonEmpty(input.controllerId, 'controllerId');
-    const approvalGate = parseApprovalGate(input.approvalGate);
+    const mappingAuthority = input.mappingAuthority
+      ? parseMappingAuthority(input.mappingAuthority)
+      : { kind: 'v3_gate' as const, approvalGate: parseApprovalGate(input.approvalGate)! };
+    if (mappingAuthority.kind === 'legacy_untrusted') throw new Error('task_control_mapping_authority_untrusted');
+    const approvalGate = mappingAuthority.kind === 'v3_gate' ? mappingAuthority.approvalGate : undefined;
     const docToken = input.docToken === undefined ? undefined : nonEmpty(input.docToken, 'docToken');
     const mappingProof = input.mappingProof;
     if (!phaseTaskGuids.includes(taskGuid) || topicRootId !== dispatchRoot
-      || ownerId === reviewerId || ownerId === acceptorId || reviewerId === acceptorId) {
+      || ownerId === reviewerId || ownerId === acceptorId || reviewerId === acceptorId
+      || (mappingAuthority.kind === 'project_group'
+        && (mappingAuthority.acceptorAppId !== acceptorId
+          || new Set([controllerId, ownerId, reviewerId, acceptorId]).size !== 4))) {
       throw new Error('task_control_mapping_invalid');
     }
     if (phaseRegistrationRefs && (Object.keys(phaseRegistrationRefs).length !== phaseTaskGuids.length
@@ -2169,7 +3090,8 @@ export class TaskControlPlaneStore {
     }
     const mapping: TrustedTaskControlMappingRecord = {
       dispatchRoot, projectId, phaseId, phaseTaskGuids, taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-      registrationRef, ...(registrationVersion ? { registrationVersion } : {}), ...(phaseRegistrationRefs ? { phaseRegistrationRefs } : {}), controllerId, approvalGate, ...(docToken ? { docToken } : {}), ...(docRevision ? { docRevision } : {}), ...(mappingProof ? { mappingProof } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
+      registrationRef, ...(registrationVersion ? { registrationVersion } : {}), ...(phaseRegistrationRefs ? { phaseRegistrationRefs } : {}), controllerId,
+      mappingAuthority, ...(approvalGate ? { approvalGate } : {}), ...(docToken ? { docToken } : {}), ...(docRevision ? { docRevision } : {}), ...(mappingProof ? { mappingProof } : {}), createdAt: input.occurredAt ?? new Date().toISOString(),
     };
     return this.withImmediateWrite(() => {
       const existing = this.db.prepare('SELECT * FROM control_trusted_mappings WHERE dispatch_root=? AND lark_app_id=?')
@@ -2210,10 +3132,12 @@ export class TaskControlPlaneStore {
       });
       if (mappingResult.kind === 'conflict') throw new Error(`task_control_mapping_event_conflict:${dispatchRoot}`);
       this.db.prepare(`INSERT INTO control_trusted_mappings(
-        dispatch_root,lark_app_id,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,registration_version,phase_registration_refs_json,controller_id,approval_gate_json,doc_token,doc_revision,mapping_proof_json,created_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        dispatch_root,lark_app_id,project_id,phase_id,phase_task_guids_json,task_guid,topic_root_id,owner_id,reviewer_id,acceptor_id,registration_ref,registration_version,phase_registration_refs_json,controller_id,approval_gate_json,mapping_authority_json,doc_token,doc_revision,mapping_proof_json,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         dispatchRoot, this.larkAppId, projectId, phaseId, JSON.stringify(phaseTaskGuids), taskGuid, topicRootId, ownerId, reviewerId, acceptorId,
-        registrationRef, registrationVersion ?? null, phaseRegistrationRefs ? JSON.stringify(phaseRegistrationRefs) : null, controllerId, JSON.stringify(approvalGate), docToken ?? null, docRevision ?? null, mappingProof ? JSON.stringify(mappingProof) : null, mapping.createdAt,
+        registrationRef, registrationVersion ?? null, phaseRegistrationRefs ? JSON.stringify(phaseRegistrationRefs) : null, controllerId,
+        approvalGate ? JSON.stringify(approvalGate) : 'null', JSON.stringify(mappingAuthority), docToken ?? null, docRevision ?? null,
+        mappingProof ? JSON.stringify(mappingProof) : null, mapping.createdAt,
       );
       return { kind: 'registered', mapping };
     });
@@ -2278,6 +3202,55 @@ export class TaskControlPlaneStore {
   appendUnknownObservation(input: AppendTaskControlObservationInput): AppendTaskControlObservationResult {
     this.assertWritable();
     return this.withImmediateWrite(() => this.appendUnknownObservationLocked(input));
+  }
+
+  /**
+   * Controller-side first-ingress holdback record for a project worker evidence.
+   * The idempotency key is derived from evidenceId; the semantic payload binds
+   * evidence canonical hash, dispatch root, and review round but deliberately
+   * excludes request-local time. The winning inserted row's `occurred_at` is the
+   * sole controller `receivedAt`. Concurrent identical calls converge on that
+   * winner; a different canonical hash under the same key is a permanent
+   * conflict and never reopens the observation.
+   */
+  recordEvidenceFirstIngress(input: {
+    evidenceId: string;
+    canonicalHash: string;
+    dispatchRoot: string;
+    reviewRound: number;
+    occurredAt: string;
+  }): { kind: 'appended' | 'duplicate'; receivedAt: string }
+    | { kind: 'conflict'; receivedAt: string; existingCanonicalHash: string } {
+    this.assertWritable();
+    const evidenceId = nonEmpty(input.evidenceId, 'evidenceHoldback.evidenceId');
+    const canonicalHash = nonEmpty(input.canonicalHash, 'evidenceHoldback.canonicalHash');
+    const dispatchRoot = nonEmpty(input.dispatchRoot, 'evidenceHoldback.dispatchRoot');
+    if (!Number.isSafeInteger(input.reviewRound) || input.reviewRound < 1) {
+      throw new Error('task_control_invalid:evidenceHoldback.reviewRound');
+    }
+    const occurredAt = nonEmpty(input.occurredAt, 'evidenceHoldback.occurredAt');
+    const idempotencyKey = `evidence-holdback:${evidenceId}`;
+    return this.withImmediateWrite(() => {
+      const existing = this.db.prepare(
+        'SELECT * FROM control_observations WHERE idempotency_key=? AND lark_app_id=?',
+      ).get(idempotencyKey, this.larkAppId) as Record<string, unknown> | undefined;
+      if (existing) {
+        const observation = rowToObservation(existing);
+        const existingHash = String((observation.payload as { canonicalHash?: unknown }).canonicalHash ?? '');
+        if (existingHash === canonicalHash) return { kind: 'duplicate', receivedAt: observation.occurredAt };
+        return { kind: 'conflict', receivedAt: observation.occurredAt, existingCanonicalHash: existingHash };
+      }
+      const payload = { canonicalHash, dispatchRoot, reviewRound: input.reviewRound };
+      this.db.prepare(`INSERT INTO control_observations(
+        event_id,lark_app_id,attempted_event_type,source_ref,idempotency_key,occurred_at,outcome,payload_hash,payload_json
+      ) VALUES(?,?,?,?,?,?,'unknown',?,?)`).run(
+        `tcp-evidence-holdback:${evidenceId}`, this.larkAppId, 'unknown.required',
+        `evidence-holdback:${evidenceId}`, idempotencyKey, occurredAt,
+        payloadHash({ attemptedEventType: 'unknown.required', sourceRef: `evidence-holdback:${evidenceId}`, payload }),
+        JSON.stringify(payload),
+      );
+      return { kind: 'appended', receivedAt: occurredAt };
+    });
   }
 
   /**
@@ -2557,6 +3530,156 @@ export class TaskControlPlaneStore {
     return this.refreshReviewerVerdictProjection({ ...projection, taskGuid }, checkedAt);
   }
 
+  /**
+   * Narrow, valid-transition-only capacity predicate. It never accepts raw `state_after`,
+   * a natural-language report, an unmapped or wrong-role terminal, `terminal:false` delivery,
+   * or a project-side `failed`/`completed` string. Later audit defects on the same task do
+   * NOT reverse this fact; they must be checked separately by {@link getTaskAdmissionDecision}.
+   */
+  getTaskTrustedTerminalDecision(dispatchRoot: string, taskGuid: string): TaskControlTrustedTerminalDecision {
+    const mapping = this.listTrustedMappings().find(item => item.dispatchRoot === dispatchRoot && item.taskGuid === taskGuid);
+    if (!mapping) return { released: false };
+    return reduceTrustedTerminalCapacity(
+      this.listEvents({ taskGuid }),
+      { dispatchRoot: mapping.dispatchRoot, ownerId: mapping.ownerId, reviewerId: mapping.reviewerId, controllerId: mapping.controllerId },
+      ({ review, delivered, done }) => {
+        let artifact: TaskControlArtifactEvidence;
+        let deliveredArtifact: TaskControlArtifactEvidence;
+        try {
+          artifact = taskControlArtifactEvidence(review.payload);
+          deliveredArtifact = taskControlArtifactEvidence(delivered.payload);
+        } catch { return false; }
+        if (artifact.kind !== 'project_report' || deliveredArtifact.kind !== 'project_report'
+          || JSON.stringify(canonicalize(artifact)) !== JSON.stringify(canonicalize(deliveredArtifact))
+          || artifact.dispatchRoot !== mapping.dispatchRoot
+          || artifact.reporterAppId !== mapping.reviewerId
+          || review.payload.projectReportEvidenceId !== artifact.triggerId
+          || typeof review.payload.reviewerVerdictId !== 'string'
+          || delivered.sourceRef !== done.sourceRef
+          || delivered.evidenceRef !== delivered.sourceRef) return false;
+        const evidenceId = delivered.sourceRef?.match(/^project-worker-evidence:(.+)$/)?.[1];
+        if (!evidenceId) return false;
+        const ingress = this.listObservations().filter(observation => (
+          observation.idempotencyKey === `evidence-holdback:${evidenceId}`
+          && observation.sourceRef === `evidence-holdback:${evidenceId}`
+          && observation.outcome === 'unknown'
+          && observation.payload.dispatchRoot === mapping.dispatchRoot
+          && observation.payload.reviewRound === review.payload.reviewRound
+        ));
+        if (ingress.length !== 1 || review.occurredAt !== ingress[0]!.occurredAt
+          || delivered.occurredAt !== ingress[0]!.occurredAt || done.occurredAt !== ingress[0]!.occurredAt) return false;
+        const head = this.reviewerVerdictHeadById(review.payload.reviewerVerdictId, ingress[0]!.occurredAt, true);
+        const verdict = head.status === 'active' ? head.verdict : undefined;
+        const designation = verdict ? this.designatedReviewerByRef(verdict.designatedReviewerRef) : undefined;
+        if (!verdict || verdict.verdictId !== review.payload.reviewerVerdictId
+          || verdict.verdict !== 'pass' || verdict.conditionIds.length !== 0
+          || verdict.reviewRound !== review.payload.reviewRound
+          || verdict.reviewerId !== mapping.reviewerId || verdict.reviewerBotAppId !== mapping.reviewerId
+          || designation?.designatedReviewerRef !== verdict.designatedReviewerRef
+          || designation.projectId !== verdict.projectId || designation.phaseId !== verdict.phaseId
+          || designation.taskGuid !== verdict.taskGuid || designation.topicRootId !== verdict.topicRootId
+          || designation.reviewRound !== verdict.reviewRound
+          || designation.reviewerId !== verdict.reviewerId || designation.reviewerBotAppId !== verdict.reviewerBotAppId
+          || JSON.stringify(designation.taskSetSnapshot) !== JSON.stringify(exactTaskSetSnapshot(verdict.taskSetSnapshot, 'reviewerVerdict.taskSetSnapshot'))
+          || designation.controllerId !== mapping.controllerId
+          || verdict.sourceMessageId !== artifact.triggerId || verdict.sourceVersionHash !== artifact.contentHash
+          || JSON.stringify(canonicalize(verdict.artifactEvidence)) !== JSON.stringify(canonicalize(artifact))) return false;
+        const submittedCount = this.listEvents({ taskGuid }).filter(event => (
+          event.seq < review.seq && event.eventType === 'task.first_submitted'
+          && event.actorRole === 'worker' && event.actorId === mapping.ownerId
+        )).length;
+        if (submittedCount < Number(review.payload.reviewRound)) return false;
+        const rows = this.listOutbox({ eventId: delivered.eventId });
+        if (rows.length !== 1 || rows[0]!.status !== 'delivered'
+          || rows[0]!.destinationId !== `project-session:${artifact.targetSessionId}`) return false;
+        const row = rows[0]!;
+        const receipts = this.listReceipts(delivered.eventId).filter(receipt => (
+          receipt.outboxId === row.outboxId
+          && receipt.destinationId === row.destinationId
+          && receipt.state === 'delivered'
+          && !!receipt.receiptRef
+          && receiptRefBindsEventAndDestination(receipt.receiptRef, delivered.eventId, row.destinationId)
+        ));
+        return receipts.length === 1;
+      },
+    );
+  }
+
+  /**
+   * Independent admission decision for a new project-group reservation on this exact mapping.
+   * A prior valid trusted terminal is not enough: unresolved conflicts, invalid transitions,
+   * unresolved required unknowns, or reviewer-verdict issues still deny admission for a new C.
+   */
+  getTaskAdmissionDecision(dispatchRoot: string, taskGuid: string, checkedAt?: string): TaskControlAdmissionDecision {
+    const mapping = this.listTrustedMappings().find(item => item.dispatchRoot === dispatchRoot && item.taskGuid === taskGuid);
+    if (!mapping) return { safe: false, blockers: [] };
+    const events = this.listEvents({ taskGuid });
+    const byId = new Map(events.map(event => [event.eventId, event]));
+    const terminal = this.getTaskTrustedTerminalDecision(dispatchRoot, taskGuid);
+    const releaseSeq = terminal.releaseEventId ? byId.get(terminal.releaseEventId)?.seq : undefined;
+    const terminalShaped = new Set<TaskControlEventType>([
+      'task.failed', 'task.cancelled', 'task.delivered', 'task.done_marked',
+    ]);
+    const blocksAt = (event: TaskControlEvent | undefined): boolean => {
+      if (!event || releaseSeq === undefined || event.seq > releaseSeq) return true;
+      const incomingType = typeof event.payload.incomingEventType === 'string'
+        ? event.payload.incomingEventType as TaskControlEventType
+        : undefined;
+      return terminalShaped.has(event.eventType) || (!!incomingType && terminalShaped.has(incomingType));
+    };
+    const evaluationTime = checkedAt ?? new Date().toISOString();
+    const projection = this.getTaskProjection(taskGuid, evaluationTime);
+    const blockers: TaskControlAdmissionBlocker[] = [];
+    for (const violation of projection.transitionViolations) {
+      if (blocksAt(byId.get(violation.eventId))) {
+        blockers.push({ kind: 'transition_violation', eventId: violation.eventId });
+      }
+    }
+    for (const eventId of projection.unresolvedConflictEventIds) {
+      if (blocksAt(byId.get(eventId))) blockers.push({ kind: 'unresolved_conflict', eventId });
+    }
+    for (const unknown of projection.unknowns) {
+      if (!unknown.required || unknown.resolved) continue;
+      const required = events.filter(event => event.eventType === 'unknown.required'
+        && event.payload.unknownKey === unknown.key).at(-1);
+      if (releaseSeq === undefined || !required || required.seq > releaseSeq) {
+        blockers.push({ kind: 'unresolved_unknown', key: unknown.key });
+      }
+    }
+    if (projection.reviewerVerdictIssue) {
+      blockers.push({ kind: 'reviewer_verdict_issue', message: projection.reviewerVerdictIssue });
+    }
+    const releaseReview = releaseSeq !== undefined && terminal.releaseKind === 'valid_delivered_done'
+      ? reduceTask(events.filter(event => event.seq <= releaseSeq)).projection.independentReview
+      : undefined;
+    const releaseVerdictHead = releaseReview?.reviewerVerdictId
+      ? this.reviewerVerdictHeadById(releaseReview.reviewerVerdictId, evaluationTime)
+      : undefined;
+    if (terminal.releaseKind === 'valid_delivered_done'
+      && (!releaseReview?.reviewerVerdictId
+        || releaseVerdictHead?.status !== 'active'
+        || releaseVerdictHead.verdict?.verdictId !== releaseReview.reviewerVerdictId)) {
+      blockers.push({
+        kind: 'reviewer_verdict_issue',
+        message: 'current reviewer verdict head differs from the PASS bound to terminal release',
+      });
+    }
+    return { safe: blockers.length === 0, blockers };
+  }
+
+  /** One immutable capacity fact plus its independent, sequence-aware admission gate. */
+  getTaskControlMappingDecision(dispatchRoot: string, taskGuid: string, checkedAt?: string): TaskControlMappingDecision {
+    const terminal = this.getTaskTrustedTerminalDecision(dispatchRoot, taskGuid);
+    const admission = this.getTaskAdmissionDecision(dispatchRoot, taskGuid, checkedAt);
+    return {
+      capacityReleased: terminal.released,
+      admissionSafe: admission.safe,
+      ...(terminal.releaseEventId ? { releaseEventId: terminal.releaseEventId } : {}),
+      ...(terminal.releaseKind ? { releaseKind: terminal.releaseKind } : {}),
+      admissionBlockers: admission.blockers,
+    };
+  }
+
   getPhaseProjection(projectId: string, phaseId: string): PhaseProjection {
     const events = this.listEvents({ projectId, phaseId });
     const phaseEvents = events.filter(event => !event.taskGuid);
@@ -2614,10 +3737,12 @@ export class TaskControlPlaneStore {
     if (!Number.isFinite(input.now)) throw new Error('task_control_invalid:outbox_claim_now');
     return this.withImmediateWrite(() => {
       const raw = this.db.prepare(`SELECT * FROM control_outbox
-        WHERE lark_app_id=? AND event_id=? AND destination_id=? AND status='pending'`)
+        WHERE lark_app_id=? AND event_id=? AND destination_id=?`)
         .get(this.larkAppId, eventId, destinationId) as Record<string, unknown> | undefined;
       if (!raw) return undefined;
       const outbox = outboxFromRow(raw);
+      if (outbox.status === 'inflight' && outbox.claimToken === claimToken) return outbox;
+      if (outbox.status !== 'pending') return undefined;
       const changed = this.db.prepare(`UPDATE control_outbox
         SET status='inflight',attempts=attempts+1,claim_token=?,claimed_at=?,updated_at=?
         WHERE outbox_id=? AND lark_app_id=? AND status='pending'`).run(

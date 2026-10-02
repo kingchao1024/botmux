@@ -245,6 +245,39 @@ export function buildDispatchMessages(input: {
   };
 }
 
+export function buildTaskControlKickoffContent(input: {
+  title: string;
+  brief: string;
+  dispatchRoot: string;
+  bots: Array<{
+    appId: string;
+    openId: string;
+    displayName: string;
+    role: 'worker' | 'reviewer';
+  }>;
+}): { content: string; targetAppIds: string[] } {
+  const brief = buildDispatchCompletionBrief({
+    brief: input.brief,
+    dispatchRootId: input.dispatchRoot,
+    exactReportRootEnabled: true,
+    sameTopicSendEnabled: false,
+    writeReviewRequired: true,
+  });
+  const built = buildDispatchMessages({
+    title: input.title,
+    brief,
+    bots: input.bots.map(bot => ({
+      openId: bot.openId,
+      name: bot.displayName,
+      role: bot.role,
+    })),
+  });
+  return {
+    content: JSON.stringify({ zh_cn: { title: '', content: built.threadContent } }),
+    targetAppIds: input.bots.map(bot => bot.appId).sort(),
+  };
+}
+
 /**
  * Build the "repo prime" message: a `/repo <path>` command @-mentioning the
  * target bots, sent as a **plain text message** — exactly like a human typing

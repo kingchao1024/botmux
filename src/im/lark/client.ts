@@ -263,7 +263,7 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * idempotencyKey here so retries don't re-send.  Existing callers omit
  * the param and get exactly the pre-Step-6 behavior.
  */
-export interface OutboundMessageOptions {
+export interface OutboundMessageOptions extends LarkRequestOptions {
   /** The provider request is reconciling an already-attempted stable UUID.
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
@@ -313,15 +313,21 @@ export async function sendMessage(
 
     let res: any;
     try {
-      res = await c.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          msg_type: msgType as any,
-          content: body,
-          ...(uuid ? { uuid } : {}),
-        },
-      });
+      const data = {
+        receive_id: chatId,
+        msg_type: msgType as any,
+        content: body,
+        ...(uuid ? { uuid } : {}),
+      };
+      res = options?.signal || options?.timeoutMs
+        ? await c.request({
+            method: 'POST', url: '/open-apis/im/v1/messages',
+            params: { receive_id_type: 'chat_id' }, data,
+            ...larkRequestDeadline(options),
+          })
+        : await c.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' }, data,
+          });
     } catch (err: any) {
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
         throw new MessageWithdrawnError(chatId);
@@ -347,7 +353,7 @@ export async function sendMessage(
         content,
       });
     return messageId;
-  });
+  }, options?.signal ? { signal: options.signal } : undefined);
 }
 
 /**
@@ -376,15 +382,20 @@ export async function replyMessage(
 
     let res: any;
     try {
-      res = await c.im.v1.message.reply({
-        path: { message_id: messageId },
-        data: {
-          msg_type: msgType as any,
-          content: body,
-          ...(replyInThread ? { reply_in_thread: true } : {}),
-          ...(uuid ? { uuid } : {}),
-        },
-      });
+      const data = {
+        msg_type: msgType as any,
+        content: body,
+        ...(replyInThread ? { reply_in_thread: true } : {}),
+        ...(uuid ? { uuid } : {}),
+      };
+      res = options?.signal || options?.timeoutMs
+        ? await c.request({
+            method: 'POST',
+            url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`,
+            data,
+            ...larkRequestDeadline(options),
+          })
+        : await c.im.v1.message.reply({ path: { message_id: messageId }, data });
     } catch (err: any) {
       if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
         throw new MessageWithdrawnError(messageId);
@@ -411,7 +422,7 @@ export async function replyMessage(
         content,
       });
     return replyId;
-  });
+  }, options?.signal ? { signal: options.signal } : undefined);
 }
 
 export type MessageUrgentMode = 'app' | 'sms' | 'phone';

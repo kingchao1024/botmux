@@ -160,15 +160,32 @@ import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { deleteMessage, getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
-import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
+import {
+  parseProjectCoordinatorAction,
+  projectCompletionGateAuthorizationPrompt,
+  type ProjectCompletionGateLifecycleAction,
+} from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
-import { readProjectGroup } from '../services/project-group-store.js';
+import {
+  canonicalProjectTaskControlCanaryFence,
+  projectTaskControlCanaryAbandonmentFromRecord,
+  projectTaskControlCanaryFenceFingerprint,
+  projectTaskControlCanaryFenceRecord,
+  readProjectGroup,
+  TASK_CONTROL_CANARY_ABANDONED_CODE,
+  TASK_CONTROL_CANARY_QUARANTINE_CODE,
+  type ProjectTaskControlCanaryFenceInput,
+} from '../services/project-group-store.js';
 import {
   evaluateProjectDispatchPolicy,
+  groupCollaborationModeConfigFingerprint,
   readGroupCollaborationMode,
+  writeGroupCollaborationMode,
 } from '../services/group-collaboration-mode-store.js';
 import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
-import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
+import { readTaskControlSuccessCertificate } from './dispatch-registry.js';
+import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot, stripLeadingMentions } from '../im/lark/message-parser.js';
+import { canOperate } from '../im/lark/event-dispatcher.js';
 import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 
@@ -302,6 +319,21 @@ export function setCrossPrincipalInterruptionDisableHandler(
   handler: (() => number | Promise<number>) | null,
 ): void {
   crossPrincipalInterruptionDisableHandler = handler;
+}
+
+export type TaskControlCanaryPhaseASendHandler = (input: {
+  dataDir: string;
+  chatId: string;
+  larkAppId: string;
+  coordinatorSessionId: string;
+  fenceFingerprint: string;
+  instructionTemplateSha256: string;
+}) => Promise<object>;
+let taskControlCanaryPhaseASendHandler: TaskControlCanaryPhaseASendHandler | null = null;
+export function setTaskControlCanaryPhaseASendHandler(
+  handler: TaskControlCanaryPhaseASendHandler | null,
+): void {
+  taskControlCanaryPhaseASendHandler = handler;
 }
 import {
   composeRowFromActive,
@@ -2388,6 +2420,166 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   });
 });
 
+function verifiedCurrentProjectHumanActor(
+  ds: DaemonSession,
+  authorizationRef: string,
+  expectedPrompt: string,
+): string | undefined {
+  const active = ds.activeInteractiveTurn;
+  const caller = active?.caller;
+  const callerOpenId = caller?.requestUserOpenId?.trim();
+  const origin = ds.managedTurnOrigin;
+  if (!active || !/^om_[A-Za-z0-9_-]{1,128}$/.test(active.turnId)
+    || active.turnId !== authorizationRef
+    || origin?.turnId !== active.turnId
+    || origin.callerOpenId !== callerOpenId || origin.senderKind !== 'human'
+    || caller?.senderType !== 'user' || caller.source !== undefined
+    || caller.requestLarkAppId !== ds.larkAppId
+    || !callerOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(callerOpenId)) return undefined;
+
+  let authorizedOperator = ds.session.ownerOpenId === callerOpenId;
+  if (!authorizedOperator) {
+    try {
+      // This branch has already proved a human sender. Never pass its union_id
+      // into canOperate: that parameter intentionally grants trusted peer bots.
+      authorizedOperator = canOperate(ds.larkAppId, ds.chatId, callerOpenId);
+    } catch { /* missing or invalid bot config fails closed */ }
+  }
+  if (!authorizedOperator) return undefined;
+
+  let userPrompt = active.userPrompt?.trim() ?? '';
+  try {
+    const botName = getBot(ds.larkAppId).botName;
+    if (botName) userPrompt = stripLeadingMentions(userPrompt, [{ name: botName }]).trim();
+  } catch { /* an owner-bound session does not need registry data to compare its prompt */ }
+  return userPrompt === expectedPrompt ? callerOpenId : undefined;
+}
+
+function verifiedProjectCompletionGateActor(
+  ds: DaemonSession,
+  action: ProjectCompletionGateLifecycleAction,
+): string | undefined {
+  return verifiedCurrentProjectHumanActor(
+    ds,
+    action.authorizationRef,
+    projectCompletionGateAuthorizationPrompt(action),
+  );
+}
+
+function taskControlCanaryAuthorizationPrompt(body: Record<string, unknown>): string | undefined {
+  const authorizationRef = typeof body.authorizationRef === 'string' ? body.authorizationRef.trim() : '';
+  if (body.action === 'abandon_task_control_canary') {
+    const fenceFingerprint = typeof body.fenceFingerprint === 'string'
+      ? body.fenceFingerprint.trim().toLowerCase()
+      : '';
+    const expectedConfigHash = typeof body.expectedConfigHash === 'string'
+      ? body.expectedConfigHash.trim().toLowerCase()
+      : '';
+    if (!authorizationRef || !/^tccq1:[a-f0-9]{64}$/.test(fenceFingerprint)
+      || !/^pgc1:[a-f0-9]{64}$/.test(expectedConfigHash)) return undefined;
+    return '授权执行 BotMux TaskControl canary 操作：' + JSON.stringify({
+      action: body.action,
+      fenceFingerprint,
+      expectedConfigHash,
+    });
+  }
+  if (body.action !== 'prepare_task_control_canary') return undefined;
+  const planSha256 = typeof body.planSha256 === 'string' ? body.planSha256.trim().toLowerCase() : '';
+  const dispatchSpec = body.dispatchSpec;
+  if (!authorizationRef || !planSha256 || !dispatchSpec || typeof dispatchSpec !== 'object'
+    || Array.isArray(dispatchSpec)) return undefined;
+  return '授权执行 BotMux TaskControl canary 操作：' + JSON.stringify({
+    action: body.action,
+    planSha256,
+    dispatchSpec,
+  });
+}
+
+const TASK_CONTROL_CANARY_MAINTENANCE_ACTIONS = new Set([
+  'task_control_canary_status',
+  'prepare_task_control_canary',
+  'enable_task_control_canary',
+  'send_task_control_phase_a',
+  'disable_task_control_canary',
+  'clear_task_control_canary_fence',
+  'abandon_task_control_canary',
+]);
+
+function taskControlCanaryPrepareFence(
+  ds: DaemonSession,
+  body: Record<string, unknown>,
+  authorizedByOpenId: string,
+): ProjectTaskControlCanaryFenceInput | undefined {
+  if (body.action !== 'prepare_task_control_canary') return undefined;
+  const authorizationRef = typeof body.authorizationRef === 'string' ? body.authorizationRef.trim() : '';
+  const planSha256 = typeof body.planSha256 === 'string' ? body.planSha256.trim().toLowerCase() : '';
+  if (!body.dispatchSpec || typeof body.dispatchSpec !== 'object' || Array.isArray(body.dispatchSpec)) return undefined;
+  try {
+    return canonicalProjectTaskControlCanaryFence({
+      ...(body.dispatchSpec as Omit<ProjectTaskControlCanaryFenceInput,
+        'coordinatorSessionId' | 'originTurnId' | 'authorizationRef' | 'authorizedByOpenId' | 'planSha256'>),
+      coordinatorSessionId: ds.session.sessionId,
+      originTurnId: authorizationRef,
+      authorizationRef,
+      authorizedByOpenId,
+      planSha256,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function currentTaskControlCanaryFence(dataDir: string, chatId: string) {
+  const project = readProjectGroup(dataDir, chatId);
+  if (!project) throw new Error('project_not_found');
+  const record = project.blockerRecords.find(item => item.code === TASK_CONTROL_CANARY_QUARANTINE_CODE);
+  if (!record) throw new Error('project_task_control_canary_fence_missing');
+  try {
+    const { fingerprint, ...input } = JSON.parse(record.summary) as Record<string, unknown>;
+    const fence = canonicalProjectTaskControlCanaryFence(input as unknown as ProjectTaskControlCanaryFenceInput);
+    const canonicalFingerprint = projectTaskControlCanaryFenceFingerprint(fence);
+    const expectedRecord = projectTaskControlCanaryFenceRecord(fence, record.openedAt);
+    if (fingerprint !== canonicalFingerprint || record.summary !== expectedRecord.summary
+      || record.blockerId !== expectedRecord.blockerId || record.eventId !== expectedRecord.eventId
+      || record.taskGuid !== expectedRecord.taskGuid) {
+      throw new Error('project_task_control_canary_fence_conflict');
+    }
+    return { project, fence, fingerprint: canonicalFingerprint };
+  } catch (error) {
+    if (error instanceof Error && error.message === 'project_task_control_canary_fence_conflict') throw error;
+    throw new Error('project_task_control_canary_fence_conflict');
+  }
+}
+
+function currentTaskControlCanaryLifecycle(dataDir: string, chatId: string) {
+  const project = readProjectGroup(dataDir, chatId);
+  if (!project) throw new Error('project_task_control_canary_fence_missing');
+  const fenceRecord = project.blockerRecords.find(
+    item => item.code === TASK_CONTROL_CANARY_QUARANTINE_CODE,
+  );
+  if (fenceRecord) {
+    const binding = currentTaskControlCanaryFence(dataDir, chatId);
+    return { ...binding, abandoned: undefined };
+  }
+  const abandonedRecord = project.blockerRecords.find(
+    item => item.code === TASK_CONTROL_CANARY_ABANDONED_CODE,
+  );
+  if (!abandonedRecord) throw new Error('project_task_control_canary_fence_missing');
+  const abandoned = projectTaskControlCanaryAbandonmentFromRecord(abandonedRecord);
+  return {
+    project,
+    fence: abandoned.fence,
+    fingerprint: abandoned.fenceFingerprint,
+    abandoned,
+  };
+}
+
+function exactTaskControlCanaryField(body: Record<string, unknown>, field: string, pattern: RegExp): string {
+  const value = typeof body[field] === 'string' ? body[field].trim().toLowerCase() : '';
+  if (!pattern.test(value)) throw new Error(`invalid_${field}`);
+  return value;
+}
+
 /** Project-group control plane. The authenticated ordinary-group chat session
  * is the only caller identity; project state is durable and the pinned card is
  * merely a projection that this route recreates if a user withdraws it. */
@@ -2416,8 +2608,205 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   if (hasTrustedReportFields && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, error: 'project_report_trusted_relay_required' });
   }
+  if (TASK_CONTROL_CANARY_MAINTENANCE_ACTIONS.has(String(body?.action ?? ''))
+    && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'project_task_control_canary_host_authority_required' });
+  }
+  const canaryAuthorizationPrompt = body ? taskControlCanaryAuthorizationPrompt(body) : undefined;
+  if (body?.action === 'prepare_task_control_canary') {
+    const authorizationRef = typeof body.authorizationRef === 'string' ? body.authorizationRef.trim() : '';
+    const authorizedByOpenId = canaryAuthorizationPrompt
+      ? verifiedCurrentProjectHumanActor(ds, authorizationRef, canaryAuthorizationPrompt)
+      : undefined;
+    if (!authorizedByOpenId) {
+      return jsonRes(res, 403, { ok: false, error: 'project_task_control_canary_authorization_required' });
+    }
+    const fence = taskControlCanaryPrepareFence(ds, body, authorizedByOpenId);
+    if (!fence) return jsonRes(res, 400, { ok: false, error: 'invalid_project_task_control_canary_prepare' });
+    try {
+      const project = await projectCoordinator.run({
+        dataDir: config.session.dataDir,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        coordinatorSessionId: ds.session.sessionId,
+      }, { action: 'install_task_control_canary_fence', fence });
+      const configValue = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+      return jsonRes(res, 200, {
+        ok: true,
+        project,
+        fenceFingerprint: projectTaskControlCanaryFenceFingerprint(fence),
+        ...(configValue ? { configPreimageHash: groupCollaborationModeConfigFingerprint(configValue) } : {}),
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return jsonRes(res, detail === 'project_not_found' ? 404 : 409, { ok: false, error: detail });
+    }
+  }
+  if (body?.action === 'abandon_task_control_canary') {
+    const authorizationRef = typeof body.authorizationRef === 'string' ? body.authorizationRef.trim() : '';
+    const authorizedByOpenId = canaryAuthorizationPrompt
+      ? verifiedCurrentProjectHumanActor(ds, authorizationRef, canaryAuthorizationPrompt)
+      : undefined;
+    if (!authorizedByOpenId) {
+      return jsonRes(res, 403, { ok: false, error: 'project_task_control_canary_authorization_required' });
+    }
+    try {
+      const binding = currentTaskControlCanaryLifecycle(config.session.dataDir, ds.chatId);
+      const fenceFingerprint = exactTaskControlCanaryField(
+        body, 'fenceFingerprint', /^tccq1:[a-f0-9]{64}$/,
+      );
+      const expectedConfigHash = exactTaskControlCanaryField(
+        body, 'expectedConfigHash', /^pgc1:[a-f0-9]{64}$/,
+      );
+      if (fenceFingerprint !== binding.fingerprint) {
+        throw new Error('project_task_control_canary_fence_conflict');
+      }
+      const project = await projectCoordinator.run({
+        dataDir: config.session.dataDir,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        coordinatorSessionId: ds.session.sessionId,
+      }, {
+        action: 'abandon_task_control_canary',
+        fence: binding.fence,
+        expectedConfigHash,
+        authorizationRef,
+        authorizedByOpenId,
+      });
+      return jsonRes(res, 200, { ok: true, project, fenceFingerprint });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return jsonRes(res, detail === 'project_not_found' ? 404 : 409, { ok: false, error: detail });
+    }
+  }
+  if (body?.action === 'task_control_canary_status') {
+    try {
+      const binding = currentTaskControlCanaryLifecycle(config.session.dataDir, ds.chatId);
+      const configValue = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+      const successCertificate = readTaskControlSuccessCertificate(
+        join(config.session.dataDir, 'orchestrate-dispatch.json'),
+        binding.fence.dispatchOperationId,
+      );
+      return jsonRes(res, 200, {
+        ok: true,
+        project: binding.project,
+        fence: binding.fence,
+        fenceFingerprint: binding.fingerprint,
+        ...(binding.abandoned ? { abandoned: binding.abandoned } : {}),
+        ...(successCertificate ? {
+          successCertificate,
+          successCertificateHash: successCertificate.certificateHash,
+        } : {}),
+        ...(configValue ? {
+          config: configValue,
+          configHash: groupCollaborationModeConfigFingerprint(configValue),
+        } : {}),
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return jsonRes(res, detail === 'project_not_found' ? 404 : 409, { ok: false, error: detail });
+    }
+  }
+  if (body?.action === 'enable_task_control_canary' || body?.action === 'disable_task_control_canary') {
+    try {
+      const binding = currentTaskControlCanaryFence(config.session.dataDir, ds.chatId);
+      const fenceFingerprint = exactTaskControlCanaryField(body, 'fenceFingerprint', /^tccq1:[a-f0-9]{64}$/);
+      const expectedConfigHash = exactTaskControlCanaryField(body, 'expectedConfigHash', /^pgc1:[a-f0-9]{64}$/);
+      if (fenceFingerprint !== binding.fingerprint) throw new Error('project_task_control_canary_fence_conflict');
+      const current = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+      if (!current || current.mode !== 'project' || current.coordinatorAppId !== ds.larkAppId) {
+        throw new Error('project_task_control_config_cas_conflict');
+      }
+      const enabling = body.action === 'enable_task_control_canary';
+      const next = await writeGroupCollaborationMode(config.session.dataDir, {
+        chatId: current.chatId,
+        mode: current.mode,
+        coordinatorAppId: current.coordinatorAppId,
+        workerAppIds: current.workerAppIds,
+        autoEnrollWorkers: current.autoEnrollWorkers,
+        progressCard: current.progressCard,
+        taskControlPlane: enabling
+          ? { mode: 'audit_only', acceptorAppId: binding.fence.acceptorAppId, maxActiveMappings: 1 }
+          : null,
+        taskControlPlaneCas: {
+          operation: enabling ? 'enable' : 'disable',
+          expectedConfigHash,
+          expectedFenceFingerprint: fenceFingerprint,
+        },
+      });
+      return jsonRes(res, 200, {
+        ok: true,
+        config: next,
+        configHash: groupCollaborationModeConfigFingerprint(next),
+        fenceFingerprint,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return jsonRes(res, detail === 'project_not_found' ? 404 : 409, { ok: false, error: detail });
+    }
+  }
+  if (body?.action === 'send_task_control_phase_a') {
+    if (!taskControlCanaryPhaseASendHandler) {
+      return jsonRes(res, 503, { ok: false, error: 'project_task_control_phase_a_sender_unavailable' });
+    }
+    try {
+      const fenceFingerprint = exactTaskControlCanaryField(body, 'fenceFingerprint', /^tccq1:[a-f0-9]{64}$/);
+      const instructionTemplateSha256 = exactTaskControlCanaryField(
+        body, 'instructionTemplateSha256', /^[a-f0-9]{64}$/,
+      );
+      const result = await taskControlCanaryPhaseASendHandler({
+        dataDir: config.session.dataDir,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        coordinatorSessionId: ds.session.sessionId,
+        fenceFingerprint,
+        instructionTemplateSha256,
+      });
+      return jsonRes(res, 200, { ok: true, ...result });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return jsonRes(res, detail === 'project_not_found' ? 404 : 409, { ok: false, error: detail });
+    }
+  }
+  if (body?.action === 'clear_task_control_canary_fence') {
+    try {
+      const binding = currentTaskControlCanaryFence(config.session.dataDir, ds.chatId);
+      const fenceFingerprint = exactTaskControlCanaryField(body, 'fenceFingerprint', /^tccq1:[a-f0-9]{64}$/);
+      if (fenceFingerprint !== binding.fingerprint) throw new Error('project_task_control_canary_fence_conflict');
+      const cleanupState = body.cleanupState;
+      if (cleanupState !== 'pre_dispatch_abort' && cleanupState !== 'phase_a_terminal_no_canary'
+        && cleanupState !== 'delivered_terminal') throw new Error('invalid_cleanupState');
+      const successCertificateHash = body.successCertificateHash === undefined
+        ? undefined
+        : exactTaskControlCanaryField(body, 'successCertificateHash', /^tcsc1:[a-f0-9]{64}$/);
+      const project = await projectCoordinator.run({
+        dataDir: config.session.dataDir,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        coordinatorSessionId: ds.session.sessionId,
+      }, {
+        action: 'clear_task_control_canary_fence',
+        fence: binding.fence,
+        auditOnlyConfirmedAbsent: readGroupCollaborationMode(config.session.dataDir, ds.chatId)?.taskControlPlane === undefined,
+        cleanupState,
+        ...(successCertificateHash ? { successCertificateHash } : {}),
+      });
+      return jsonRes(res, 200, { ok: true, project, fenceFingerprint });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return jsonRes(res, detail === 'project_not_found' ? 404 : 409, { ok: false, error: detail });
+    }
+  }
   const action = parseProjectCoordinatorAction(body);
   if (!action) return jsonRes(res, 400, { ok: false, error: 'invalid_project_action' });
+  let verifiedAction = action;
+  if (action.action === 'retire_completion_gate' || action.action === 'replace_completion_gate') {
+    const authorizedByOpenId = verifiedProjectCompletionGateActor(ds, action);
+    if (!authorizedByOpenId) {
+      return jsonRes(res, 403, { ok: false, error: 'project_completion_gate_authorization_required' });
+    }
+    verifiedAction = { ...action, authorizedByOpenId };
+  }
   try {
     const context = {
       dataDir: config.session.dataDir,
@@ -2425,14 +2814,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
       larkAppId: ds.larkAppId,
       coordinatorSessionId: ds.session.sessionId,
     };
-    if (action.action === 'report') {
-      const { project, projectionWarning } = await projectCoordinator.runReport(context, action);
+    if (verifiedAction.action === 'report') {
+      const { project, projectionWarning } = await projectCoordinator.runReport(context, verifiedAction);
       if (projectionWarning) {
         logger.warn(`[project] report persisted but card projection failed: ${projectionWarning}`);
       }
       return jsonRes(res, 200, { ok: true, project, ...(projectionWarning ? { projectionWarning } : {}) });
     }
-    const project = await projectCoordinator.run(context, action);
+    const project = await projectCoordinator.run(context, verifiedAction);
     return jsonRes(res, 200, { ok: true, project });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -2440,7 +2829,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
       : detail === 'project_already_exists' || detail === 'project_coordinator_mismatch' ? 409
         : detail.startsWith('invalid_') || detail === 'title_and_goal_required' || detail === 'workstream_not_found'
           || detail === 'project_workstream_title_required' || detail === 'project_workstream_title_too_long' ? 400
-          : 502;
+          : detail === 'project_completion_gate_authorization_required' ? 403
+            : 502;
     return jsonRes(res, status, { ok: false, error: detail });
   }
 });
@@ -2631,6 +3021,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy', async (req,
     ? body.targetAppIds.filter((value): value is string => typeof value === 'string').map(value => value.trim()).filter(Boolean)
     : undefined;
   const readOnly = body?.readOnly === true;
+  const taskControlMode = body?.taskControlMode === 'audit_only' ? 'audit_only' : undefined;
   const dispatchRoot = typeof body?.dispatchRoot === 'string' ? body.dispatchRoot.trim() : undefined;
   const writeScopes = Array.isArray(body?.writeScopes)
     && body.writeScopes.length <= 64
@@ -2640,6 +3031,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy', async (req,
   if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId) || !targetAppIds
     || (body?.existingDispatch === true && (!dispatchRoot || !/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot)))
     || (body?.readOnly !== undefined && typeof body.readOnly !== 'boolean')
+    || (body?.taskControlMode !== undefined && taskControlMode === undefined)
     || (body?.writeScopes !== undefined && !writeScopes)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_project_dispatch_policy_request' });
   }
@@ -2658,13 +3050,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy', async (req,
     existingDispatch: body?.existingDispatch === true,
     readOnly,
     writeScopes,
+    taskControlMode,
     ...(body?.existingDispatch === true && dispatchRoot
       ? { assignedAppIds: readProjectGroup(config.session.dataDir, ds.chatId)?.workstreams
           .find(item => item.dispatchRoot === dispatchRoot)?.targetAppIds ?? [] }
       : {}),
   });
   if (!decision.ok) return jsonRes(res, 403, decision);
-  return jsonRes(res, 200, { ok: true, projectMode: decision.projectMode });
+  return jsonRes(res, 200, decision);
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）

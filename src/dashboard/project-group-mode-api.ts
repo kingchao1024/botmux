@@ -91,6 +91,11 @@ function bad(error: string, status = 400, detail?: Record<string, unknown>): Pro
   return { status, body: { ok: false, error, ...detail } };
 }
 
+function taskControlConfigConflict(error: unknown): ProjectGroupModeApiResult | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith('project_task_control_') ? bad(message, 409) : undefined;
+}
+
 export async function getProjectGroupMode(
   chatId: string,
   deps: ProjectGroupModeApiDeps,
@@ -107,7 +112,7 @@ export async function putProjectGroupMode(
 ): Promise<ProjectGroupModeApiResult> {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body_must_be_object');
   const record = body as Record<string, unknown>;
-  const supported = new Set(['mode', 'coordinatorAppId', 'workerAppIds', 'autoEnrollWorkers', 'progressCard']);
+  const supported = new Set(['mode', 'coordinatorAppId', 'workerAppIds', 'autoEnrollWorkers', 'progressCard', 'taskControlPlane']);
   const unsupported = Object.keys(record).filter(key => !supported.has(key));
   if (unsupported.length > 0) return bad('unsupported_field', 400, { fields: unsupported });
   if (record.mode !== 'standard' && record.mode !== 'project') return bad('invalid_mode');
@@ -132,7 +137,14 @@ export async function putProjectGroupMode(
         });
       }
     }
-    const config = await writeConfig(deps.dataDir, { chatId, mode: 'standard' });
+    let config: GroupCollaborationModeConfig;
+    try {
+      config = await writeConfig(deps.dataDir, { chatId, mode: 'standard' });
+    } catch (error) {
+      const conflict = taskControlConfigConflict(error);
+      if (conflict) return conflict;
+      throw error;
+    }
     return { status: 200, body: responseBody(chatId, config, readProject(deps.dataDir, chatId)) };
   }
 
@@ -147,6 +159,25 @@ export async function putProjectGroupMode(
   if (workerAppIds.includes(coordinatorAppId)) return bad('coordinator_cannot_be_worker');
   if (record.autoEnrollWorkers !== undefined && typeof record.autoEnrollWorkers !== 'boolean') {
     return bad('invalid_auto_enroll_workers');
+  }
+  let taskControlPlane: GroupCollaborationModeConfig['taskControlPlane'] | null | undefined;
+  if (record.taskControlPlane === null) {
+    taskControlPlane = null;
+  } else if (record.taskControlPlane !== undefined) {
+    if (typeof record.taskControlPlane !== 'object' || Array.isArray(record.taskControlPlane)) {
+      return bad('invalid_task_control_plane_config');
+    }
+    const taskControl = record.taskControlPlane as Record<string, unknown>;
+    const keys = Object.keys(taskControl);
+    if (keys.some(key => !['mode', 'acceptorAppId', 'maxActiveMappings'].includes(key))
+      || taskControl.mode !== 'audit_only'
+      || typeof taskControl.acceptorAppId !== 'string' || !taskControl.acceptorAppId.trim()
+      || taskControl.maxActiveMappings !== 1) {
+      return bad('invalid_task_control_plane_config');
+    }
+    taskControlPlane = {
+      mode: 'audit_only', acceptorAppId: taskControl.acceptorAppId.trim(), maxActiveMappings: 1,
+    };
   }
   const autoEnrollWorkers = record.autoEnrollWorkers === true;
   const progressCardParsed = record.progressCard === undefined
@@ -165,6 +196,12 @@ export async function putProjectGroupMode(
   if (unavailableWorkerAppIds.length > 0) {
     return bad('worker_not_in_chat', 409, { unavailableWorkerAppIds });
   }
+  if (taskControlPlane && !workerAppIds.includes(taskControlPlane.acceptorAppId)) {
+    return bad('task_control_acceptor_not_in_workers', 409);
+  }
+  if (taskControlPlane?.acceptorAppId === coordinatorAppId) {
+    return bad('invalid_task_control_plane_config');
+  }
   const project = readProject(deps.dataDir, chatId);
   if (project && project.larkAppId !== coordinatorAppId) {
     return bad('project_coordinator_conflict', 409, { currentCoordinatorAppId: project.larkAppId });
@@ -179,14 +216,22 @@ export async function putProjectGroupMode(
       });
     }
   }
-  const config = await writeConfig(deps.dataDir, {
-    chatId,
-    mode: 'project',
-    coordinatorAppId,
-    workerAppIds,
-    autoEnrollWorkers,
-    progressCard: progressCardParsed.value,
-  });
+  let config: GroupCollaborationModeConfig;
+  try {
+    config = await writeConfig(deps.dataDir, {
+      chatId,
+      mode: 'project',
+      coordinatorAppId,
+      workerAppIds,
+      autoEnrollWorkers,
+      taskControlPlane,
+      progressCard: progressCardParsed.value,
+    });
+  } catch (error) {
+    const conflict = taskControlConfigConflict(error);
+    if (conflict) return conflict;
+    throw error;
+  }
   if (!project) {
     if (!deps.ensureOnboardingCard) {
       return { status: 200, body: responseBody(chatId, config, project, { cardRefresh: 'deferred' }) };

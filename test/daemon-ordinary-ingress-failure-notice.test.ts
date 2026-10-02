@@ -20,6 +20,7 @@
  * Run:  pnpm vitest run test/daemon-ordinary-ingress-failure-notice.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createHash } from 'node:crypto';
 
 const mocks = vi.hoisted(() => {
   const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-ingress-notice-${process.pid}`;
@@ -164,7 +165,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 
 import { getBot, registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
@@ -178,9 +179,19 @@ import {
   __testOnly_forkReservedInitialSession as forkReservedInitialSession,
   __testOnly_notifyCrossPrincipalTerminal as notifyCrossPrincipalTerminal,
   __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
+  __testOnly_recoverProjectTaskControlSeed as recoverProjectTaskControlSeed,
   __testOnly_resolveXpiHumanOpenId as resolveXpiHumanOpenId,
   __testOnly_restoreSessionsAndScheduleStartupRecovery as restoreSessionsAndScheduleStartupRecovery,
+  __testOnly_terminalizeProjectTaskControlTurnAdmission as terminalizeProjectTaskControlTurnAdmission,
+  awaitProjectTaskControlInboundAdmission,
+  awaitProjectTaskControlPhaseAInstruction,
+  deliverProjectTaskControlPhaseAInstruction,
+  deliverProjectTaskControlKickoff,
 } from '../src/daemon.js';
+import {
+  beginTaskControlSeedOperationSync,
+  readTaskControlSeedOperation,
+} from '../src/core/dispatch-registry.js';
 import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
 import {
   findPendingAskByAnchor,
@@ -191,6 +202,11 @@ import {
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { t as tr, localeForBot } from '../src/i18n/index.js';
 import type { DaemonSession } from '../src/core/types.js';
+import {
+  projectTaskControlCanaryAbandonedRecord,
+  projectTaskControlCanaryFenceFingerprint,
+  projectTaskControlCanaryFenceRecord,
+} from '../src/services/project-group-store.js';
 
 const APP = 'ingress_notice_app';
 const CHAT = 'oc_ingress_notice_chat';
@@ -267,6 +283,85 @@ function seedThreadSession(anchor: string, title: string): DaemonSession {
   return ds;
 }
 
+function writeAbandonedTaskControlFixture(options: { legacy?: boolean } = {}) {
+  mkdirSync(mocks.dataDir, { recursive: true });
+  const dispatchRoot = 'om_abandoned_canary_root';
+  const operationId = 'c'.repeat(50);
+  const taskGuid = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const purpose = 'abandoned canary must stay isolated';
+  const instructionTemplate = 'frozen abandoned Phase A instruction';
+  const failedReportContent = 'frozen abandoned Phase A failure';
+  const fence = {
+    dispatchOperationId: operationId, taskGuid,
+    coordinatorSessionId: 'session_controller', originTurnId: 'om_authorized_turn',
+    authorizationRef: 'om_authorized_turn', authorizedByOpenId: 'ou_controller', planSha256: 'c'.repeat(64),
+    controllerAppId: 'cli_controller', workerAppId: 'cli_worker', reviewerAppId: 'cli_reviewer',
+    acceptorAppId: 'cli_acceptor', targetChatId: CHAT,
+    targetAppIds: ['cli_worker', 'cli_reviewer'], writeScopes: [mocks.dataDir],
+    title: 'abandoned canary', purpose, owners: ['Worker', 'Reviewer'],
+    botOpenIds: ['ou_worker', 'ou_reviewer'], acceptanceRequested: true,
+    seedText: 'frozen abandoned seed', taskControlMode: 'audit_only' as const,
+    kickoff: {
+      templateVersion: 'TaskControlKickoff.v1' as const, rootPlaceholder: '{{dispatchRoot}}' as const,
+      brief: purpose, briefSha256: createHash('sha256').update(purpose).digest('hex'),
+      bots: [
+        { appId: 'cli_worker', openId: 'ou_worker', displayName: 'Worker', role: 'worker' as const },
+        { appId: 'cli_reviewer', openId: 'ou_reviewer', displayName: 'Reviewer', role: 'reviewer' as const },
+      ],
+    },
+    phaseA: {
+      historicalDispatchRoot: 'om_abandoned_historical',
+      historicalTaskGuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      mappedWorkerAppId: 'cli_historical_worker', failedReportContent,
+      failedReportSha256: createHash('sha256').update(failedReportContent).digest('hex'),
+      instructionTemplateVersion: 'TaskControlPhaseAInstruction.v1' as const,
+      instructionTemplate,
+      instructionTemplateSha256: createHash('sha256').update(instructionTemplate).digest('hex'),
+    },
+  };
+  const tombstone = projectTaskControlCanaryAbandonedRecord(fence, {
+    authorizationRef: 'om_abandon', authorizedByOpenId: 'ou_controller', abandonedAt: NOW,
+    ...(options.legacy ? {} : { phaseBDispatchRoot: dispatchRoot }),
+  } as any, NOW);
+  writeFileSync(`${mocks.dataDir}/project-groups.json`, JSON.stringify({
+    schemaVersion: 3,
+    projects: {
+      [CHAT]: {
+        schemaVersion: 3, revision: 4, chatId: CHAT, larkAppId: fence.controllerAppId,
+        coordinatorSessionId: fence.coordinatorSessionId, title: '项目', goal: '验证 abandoned 隔离',
+        phase: '执行', focus: 'abandoned', status: 'active', blockers: [tombstone.summary],
+        blockerRecords: [tombstone],
+        workstreams: [{
+          dispatchRoot, title: fence.title, purpose, owners: fence.owners,
+          targetAppIds: fence.targetAppIds, workerAppIds: [fence.workerAppId],
+          reviewerAppIds: [fence.reviewerAppId], access: { mode: 'write', scopes: fence.writeScopes },
+          status: 'in_progress', progress: 40, createdAt: NOW, updatedAt: NOW,
+          taskControl: {
+            taskGuid, phaseId: `workstream:${taskGuid}`, mappingRef: `topic-message:${dispatchRoot}`,
+            mappingStatus: 'registered', sourceKind: 'project_group', controllerAppId: fence.controllerAppId,
+            workerAppId: fence.workerAppId, reviewerAppId: fence.reviewerAppId,
+            acceptorAppId: fence.acceptorAppId, projectRevision: 3, reservationId: operationId,
+            coordinatorSessionId: fence.coordinatorSessionId, originTurnId: fence.originTurnId,
+            reservationCreatedAt: NOW, reservationExpiresAt: '2099-09-30T00:02:00.000Z', rootCreateTime: NOW,
+            reservationProof: {
+              schemaVersion: 'ProjectDispatchReservationProof.v1', larkAppId: fence.controllerAppId,
+              issuedAt: NOW, keyId: 'tcpr1:abandoned', signature: 'c'.repeat(64),
+            },
+          },
+        }],
+        completionGates: [], dispatchReservations: [], milestones: [], createdAt: NOW, updatedAt: NOW,
+      },
+    },
+  }));
+  writeFileSync(`${mocks.dataDir}/orchestrate-dispatch.json`, JSON.stringify({
+    [dispatchRoot]: {
+      dispatchOperationId: operationId, targetAppIds: fence.targetAppIds,
+      taskControl: { mode: 'audit_only', taskGuid },
+    },
+  }));
+  return { dispatchRoot, operationId, fence };
+}
+
 /** All text replied through the mocked Lark client in this test, joined. */
 function repliedText(): string {
   return [...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]
@@ -277,6 +372,97 @@ function repliedText(): string {
 function expectedNotice(): string {
   return tr('daemon.ordinary_ingress_failed', undefined, localeForBot(APP));
 }
+
+describe('TaskControl seed audit recovery', () => {
+  const operationId = 'a'.repeat(50);
+  const sourceAppId = 'cli_coordinator';
+  const targetChatId = 'oc_project';
+  const seedText = 'frozen seed';
+  const payloadHash = createHash('sha256').update(seedText).digest('hex');
+
+  function pendingSeed(registryPath: string) {
+    return beginTaskControlSeedOperationSync(registryPath, {
+      operationId,
+      sourceAppId,
+      targetChatId,
+      messageType: 'text',
+      payloadHash,
+      attempt: {
+        wallTime: '2026-09-30T00:00:00.000Z',
+        bootId: 'boot-1',
+        processStartIdentity: 'process-start-1',
+        monotonicMs: 10_000,
+      },
+    });
+  }
+
+  beforeEach(() => {
+    rmSync(mocks.dataDir, { recursive: true, force: true });
+    mkdirSync(mocks.dataDir, { recursive: true });
+    mocks.sendMessage.mockReset();
+    mocks.sendMessage.mockResolvedValue('om_recovered_seed');
+  });
+
+  it('reuses the persisted provider UUID after provider acceptance but before journal completion', async () => {
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const pending = pendingSeed(registryPath);
+
+    await expect(recoverProjectTaskControlSeed({
+      registryPath, operationId, sourceAppId, targetChatId, seedText,
+      attempt: {
+        wallTime: '2026-09-30T00:53:59.999Z',
+        bootId: 'boot-1',
+        processStartIdentity: 'process-start-1',
+        monotonicMs: 3_249_999,
+      },
+    })).resolves.toEqual({ state: 'delivered', dispatchRoot: 'om_recovered_seed' });
+
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      sourceAppId, targetChatId, seedText, 'text', pending.providerUuid,
+      undefined, expect.objectContaining({ timeoutMs: 5_000 }),
+    );
+    expect(readTaskControlSeedOperation(registryPath, operationId)).toMatchObject({
+      state: 'delivered', dispatchRoot: 'om_recovered_seed', providerUuid: pending.providerUuid,
+    });
+  });
+
+  it('marks restart recovery ambiguous without sending again', async () => {
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const pending = pendingSeed(registryPath);
+
+    await expect(recoverProjectTaskControlSeed({
+      registryPath, operationId, sourceAppId, targetChatId, seedText,
+      attempt: {
+        wallTime: '2026-09-30T00:00:01.000Z',
+        bootId: 'boot-1',
+        processStartIdentity: 'process-start-2',
+        monotonicMs: 1,
+      },
+    })).resolves.toEqual({ state: 'ambiguous' });
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(readTaskControlSeedOperation(registryPath, operationId)).toEqual({
+      ...pending, state: 'ambiguous',
+    });
+  });
+
+  it('treats the exact 54 minute boundary as ambiguous without sending again', async () => {
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    pendingSeed(registryPath);
+
+    await expect(recoverProjectTaskControlSeed({
+      registryPath, operationId, sourceAppId, targetChatId, seedText,
+      attempt: {
+        wallTime: '2026-09-30T00:54:00.000Z',
+        bootId: 'boot-1',
+        processStartIdentity: 'process-start-1',
+        monotonicMs: 3_250_000,
+      },
+    })).resolves.toEqual({ state: 'ambiguous' });
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+});
 
 describe('completed-turn XPI progression', () => {
   it('uses the durable owner turn even after the active-turn mirror was revoked', () => {
@@ -324,6 +510,7 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       openId: `ou_target_${unionId.slice(3)}`,
     }));
     mocks.sessions.clear();
+    mocks.forkWorker.mockReset();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
     });
@@ -1376,6 +1563,990 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     ]);
     expect(ds.pendingTurnId).toBeUndefined();
     expect(ds.initialStartPending).toBe(false);
+  });
+
+  it('keeps the exact human prompt on an accepted cold opening turn', () => {
+    const ds = seedThreadSession('om_thread_cold_authorization', 'seeded') as any;
+    ds.pendingPrompt = 'exact authorization statement';
+    ds.pendingTurnId = 'om_cold_authorization';
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    mocks.forkWorker.mockReturnValueOnce(true);
+
+    expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(true);
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'om_cold_authorization',
+      caller: trustedCaller,
+      userPrompt: 'exact authorization statement',
+    });
+  });
+
+  it('persists the mapped TaskControl admission claim as active at the final cold-fork boundary', () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const dispatchRoot = 'om_task_control_pre_fork';
+    const messageId = 'om_task_control_kickoff';
+    const taskGuid = '11111111-1111-4111-8111-111111111111';
+    writeFileSync(projectPath, JSON.stringify({
+      schemaVersion: 3,
+      projects: {
+        [CHAT]: {
+          schemaVersion: 3, revision: 2, chatId: CHAT, larkAppId: 'cli_controller',
+          coordinatorSessionId: 'session_controller', title: '项目', goal: '验证 pre-fork claim',
+          phase: '执行', focus: '冷启动', status: 'active', blockers: [], blockerRecords: [],
+          workstreams: [{
+            dispatchRoot, title: '受控任务', purpose: '验证入站', owners: [], targetAppIds: [APP, 'cli_reviewer'],
+            workerAppIds: [APP], reviewerAppIds: ['cli_reviewer'], access: { mode: 'write', scopes: [mocks.dataDir] },
+            status: 'pending', progress: 0, createdAt: NOW, updatedAt: NOW,
+            taskControl: {
+              taskGuid, phaseId: `workstream:${taskGuid}`, mappingRef: `topic-message:${dispatchRoot}`,
+              mappingStatus: 'registered', sourceKind: 'project_group', controllerAppId: 'cli_controller',
+              workerAppId: APP, reviewerAppId: 'cli_reviewer', acceptorAppId: 'cli_acceptor', projectRevision: 2,
+              reservationId: '4'.repeat(50), coordinatorSessionId: 'session_controller',
+              originTurnId: 'om_authorized_turn', reservationCreatedAt: NOW,
+              reservationExpiresAt: '2099-09-29T00:02:00.000Z', rootCreateTime: NOW,
+              reservationProof: {
+                schemaVersion: 'ProjectDispatchReservationProof.v1', larkAppId: 'cli_controller',
+                issuedAt: NOW, keyId: 'tcpr1:test', signature: 'd'.repeat(64),
+              },
+            },
+          }],
+          completionGates: [], dispatchReservations: [], milestones: [], createdAt: NOW, updatedAt: NOW,
+        },
+      },
+    }));
+    writeFileSync(registryPath, JSON.stringify({
+      [dispatchRoot]: { dispatchOperationId: '4'.repeat(50), taskControl: { mode: 'audit_only' } },
+    }));
+    const ds = seedThreadSession(dispatchRoot, 'task-control') as any;
+    ds.pendingPrompt = '执行冻结 canary';
+    ds.pendingTurnId = messageId;
+    const trustedCaller = {
+      requestLarkAppId: 'cli_controller', requestUserOpenId: 'ou_controller', senderType: 'bot' as const,
+    };
+    mocks.forkWorker.mockReturnValueOnce(false);
+    mocks.forkWorker.mockImplementationOnce((workerDs: any, _input: any, turn: any) => {
+      turn?.onWorkerGenerationReserved?.(7);
+      workerDs.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    try {
+      expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(false);
+      expect(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1.claims[messageId]).toMatchObject({
+        messageId, dispatchRoot, targetAppId: APP, sessionId: ds.session.sessionId,
+        state: 'pending',
+      });
+      expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(true);
+      const registry = JSON.parse(readFileSync(registryPath, 'utf8')) as any;
+      expect(registry.__taskControlTurnAdmissionsV1?.claims?.[messageId]).toMatchObject({
+        messageId, dispatchRoot, targetAppId: APP, sessionId: ds.session.sessionId,
+        workerGeneration: 7, state: 'active',
+      });
+      const callsAfterFirstFork = mocks.forkWorker.mock.calls.length;
+      ds.worker = null;
+      ds.pendingPrompt = '重复投递同一条 canary';
+      ds.pendingTurnId = messageId;
+      mocks.forkWorker.mockReturnValueOnce(true);
+      expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(false);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(callsAfterFirstFork);
+      const terminalAt = new Date().toISOString();
+      expect(terminalizeProjectTaskControlTurnAdmission(ds, messageId, 7, terminalAt)).toBe(true);
+      expect(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1.claims[messageId]).toMatchObject({
+        messageId, dispatchRoot, targetAppId: APP, sessionId: ds.session.sessionId,
+        workerGeneration: 7, state: 'terminal', terminalAt,
+      });
+      ds.pendingPrompt = '终态后再次投递同一条 canary';
+      ds.pendingTurnId = messageId;
+      expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(false);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(callsAfterFirstFork);
+
+      const fullClaims = Object.fromEntries(Array.from({ length: 32 }, (_, index) => {
+        const id = `om_capacity_${index}`;
+        return [id, {
+          messageId: id, chatId: CHAT, dispatchRoot, targetAppId: APP,
+          sessionId: `session_capacity_${index}`, state: 'pending',
+          createdAt: NOW, updatedAt: NOW,
+        }];
+      }));
+      writeFileSync(registryPath, JSON.stringify({
+        [dispatchRoot]: { dispatchOperationId: '4'.repeat(50), taskControl: { mode: 'audit_only' } },
+        __taskControlTurnAdmissionsV1: { claims: fullClaims },
+      }));
+      ds.pendingPrompt = '超过单 root admission 上限';
+      ds.pendingTurnId = 'om_capacity_overflow';
+      expect(() => forkReservedInitialSession(ds, [], trustedCaller))
+        .toThrow('project_task_control_turn_claim_per_root_capacity');
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(callsAfterFirstFork);
+      const overflowRegistry = JSON.parse(readFileSync(registryPath, 'utf8'));
+      expect(Object.keys(overflowRegistry.__taskControlTurnAdmissionsV1.claims)).toHaveLength(32);
+      expect(Object.keys(overflowRegistry.__taskControlTurnAdmissionsV1.overflowMarkers)).toEqual(['perRoot']);
+    } finally {
+      rmSync(projectPath, { force: true });
+      rmSync(registryPath, { force: true });
+    }
+  });
+
+  it('admits only the delivered Phase A instruction message through the historical-root fence', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const workerAppId = 'cli_phase_a_worker';
+    registerBot({
+      larkAppId: workerAppId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER],
+    }).resolvedAllowedUsers = [OWNER];
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const dispatchRoot = 'om_phase_a_historical';
+    const messageId = 'om_phase_a_instruction';
+    const taskGuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const instructionTemplate = 'Submit only the frozen Phase A failed report';
+    const failedReportContent = 'Phase A failed as frozen';
+    const fence = {
+      dispatchOperationId: 'a'.repeat(50), taskGuid: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+      coordinatorSessionId: 'session_controller', originTurnId: 'om_authorized_turn',
+      authorizationRef: 'om_authorized_turn', authorizedByOpenId: 'ou_controller', planSha256: 'f'.repeat(64),
+      controllerAppId: 'cli_controller', workerAppId: 'cli_canary_worker', reviewerAppId: 'cli_canary_reviewer',
+      acceptorAppId: 'cli_canary_acceptor', targetChatId: CHAT,
+      targetAppIds: ['cli_canary_worker', 'cli_canary_reviewer'], writeScopes: [mocks.dataDir],
+      title: '无文件 canary', purpose: '验证 Phase A 单次入站', owners: ['Worker', 'Reviewer'],
+      botOpenIds: ['ou_worker', 'ou_reviewer'], acceptanceRequested: true,
+      seedText: '冻结 seed', taskControlMode: 'audit_only' as const,
+      phaseA: {
+        historicalDispatchRoot: dispatchRoot, historicalTaskGuid: taskGuid, mappedWorkerAppId: workerAppId,
+        failedReportContent,
+        failedReportSha256: createHash('sha256').update(failedReportContent).digest('hex'),
+        instructionTemplateVersion: 'TaskControlPhaseAInstruction.v1' as const,
+        instructionTemplate,
+        instructionTemplateSha256: createHash('sha256').update(instructionTemplate).digest('hex'),
+      },
+    };
+    const fenceFingerprint = projectTaskControlCanaryFenceFingerprint(fence);
+    const fenceRecord = projectTaskControlCanaryFenceRecord(fence, NOW);
+    writeFileSync(projectPath, JSON.stringify({
+      schemaVersion: 3,
+      projects: {
+        [CHAT]: {
+          schemaVersion: 3, revision: 2, chatId: CHAT, larkAppId: 'cli_controller',
+          coordinatorSessionId: 'session_controller', title: '项目', goal: '验证 Phase A 入站',
+          phase: '执行', focus: 'Phase A', status: 'active', blockers: [fenceRecord.summary],
+          blockerRecords: [fenceRecord],
+          workstreams: [{
+            dispatchRoot, title: '历史任务', purpose: '验证 Phase A', owners: [], targetAppIds: [workerAppId, 'cli_reviewer'],
+            workerAppIds: [workerAppId], reviewerAppIds: ['cli_reviewer'], access: { mode: 'write', scopes: [mocks.dataDir] },
+            status: 'in_progress', progress: 50, createdAt: NOW, updatedAt: NOW,
+            taskControl: {
+              taskGuid, phaseId: `workstream:${taskGuid}`, mappingRef: `topic-message:${dispatchRoot}`,
+              mappingStatus: 'registered', sourceKind: 'project_group', controllerAppId: 'cli_controller',
+              workerAppId: workerAppId, reviewerAppId: 'cli_reviewer', acceptorAppId: 'cli_acceptor', projectRevision: 2,
+              reservationId: '4'.repeat(50), coordinatorSessionId: 'session_controller',
+              originTurnId: 'om_historical_origin', reservationCreatedAt: NOW,
+              reservationExpiresAt: '2099-09-29T00:02:00.000Z', rootCreateTime: NOW,
+              reservationProof: {
+                schemaVersion: 'ProjectDispatchReservationProof.v1', larkAppId: 'cli_controller',
+                issuedAt: NOW, keyId: 'tcpr1:phase-a', signature: 'd'.repeat(64),
+              },
+            },
+          }],
+          completionGates: [], dispatchReservations: [], milestones: [], createdAt: NOW, updatedAt: NOW,
+        },
+      },
+    }));
+    writeFileSync(registryPath, JSON.stringify({
+      [dispatchRoot]: { dispatchOperationId: '4'.repeat(50), taskControl: { mode: 'audit_only' } },
+    }));
+    mocks.replyMessage
+      .mockRejectedValueOnce(new Error('provider response lost'))
+      .mockResolvedValueOnce(messageId);
+    const input = {
+      context: {
+        dataDir: mocks.dataDir, chatId: CHAT, larkAppId: 'cli_controller',
+        coordinatorSessionId: 'session_controller',
+      },
+      fenceFingerprint, instructionTemplateSha256: fence.phaseA.instructionTemplateSha256,
+      attempt: { wallTime: NOW, bootId: 'boot-1', processStartedAt: NOW, monotonicMs: 1_000 },
+    } as const;
+    const responseLost = await deliverProjectTaskControlPhaseAInstruction(input);
+    expect(responseLost).toMatchObject({ state: 'pending' });
+    const inboundBeforeResponse = awaitProjectTaskControlPhaseAInstruction({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: workerAppId,
+      messageId,
+    });
+    const delivery = await deliverProjectTaskControlPhaseAInstruction({
+      ...input,
+      attempt: { ...input.attempt, monotonicMs: 2_000 },
+    });
+    expect(delivery).toMatchObject({ state: 'delivered', messageId });
+    await expect(inboundBeforeResponse).resolves.toBe('allowed');
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(2);
+    expect(mocks.replyMessage).toHaveBeenLastCalledWith(
+      fence.controllerAppId, dispatchRoot, instructionTemplate, 'text', true,
+      expect.stringMatching(/^[a-f0-9]{50}$/),
+      undefined,
+      { timeoutMs: 5_000, signal: expect.any(AbortSignal) },
+    );
+    expect(mocks.replyMessage.mock.calls[0]?.[7]?.signal).toBeInstanceOf(AbortSignal);
+    expect(mocks.replyMessage.mock.calls[1]?.[7]?.signal).toBeInstanceOf(AbortSignal);
+    expect(mocks.replyMessage.mock.calls[0]?.[7]?.signal)
+      .not.toBe(mocks.replyMessage.mock.calls[1]?.[7]?.signal);
+    expect(mocks.replyMessage.mock.calls[0]?.[5]).toBe(mocks.replyMessage.mock.calls[1]?.[5]);
+    const ds = seedThreadSession(dispatchRoot, 'phase-a') as any;
+    activeSessions.delete(sessionKey(dispatchRoot, APP));
+    ds.larkAppId = workerAppId;
+    ds.session.larkAppId = workerAppId;
+    activeSessions.set(sessionKey(dispatchRoot, workerAppId), ds);
+    ds.pendingPrompt = instructionTemplate;
+    ds.pendingTurnId = messageId;
+    const trustedCaller = {
+      requestLarkAppId: 'cli_controller', requestUserOpenId: 'ou_controller', senderType: 'bot' as const,
+    };
+    mocks.forkWorker.mockImplementationOnce((workerDs: any, _input: any, turn: any) => {
+      turn?.onWorkerGenerationReserved?.(9);
+      workerDs.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    try {
+      ds.pendingTurnId = 'om_phase_a_wrong_message';
+      expect(() => forkReservedInitialSession(ds, [], trustedCaller))
+        .toThrow('project_task_control_canary_fence_rejects_turn');
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1).toBeUndefined();
+
+      ds.pendingTurnId = messageId;
+      expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(true);
+      expect(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1.claims[messageId]).toMatchObject({
+        messageId, dispatchRoot, targetAppId: workerAppId, state: 'active', workerGeneration: 9,
+      });
+    } finally {
+      rmSync(projectPath, { force: true });
+      rmSync(registryPath, { force: true });
+    }
+  });
+
+  it('builds and journals the exact fenced kickoff in the daemon before provider delivery', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const dispatchRoot = 'om_task_control_kickoff_root';
+    const foreignMappedRoot = 'om_task_control_foreign_mapped_root';
+    const operationId = 'b'.repeat(50);
+    const taskGuid = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const purpose = '只执行冻结的 canary，并按原 root 回报';
+    const failedReportContent = 'Phase A failed as frozen';
+    const instructionTemplate = 'Submit only the frozen Phase A failed report';
+    const fence = {
+      dispatchOperationId: operationId, taskGuid,
+      coordinatorSessionId: 'session_controller', originTurnId: 'om_authorized_turn',
+      authorizationRef: 'om_authorized_turn', authorizedByOpenId: 'ou_controller', planSha256: 'f'.repeat(64),
+      controllerAppId: 'cli_controller', workerAppId: 'cli_worker', reviewerAppId: 'cli_reviewer',
+      acceptorAppId: 'cli_acceptor', targetChatId: CHAT,
+      targetAppIds: ['cli_worker', 'cli_reviewer'], writeScopes: [mocks.dataDir],
+      title: '无文件 canary', purpose, owners: ['Worker', 'Reviewer'],
+      botOpenIds: ['ou_worker', 'ou_reviewer'], acceptanceRequested: true,
+      seedText: '冻结 seed', taskControlMode: 'audit_only' as const,
+      kickoff: {
+        templateVersion: 'TaskControlKickoff.v1' as const,
+        rootPlaceholder: '{{dispatchRoot}}' as const,
+        brief: purpose,
+        briefSha256: createHash('sha256').update(purpose).digest('hex'),
+        bots: [
+          { appId: 'cli_worker', openId: 'ou_worker', displayName: 'Worker', role: 'worker' as const },
+          { appId: 'cli_reviewer', openId: 'ou_reviewer', displayName: 'Reviewer', role: 'reviewer' as const },
+        ],
+      },
+      phaseA: {
+        historicalDispatchRoot: 'om_phase_a_historical',
+        historicalTaskGuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        mappedWorkerAppId: 'cli_phase_a_worker', failedReportContent,
+        failedReportSha256: createHash('sha256').update(failedReportContent).digest('hex'),
+        instructionTemplateVersion: 'TaskControlPhaseAInstruction.v1' as const,
+        instructionTemplate,
+        instructionTemplateSha256: createHash('sha256').update(instructionTemplate).digest('hex'),
+      },
+    };
+    const fenceRecord = projectTaskControlCanaryFenceRecord(fence, NOW);
+    writeFileSync(projectPath, JSON.stringify({
+      schemaVersion: 3,
+      projects: {
+        [CHAT]: {
+          schemaVersion: 3, revision: 3, chatId: CHAT, larkAppId: fence.controllerAppId,
+          coordinatorSessionId: fence.coordinatorSessionId, title: '项目', goal: '验证 kickoff',
+          phase: '执行', focus: 'kickoff', status: 'active', blockers: [fenceRecord.summary],
+          blockerRecords: [fenceRecord],
+          workstreams: [{
+            dispatchRoot, title: fence.title, purpose, owners: fence.owners,
+            targetAppIds: fence.targetAppIds, workerAppIds: [fence.workerAppId],
+            reviewerAppIds: [fence.reviewerAppId], access: { mode: 'write', scopes: fence.writeScopes },
+            status: 'pending', progress: 0, createdAt: NOW, updatedAt: NOW,
+            taskControl: {
+              taskGuid, phaseId: `workstream:${taskGuid}`, mappingRef: `topic-message:${dispatchRoot}`,
+              mappingStatus: 'registered', sourceKind: 'project_group', controllerAppId: fence.controllerAppId,
+              workerAppId: fence.workerAppId, reviewerAppId: fence.reviewerAppId,
+              acceptorAppId: fence.acceptorAppId, projectRevision: 3, reservationId: operationId,
+              coordinatorSessionId: fence.coordinatorSessionId, originTurnId: fence.originTurnId,
+              reservationCreatedAt: NOW, reservationExpiresAt: '2099-09-30T00:02:00.000Z', rootCreateTime: NOW,
+              reservationProof: {
+                schemaVersion: 'ProjectDispatchReservationProof.v1', larkAppId: fence.controllerAppId,
+                issuedAt: NOW, keyId: 'tcpr1:kickoff', signature: 'd'.repeat(64),
+              },
+            },
+          }, {
+            dispatchRoot: foreignMappedRoot, title: '其他已注册任务', purpose: '不得穿过当前 live fence', owners: [],
+            targetAppIds: [fence.workerAppId], workerAppIds: [fence.workerAppId], reviewerAppIds: [],
+            access: { mode: 'write', scopes: fence.writeScopes }, status: 'in_progress', progress: 10,
+            createdAt: NOW, updatedAt: NOW,
+            taskControl: {
+              taskGuid: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+              phaseId: 'workstream:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+              mappingRef: `topic-message:${foreignMappedRoot}`,
+              mappingStatus: 'registered', sourceKind: 'project_group', controllerAppId: fence.controllerAppId,
+              workerAppId: fence.workerAppId, reviewerAppId: fence.reviewerAppId,
+              acceptorAppId: fence.acceptorAppId, projectRevision: 3, reservationId: 'e'.repeat(50),
+              coordinatorSessionId: fence.coordinatorSessionId, originTurnId: 'om_foreign_origin',
+              reservationCreatedAt: NOW, reservationExpiresAt: '2099-09-30T00:02:00.000Z', rootCreateTime: NOW,
+              reservationProof: {
+                schemaVersion: 'ProjectDispatchReservationProof.v1', larkAppId: fence.controllerAppId,
+                issuedAt: NOW, keyId: 'tcpr1:foreign', signature: 'e'.repeat(64),
+              },
+            },
+          }],
+          completionGates: [], dispatchReservations: [], milestones: [], createdAt: NOW, updatedAt: NOW,
+        },
+      },
+    }));
+    writeFileSync(registryPath, JSON.stringify({
+      [dispatchRoot]: {
+        dispatchOperationId: operationId, targetAppIds: fence.targetAppIds,
+        taskControl: { mode: 'audit_only', taskGuid },
+      },
+    }));
+    mocks.replyMessage
+      .mockRejectedValueOnce(new Error('provider response lost'))
+      .mockImplementationOnce(async () => {
+        const project = JSON.parse(readFileSync(projectPath, 'utf8'));
+        project.projects[CHAT].workstreams[0].taskControl.mappingRef = 'topic-message:om_changed_after_send';
+        writeFileSync(projectPath, JSON.stringify(project));
+        return 'om_exact_kickoff';
+      })
+      .mockResolvedValueOnce('om_exact_kickoff');
+
+    try {
+      const deliveryInput = {
+        context: {
+          dataDir: mocks.dataDir, chatId: CHAT, larkAppId: fence.controllerAppId,
+          coordinatorSessionId: fence.coordinatorSessionId,
+        },
+        dispatchRoot,
+        operationId,
+        attempt: {
+          wallTime: NOW, bootId: 'boot-1', processStartIdentity: 'process-start-1', monotonicMs: 10_000,
+        },
+      } as const;
+      const responseLost = await deliverProjectTaskControlKickoff(deliveryInput);
+      expect(responseLost).toMatchObject({ state: 'pending' });
+
+      const stableProject = readFileSync(projectPath, 'utf8');
+      const stableRegistry = readFileSync(registryPath, 'utf8');
+      const settleFailed = await deliverProjectTaskControlKickoff({
+        ...deliveryInput,
+        attempt: { ...deliveryInput.attempt, monotonicMs: 10_500 },
+      });
+      expect(settleFailed).toEqual({ state: 'ambiguous' });
+      expect(JSON.parse(readFileSync(projectPath, 'utf8')).projects[CHAT].blockerRecords)
+        .toContainEqual(expect.objectContaining({ code: 'task_control_canary_quarantine' }));
+      writeFileSync(projectPath, stableProject);
+      writeFileSync(registryPath, stableRegistry);
+
+      registerBot({
+        larkAppId: fence.workerAppId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER],
+      }).resolvedAllowedUsers = [OWNER];
+      await expect(awaitProjectTaskControlInboundAdmission({
+        dataDir: mocks.dataDir, chatId: CHAT, dispatchRoot: foreignMappedRoot,
+        targetAppId: fence.workerAppId, messageId: 'om_foreign_mapped_message',
+      })).resolves.toBe('rejected');
+      await expect(awaitProjectTaskControlInboundAdmission({
+        dataDir: mocks.dataDir, chatId: CHAT, dispatchRoot: 'om_ordinary_unmapped_root',
+        targetAppId: fence.workerAppId, messageId: 'om_ordinary_message',
+      })).resolves.toBe('unfenced');
+      const ds = seedThreadSession(dispatchRoot, 'task-control-kickoff') as any;
+      activeSessions.delete(sessionKey(dispatchRoot, APP));
+      ds.larkAppId = fence.workerAppId;
+      ds.session.larkAppId = fence.workerAppId;
+      activeSessions.set(sessionKey(dispatchRoot, fence.workerAppId), ds);
+      ds.pendingPrompt = purpose;
+      ds.pendingTurnId = 'om_exact_kickoff';
+      const trustedCaller = {
+        requestLarkAppId: fence.controllerAppId,
+        requestUserOpenId: 'ou_controller',
+        senderType: 'bot' as const,
+      };
+      expect(() => forkReservedInitialSession(ds, [], trustedCaller))
+        .toThrow('project_task_control_canary_fence_rejects_turn');
+      expect(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1).toBeUndefined();
+
+      const result = await deliverProjectTaskControlKickoff({
+        ...deliveryInput,
+        attempt: { ...deliveryInput.attempt, monotonicMs: 11_000 },
+      });
+      expect(result).toMatchObject({ state: 'delivered', messageId: 'om_exact_kickoff' });
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(3);
+      const call = mocks.replyMessage.mock.calls[2]!;
+      expect(mocks.replyMessage.mock.calls[0]?.[5]).toBe(call[5]);
+      expect(mocks.replyMessage.mock.calls[1]?.[5]).toBe(call[5]);
+      expect(call.slice(0, 2)).toEqual([fence.controllerAppId, dispatchRoot]);
+      expect(call[3]).toBe('post');
+      expect(call[4]).toBe(true);
+      expect(call[5]).toMatch(/^[a-f0-9]{50}$/);
+      expect(call[6]).toBeUndefined();
+      expect(call[7]).toEqual({ timeoutMs: 5_000, signal: expect.any(AbortSignal) });
+      const content = String(call[2]);
+      expect(content).toContain('ou_worker');
+      expect(content).toContain('ou_reviewer');
+      expect(content).toContain(purpose);
+      expect(content).toContain(`botmux report --dispatch-root ${dispatchRoot}`);
+      const operation = JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlKickoffOperationsV1.operations[operationId];
+      expect(operation).toMatchObject({
+        schemaVersion: 'TaskControlKickoffOperation.v1', operationId,
+        chatId: CHAT, dispatchRoot, fenceFingerprint: projectTaskControlCanaryFenceFingerprint(fence),
+        targetAppIds: ['cli_reviewer', 'cli_worker'], messageType: 'post',
+        payloadHash: createHash('sha256').update(content).digest('hex'),
+        providerUuid: call[5], state: 'delivered', messageId: 'om_exact_kickoff',
+      });
+
+      const foreignDs = seedThreadSession(foreignMappedRoot, 'foreign-mapped-task') as any;
+      activeSessions.delete(sessionKey(foreignMappedRoot, APP));
+      foreignDs.larkAppId = fence.workerAppId;
+      foreignDs.session.larkAppId = fence.workerAppId;
+      foreignDs.worker = { killed: false, send: vi.fn() };
+      activeSessions.set(sessionKey(foreignMappedRoot, fence.workerAppId), foreignDs);
+      await expect(handleThreadReply(
+        makeEventData('om_foreign_mapped_message', 'must be rejected before the live session', foreignMappedRoot),
+        { ...makeCtx(foreignMappedRoot, 'om_foreign_mapped_message'), larkAppId: fence.workerAppId },
+      )).rejects.toThrow('project_task_control_canary_fence_rejects_turn');
+      expect(foreignDs.worker.send).not.toHaveBeenCalled();
+      activeSessions.delete(sessionKey(foreignMappedRoot, fence.workerAppId));
+
+      for (const rejected of [
+        { messageId: 'om_direct_human_reply', caller: { ...trustedCaller, senderType: 'user' as const } },
+        { messageId: 'om_alternate_bot_mention', caller: { ...trustedCaller, requestLarkAppId: 'cli_foreign' } },
+        { messageId: 'om_cross_turn_into', caller: trustedCaller },
+      ]) {
+        ds.pendingTurnId = rejected.messageId;
+        expect(() => forkReservedInitialSession(ds, [], rejected.caller))
+          .toThrow('project_task_control_canary_fence_rejects_turn');
+      }
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+      ds.pendingTurnId = 'om_exact_kickoff';
+      mocks.forkWorker.mockImplementationOnce((workerDs: any, _input: any, turn: any) => {
+        turn?.onWorkerGenerationReserved?.(10);
+        workerDs.worker = { killed: false, send: vi.fn() };
+        return true;
+      });
+      expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(true);
+      expect(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1.claims.om_exact_kickoff).toMatchObject({
+        messageId: 'om_exact_kickoff', dispatchRoot, targetAppId: fence.workerAppId,
+        sessionId: ds.session.sessionId, workerGeneration: 10, state: 'active',
+      });
+
+      const activeWorkerSend = ds.worker!.send as ReturnType<typeof vi.fn>;
+      await expect(handleThreadReply(
+        makeEventData('om_exact_kickoff', 'duplicate provider delivery', dispatchRoot),
+        { ...makeCtx(dispatchRoot, 'om_exact_kickoff'), larkAppId: fence.workerAppId },
+      )).rejects.toThrow('project_task_control_canary_fence_rejects_turn');
+      await expect(handleThreadReply(
+        makeEventData('om_later_human_reply', 'run another turn', dispatchRoot),
+        { ...makeCtx(dispatchRoot, 'om_later_human_reply'), larkAppId: fence.workerAppId },
+      )).rejects.toThrow('project_task_control_canary_fence_rejects_turn');
+      expect(activeWorkerSend).not.toHaveBeenCalled();
+
+      const callsAfterWorker = mocks.forkWorker.mock.calls.length;
+      ds.worker = null;
+      await expect(handleThreadReply(
+        makeEventData('om_later_refork_reply', 'restart another turn', dispatchRoot),
+        { ...makeCtx(dispatchRoot, 'om_later_refork_reply'), larkAppId: fence.workerAppId },
+      )).rejects.toThrow('project_task_control_canary_fence_rejects_turn');
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(callsAfterWorker);
+      ds.pendingTurnId = 'om_exact_kickoff';
+      expect(forkReservedInitialSession(ds, [], trustedCaller)).toBe(false);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(callsAfterWorker);
+
+      registerBot({
+        larkAppId: fence.reviewerAppId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER],
+      }).resolvedAllowedUsers = [OWNER];
+      const reviewerDs = seedThreadSession(dispatchRoot, 'task-control-kickoff-reviewer') as any;
+      activeSessions.delete(sessionKey(dispatchRoot, APP));
+      reviewerDs.larkAppId = fence.reviewerAppId;
+      reviewerDs.session.larkAppId = fence.reviewerAppId;
+      activeSessions.set(sessionKey(dispatchRoot, fence.reviewerAppId), reviewerDs);
+      reviewerDs.pendingPrompt = purpose;
+      reviewerDs.pendingTurnId = 'om_exact_kickoff';
+      mocks.forkWorker.mockImplementationOnce((reviewerSession: any, _input: any, turn: any) => {
+        turn?.onWorkerGenerationReserved?.(11);
+        reviewerSession.worker = { killed: false, send: vi.fn() };
+        return true;
+      });
+      expect(forkReservedInitialSession(reviewerDs, [], trustedCaller)).toBe(true);
+      expect(Object.values(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1.claims)).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          messageId: 'om_exact_kickoff', dispatchRoot, targetAppId: fence.workerAppId,
+          sessionId: ds.session.sessionId, workerGeneration: 10, state: 'active',
+        }),
+        expect.objectContaining({
+          messageId: 'om_exact_kickoff', dispatchRoot, targetAppId: fence.reviewerAppId,
+          sessionId: reviewerDs.session.sessionId, workerGeneration: 11, state: 'active',
+        }),
+      ]));
+      expect(terminalizeProjectTaskControlTurnAdmission(
+        ds, 'om_exact_kickoff', 10, '2026-09-30T00:04:00.000Z',
+      )).toBe(true);
+      expect(terminalizeProjectTaskControlTurnAdmission(
+        reviewerDs, 'om_exact_kickoff', 11, '2026-09-30T00:04:01.000Z',
+      )).toBe(true);
+      expect(Object.values(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlTurnAdmissionsV1.claims)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ targetAppId: fence.workerAppId, state: 'terminal' }),
+        expect.objectContaining({ targetAppId: fence.reviewerAppId, state: 'terminal' }),
+      ]));
+    } finally {
+      rmSync(projectPath, { force: true });
+      rmSync(registryPath, { force: true });
+    }
+  });
+
+  it('rejects the exact historical inbound after its fence becomes an abandonment tombstone', async () => {
+    const { fence } = writeAbandonedTaskControlFixture();
+
+    await expect(awaitProjectTaskControlPhaseAInstruction({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot: fence.phaseA.historicalDispatchRoot,
+      targetAppId: fence.phaseA.mappedWorkerAppId,
+      messageId: 'om_late_phase_a_instruction',
+    })).resolves.toBe('rejected');
+  });
+
+  it('allows unrelated ordinary inbound when an abandonment tombstone exists in the same chat', async () => {
+    const { fence } = writeAbandonedTaskControlFixture();
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot: 'om_unrelated_ordinary_root',
+      targetAppId: fence.workerAppId,
+      messageId: 'om_unrelated_ordinary_message',
+    })).resolves.toBe('unfenced');
+  });
+
+  it('allows a differently identified mapped root when an abandonment tombstone exists in the same chat', async () => {
+    const { fence } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    const boundWorkstream = projectRegistry.projects[CHAT].workstreams[0];
+    const dispatchRoot = 'om_unrelated_mapped_root';
+    const taskGuid = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    projectRegistry.projects[CHAT].workstreams.push({
+      ...boundWorkstream,
+      dispatchRoot,
+      title: 'unrelated mapped task',
+      taskControl: {
+        ...boundWorkstream.taskControl,
+        taskGuid,
+        phaseId: `workstream:${taskGuid}`,
+        mappingRef: `topic-message:${dispatchRoot}`,
+        reservationId: 'd'.repeat(50),
+        originTurnId: 'om_unrelated_mapped_origin',
+        reservationProof: {
+          ...boundWorkstream.taskControl.reservationProof,
+          keyId: 'tcpr1:unrelated',
+          signature: 'd'.repeat(64),
+        },
+      },
+    });
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: fence.workerAppId,
+      messageId: 'om_unrelated_mapped_message',
+    })).resolves.toBe('unfenced');
+  });
+
+  it('rejects the exact abandoned canary workstream when its registry operation is missing', async () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture();
+    rmSync(`${mocks.dataDir}/orchestrate-dispatch.json`, { force: true });
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: fence.workerAppId,
+      messageId: 'om_missing_registry_bound_message',
+    })).resolves.toBe('rejected');
+  });
+
+  it('keeps a truly unrelated root unfenced when the abandoned registry operation is missing', async () => {
+    const { fence } = writeAbandonedTaskControlFixture();
+    rmSync(`${mocks.dataDir}/orchestrate-dispatch.json`, { force: true });
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot: 'om_unrelated_without_registry',
+      targetAppId: fence.workerAppId,
+      messageId: 'om_unrelated_without_registry_message',
+    })).resolves.toBe('unfenced');
+  });
+
+  it('rejects a same-root workstream operation conflict when the registry operation is missing', async () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    const exactWorkstream = projectRegistry.projects[CHAT].workstreams[0];
+    projectRegistry.projects[CHAT].workstreams.push({
+      ...exactWorkstream,
+      taskControl: {
+        ...exactWorkstream.taskControl,
+        reservationId: 'd'.repeat(50),
+        phaseId: `workstream:${fence.taskGuid}`,
+        reservationProof: {
+          ...exactWorkstream.taskControl.reservationProof,
+          keyId: 'tcpr1:same-root-conflict',
+          signature: 'd'.repeat(64),
+        },
+      },
+    });
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+    rmSync(`${mocks.dataDir}/orchestrate-dispatch.json`, { force: true });
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: fence.reviewerAppId,
+      messageId: 'om_same_root_operation_conflict',
+    })).resolves.toBe('rejected');
+  });
+
+  it('rejects every registry root in an abandoned operation conflict but not an unrelated root', async () => {
+    const { dispatchRoot, operationId, fence } = writeAbandonedTaskControlFixture();
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    const conflictingRoot = 'om_abandoned_registry_conflict';
+    registry[conflictingRoot] = {
+      ...registry[dispatchRoot],
+      dispatchOperationId: operationId,
+    };
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    for (const candidateRoot of [dispatchRoot, conflictingRoot]) {
+      await expect(awaitProjectTaskControlInboundAdmission({
+        dataDir: mocks.dataDir,
+        chatId: CHAT,
+        dispatchRoot: candidateRoot,
+        targetAppId: fence.workerAppId,
+        messageId: `om_registry_conflict_${candidateRoot}`,
+      })).resolves.toBe('rejected');
+    }
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot: 'om_registry_conflict_unrelated',
+      targetAppId: fence.workerAppId,
+      messageId: 'om_registry_conflict_unrelated_message',
+    })).resolves.toBe('unfenced');
+  });
+
+  it('rejects the abandoned canary root after its current workstream identity drifts', async () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    const mapping = projectRegistry.projects[CHAT].workstreams[0].taskControl;
+    const taskGuid = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    mapping.taskGuid = taskGuid;
+    mapping.phaseId = `workstream:${taskGuid}`;
+    mapping.reservationId = 'e'.repeat(50);
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: fence.workerAppId,
+      messageId: 'om_drifted_bound_root_message',
+    })).resolves.toBe('rejected');
+  });
+
+  it('rejects the persisted abandoned canary root across target and message variations', async () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    const mapping = projectRegistry.projects[CHAT].workstreams[0].taskControl;
+    mapping.taskGuid = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    mapping.reservationId = 'e'.repeat(50);
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+
+    for (const [targetAppId, messageId] of [
+      [fence.workerAppId, 'om_drifted_worker_message'],
+      [fence.reviewerAppId, 'om_drifted_reviewer_message'],
+      ['cli_unrelated_target', 'om_drifted_unrelated_target_message'],
+    ]) {
+      await expect(awaitProjectTaskControlInboundAdmission({
+        dataDir: mocks.dataDir,
+        chatId: CHAT,
+        dispatchRoot,
+        targetAppId,
+        messageId,
+      })).resolves.toBe('rejected');
+    }
+  });
+
+  it('rejects the persisted abandoned canary root when its current workstream is missing', async () => {
+    const { dispatchRoot } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    projectRegistry.projects[CHAT].workstreams = [];
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: 'cli_unrelated_target',
+      messageId: 'om_missing_workstream_message',
+    })).resolves.toBe('rejected');
+  });
+
+  it('rejects the persisted abandoned canary root when its current workstream was replaced', async () => {
+    const { dispatchRoot } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    const replacement = projectRegistry.projects[CHAT].workstreams[0];
+    const replacementRoot = 'om_replacement_mapped_root';
+    const replacementTaskGuid = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    replacement.dispatchRoot = replacementRoot;
+    replacement.taskControl.taskGuid = replacementTaskGuid;
+    replacement.taskControl.phaseId = `workstream:${replacementTaskGuid}`;
+    replacement.taskControl.mappingRef = `topic-message:${replacementRoot}`;
+    replacement.taskControl.reservationId = 'f'.repeat(50);
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: 'cli_replacement_target',
+      messageId: 'om_replaced_workstream_message',
+    })).resolves.toBe('rejected');
+  });
+
+  it('uses the durable tombstone root when registry and current workstream are both missing', async () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    projectRegistry.projects[CHAT].workstreams = [];
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+    rmSync(`${mocks.dataDir}/orchestrate-dispatch.json`, { force: true });
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: fence.workerAppId,
+      messageId: 'om_durable_bound_root_without_derived_state',
+    })).resolves.toBe('rejected');
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot: 'om_unrelated_without_derived_state',
+      targetAppId: fence.reviewerAppId,
+      messageId: 'om_unrelated_without_derived_state_message',
+    })).resolves.toBe('unfenced');
+  });
+
+  it('recovers one exact Phase-B root from a legacy v1 tombstone', async () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture({ legacy: true });
+    rmSync(`${mocks.dataDir}/orchestrate-dispatch.json`, { force: true });
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot,
+      targetAppId: fence.workerAppId,
+      messageId: 'om_legacy_unique_bound_root',
+    })).resolves.toBe('rejected');
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot: 'om_legacy_unique_unrelated_root',
+      targetAppId: fence.workerAppId,
+      messageId: 'om_legacy_unique_unrelated_message',
+    })).resolves.toBe('unfenced');
+  });
+
+  it('keeps an unrecoverable legacy v1 tombstone isolated instead of guessing unfenced', async () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture({ legacy: true });
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    projectRegistry.projects[CHAT].workstreams = [];
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+    rmSync(`${mocks.dataDir}/orchestrate-dispatch.json`, { force: true });
+
+    for (const candidateRoot of [dispatchRoot, 'om_legacy_unrecoverable_unrelated']) {
+      await expect(awaitProjectTaskControlInboundAdmission({
+        dataDir: mocks.dataDir,
+        chatId: CHAT,
+        dispatchRoot: candidateRoot,
+        targetAppId: fence.workerAppId,
+        messageId: `om_legacy_unrecoverable_${candidateRoot}`,
+      })).resolves.toBe('rejected');
+    }
+  });
+
+  it('keeps a conflicting legacy v1 root recovery isolated', async () => {
+    const { dispatchRoot, operationId, fence } = writeAbandonedTaskControlFixture({ legacy: true });
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.om_legacy_conflicting_root = {
+      ...registry[dispatchRoot],
+      dispatchOperationId: operationId,
+    };
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    await expect(awaitProjectTaskControlInboundAdmission({
+      dataDir: mocks.dataDir,
+      chatId: CHAT,
+      dispatchRoot: 'om_legacy_conflict_unrelated',
+      targetAppId: fence.workerAppId,
+      messageId: 'om_legacy_conflict_unrelated_message',
+    })).resolves.toBe('rejected');
+  });
+
+  it('rejects the exact bound-root ingress after abandonment before a durable claim or fork', () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture();
+    registerBot({
+      larkAppId: fence.workerAppId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER],
+    }).resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(dispatchRoot, 'abandoned canary') as any;
+    activeSessions.delete(sessionKey(dispatchRoot, APP));
+    ds.larkAppId = fence.workerAppId;
+    ds.session.larkAppId = fence.workerAppId;
+    ds.pendingPrompt = fence.purpose;
+    ds.pendingTurnId = 'om_late_kickoff';
+    activeSessions.set(sessionKey(dispatchRoot, fence.workerAppId), ds);
+
+    expect(() => forkReservedInitialSession(ds, [], {
+      requestLarkAppId: fence.controllerAppId,
+      requestUserOpenId: 'ou_controller',
+      senderType: 'bot' as const,
+    })).toThrow('project_task_control_canary_abandoned');
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(`${mocks.dataDir}/orchestrate-dispatch.json`, 'utf8'))
+      .__taskControlTurnAdmissionsV1).toBeUndefined();
+  });
+
+  it('rechecks abandonment before fork when the mapped workstream disappears after ingress', () => {
+    const { dispatchRoot, fence } = writeAbandonedTaskControlFixture();
+    registerBot({
+      larkAppId: fence.workerAppId, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER],
+    }).resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession(dispatchRoot, 'abandoned canary after initial ingress') as any;
+    activeSessions.delete(sessionKey(dispatchRoot, APP));
+    ds.larkAppId = fence.workerAppId;
+    ds.session.larkAppId = fence.workerAppId;
+    ds.pendingPrompt = fence.purpose;
+    ds.pendingTurnId = 'om_late_kickoff_after_mapping_removed';
+    activeSessions.set(sessionKey(dispatchRoot, fence.workerAppId), ds);
+
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    projectRegistry.projects[CHAT].workstreams = [];
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+    rmSync(`${mocks.dataDir}/orchestrate-dispatch.json`, { force: true });
+    mocks.forkWorker.mockReturnValueOnce(true);
+
+    expect(() => forkReservedInitialSession(ds, [], {
+      requestLarkAppId: fence.controllerAppId,
+      requestUserOpenId: 'ou_controller',
+      senderType: 'bot' as const,
+    })).toThrow('project_task_control_canary_abandoned');
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('rejects a kickoff provider replay after abandonment before calling Lark', async () => {
+    const { dispatchRoot, operationId, fence } = writeAbandonedTaskControlFixture();
+
+    await expect(deliverProjectTaskControlKickoff({
+      context: {
+        dataDir: mocks.dataDir, chatId: CHAT, larkAppId: fence.controllerAppId,
+        coordinatorSessionId: fence.coordinatorSessionId,
+      },
+      dispatchRoot,
+      operationId,
+      attempt: {
+        wallTime: NOW, bootId: 'boot-abandoned',
+        processStartIdentity: 'process-abandoned', monotonicMs: 1_000,
+      },
+    })).rejects.toThrow('project_task_control_canary_abandoned');
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not journal a kickoff provider response that arrives after abandonment', async () => {
+    const { dispatchRoot, operationId, fence } = writeAbandonedTaskControlFixture();
+    const projectPath = `${mocks.dataDir}/project-groups.json`;
+    const registryPath = `${mocks.dataDir}/orchestrate-dispatch.json`;
+    const projectRegistry = JSON.parse(readFileSync(projectPath, 'utf8'));
+    const liveFence = projectTaskControlCanaryFenceRecord(fence, NOW);
+    projectRegistry.projects[CHAT].blockerRecords = [liveFence];
+    projectRegistry.projects[CHAT].blockers = [liveFence.summary];
+    writeFileSync(projectPath, JSON.stringify(projectRegistry));
+    mocks.replyMessage.mockImplementationOnce(async () => {
+      const current = JSON.parse(readFileSync(projectPath, 'utf8'));
+      const tombstone = projectTaskControlCanaryAbandonedRecord(fence, {
+        authorizationRef: 'om_abandon', authorizedByOpenId: 'ou_controller', abandonedAt: NOW,
+      }, NOW);
+      current.projects[CHAT].blockerRecords = [tombstone];
+      current.projects[CHAT].blockers = [tombstone.summary];
+      writeFileSync(projectPath, JSON.stringify(current));
+      return 'om_late_kickoff_response';
+    });
+
+    try {
+      await expect(deliverProjectTaskControlKickoff({
+        context: {
+          dataDir: mocks.dataDir, chatId: CHAT, larkAppId: fence.controllerAppId,
+          coordinatorSessionId: fence.coordinatorSessionId,
+        },
+        dispatchRoot,
+        operationId,
+        attempt: {
+          wallTime: NOW, bootId: 'boot-live',
+          processStartIdentity: 'process-live', monotonicMs: 1_000,
+        },
+      })).resolves.toEqual({ state: 'ambiguous' });
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      expect(JSON.parse(readFileSync(registryPath, 'utf8'))
+        .__taskControlKickoffOperationsV1.operations[operationId]).toMatchObject({ state: 'ambiguous' });
+    } finally {
+      rmSync(projectPath, { force: true });
+      rmSync(registryPath, { force: true });
+    }
   });
 
   it('retains a grouped opening buffers when its cold fork is synchronously refused outside marginal', () => {

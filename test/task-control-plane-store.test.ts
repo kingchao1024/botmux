@@ -9,6 +9,7 @@ import {
   TaskControlPlaneStore,
   type AppendTaskControlEventInput,
   type AuthenticatedTaskControlPrincipal,
+  type TaskControlArtifactEvidence,
   type TaskControlActorRole,
   type TaskControlAuthority,
   type VerifiedTaskControlApproval,
@@ -80,6 +81,21 @@ function trustedMappingInput(): Parameters<TaskControlPlaneStore['registerTruste
     docToken: 'doc-token-12345678', authentication: auth('controller-1', 'controller'),
     occurredAt: '2026-09-05T00:00:00.000Z',
   };
+}
+
+function projectGroupMappingInput(): Parameters<TaskControlPlaneStore['registerTrustedMapping']>[0] {
+  return {
+    dispatchRoot: 'om_projectroot', projectId: 'project-group:oc_project', phaseId: 'workstream:task-project',
+    phaseTaskGuids: ['task-project'], taskGuid: 'task-project', topicRootId: 'om_projectroot',
+    ownerId: 'worker-project', reviewerId: 'reviewer-project', acceptorId: 'acceptor-project',
+    registrationRef: 'topic-message:om_projectroot', controllerId: 'controller-project',
+    mappingAuthority: {
+      kind: 'project_group', chatId: 'oc_project', reservationId: 'reservation-1', projectRevision: 4,
+      acceptorAppId: 'acceptor-project', mode: 'audit_only',
+    },
+    authentication: auth('controller-project', 'controller'),
+    occurredAt: '2026-09-29T00:00:00.000Z',
+  } as Parameters<TaskControlPlaneStore['registerTrustedMapping']>[0];
 }
 
 function createV8LogicalIdSchema(db: DatabaseSync): void {
@@ -192,33 +208,42 @@ function appendTrustedReview(
     reviewRound: number; reviewCommentId: string; verdict: 'pass' | 'conditional' | 'fail';
     conditionIds?: string[]; resolvedConditionEvidence?: Record<string, ReviewerConditionEvidence>;
     docToken: string; docRevision: number; reviewerId?: string; occurredAt?: string; designationExpiresAt?: string;
+    controllerId?: string; reviewerBotAppId?: string;
+    artifactEvidence?: Extract<TaskControlArtifactEvidence, { kind: 'project_report' }>;
   },
 ): string {
   const provider = reviewerProvider();
   const reviewerId = input.reviewerId ?? 'reviewer-1';
+  const reviewerBotAppId = input.reviewerBotAppId ?? 'reviewer-app';
+  const controllerId = input.controllerId ?? 'actor-1';
   const occurredAt = input.occurredAt ?? '2026-09-04T00:30:00.000Z';
   store.setReviewerVerdictVerifier(provider);
   const designation = provider.issueDesignatedReviewer({
     designatedReviewerRef: `designated-${suffix}`,
     projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root_1', taskSetSnapshot: ['task-1'],
-    reviewRound: input.reviewRound, reviewerId, reviewerBotAppId: 'reviewer-app',
-    controllerId: 'actor-1', controllerBotAppId: 'test:unscoped',
+    reviewRound: input.reviewRound, reviewerId, reviewerBotAppId,
+    controllerId, controllerBotAppId: 'test:unscoped',
     effectiveAt: '2026-09-04T00:00:00.000Z', expiresAt: input.designationExpiresAt ?? '2099-01-01T00:00:00.000Z',
   });
-  store.appendDesignatedReviewer(designation, auth('actor-1', 'controller'), value => provider.verifyDesignatedReviewer(value));
+  store.appendDesignatedReviewer(designation, auth(controllerId, 'controller'), value => provider.verifyDesignatedReviewer(value));
   const verdict = provider.issueVerdict({
     verdictId: `reviewer-verdict-${suffix}`,
     projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root_1', taskSetSnapshot: ['task-1'],
-    reviewRound: input.reviewRound, designatedReviewerRef: designation.designatedReviewerRef, reviewerId, reviewerBotAppId: 'reviewer-app',
+    reviewRound: input.reviewRound, designatedReviewerRef: designation.designatedReviewerRef, reviewerId, reviewerBotAppId,
     sessionId: `reviewer-session-${suffix}`, workerGeneration: input.reviewRound, capability: `reviewer-capability-${suffix}`,
-    sourceCommentId: input.reviewCommentId, sourceVersionHash: `sha256:${'a'.repeat(64)}`,
+    ...(input.artifactEvidence
+      ? { sourceMessageId: input.artifactEvidence.triggerId, sourceVersionHash: input.artifactEvidence.contentHash }
+      : { sourceCommentId: input.reviewCommentId, sourceVersionHash: `sha256:${'a'.repeat(64)}` }),
     kind: 'verdict', verdict: input.verdict, conditionIds: input.conditionIds ?? [],
-    resolvedConditionEvidence: input.resolvedConditionEvidence ?? {}, docToken: input.docToken, docRevision: input.docRevision,
+    resolvedConditionEvidence: input.resolvedConditionEvidence ?? {},
+    ...(input.artifactEvidence
+      ? { artifactEvidence: input.artifactEvidence }
+      : { docToken: input.docToken, docRevision: input.docRevision }),
     expiresAt: '2099-01-01T00:00:00.000Z',
   });
   expect(store.appendReviewerVerdict({
     verdict, authentication: auth(reviewerId, 'reviewer'),
-    attestation: { reviewerId, reviewerBotAppId: 'reviewer-app', sessionId: `reviewer-session-${suffix}`, workerGeneration: input.reviewRound, capability: `reviewer-capability-${suffix}` },
+    attestation: { reviewerId, reviewerBotAppId, sessionId: `reviewer-session-${suffix}`, workerGeneration: input.reviewRound, capability: `reviewer-capability-${suffix}` },
     verifyVerdict: value => provider.verifyVerdict(value), now: occurredAt,
   })).toMatchObject({ status: 'active', verdict: { verdictId: verdict.verdictId } });
   store.appendEvent(taskEvent(suffix, 'task.reviewed', {
@@ -226,7 +251,10 @@ function appendTrustedReview(
     payload: {
       reviewRound: input.reviewRound, reviewCommentId: input.reviewCommentId, independent: true, verdict: input.verdict,
       conditionIds: input.conditionIds ?? [], resolvedConditionEvidence: input.resolvedConditionEvidence ?? {},
-      reviewerVerdictId: verdict.verdictId, docToken: input.docToken, docRevision: input.docRevision,
+      reviewerVerdictId: verdict.verdictId,
+      ...(input.artifactEvidence
+        ? { artifactEvidence: input.artifactEvidence, projectReportEvidenceId: input.artifactEvidence.triggerId }
+        : { docToken: input.docToken, docRevision: input.docRevision }),
     },
   }));
   return verdict.verdictId;
@@ -261,7 +289,564 @@ function seedFreezableTask(store: TaskControlPlaneStore, opts: {
   }));
 }
 
+function seedProjectReportSuccess(store: TaskControlPlaneStore, opts: {
+  artifactDispatchRoot?: string;
+  artifactReporterAppId?: string;
+  recordFirstIngress?: boolean;
+} = {}): void {
+  expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+  store.appendEvent(taskEvent('03', 'task.accepted', { actorId: 'worker-1', actorRole: 'worker' }));
+  store.appendEvent(taskEvent('04', 'task.execution_started', { actorId: 'worker-1', actorRole: 'worker' }));
+  store.appendEvent(taskEvent('05', 'task.first_submitted', {
+    actorId: 'worker-1', actorRole: 'worker', sourceRef: 'project-worker-evidence:worker-submitted',
+    payload: { docToken: 'doc-final', docRevision: 7 },
+  }));
+  const evidenceId = 'reviewer-pass';
+  const firstIngressAt = '2026-09-04T00:30:00.000Z';
+  if (opts.recordFirstIngress !== false) {
+    expect(store.recordEvidenceFirstIngress({
+      evidenceId, canonicalHash: `sha256:${'d'.repeat(64)}`, dispatchRoot: 'om_root_1', reviewRound: 1,
+      occurredAt: firstIngressAt,
+    })).toMatchObject({ kind: 'appended', receivedAt: firstIngressAt });
+  }
+  const artifactEvidence = {
+    kind: 'project_report' as const,
+    reportRequestId: 'report:review-pass', triggerId: 'message-review-pass',
+    dispatchRoot: opts.artifactDispatchRoot ?? 'om_root_1',
+    sourceSessionId: 'reviewer-session-06', sourceTurnId: 'reviewer-turn-1',
+    reporterAppId: opts.artifactReporterAppId ?? 'reviewer-1', targetSessionId: 'session-controller',
+    projectRevision: 7, contentHash: `sha256:${'e'.repeat(64)}`,
+  };
+  appendTrustedReview(store, '06', {
+    reviewRound: 1, reviewCommentId: 'comment-1', verdict: 'pass',
+    docToken: 'doc-final', docRevision: 7, occurredAt: firstIngressAt,
+    controllerId: 'controller-1', reviewerBotAppId: 'reviewer-1', artifactEvidence,
+  });
+  const reviewerEvidenceRef = `project-worker-evidence:${evidenceId}`;
+  store.appendEvent(taskEvent('07', 'task.delivered', {
+    actorId: 'controller-1', actorRole: 'controller', sourceRef: reviewerEvidenceRef,
+    evidenceRef: reviewerEvidenceRef, occurredAt: firstIngressAt, terminal: true,
+    payload: { artifactEvidence }, deliverTo: [`project-session:${artifactEvidence.targetSessionId}`],
+  }));
+  claimAndDeliver(store, 'evt_07', Date.parse('2026-09-04T00:30:01.000Z'));
+  store.appendEvent(taskEvent('09', 'task.done_marked', {
+    actorId: 'controller-1', actorRole: 'controller', sourceRef: reviewerEvidenceRef,
+    occurredAt: firstIngressAt, payload: { projectRevision: artifactEvidence.projectRevision },
+  }));
+}
+
+function appendPostTerminalReviewerHead(
+  store: TaskControlPlaneStore,
+  input: {
+    suffix: string;
+    kind?: 'verdict' | 'revocation';
+    verdict?: 'pass' | 'conditional' | 'fail';
+    targetVerdictId?: string;
+    appendReviewEvent?: boolean;
+    expectedStatus?: 'active' | 'revoked' | 'unknown';
+    provider?: DaemonReviewerVerdictProvider;
+    setVerifier?: boolean;
+    issuedAt?: string;
+  },
+): void {
+  const provider = input.provider ?? new DaemonReviewerVerdictProvider({
+    key: Buffer.from('store-reviewer-verdict-test-key'), keyId: 'store-reviewer-key',
+    now: () => Date.parse('2026-09-04T00:31:00.000Z'),
+  });
+  if (input.setVerifier !== false) store.setReviewerVerdictVerifier(provider);
+  const targetVerdictId = input.targetVerdictId ?? 'reviewer-verdict-06';
+  const artifactEvidence = {
+    kind: 'project_report' as const,
+    reportRequestId: `report:${input.suffix}`, triggerId: `message-${input.suffix}`,
+    dispatchRoot: 'om_root_1', sourceSessionId: `reviewer-session-${input.suffix}`,
+    sourceTurnId: `reviewer-turn-${input.suffix}`, reporterAppId: 'reviewer-1',
+    targetSessionId: 'session-controller', projectRevision: 8,
+    contentHash: `sha256:${'d'.repeat(64)}`,
+  };
+  const common = {
+    verdictId: `reviewer-verdict-${input.suffix}`,
+    projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root_1',
+    taskSetSnapshot: ['task-1'], reviewRound: 1, designatedReviewerRef: 'designated-06',
+    reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-1',
+    sessionId: artifactEvidence.sourceSessionId, workerGeneration: 1,
+    capability: `reviewer-capability-${input.suffix}`, sourceMessageId: artifactEvidence.triggerId,
+    sourceVersionHash: artifactEvidence.contentHash, resolvedConditionEvidence: {}, artifactEvidence,
+    expiresAt: '2099-01-01T00:00:00.000Z', issuedAt: input.issuedAt,
+  } as const;
+  const conditionIds = input.verdict === 'conditional' ? ['condition-1'] : [];
+  const verdict = input.kind === 'revocation'
+    ? provider.issueVerdict({
+        ...common, kind: 'revocation', conditionIds: [], revokesVerdictId: targetVerdictId,
+      })
+    : provider.issueVerdict({
+        ...common, kind: 'verdict', verdict: input.verdict ?? 'pass', conditionIds,
+        supersedesVerdictId: targetVerdictId,
+      });
+  expect(store.appendReviewerVerdict({
+    verdict, authentication: auth('reviewer-1', 'reviewer'),
+    attestation: {
+      reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-1', sessionId: artifactEvidence.sourceSessionId,
+      workerGeneration: 1, capability: `reviewer-capability-${input.suffix}`,
+    },
+    verifyVerdict: value => provider.verifyVerdict(value), now: '2026-09-04T00:31:00.000Z',
+  })).toMatchObject({ status: input.expectedStatus ?? (input.kind === 'revocation' ? 'revoked' : 'active') });
+  if (input.kind === 'revocation' || input.appendReviewEvent === false) return;
+  expect(store.appendEvent(taskEvent('10', 'task.review_corrected', {
+    actorId: 'reviewer-1', actorRole: 'reviewer', occurredAt: '2026-09-04T00:31:00.000Z',
+    sourceRef: `reviewer-verdict:${verdict.verdictId}`,
+    payload: {
+      reviewRound: 1, reviewCommentId: artifactEvidence.triggerId, independent: true,
+      verdict: input.verdict ?? 'pass', conditionIds, resolvedConditionEvidence: {},
+      reviewerVerdictId: verdict.verdictId, artifactEvidence,
+      projectReportEvidenceId: artifactEvidence.triggerId,
+    },
+  }))).toMatchObject({ kind: 'appended' });
+}
+
 describe('TaskControlPlaneStore event ledger', () => {
+  it('does not release successful terminal capacity without the exact delivered outbox receipt', async () => {
+    const { store } = await fixture();
+    expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+    store.appendEvent(taskEvent('03', 'task.accepted', { actorId: 'worker-1', actorRole: 'worker' }));
+    store.appendEvent(taskEvent('04', 'task.execution_started', { actorId: 'worker-1', actorRole: 'worker' }));
+    store.appendEvent(taskEvent('05', 'task.first_submitted', {
+      actorId: 'worker-1', actorRole: 'worker',
+      sourceRef: 'project-worker-evidence:worker-submitted',
+      payload: { docToken: 'doc-final', docRevision: 7 },
+    }));
+    appendTrustedReview(store, '06', {
+      reviewRound: 1, reviewCommentId: 'comment-1', verdict: 'pass',
+      docToken: 'doc-final', docRevision: 7,
+    });
+    const reviewerEvidenceRef = 'project-worker-evidence:reviewer-pass';
+    store.appendEvent(taskEvent('07', 'task.delivered', {
+      actorId: 'controller-1', actorRole: 'controller', sourceRef: reviewerEvidenceRef,
+      terminal: true, payload: { docToken: 'doc-final', docRevision: 7 }, deliverTo: ['project-session:session-controller'],
+    }));
+    store.appendEvent(taskEvent('08', 'task.done_marked', {
+      actorId: 'controller-1', actorRole: 'controller', sourceRef: reviewerEvidenceRef,
+    }));
+
+    expect(store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toEqual({ released: false });
+    store.close();
+  });
+
+  it('does not release successful terminal capacity from an independently signed FAIL review', async () => {
+    const { store } = await fixture();
+    expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+    store.appendEvent(taskEvent('03', 'task.accepted', { actorId: 'worker-1', actorRole: 'worker' }));
+    store.appendEvent(taskEvent('04', 'task.execution_started', { actorId: 'worker-1', actorRole: 'worker' }));
+    store.appendEvent(taskEvent('05', 'task.first_submitted', {
+      actorId: 'worker-1', actorRole: 'worker',
+      sourceRef: 'project-worker-evidence:worker-submitted',
+      payload: { docToken: 'doc-final', docRevision: 7 },
+    }));
+    appendTrustedReview(store, '06', {
+      reviewRound: 1, reviewCommentId: 'comment-1', verdict: 'fail',
+      docToken: 'doc-final', docRevision: 7,
+    });
+    const reviewerEvidenceRef = 'project-worker-evidence:reviewer-fail';
+    store.appendEvent(taskEvent('07', 'task.delivered', {
+      actorId: 'controller-1', actorRole: 'controller', sourceRef: reviewerEvidenceRef,
+      terminal: true, payload: { docToken: 'doc-final', docRevision: 7 }, deliverTo: ['project-session:session-controller'],
+    }));
+    claimAndDeliver(store, 'evt_07', Date.parse('2026-09-04T00:00:08.000Z'));
+    store.appendEvent(taskEvent('09', 'task.done_marked', {
+      actorId: 'controller-1', actorRole: 'controller', sourceRef: reviewerEvidenceRef,
+    }));
+
+    expect(store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toEqual({ released: false });
+    store.close();
+  });
+
+  it('releases only an exact project-report success chain bound to first ingress and mapping identities', async () => {
+    const exact = await fixture();
+    seedProjectReportSuccess(exact.store);
+    expect(exact.store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toMatchObject({
+      released: true, releaseKind: 'valid_delivered_done', releaseEventId: 'evt_09',
+    });
+    exact.store.close();
+
+    const foreign = await fixture();
+    seedProjectReportSuccess(foreign.store, { artifactDispatchRoot: 'om_foreign', artifactReporterAppId: 'foreign-reviewer' });
+    expect(foreign.store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toEqual({ released: false });
+    foreign.store.close();
+
+    const noIngress = await fixture();
+    seedProjectReportSuccess(noIngress.store, { recordFirstIngress: false });
+    expect(noIngress.store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toEqual({ released: false });
+    noIngress.store.close();
+  });
+
+  it('keeps terminal capacity released but blocks admission after a superseding FAIL review', async () => {
+    const { store } = await fixture();
+    seedProjectReportSuccess(store);
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: true, releaseEventId: 'evt_09',
+    });
+
+    const provider = new DaemonReviewerVerdictProvider({
+      key: Buffer.from('store-reviewer-verdict-test-key'), keyId: 'store-reviewer-key',
+      now: () => Date.parse('2026-09-04T00:31:00.000Z'),
+    });
+    store.setReviewerVerdictVerifier(provider);
+    const artifactEvidence = {
+      kind: 'project_report' as const,
+      reportRequestId: 'report:post-terminal-fail', triggerId: 'message-post-terminal-fail',
+      dispatchRoot: 'om_root_1', sourceSessionId: 'reviewer-session-fail', sourceTurnId: 'reviewer-turn-fail',
+      reporterAppId: 'reviewer-1', targetSessionId: 'session-controller', projectRevision: 8,
+      contentHash: `sha256:${'b'.repeat(64)}`,
+    };
+    const verdict = provider.issueVerdict({
+      verdictId: 'reviewer-verdict-post-terminal-fail',
+      projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root_1',
+      taskSetSnapshot: ['task-1'], reviewRound: 1, designatedReviewerRef: 'designated-06',
+      reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-1', sessionId: 'reviewer-session-fail',
+      workerGeneration: 1, capability: 'reviewer-capability-fail', sourceMessageId: artifactEvidence.triggerId,
+      sourceVersionHash: artifactEvidence.contentHash, kind: 'verdict', verdict: 'fail', conditionIds: [],
+      resolvedConditionEvidence: {}, artifactEvidence, supersedesVerdictId: 'reviewer-verdict-06',
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    });
+    expect(store.appendReviewerVerdict({
+      verdict, authentication: auth('reviewer-1', 'reviewer'),
+      attestation: {
+        reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-1', sessionId: 'reviewer-session-fail',
+        workerGeneration: 1, capability: 'reviewer-capability-fail',
+      },
+      verifyVerdict: value => provider.verifyVerdict(value), now: '2026-09-04T00:31:00.000Z',
+    })).toMatchObject({ status: 'active', verdict: { verdictId: verdict.verdictId, verdict: 'fail' } });
+    expect(store.appendEvent(taskEvent('10', 'task.review_corrected', {
+      actorId: 'reviewer-1', actorRole: 'reviewer', occurredAt: '2026-09-04T00:31:00.000Z',
+      sourceRef: `reviewer-verdict:${verdict.verdictId}`,
+      payload: {
+        reviewRound: 1, reviewCommentId: artifactEvidence.triggerId, independent: true, verdict: 'fail',
+        conditionIds: [], resolvedConditionEvidence: {}, reviewerVerdictId: verdict.verdictId,
+        artifactEvidence, projectReportEvidenceId: artifactEvidence.triggerId,
+      },
+    }))).toMatchObject({ kind: 'appended' });
+
+    expect(store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toMatchObject({
+      released: true, releaseKind: 'valid_delivered_done', releaseEventId: 'evt_09',
+    });
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false, releaseEventId: 'evt_09',
+      admissionBlockers: expect.arrayContaining([
+        expect.objectContaining({ kind: 'reviewer_verdict_issue' }),
+      ]),
+    });
+    store.close();
+  });
+
+  it('keeps terminal capacity released but blocks admission after a superseding PASS review', async () => {
+    const { store } = await fixture();
+    seedProjectReportSuccess(store);
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: true, releaseEventId: 'evt_09',
+    });
+
+    const provider = new DaemonReviewerVerdictProvider({
+      key: Buffer.from('store-reviewer-verdict-test-key'), keyId: 'store-reviewer-key',
+      now: () => Date.parse('2026-09-04T00:31:00.000Z'),
+    });
+    store.setReviewerVerdictVerifier(provider);
+    const artifactEvidence = {
+      kind: 'project_report' as const,
+      reportRequestId: 'report:post-terminal-pass', triggerId: 'message-post-terminal-pass',
+      dispatchRoot: 'om_root_1', sourceSessionId: 'reviewer-session-pass', sourceTurnId: 'reviewer-turn-pass',
+      reporterAppId: 'reviewer-1', targetSessionId: 'session-controller', projectRevision: 8,
+      contentHash: `sha256:${'c'.repeat(64)}`,
+    };
+    const verdict = provider.issueVerdict({
+      verdictId: 'reviewer-verdict-post-terminal-pass',
+      projectId: 'project-1', phaseId: 'phase-1', taskGuid: 'task-1', topicRootId: 'om_root_1',
+      taskSetSnapshot: ['task-1'], reviewRound: 1, designatedReviewerRef: 'designated-06',
+      reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-1', sessionId: 'reviewer-session-pass',
+      workerGeneration: 1, capability: 'reviewer-capability-pass', sourceMessageId: artifactEvidence.triggerId,
+      sourceVersionHash: artifactEvidence.contentHash, kind: 'verdict', verdict: 'pass', conditionIds: [],
+      resolvedConditionEvidence: {}, artifactEvidence, supersedesVerdictId: 'reviewer-verdict-06',
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    });
+    expect(store.appendReviewerVerdict({
+      verdict, authentication: auth('reviewer-1', 'reviewer'),
+      attestation: {
+        reviewerId: 'reviewer-1', reviewerBotAppId: 'reviewer-1', sessionId: 'reviewer-session-pass',
+        workerGeneration: 1, capability: 'reviewer-capability-pass',
+      },
+      verifyVerdict: value => provider.verifyVerdict(value), now: '2026-09-04T00:31:00.000Z',
+    })).toMatchObject({ status: 'active', verdict: { verdictId: verdict.verdictId, verdict: 'pass' } });
+    expect(store.appendEvent(taskEvent('10', 'task.review_corrected', {
+      actorId: 'reviewer-1', actorRole: 'reviewer', occurredAt: '2026-09-04T00:31:00.000Z',
+      sourceRef: `reviewer-verdict:${verdict.verdictId}`,
+      payload: {
+        reviewRound: 1, reviewCommentId: artifactEvidence.triggerId, independent: true, verdict: 'pass',
+        conditionIds: [], resolvedConditionEvidence: {}, reviewerVerdictId: verdict.verdictId,
+        artifactEvidence, projectReportEvidenceId: artifactEvidence.triggerId,
+      },
+    }))).toMatchObject({ kind: 'appended' });
+
+    expect(store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toMatchObject({
+      released: true, releaseKind: 'valid_delivered_done', releaseEventId: 'evt_09',
+    });
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false, releaseEventId: 'evt_09',
+      admissionBlockers: expect.arrayContaining([
+        expect.objectContaining({ kind: 'reviewer_verdict_issue' }),
+      ]),
+    });
+    store.close();
+  });
+
+  it('keeps terminal capacity released but blocks admission after a superseding CONDITIONAL review', async () => {
+    const { store } = await fixture();
+    seedProjectReportSuccess(store);
+    appendPostTerminalReviewerHead(store, { suffix: 'post-terminal-conditional', verdict: 'conditional' });
+
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false, releaseEventId: 'evt_09',
+      admissionBlockers: [expect.objectContaining({ kind: 'reviewer_verdict_issue' })],
+    });
+    store.close();
+  });
+
+  it('keeps terminal capacity released but blocks admission after the release-bound PASS is revoked', async () => {
+    const { store } = await fixture();
+    seedProjectReportSuccess(store);
+    appendPostTerminalReviewerHead(store, { suffix: 'post-terminal-revocation', kind: 'revocation' });
+
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false, releaseEventId: 'evt_09',
+      admissionBlockers: expect.arrayContaining([
+        expect.objectContaining({ kind: 'reviewer_verdict_issue' }),
+      ]),
+    });
+    store.close();
+  });
+
+  it('keeps terminal capacity released but blocks admission when the release-bound PASS head forks', async () => {
+    const { store } = await fixture();
+    seedProjectReportSuccess(store);
+    appendPostTerminalReviewerHead(store, {
+      suffix: 'post-terminal-fork-a', verdict: 'pass', appendReviewEvent: false,
+    });
+    appendPostTerminalReviewerHead(store, {
+      suffix: 'post-terminal-fork-b', verdict: 'pass', appendReviewEvent: false, expectedStatus: 'unknown',
+    });
+
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false, releaseEventId: 'evt_09',
+      admissionBlockers: expect.arrayContaining([
+        expect.objectContaining({ kind: 'reviewer_verdict_issue' }),
+      ]),
+    });
+    store.close();
+  });
+
+  it('keeps a superseding verdict in the lineage after its current verifier key is revoked', async () => {
+    const { dir, store } = await fixture();
+    seedProjectReportSuccess(store);
+    const releaseProvider = reviewerProvider();
+    const successorProvider = new DaemonReviewerVerdictProvider({
+      key: Buffer.from('store-reviewer-successor-test-key'), keyId: 'store-reviewer-successor-key',
+      now: () => Date.parse('2026-09-04T00:31:00.000Z'),
+    });
+    store.setReviewerVerdictVerifier({
+      verifyDesignatedReviewer: value => releaseProvider.verifyDesignatedReviewer(value),
+      verifyVerdict: value => releaseProvider.verifyVerdict(value) || successorProvider.verifyVerdict(value),
+    });
+    appendPostTerminalReviewerHead(store, {
+      suffix: 'post-terminal-revoked-successor-key', verdict: 'fail', appendReviewEvent: false,
+      provider: successorProvider, setVerifier: false,
+    });
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false,
+    });
+
+    store.close();
+    const reopened = await TaskControlPlaneStore.open(dir, authority);
+    reopened.setReviewerVerdictVerifier(releaseProvider);
+    expect(reopened.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false,
+      admissionBlockers: expect.arrayContaining([
+        expect.objectContaining({ kind: 'reviewer_verdict_issue' }),
+      ]),
+    });
+    reopened.close();
+  });
+
+  it('keeps terminal capacity released after the release-bound verifier key is revoked', async () => {
+    const { dir, store } = await fixture();
+    seedProjectReportSuccess(store);
+    store.close();
+    const reopened = await TaskControlPlaneStore.open(dir, authority);
+    reopened.setReviewerVerdictVerifier({
+      verifyDesignatedReviewer: () => false,
+      verifyVerdict: () => false,
+    });
+
+    expect(reopened.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false,
+      releaseEventId: 'evt_09', releaseKind: 'valid_delivered_done',
+      admissionBlockers: expect.arrayContaining([
+        expect.objectContaining({ kind: 'reviewer_verdict_issue' }),
+      ]),
+    });
+    reopened.close();
+  });
+
+  it('keeps terminal capacity released when a late successor backdates its issuedAt', async () => {
+    const { dir, store } = await fixture();
+    seedProjectReportSuccess(store);
+    appendPostTerminalReviewerHead(store, {
+      suffix: 'post-terminal-backdated-successor', verdict: 'fail', appendReviewEvent: false,
+      issuedAt: '2026-09-04T00:29:00.000Z',
+    });
+    store.close();
+    const reopened = await TaskControlPlaneStore.open(dir, authority);
+    reopened.setReviewerVerdictVerifier(reviewerProvider());
+
+    expect(reopened.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false,
+      releaseEventId: 'evt_09', releaseKind: 'valid_delivered_done',
+      admissionBlockers: expect.arrayContaining([
+        expect.objectContaining({ kind: 'reviewer_verdict_issue' }),
+      ]),
+    });
+    reopened.close();
+  });
+
+  it('binds failed terminal capacity to the mapped root, reporter, source turn, and evidence ref', async () => {
+    const appendFailure = (store: TaskControlPlaneStore, overrides: { dispatchRoot?: string; reporterAppId?: string } = {}) => {
+      expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+      return store.appendEvent(taskEvent('03', 'task.failed', {
+        actorId: 'worker-1', actorRole: 'worker', sourceRef: 'project-worker-evidence:failed-exact',
+        errorClass: 'project_report_failed', attempt: 1,
+        payload: {
+          sourceSessionId: 'worker-session-1', sourceTurnId: 'worker-turn-1', workerGeneration: 2, dispatchAttempt: 1,
+          artifactEvidence: {
+            kind: 'project_report', reportRequestId: 'report:failed', triggerId: 'message-failed',
+            dispatchRoot: overrides.dispatchRoot ?? 'om_root_1', sourceSessionId: 'worker-session-1',
+            sourceTurnId: 'worker-turn-1', reporterAppId: overrides.reporterAppId ?? 'worker-1',
+            targetSessionId: 'session-controller', projectRevision: 7, contentHash: `sha256:${'f'.repeat(64)}`,
+          },
+        },
+      }));
+    };
+
+    const exact = await fixture();
+    const exactFailure = appendFailure(exact.store);
+    expect(exact.store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toMatchObject({
+      released: true, releaseKind: 'valid_failed', releaseEventId: exactFailure.event.eventId,
+    });
+    exact.store.close();
+
+    const foreign = await fixture();
+    appendFailure(foreign.store, { dispatchRoot: 'om_foreign', reporterAppId: 'foreign-worker' });
+    expect(foreign.store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toEqual({ released: false });
+    foreign.store.close();
+  });
+
+  it('does not release capacity after an invalid terminal-shaped prefix', async () => {
+    const { store } = await fixture();
+    expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+    store.appendEvent(taskEvent('03', 'task.done_marked', {
+      actorId: 'worker-1', actorRole: 'worker', sourceRef: 'audit:invalid-terminal-prefix',
+    }));
+    store.appendEvent(taskEvent('04', 'task.failed', {
+      actorId: 'worker-1', actorRole: 'worker', sourceRef: 'project-worker-evidence:failed-exact',
+      errorClass: 'project_report_failed', attempt: 1,
+      payload: {
+        sourceSessionId: 'worker-session-1', sourceTurnId: 'worker-turn-1', workerGeneration: 2, dispatchAttempt: 1,
+        artifactEvidence: {
+          kind: 'project_report', reportRequestId: 'report:failed', triggerId: 'message-failed',
+          dispatchRoot: 'om_root_1', sourceSessionId: 'worker-session-1', sourceTurnId: 'worker-turn-1',
+          reporterAppId: 'worker-1', targetSessionId: 'session-controller', projectRevision: 7,
+          contentHash: `sha256:${'f'.repeat(64)}`,
+        },
+      },
+    }));
+
+    expect(store.listEvents({ taskGuid: 'task-1' }).map(event => event.eventType)).toEqual([
+      'mapping.registered', 'task.done_marked', 'task.failed',
+    ]);
+    expect(store.getTaskTrustedTerminalDecision('om_root_1', 'task-1')).toEqual({ released: false });
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: false, admissionSafe: false,
+      admissionBlockers: [
+        { kind: 'transition_violation', eventId: 'evt_03' },
+        { kind: 'transition_violation', eventId: 'evt_04' },
+      ],
+    });
+    store.close();
+  });
+
+  it('separates immutable capacity release from sequence-aware post-terminal admission blockers', async () => {
+    const { store } = await fixture();
+    expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+    store.appendEvent(taskEvent('03', 'task.execution_started', {
+      actorId: 'worker-1', actorRole: 'worker', sourceRef: 'audit:historical-non-terminal-violation',
+    }));
+    store.appendEvent(taskEvent('04', 'unknown.required', {
+      actorId: 'worker-1', actorRole: 'worker', sourceRef: 'audit:historical-unknown',
+      payload: { unknownKey: 'historical:unknown' },
+    }));
+    store.appendEvent(taskEvent('05', 'task.failed', {
+      actorId: 'worker-1', actorRole: 'worker', sourceRef: 'project-worker-evidence:failed-exact',
+      errorClass: 'project_report_failed', attempt: 1,
+      payload: {
+        sourceSessionId: 'worker-session-1', sourceTurnId: 'worker-turn-1', workerGeneration: 2, dispatchAttempt: 1,
+        artifactEvidence: {
+          kind: 'project_report', reportRequestId: 'report:failed', triggerId: 'message-failed',
+          dispatchRoot: 'om_root_1', sourceSessionId: 'worker-session-1', sourceTurnId: 'worker-turn-1',
+          reporterAppId: 'worker-1', targetSessionId: 'session-controller', projectRevision: 7,
+          contentHash: `sha256:${'f'.repeat(64)}`,
+        },
+      },
+    }));
+
+    expect(store.getTaskTrustedTerminalDecision('om_root_1', 'task-1').released).toBe(true);
+    expect(store.getTaskAdmissionDecision('om_root_1', 'task-1')).toEqual({ safe: true, blockers: [] });
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: true, admissionBlockers: [], releaseEventId: 'evt_05',
+    });
+
+    store.appendEvent(taskEvent('06', 'unknown.required', {
+      actorId: 'worker-1', actorRole: 'worker', sourceRef: 'audit:late-unknown',
+      payload: { unknownKey: 'late:unknown' },
+    }));
+    expect(store.getTaskTrustedTerminalDecision('om_root_1', 'task-1').released).toBe(true);
+    expect(store.getTaskAdmissionDecision('om_root_1', 'task-1')).toMatchObject({
+      safe: false, blockers: [expect.objectContaining({ kind: 'unresolved_unknown', key: 'late:unknown' })],
+    });
+    expect(store.getTaskControlMappingDecision('om_root_1', 'task-1')).toMatchObject({
+      capacityReleased: true, admissionSafe: false,
+      admissionBlockers: [expect.objectContaining({ kind: 'unresolved_unknown', key: 'late:unknown' })],
+    });
+    store.close();
+  });
+
+  it('stores a project-group audit mapping without a fabricated approval gate', async () => {
+    const { store } = await fixture();
+    expect(store.registerTrustedMapping(projectGroupMappingInput())).toMatchObject({
+      kind: 'registered',
+      mapping: {
+        taskGuid: 'task-project',
+        mappingAuthority: {
+          kind: 'project_group', chatId: 'oc_project', reservationId: 'reservation-1',
+          projectRevision: 4, acceptorAppId: 'acceptor-project', mode: 'audit_only',
+        },
+      },
+    });
+    expect(store.listTrustedMappings()).toEqual([
+      expect.objectContaining({
+        taskGuid: 'task-project',
+        mappingAuthority: expect.objectContaining({ kind: 'project_group' }),
+      }),
+    ]);
+    expect(store.listEvents({ taskGuid: 'task-project' }).map(event => event.eventType))
+      .toEqual(['mapping.registered']);
+    store.close();
+  });
+
   it('shares one phase.opened event across exact task mappings and rejects a changed phase tuple', async () => {
     const { store } = await fixture();
     const taskGuids = ['task-1', 'task-2', 'task-3'];
@@ -393,7 +978,116 @@ describe('TaskControlPlaneStore event ledger', () => {
   });
 });
 
+describe('TaskControlPlaneStore evidence holdback', () => {
+  it('records the first ingress of an evidence in the immutable observations ledger and reuses the same receivedAt on exact retry', async () => {
+    const { store } = await fixture();
+    const result = store.recordEvidenceFirstIngress({
+      evidenceId: 'tcpe_holdback_1', canonicalHash: 'sha256:aaaa', dispatchRoot: 'om_projectroot', reviewRound: 1,
+      occurredAt: '2026-09-29T00:00:00.000Z',
+    });
+    expect(result).toMatchObject({ kind: 'appended', receivedAt: '2026-09-29T00:00:00.000Z' });
+    const replay = store.recordEvidenceFirstIngress({
+      evidenceId: 'tcpe_holdback_1', canonicalHash: 'sha256:aaaa', dispatchRoot: 'om_projectroot', reviewRound: 1,
+      occurredAt: '2026-09-29T00:05:00.000Z',
+    });
+    expect(replay).toMatchObject({ kind: 'duplicate', receivedAt: '2026-09-29T00:00:00.000Z' });
+    const rows = store.listObservations().filter(item => item.idempotencyKey === 'evidence-holdback:tcpe_holdback_1');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ outcome: 'unknown', payload: expect.objectContaining({ canonicalHash: 'sha256:aaaa', reviewRound: 1 }) });
+    store.close();
+  });
+
+  it('records exactly one first-ingress row when the same evidence is ingested concurrently and preserves the winning receivedAt', async () => {
+    const { store } = await fixture();
+    const inputs = Array.from({ length: 6 }, (_, index) => () => store.recordEvidenceFirstIngress({
+      evidenceId: 'tcpe_holdback_concurrent', canonicalHash: 'sha256:bbbb', dispatchRoot: 'om_projectroot', reviewRound: 1,
+      occurredAt: `2026-09-29T00:00:0${index}.000Z`,
+    }));
+    const results = await Promise.all(inputs.map(async fn => fn()));
+    const receivedAts = new Set(results.map(item => item.receivedAt));
+    expect(receivedAts.size).toBe(1);
+    expect(store.listObservations()
+      .filter(item => item.idempotencyKey === 'evidence-holdback:tcpe_holdback_concurrent')).toHaveLength(1);
+    store.close();
+  });
+
+  it('rejects an evidenceId retry that changes its canonical hash as a permanent conflict without touching the winning row', async () => {
+    const { store } = await fixture();
+    expect(store.recordEvidenceFirstIngress({
+      evidenceId: 'tcpe_holdback_conflict', canonicalHash: 'sha256:cccc', dispatchRoot: 'om_projectroot', reviewRound: 1,
+      occurredAt: '2026-09-29T00:00:00.000Z',
+    })).toMatchObject({ kind: 'appended', receivedAt: '2026-09-29T00:00:00.000Z' });
+    const conflict = store.recordEvidenceFirstIngress({
+      evidenceId: 'tcpe_holdback_conflict', canonicalHash: 'sha256:dddd', dispatchRoot: 'om_projectroot', reviewRound: 1,
+      occurredAt: '2026-09-29T00:01:00.000Z',
+    });
+    expect(conflict).toMatchObject({ kind: 'conflict', existingCanonicalHash: 'sha256:cccc', receivedAt: '2026-09-29T00:00:00.000Z' });
+    const rows = store.listObservations().filter(item => item.idempotencyKey === 'evidence-holdback:tcpe_holdback_conflict');
+    expect(rows).toHaveLength(1);
+    store.close();
+  });
+});
+
 describe('TaskControlPlaneStore v4 to v5 migration', () => {
+  it('upgrades schema 13 mappings to explicit v3-gate authority without changing their identity', async () => {
+    const { dir, store } = await fixture();
+    expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+    store.close();
+    const path = join(dir, 'botmux-task-control-plane.sqlite');
+    const db = new DatabaseSync(path);
+    try {
+      db.exec(`
+        DROP TRIGGER control_trusted_mappings_no_update;
+        ALTER TABLE control_trusted_mappings DROP COLUMN mapping_authority_json;
+        CREATE TRIGGER control_trusted_mappings_no_update BEFORE UPDATE ON control_trusted_mappings
+        BEGIN SELECT RAISE(ABORT,'control_mapping_immutable'); END;
+        PRAGMA user_version=13;
+      `);
+    } finally { db.close(); }
+
+    const upgraded = await TaskControlPlaneStore.open(dir, authority);
+    expect(upgraded.listTrustedMappings()).toEqual([
+      expect.objectContaining({
+        dispatchRoot: 'om_root_1',
+        mappingAuthority: { kind: 'v3_gate', approvalGate: expect.objectContaining({ approvalRef: 'approval:gate-1' }) },
+      }),
+    ]);
+    upgraded.close();
+    const verify = new DatabaseSync(path, { readOnly: true });
+    try {
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(14);
+      expect(verify.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='control_trusted_mappings_no_update'`).get())
+        .toEqual(expect.objectContaining({ sql: expect.stringContaining('control_mapping_immutable') }));
+    } finally { verify.close(); }
+  });
+
+  it('rolls back the schema 13 authority migration when an existing gate is malformed', async () => {
+    const { dir, store } = await fixture();
+    expect(store.registerTrustedMapping(trustedMappingInput())).toMatchObject({ kind: 'registered' });
+    store.close();
+    const path = join(dir, 'botmux-task-control-plane.sqlite');
+    const db = new DatabaseSync(path);
+    try {
+      db.exec(`
+        DROP TRIGGER control_trusted_mappings_no_update;
+        ALTER TABLE control_trusted_mappings DROP COLUMN mapping_authority_json;
+        UPDATE control_trusted_mappings SET approval_gate_json='not-json';
+        CREATE TRIGGER control_trusted_mappings_no_update BEFORE UPDATE ON control_trusted_mappings
+        BEGIN SELECT RAISE(ABORT,'control_mapping_immutable'); END;
+        PRAGMA user_version=13;
+      `);
+    } finally { db.close(); }
+
+    await expect(TaskControlPlaneStore.open(dir, authority)).rejects.toThrow('task_control_schema_mapping_authority_invalid');
+    const verify = new DatabaseSync(path, { readOnly: true });
+    try {
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(13);
+      expect(verify.prepare('PRAGMA table_info(control_trusted_mappings)').all()
+        .some((column: any) => column.name === 'mapping_authority_json')).toBe(false);
+      expect(verify.prepare('SELECT COUNT(*) AS n FROM control_trusted_mappings').get()).toEqual({ n: 1 });
+    } finally { verify.close(); }
+  });
+
   it('upgrades v4 in one transaction, preserves old rows, and leaves them unclaimable by a v5 owner', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-task-control-v4-migrate-'));
     dirs.push(dir);
@@ -423,7 +1117,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     upgraded.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(13);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(14);
       expect(verify.prepare('SELECT lark_app_id FROM control_events WHERE event_id=?').get('legacy-event')).toEqual({ lark_app_id: 'legacy:v4' });
       expect(verify.prepare('SELECT COUNT(*) AS n FROM control_events').get()).toEqual({ n: 1 });
     } finally { verify.close(); }
@@ -469,7 +1163,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     upgraded.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(13);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as any).user_version)).toBe(14);
       expect(verify.prepare('SELECT topic_root_id FROM control_designated_reviewers WHERE designated_reviewer_ref=?').get('legacy-reviewer')).toEqual({ topic_root_id: '' });
       expect(verify.prepare('PRAGMA table_info(control_designated_reviewers)').all().filter((row: any) => row.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((row: any) => row.name)).toEqual(['lark_app_id', 'designated_reviewer_ref']);
       expect(verify.prepare('PRAGMA table_info(control_reviewer_verdicts)').all().filter((row: any) => row.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((row: any) => row.name)).toEqual(['lark_app_id', 'verdict_id']);
@@ -521,7 +1215,7 @@ describe('TaskControlPlaneStore v4 to v5 migration', () => {
     migrated.close();
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
-      expect(Number((verify.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)).toBe(13);
+      expect(Number((verify.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)).toBe(14);
       for (const table of ['control_events', 'control_observations', 'control_approval_consumptions', 'control_trusted_mappings', 'control_outbox', 'control_delivery_receipts']) {
         const expected = table === 'control_events' || table === 'control_observations' ? 2 : 1;
         expect(verify.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: expected });
@@ -814,6 +1508,14 @@ describe('TaskControlPlaneStore durable delivery', () => {
       eventId: targetEventId, destinationId: targetDestination, now: Date.parse('2026-09-04T00:00:10.000Z'), claimToken: 'target-only',
     });
     expect(claimed).toMatchObject({ eventId: targetEventId, destinationId: targetDestination, status: 'inflight', claimToken: 'target-only', attempts: 1 });
+    expect(store.claimOutboxForEventDestination({
+      eventId: targetEventId, destinationId: targetDestination,
+      now: Date.parse('2026-09-04T00:00:11.000Z'), claimToken: 'target-only',
+    })).toMatchObject({ outboxId: claimed!.outboxId, status: 'inflight', claimToken: 'target-only', attempts: 1 });
+    expect(store.claimOutboxForEventDestination({
+      eventId: targetEventId, destinationId: targetDestination,
+      now: Date.parse('2026-09-04T00:00:11.000Z'), claimToken: 'different-token',
+    })).toBeUndefined();
     const rows = store.listOutbox();
     expect(rows.filter(row => row.status === 'inflight')).toEqual([expect.objectContaining({ outboxId: claimed!.outboxId })]);
     expect(rows.filter(row => row.status === 'pending')).toHaveLength(10);

@@ -131,6 +131,12 @@ import { logger } from './utils/logger.js';
 import { reapLegacyPm2, liveGodAt } from './core/legacy-pm2-reaper.js';
 import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/file-lock.js';
 import { scheduleTimeZone } from './utils/timezone.js';
+import {
+  authorizeScheduledTurn,
+  parseScheduledTurnId,
+  scheduledTurnAuthErrorMessage,
+} from './core/scheduled-turn-provenance.js';
+import { sendScheduleDeliveryOnce } from './services/schedule-delivery-once.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
@@ -5917,10 +5923,21 @@ async function cmdProject(argv: string[]): Promise<void> {
                         [--milestone <里程碑>] [--next-milestone <下一节点>] [--clear-next-milestone]
   botmux project close [--milestone <完成说明>]
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
+  botmux project gate add --id <gate-id> --source-chat-id <oc_xxx>
+                         --dispatch-root <om_xxx> --task-guid <uuid> --label <名称>
+  botmux project gate retire --id <gate-id> --expected-fingerprint <pcg1:...>
+                            --authorization-ref <om_xxx> --reason <原因>
+  botmux project gate replace --id <旧-gate-id> --expected-fingerprint <pcg1:...>
+                             --new-id <新-gate-id> --source-chat-id <oc_xxx>
+                             --dispatch-root <om_xxx> --task-guid <uuid> --label <名称>
+                             --authorization-ref <om_xxx> --reason <原因>
+  botmux project gate status
 
 说明:
   仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
   botmux dispatch 会自动登记子任务，botmux report 会把进展同步回同一张卡。
+  gate retire/replace 的 --authorization-ref 必须指向当前有权限真人发送的精确 canonical action summary；
+  只回复“授权”、复用旧消息或让 bot/定时任务代发都会被 daemon 拒绝。
   所有命令可加 --session-id <id>；--json 输出完整状态。`);
     return;
   }
@@ -5960,7 +5977,7 @@ async function cmdProject(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (parsed.json || subcommand === 'status') {
+  if (parsed.json || subcommand === 'status' || (subcommand === 'gate' && argv[1] === 'status')) {
     console.log(JSON.stringify(body.project, null, 2));
   } else {
     const project = body.project as { title?: string; revision?: number; card?: { messageId?: string; pinned?: boolean } };
@@ -6750,6 +6767,7 @@ const SEND_HELP_BODY = [
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
   '       --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）',
+  '       --schedule-once                 当前定时轮次先原子 claim，再发送唯一一条顶层消息',
   '       --attention[=kind]              举手：发消息的同时把本会话标进 dashboard',
   '                                       「需要你」列并通知你——撞到只有你能解的硬阻碍',
   '                                       （授权/拍板/缺权限）无法继续时用。消息正文即看板',
@@ -9491,6 +9509,15 @@ async function cmdSend(rest: string[]): Promise<void> {
   // chat (e.g. a public release-notes group) while keeping its own thread
   // for streaming-card / progress UI.
   const sendTopLevel = rest.includes('--top-level');
+  if (rest.some(token => token.startsWith('--schedule-once='))) {
+    console.error('botmux send: --schedule-once 不接受参数');
+    process.exit(2);
+  }
+  const scheduleOnce = rest.includes('--schedule-once');
+  if (rest.filter(token => token === '--schedule-once').length > 1) {
+    console.error('botmux send: --schedule-once 只能指定一次');
+    process.exit(2);
+  }
   const overrideChatId = argValue(rest, '--chat-id');
   // --into <话题根id>: reply this send into a specific topic (a sub-bot's topic,
   // another thread, etc.) instead of the session's own location. Wins over the
@@ -9827,7 +9854,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent']);
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--schedule-once']);
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -9905,7 +9932,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--schedule-once']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -9965,6 +9992,42 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
+  const targetChatId = overrideChatId ?? s.chatId;
+  const scheduleDeliveryContext = (() => {
+    if (!scheduleOnce) return undefined;
+    const taskId = originTurnId ? parseScheduledTurnId(originTurnId) : null;
+    if (!taskId || !originTurnId || originSessionId !== sid) {
+      console.error('botmux send: --schedule-once 只允许当前定时任务的已认证 turn 使用');
+      process.exit(2);
+    }
+    if (!sendTopLevel || !!sendInto || explicitQuote !== undefined || customCardRequested
+      || asVoice || isSlashSend || attention.requested || urgent.requested
+      || images.length > 0 || files.length > 0 || videoAttachments.length > 0) {
+      console.error('botmux send: --schedule-once 只支持单条顶层普通消息，不支持回复、附件、自定义卡片、语音、斜杠命令、加急或举手');
+      process.exit(2);
+    }
+    if (targetChatId !== s.chatId) {
+      console.error('botmux send: --schedule-once 的目标群必须与当前定时 turn 绑定群一致');
+      process.exit(2);
+    }
+    const auth = authorizeScheduledTurn({
+      turnId: originTurnId,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: s.chatId,
+      isOwnerAllowed: () => true,
+      isScheduledTurnLive: turnId => turnId === originTurnId,
+    });
+    if ('error' in auth) {
+      console.error(`botmux send: --schedule-once ${scheduledTurnAuthErrorMessage(auth.error)}`);
+      process.exit(2);
+    }
+    if (!auth.task.lastRunAt) {
+      console.error('botmux send: --schedule-once 当前任务缺少 lastRunAt，拒绝发送');
+      process.exit(2);
+    }
+    return { taskId, runAt: auth.task.lastRunAt, turnId: originTurnId };
+  })();
   // Resolve sender-scoped bot identities before the early voice return. Voice
   // used to skip the text path's XPI gate entirely, so an explicitly addressed
   // bot received an unclassified bot message that the receiver then dropped.
@@ -10467,7 +10530,6 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   const { sendMessage, replyMessage, urgentMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
   // Effective target chat for top-level mode (defaults to session's chat)
-  const targetChatId = overrideChatId ?? s.chatId;
   // Chat-scope sessions (普通群整群一会话) post to chatId without
   // reply_in_thread, otherwise Lark would force every reply into a fresh
   // topic — defeating the whole point of chat-scope routing.
@@ -10839,6 +10901,20 @@ async function cmdSend(rest: string[]): Promise<void> {
     recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);
     return result.messageId;
   };
+  let scheduleDeliveryReceipt: { runKey: string; providerKey: string } | undefined;
+  const dispatchScheduledPrimary = async (body: string, msgType: string): Promise<string> => {
+    if (!scheduleDeliveryContext) return dispatchPrimary(body, msgType);
+    const result = await sendScheduleDeliveryOnce({
+      dataDir,
+      chatId: targetChatId,
+      taskId: scheduleDeliveryContext.taskId,
+      runAt: scheduleDeliveryContext.runAt,
+      turnId: scheduleDeliveryContext.turnId,
+      send: providerKey => dispatchPrimary(body, msgType, false, providerKey),
+    });
+    scheduleDeliveryReceipt = { runKey: result.runKey, providerKey: result.providerKey };
+    return result.messageId;
+  };
 
   // Bot-to-bot XPI classification must be decided before the message leaves
   // this process. The former post-send control prompt was published into the
@@ -10876,6 +10952,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (preparedContentFile) {
       try { text = readFileSync(preparedContentFile, 'utf-8'); } catch { /* fall back safely below */ }
     }
+    // The sandbox prepares presentation bytes before the trusted host parses
+    // `--as`. Re-apply the explicit choice after that replacement so the final
+    // Lark payload cannot silently lose its XPI classification marker.
+    if (asChoice) text = embedCrossPrincipalAsToken(text, asChoice);
 
     // `preparedContentFile` is presentation data produced inside an untrusted
     // sandbox and only TOCTOU-materialized by the host watcher. It is not an
@@ -11294,7 +11374,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
         messageId = delivered.messageId;
       } else {
-        messageId = await dispatchPrimary(replyCardJson, 'interactive');
+        messageId = await dispatchScheduledPrimary(replyCardJson, 'interactive');
       }
     }
 
@@ -11528,6 +11608,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
+      ...(scheduleDeliveryReceipt
+        ? { scheduleDelivery: { ...scheduleDeliveryReceipt, status: 'sent' } }
+        : {}),
       ...(failedAttachments.length > 0
         ? { failedAttachments: failedAttachments.map(f => f.path) }
         : {}),
@@ -11973,8 +12056,14 @@ async function assertProjectDispatchPolicy(input: {
   existingDispatch: boolean;
   readOnly: boolean;
   writeScopes: string[];
+  taskControlMode?: 'audit_only';
   dispatchRoot?: string;
-}): Promise<boolean> {
+}): Promise<{
+  projectMode: boolean;
+  taskControlMode?: 'audit_only';
+  acceptorAppId?: string;
+  maxActiveMappings?: 1;
+}> {
   const response = await postCurrentSessionDaemonRoute({
     path: `/api/sessions/${encodeURIComponent(input.sessionId)}/project-dispatch-policy`,
     sessionId: input.sessionId,
@@ -11987,16 +12076,25 @@ async function assertProjectDispatchPolicy(input: {
       existingDispatch: input.existingDispatch,
       readOnly: input.readOnly,
       writeScopes: input.writeScopes,
+      ...(input.taskControlMode ? { taskControlMode: input.taskControlMode } : {}),
       ...(input.dispatchRoot ? { dispatchRoot: input.dispatchRoot } : {}),
     },
   });
   const body = await response.json().catch(() => ({})) as {
     ok?: boolean;
     projectMode?: boolean;
+    taskControlMode?: 'audit_only';
+    acceptorAppId?: string;
+    maxActiveMappings?: 1;
     error?: string;
     disallowedAppIds?: string[];
   };
-  if (response.ok && body.ok) return body.projectMode === true;
+  if (response.ok && body.ok) return {
+    projectMode: body.projectMode === true,
+    ...(body.taskControlMode ? { taskControlMode: body.taskControlMode } : {}),
+    ...(body.acceptorAppId ? { acceptorAppId: body.acceptorAppId } : {}),
+    ...(body.maxActiveMappings === 1 ? { maxActiveMappings: 1 as const } : {}),
+  };
   const disallowed = body.disallowedAppIds?.length ? ` (${body.disallowedAppIds.join(', ')})` : '';
   throw new Error(`${body.error ?? `HTTP ${response.status}`}${disallowed}`);
 }
@@ -12169,6 +12267,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --read-only           project mode 新任务声明只读访问；与 --write-scope 二选一
   --write-scope <path>  project mode 新任务声明写目录，可重复；必须是本机现存绝对目录
+  --task-control audit-only
+                        显式请求 project-group TaskControl audit-only canary；必须配合 write scope
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
@@ -12196,6 +12296,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const botSpecs = dispatchArgs.bots;
   const botAppSpecs = dispatchArgs.botApps;
   const readOnly = dispatchArgs.readOnly;
+  const taskControlMode = dispatchArgs.taskControlMode;
   let writeScopes: string[];
   if (readOnly && dispatchArgs.writeScopes.length > 0) {
     console.error('--read-only 与 --write-scope 不能同用。');
@@ -12203,6 +12304,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (intoRoot && (readOnly || dispatchArgs.writeScopes.length > 0)) {
     console.error('--into 不能携带 --read-only 或 --write-scope；已有 workstream 沿用原 access。');
+    process.exit(1);
+  }
+  if (taskControlMode && (intoRoot || readOnly || dispatchArgs.writeScopes.length === 0 || standby)) {
+    console.error('--task-control audit-only 只用于带 --write-scope 的新建非 standby project workstream。');
     process.exit(1);
   }
   try {
@@ -12311,9 +12416,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (!parsedBotApps.some(item => item.appId === targetAppId)) parsedBotApps.push({ appId: targetAppId, role });
   }
 
-  let projectMode = false;
+  let projectPolicy: Awaited<ReturnType<typeof assertProjectDispatchPolicy>> = { projectMode: false };
   try {
-    projectMode = await assertProjectDispatchPolicy({
+    projectPolicy = await assertProjectDispatchPolicy({
       sessionId: sid,
       larkAppId: appId,
       targetChatId,
@@ -12323,12 +12428,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       existingDispatch: !!intoRoot,
       readOnly,
       writeScopes,
+      taskControlMode,
       ...(intoRoot ? { dispatchRoot: intoRoot } : {}),
     });
   } catch (error) {
     console.error(`dispatch 不符合当前群的协作模式: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
+  const projectMode = projectPolicy.projectMode;
   let projectRoles: { workerAppIds: string[]; reviewerAppIds: string[] } | undefined;
   if (projectMode && access?.mode === 'write') {
     try { projectRoles = partitionProjectDispatchRoles(parsedBotApps); }
@@ -12392,17 +12499,43 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     ? JSON.stringify({ zh_cn: { title: '', content: built.threadContent } })
     : undefined;
 
-  const deliverKickoff = async (rootId: string, content: string): Promise<string> => {
+  const deliverKickoff = async (
+    rootId: string,
+    content: string | undefined,
+    dispatchOperationId?: string,
+  ): Promise<{
+    messageId: string;
+    taskControlState?: 'delivered';
+  }> => {
     const response = await postCurrentSessionDaemonRoute({
       path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId,
-      body: { rootId, chatId: targetChatId, content,
-        targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0 },
+      body: dispatchOperationId
+        ? { rootId, chatId: targetChatId, dispatchOperationId }
+        : { rootId, chatId: targetChatId, content,
+            targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0 },
     });
     const result: any = await response.json();
+    if (dispatchOperationId) {
+      const state = result?.state === 'delivered'
+        || result?.state === 'pending'
+        || result?.state === 'ambiguous'
+        || result?.state === 'permanent_reject_before_send'
+        ? result.state
+        : 'ambiguous';
+      if (response.ok && result?.ok === true && state === 'delivered'
+        && typeof result.messageId === 'string') {
+        return { messageId: result.messageId, taskControlState: 'delivered' };
+      }
+      const error = new Error(`dispatch delivery failed: ${result?.error ?? response.status}`) as Error & {
+        taskControlDeliveryState: typeof state;
+      };
+      error.taskControlDeliveryState = state;
+      throw error;
+    }
     if (!response.ok || result?.ok !== true || typeof result.messageId !== 'string') {
       throw new Error(`dispatch delivery failed: ${result?.error ?? response.status}`);
     }
-    return result.messageId;
+    return { messageId: result.messageId };
   };
 
   let dispatchRootForLifecycle = intoRoot;
@@ -12410,7 +12543,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
       const sentAtMs = Date.now();
-      const kickoffId = await deliverKickoff(intoRoot, intoBriefJson!);
+      const { messageId: kickoffId } = await deliverKickoff(intoRoot, intoBriefJson!);
       const acceptance = parsedBotApps.length > 0
         ? await waitForExactDispatchAcceptance({
             targetAppIds: parsedBotApps.map(item => item.appId),
@@ -12462,6 +12595,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         kickoffMessageId: kickoffId, chatId: targetChatId, bots: built.mentionedOpenIds,
         collaborationReady: parsedBotApps.length > 0,
         access,
+        ...(taskControlMode ? { taskControlMode } : {}),
         projectSynced,
         ...(acceptance ? {
           accepted,
@@ -12493,6 +12627,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         owners: bots.map(bot => bot.name ?? bot.openId),
         access,
         ...(projectRoles ?? {}),
+        ...(taskControlMode ? { taskControlMode } : {}),
       },
     });
     const registrationBody: any = await registration.json().catch(() => ({}));
@@ -12504,6 +12639,13 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const seedId = registrationBody?.dispatchRoot;
     if (typeof seedId !== 'string' || !seedId) {
       throw new Error('dispatch report binding registration did not return a seed id');
+    }
+    const taskControlOperationId = taskControlMode === 'audit_only'
+      ? registrationBody?.dispatchOperationId
+      : undefined;
+    if (taskControlMode === 'audit_only'
+      && (typeof taskControlOperationId !== 'string' || !/^[a-f0-9]{50}$/.test(taskControlOperationId))) {
+      throw new Error('dispatch report binding registration did not return an operation id');
     }
     dispatchRootForLifecycle = seedId;
 
@@ -12533,7 +12675,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       });
       const kickoffBriefJson = JSON.stringify({ zh_cn: { title: '', content: kickoffBuilt.threadContent } });
       const sentAtMs = Date.now();
-      kickoffId = await deliverKickoff(seedId, kickoffBriefJson);
+      ({ messageId: kickoffId } = await deliverKickoff(
+        seedId,
+        taskControlMode === 'audit_only' ? undefined : kickoffBriefJson,
+        taskControlOperationId,
+      ));
       if (parsedBotApps.length > 0) {
         acceptance = await waitForExactDispatchAcceptance({
           targetAppIds: parsedBotApps.map(item => item.appId),
@@ -12603,12 +12749,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }));
     if (!accepted) process.exitCode = 1;
   } catch (err: any) {
-    let receiptState: DispatchReceiptState = {
-      transportState: 'failed',
-      acceptanceState: 'failed',
-      errorCode: 'TRANSPORT_FAILED',
-    };
-    if (dispatchRootForLifecycle) {
+    const taskControlDeliveryState = err?.taskControlDeliveryState === 'pending'
+      || err?.taskControlDeliveryState === 'ambiguous'
+      || err?.taskControlDeliveryState === 'permanent_reject_before_send'
+      ? err.taskControlDeliveryState as 'pending' | 'ambiguous' | 'permanent_reject_before_send'
+      : undefined;
+    const permanentTransportFailure = taskControlDeliveryState === undefined
+      || taskControlDeliveryState === 'permanent_reject_before_send';
+    let receiptState: DispatchReceiptState = permanentTransportFailure
+      ? {
+          transportState: 'failed',
+          acceptanceState: 'failed',
+          errorCode: 'TRANSPORT_FAILED',
+        }
+      : {
+          transportState: 'dispatched',
+          acceptanceState: 'not_requested',
+          errorCode: null,
+        };
+    if (dispatchRootForLifecycle && permanentTransportFailure) {
       receiptState = await persistDispatchLifecycle({
         dispatchRoot: dispatchRootForLifecycle,
         sourceSessionId: sid,
@@ -12636,6 +12795,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       threadRootId: dispatchRootForLifecycle ?? null,
       threadId: null,
       ...receiptState,
+      ...(taskControlDeliveryState ? { taskControlDeliveryState } : {}),
       detail: err?.message ?? String(err),
     }));
     process.exit(1);

@@ -105,6 +105,36 @@ describe('Lark outbound hook provider replay suppression', () => {
     expect(mocks.emitHookEvent).not.toHaveBeenCalled();
   });
 
+  it.each(['send', 'reply'] as const)(
+    'passes one AbortSignal through the gate and actual %s provider request', async (_kind) => {
+    const deadline = new Error('provider deadline exceeded');
+    let providerSignal: AbortSignal | undefined;
+    mocks.request.mockImplementationOnce(async (request: { signal?: AbortSignal }) => {
+      providerSignal = request.signal;
+      return new Promise((_resolve, reject) => {
+        request.signal?.addEventListener('abort', () => reject(request.signal?.reason), { once: true });
+      });
+    });
+    const controller = new AbortController();
+    const call = _kind === 'send'
+      ? sendMessage(
+          'app', 'oc_chat', 'answer', 'text', 'stable-send', undefined,
+          { signal: controller.signal } as any,
+        )
+      : replyMessage(
+          'app', 'om_parent', 'answer', 'text', true, 'stable-reply', undefined,
+          { signal: controller.signal } as any,
+        );
+    await Promise.resolve();
+    controller.abort(deadline);
+
+    await expect(call).rejects.toBe(deadline);
+    expect(providerSignal).toBe(controller.signal);
+    expect(mocks.request).toHaveBeenCalledOnce();
+    expect(_kind === 'send' ? mocks.create : mocks.reply).not.toHaveBeenCalled();
+    },
+  );
+
   it('sends each Buzz mode through the matching PATCH endpoint', async () => {
     for (const mode of ['app', 'sms', 'phone'] as const) {
       await urgentMessage('app', 'om_send', ['ou_user', 'ou_user'], mode);
