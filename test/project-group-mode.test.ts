@@ -130,6 +130,24 @@ describe('project group mode', () => {
     });
   });
 
+  it('migrates a schema-v3 project without stage events to an empty event outbox', async () => {
+    const f = fixture();
+    const now = '2026-10-03T00:00:00.000Z';
+    writeFileSync(join(f.dataDir, 'project-groups.json'), JSON.stringify({
+      schemaVersion: 3,
+      projects: {
+        [f.context.chatId]: {
+          schemaVersion: 3, revision: 1, chatId: f.context.chatId, larkAppId: f.context.larkAppId,
+          coordinatorSessionId: f.context.coordinatorSessionId, title: '阶段推进', goal: '兼容读取',
+          phase: '执行', focus: '迁移', status: 'active', blockers: [], blockerRecords: [],
+          workstreams: [], milestones: [], createdAt: now, updatedAt: now,
+        },
+      },
+    }));
+
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.stageAdvanceEvents).toEqual([]);
+  });
+
   it('clears only manual blockers and refuses to close with derived blockers open', async () => {
     const f = fixture();
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '验证阻塞来源' });

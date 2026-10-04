@@ -8,6 +8,10 @@ import type {
   ProjectDispatchReservationFactsV1,
   ProjectDispatchReservationProofV1,
 } from './task-control-plane-project-group-mapping-source.js';
+import {
+  normalizeProjectStageAdvanceEvents,
+  type ProjectStageAdvanceEvent,
+} from './project-stage-auto-advance.js';
 
 export const PROJECT_GROUP_STORE_FILE = 'project-groups.json';
 export const PROJECT_COMPLETION_GATE_VALIDITY_MS = 5 * 60_000;
@@ -247,6 +251,8 @@ export interface ProjectGroupState {
   blockers: string[];
   blockerRecords: ProjectBlockerRecord[];
   workstreams: ProjectWorkstream[];
+  /** Bounded durable outbox for trusted coordinator wake-ups. */
+  stageAdvanceEvents?: ProjectStageAdvanceEvent[];
   /** Durable cross-chat dependencies that must pass before the parent may complete. */
   completionGates?: ProjectCompletionGate[];
   /** Optional for backwards-compatible reads of project state written before reservations. */
@@ -749,12 +755,17 @@ function migrateProject(project: unknown): ProjectGroupState {
   if (raw.schemaVersion === 3 && JSON.stringify(legacyBlockers) !== JSON.stringify(projected)) {
     throw new Error(`${PROJECT_GROUP_STORE_FILE} blocker projection mismatch`);
   }
+  const stageAdvanceEvents = normalizeProjectStageAdvanceEvents(raw.stageAdvanceEvents);
+  if (stageAdvanceEvents.some(event => event.chatId !== raw.chatId)) {
+    throw new Error(`${PROJECT_GROUP_STORE_FILE} has a stage advance chat mismatch`);
+  }
   return {
     ...(raw as unknown as ProjectGroupState),
     schemaVersion: 3,
     blockers: projected,
     blockerRecords: records,
     completionGates: normalizedCompletionGates(raw.completionGates),
+    stageAdvanceEvents,
   };
 }
 

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadDashboardSecret } from '../dashboard/auth.js';
@@ -87,6 +87,10 @@ import {
 } from './task-control-plane-store.js';
 import { TaskControlMappingTrust } from './task-control-plane-mapping-trust.js';
 import type { ProjectDispatchReservationFactsV1 } from './task-control-plane-project-group-mapping-source.js';
+import {
+  appendProjectStageAdvanceEvent,
+  type ClaimedProjectStageAdvance,
+} from './project-stage-auto-advance.js';
 
 export type ProjectCompletionGateEvaluator = (input: {
   parentProject: ProjectGroupState;
@@ -2134,6 +2138,121 @@ export class ProjectCoordinator {
     });
   }
 
+  async claimStageAdvance(
+    context: ProjectCoordinatorContext,
+    options: {
+      now?: string;
+      leaseMs?: number;
+      excludeFingerprints?: readonly string[] | ReadonlySet<string>;
+    } = {},
+  ): Promise<ClaimedProjectStageAdvance | undefined> {
+    const now = new Date(options.now ?? nowIso()).toISOString();
+    const leaseMs = options.leaseMs ?? 30_000;
+    if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) throw new Error('project_stage_advance_lease_invalid');
+    let claimed: ClaimedProjectStageAdvance | undefined;
+    await mutateProjectGroup(context.dataDir, context.chatId, current => {
+      if (!current) throw new Error('project_not_found');
+      if (current.larkAppId !== context.larkAppId) throw new Error('project_coordinator_mismatch');
+      current.stageAdvanceEvents ??= [];
+      const excluded = options.excludeFingerprints instanceof Set
+        ? options.excludeFingerprints
+        : new Set(options.excludeFingerprints ?? []);
+      const nowMs = Date.parse(now);
+      const event = current.stageAdvanceEvents.find(candidate => (
+        !excluded.has(candidate.fingerprint)
+        && (candidate.status === 'pending'
+          || (candidate.status === 'dispatching' && !!candidate.claimExpiresAt && Date.parse(candidate.claimExpiresAt) <= nowMs))
+      ));
+      if (!event) return current;
+      if (event.status === 'pending' && event.attemptCount >= 3) {
+        const blockerId = projectBlockerId('task_control', `stage-auto-advance:${event.fingerprint}`);
+        delete event.claimId;
+        delete event.claimExpiresAt;
+        event.status = 'blocked';
+        event.lastErrorCode = 'stage_auto_advance_attempt_limit';
+        event.updatedAt = now;
+        upsertProjectBlocker(current, {
+          blockerId,
+          source: 'task_control',
+          code: event.lastErrorCode,
+          summary: '阶段自动推进重试次数已达上限',
+          openedAt: now,
+          eventId: event.fingerprint,
+        });
+        current.revision += 1;
+        current.updatedAt = now;
+        return current;
+      }
+      const targetSessionId = (event.status === 'pending'
+        ? current.coordinatorSessionId
+        : event.targetSessionId ?? current.coordinatorSessionId).trim();
+      if (!targetSessionId) throw new Error('project_stage_advance_target_invalid');
+      const claimId = `psac:${randomUUID()}`;
+      event.status = 'dispatching';
+      event.claimId = claimId;
+      event.claimExpiresAt = new Date(nowMs + leaseMs).toISOString();
+      event.targetSessionId = targetSessionId;
+      if (event.attemptCount < 3) event.attemptCount += 1;
+      event.updatedAt = now;
+      current.revision += 1;
+      current.updatedAt = now;
+      claimed = { event: structuredClone(event), claimId };
+      return current;
+    });
+    return claimed;
+  }
+
+  async settleStageAdvance(
+    context: ProjectCoordinatorContext,
+    input: {
+      fingerprint: string;
+      claimId: string;
+      outcome: 'dispatched' | 'retryable_failure' | 'blocked';
+      targetSessionId: string;
+      triggerId?: string;
+      errorCode?: string;
+      now?: string;
+    },
+  ): Promise<ProjectGroupState> {
+    const now = new Date(input.now ?? nowIso()).toISOString();
+    const next = await mutateProjectGroup(context.dataDir, context.chatId, current => {
+      if (!current) throw new Error('project_not_found');
+      if (current.larkAppId !== context.larkAppId) throw new Error('project_coordinator_mismatch');
+      const event = (current.stageAdvanceEvents ?? []).find(item => item.fingerprint === input.fingerprint);
+      if (!event || event.status !== 'dispatching' || event.claimId !== input.claimId
+        || !input.targetSessionId.trim() || event.targetSessionId !== input.targetSessionId.trim()) {
+        throw new Error('project_stage_advance_claim_conflict');
+      }
+      const blockerId = projectBlockerId('task_control', `stage-auto-advance:${event.fingerprint}`);
+      delete event.claimId;
+      delete event.claimExpiresAt;
+      event.updatedAt = now;
+      if (input.outcome === 'dispatched') {
+        if (!input.targetSessionId?.trim() || !input.triggerId?.trim()) throw new Error('project_stage_advance_dispatch_identity_required');
+        event.status = 'dispatched';
+        event.targetSessionId = input.targetSessionId.trim();
+        event.triggerId = input.triggerId.trim();
+        delete event.lastErrorCode;
+        removeProjectBlocker(current, blockerId);
+      } else if (input.outcome === 'retryable_failure' && event.attemptCount < 3) {
+        event.status = 'pending';
+        event.lastErrorCode = (input.errorCode ?? 'pre_dispatch_failed').trim();
+      } else {
+        event.status = 'blocked';
+        event.lastErrorCode = (input.errorCode ?? 'stage_auto_advance_blocked').trim();
+        upsertProjectBlocker(current, {
+          blockerId, source: 'task_control', code: event.lastErrorCode,
+          summary: `阶段自动推进受阻：${event.lastErrorCode}`, openedAt: now, eventId: event.fingerprint,
+        });
+      }
+      current.revision += 1;
+      current.updatedAt = now;
+      return current;
+    });
+    if (!next) throw new Error('project_not_found');
+    return next;
+  }
+
   private async apply(
     context: ProjectCoordinatorContext,
     action: Exclude<ProjectCoordinatorAction, {
@@ -2169,7 +2288,7 @@ export class ProjectCoordinator {
           focus: boundedText(action.focus, 300, '拆解并派发首批子任务'),
           status: 'active' as ProjectGroupStatus,
           ...(boundedText(action.remaining, 160) ? { remaining: boundedText(action.remaining, 160) } : {}),
-          blockers: [], blockerRecords: [], workstreams: [], completionGates: [], dispatchReservations: [], milestones: [], createdAt: now, updatedAt: now,
+          blockers: [], blockerRecords: [], workstreams: [], stageAdvanceEvents: [], completionGates: [], dispatchReservations: [], milestones: [], createdAt: now, updatedAt: now,
         };
       }
       if (!current) throw new Error('project_not_found');
@@ -2693,6 +2812,7 @@ export class ProjectCoordinator {
         }
         const item = current.workstreams.find(candidate => candidate.dispatchRoot === action.dispatchRoot);
         if (!item) throw new Error('workstream_not_found');
+        const beforeStage = structuredClone(item);
         if (item.access?.mode === 'write') {
           const reporterAppId = action.reporterAppId?.trim();
           if (!reporterAppId) throw new Error('project_reporter_identity_required');
@@ -2759,6 +2879,7 @@ export class ProjectCoordinator {
               if (status === 'blocked' || preserveTerminalAudit) item.blocker = content;
               else delete item.blocker;
               current.milestones = current.milestones.slice(-50);
+              appendProjectStageAdvanceEvent(current, beforeStage, item, now);
               return current;
             }
             if (item.status === 'in_review'
@@ -2787,6 +2908,7 @@ export class ProjectCoordinator {
             item.updatedAt = now;
           }
           current.milestones = current.milestones.slice(-50);
+          appendProjectStageAdvanceEvent(current, beforeStage, item, now);
           return current;
         }
         const status = action.status ?? 'in_progress';
@@ -2811,6 +2933,7 @@ export class ProjectCoordinator {
         }
         const milestone = boundedText(action.milestone, 300);
         if (milestone) current.milestones.push({ content: milestone, createdAt: now });
+        appendProjectStageAdvanceEvent(current, beforeStage, item, now);
       }
       current.milestones = current.milestones.slice(-50);
       return current;

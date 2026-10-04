@@ -336,7 +336,7 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setTaskControlCanaryPhaseASendHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, reconcileProjectStageAdvanceEventsAfterRestore, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setTaskControlCanaryPhaseASendHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
   awaitAskReceiptAuthorityBootstrapInventory,
@@ -30626,6 +30626,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // The lock helper also checks again after the full callback returns.
         assertTargetStable();
         sessionsRestored = true;
+        // Recover one bounded stage-event outbox entry per active project only
+        // after this daemon's session restore has completed. This applies to
+        // normal fleet and core-only boots; the readiness setter is only a
+        // barrier release and must not be the recovery trigger.
+        await reconcileProjectStageAdvanceEventsAfterRestore();
         markIpcReady();
         clearDeviceIsolationStartupIntent({
           intentId: startupIntent.intentId,

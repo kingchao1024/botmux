@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setProjectStageAdvanceTriggerHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -25,6 +25,10 @@ import {
   appendScheduleRunLog,
   scheduleRunLogDirectory,
 } from '../src/services/schedule-run-log-store.js';
+import { projectStageAdvanceFingerprint } from '../src/services/project-stage-auto-advance.js';
+import { mutateProjectGroup, readProjectGroup } from '../src/services/project-group-store.js';
+import { writeGroupCollaborationMode } from '../src/services/group-collaboration-mode-store.js';
+import { reconcileProjectStageAdvanceEventsAfterRestore } from '../src/core/dashboard-ipc-server.js';
 
 // Per-bot schedule stores: the daemon binds the store to its own bot before
 // serving IPC; the schedule endpoints under test assume that binding exists.
@@ -413,6 +417,7 @@ describe('POST /api/sessions/:sessionId/project report trust boundary', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-project-report-'));
     const previousDataDir = config.session.dataDir;
     config.session.dataDir = dataDir;
+    setLarkAppId('cli_coordinator');
     workerPool.setActiveSessionsRegistry(new Map([[SESSION_ID, {
       session: { sessionId: SESSION_ID },
       worker: null, workerPort: null, workerToken: null,
@@ -427,15 +432,729 @@ describe('POST /api/sessions/:sessionId/project report trust boundary', () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     return {
-      runReport,
+      runReport, dataDir,
       cleanup: () => {
         runReport.mockRestore();
+        setProjectStageAdvanceTriggerHandler(null);
         workerPool.setActiveSessionsRegistry(new Map());
         config.session.dataDir = previousDataDir;
         rmSync(dataDir, { recursive: true, force: true });
       },
     };
   }
+
+  function stageEventFixture(
+    now = '2026-10-03T00:00:00.000Z',
+    status: 'pending' | 'dispatching' | 'dispatched' = 'pending',
+  ) {
+    const fingerprint = projectStageAdvanceFingerprint({
+      chatId: 'oc_project', dispatchRoot: 'om_work', kind: 'delivery_ready', deliveryRound: 1,
+    });
+    return {
+      schemaVersion: 'ProjectStageAdvanceEvent.v1', fingerprint,
+      chatId: 'oc_project', dispatchRoot: 'om_work', kind: 'delivery_ready', deliveryRound: 1,
+      projectRevision: 2, status, createdAt: now, updatedAt: now, attemptCount: status === 'pending' ? 0 : 1,
+      ...(status === 'dispatching' ? { claimId: 'psac:expired', claimExpiresAt: '2026-10-03T00:00:01.000Z' } : {}),
+      ...(status === 'dispatched' ? { targetSessionId: SESSION_ID, triggerId: 'trigger_1' } : {}),
+    };
+  }
+
+  function writeStageProject(dataDir: string, event: Record<string, unknown>): void {
+    const now = '2026-10-03T00:00:00.000Z';
+    writeFileSync(join(dataDir, 'project-groups.json'), JSON.stringify({ schemaVersion: 3, projects: {
+      oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator', coordinatorSessionId: SESSION_ID,
+        title: '阶段推进', goal: '测试', phase: '执行', focus: '触发', status: 'active', blockers: [], blockerRecords: [],
+        workstreams: [], stageAdvanceEvents: [event], milestones: [], createdAt: now, updatedAt: now,
+      },
+    } }));
+  }
+
+  it('keeps the report successful and settles one trusted stage trigger after persistence', async () => {
+    const fixture = await setupProjectReportRoute();
+    const now = '2026-10-03T00:00:00.000Z';
+    const fingerprint = projectStageAdvanceFingerprint({
+      chatId: 'oc_project', dispatchRoot: 'om_work', kind: 'delivery_ready', deliveryRound: 1,
+    });
+    const event = {
+      schemaVersion: 'ProjectStageAdvanceEvent.v1', fingerprint,
+      chatId: 'oc_project', dispatchRoot: 'om_work', kind: 'delivery_ready', deliveryRound: 1,
+      projectRevision: 2, status: 'pending', createdAt: now, updatedAt: now, attemptCount: 0,
+    };
+    writeFileSync(join(fixture.dataDir, 'project-groups.json'), JSON.stringify({ schemaVersion: 3, projects: {
+      oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator', coordinatorSessionId: SESSION_ID,
+        title: '阶段推进', goal: '测试', phase: '执行', focus: '触发', status: 'active', blockers: [], blockerRecords: [],
+        workstreams: [], stageAdvanceEvents: [event], milestones: [], createdAt: now, updatedAt: now,
+      },
+    } }));
+    const claim = { event: { ...event, targetSessionId: SESSION_ID }, claimId: 'psac:test' };
+    const claimStageAdvance = vi.spyOn(projectCoordinator, 'claimStageAdvance').mockResolvedValue(claim as any);
+    const settleStageAdvance = vi.spyOn(projectCoordinator, 'settleStageAdvance').mockResolvedValue({} as any);
+    const trigger = vi.fn(async (request: any) => ({ ok: true, triggerId: 'trigger_1', target: request.target }));
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(await response.json()).not.toHaveProperty('stageAdvanceWarning');
+      expect(claimStageAdvance).toHaveBeenCalledOnce();
+      expect(trigger).toHaveBeenCalledWith(expect.objectContaining({
+        target: { kind: 'turn', sessionId: SESSION_ID },
+        options: expect.objectContaining({ turnIdempotencyKey: fingerprint }),
+      }), expect.anything());
+      expect(settleStageAdvance).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        outcome: 'dispatched', fingerprint, claimId: 'psac:test', triggerId: 'trigger_1',
+      }));
+    } finally {
+      claimStageAdvance.mockRestore();
+      settleStageAdvance.mockRestore();
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance keeps a successful report 200 and retains a retryable trigger failure', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    setProjectStageAdvanceTriggerHandler(async request => ({
+      ok: false, errorCode: 'trigger_failed', error: 'pre-dispatch failure', target: request.target,
+    }));
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true, stageAdvanceWarning: 'trigger_failed' });
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'pending', attemptCount: 1, fingerprint: event.fingerprint }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance blocks a trigger failure with post-barrier response evidence', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    const trigger = vi.fn(async (request: any) => ({
+      ok: false, triggerId: 'trigger_commit_unknown', turnIdempotencyKey: event.fingerprint,
+      errorCode: 'trigger_failed', target: request.target,
+    }));
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+        }, TEST_IPC_SECRET);
+        expect(response.status).toBe(200);
+      }
+      expect(trigger).toHaveBeenCalledOnce();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'blocked', lastErrorCode: 'trigger_failed', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance blocks post-barrier terminal persistence failure without a triggerId', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    const trigger = vi.fn(async () => ({
+      ok: false, errorCode: 'trigger_failed',
+      error: 'idempotent turn terminal outcome could not be persisted: EIO',
+      turnIdempotencyKey: event.fingerprint,
+    }));
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(trigger).toHaveBeenCalledOnce();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'blocked', lastErrorCode: 'trigger_failed', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance blocks queued-shaped errors that omit the real triggerId', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    setProjectStageAdvanceTriggerHandler(async () => ({
+      ok: false, errorCode: 'trigger_failed',
+      error: 'session activation in progress; retry the idempotent follow-up shortly',
+      turnIdempotencyKey: event.fingerprint,
+    }));
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'blocked', lastErrorCode: 'trigger_failed', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance keeps a triggerId-only pre-dispatch failure retryable', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    setProjectStageAdvanceTriggerHandler(async request => ({
+      ok: false, triggerId: 'trigger_pre_dispatch', errorCode: 'trigger_failed', target: request.target,
+    }));
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'pending', lastErrorCode: 'trigger_failed', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance keeps device credential activation freeze retryable', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    setProjectStageAdvanceTriggerHandler(async () => ({
+      ok: false,
+      errorCode: 'trigger_failed',
+      error: 'device credential activation in progress; retry the idempotent trigger shortly',
+      turnIdempotencyKey: event.fingerprint,
+    }));
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'pending', lastErrorCode: 'trigger_failed', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance keeps worker refusal before acceptance retryable', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    setProjectStageAdvanceTriggerHandler(async request => ({
+      ok: false,
+      triggerId: 'trigger_worker_refused',
+      errorCode: 'trigger_failed',
+      error: 'worker refused async trigger input before acceptance',
+      turnIdempotencyKey: event.fingerprint,
+      target: request.target,
+    }));
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'pending', lastErrorCode: 'trigger_failed', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance blocks worker refusal with an empty triggerId', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    setProjectStageAdvanceTriggerHandler(async () => ({
+      ok: false,
+      triggerId: '  ',
+      errorCode: 'trigger_failed',
+      error: 'worker refused async trigger input before acceptance',
+      turnIdempotencyKey: event.fingerprint,
+    }));
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'blocked', lastErrorCode: 'trigger_failed', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance refresh retries the same pending event after a report failure', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    await writeGroupCollaborationMode(fixture.dataDir, {
+      chatId: 'oc_project', mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+    });
+    const run = vi.spyOn(projectCoordinator, 'run').mockResolvedValue(readProjectGroup(fixture.dataDir, 'oc_project')!);
+    let calls = 0;
+    setProjectStageAdvanceTriggerHandler(async request => {
+      calls += 1;
+      return calls === 1
+        ? { ok: false, errorCode: 'trigger_failed', target: request.target }
+        : { ok: true, triggerId: 'trigger_2', target: request.target };
+    });
+    try {
+      const first = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+      }, TEST_IPC_SECRET);
+      expect(first.status).toBe(200);
+      const refresh = await fetchDaemonIpc(handle!.port, '/api/project-groups/oc_project/refresh-card', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      }, TEST_IPC_SECRET);
+      expect(refresh.status).toBe(200);
+      expect(calls).toBe(2);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'dispatched', triggerId: 'trigger_2', fingerprint: event.fingerprint }),
+      ]);
+    } finally {
+      run.mockRestore();
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance uses one idempotency key and does not redispatch a replayed report', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    const calls: string[] = [];
+    setProjectStageAdvanceTriggerHandler(async request => {
+      calls.push(request.options?.turnIdempotencyKey ?? '');
+      return { ok: true, triggerId: 'trigger_1', target: request.target };
+    });
+    try {
+      for (let i = 0; i < 2; i += 1) {
+        const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+        }, TEST_IPC_SECRET);
+        expect(response.status).toBe(200);
+      }
+      expect(calls).toEqual([event.fingerprint]);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'dispatched', triggerId: 'trigger_1' }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance blocks a target-session identity mismatch without redispatch', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    setProjectStageAdvanceTriggerHandler(async request => ({
+      ok: true, triggerId: 'trigger_wrong', target: { ...request.target, sessionId: 'session_other' },
+    }));
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true, stageAdvanceWarning: 'target_session_mismatch' });
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'blocked', lastErrorCode: 'target_session_mismatch' }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance deduplicates repeated report and review boundary notifications', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture('2026-10-03T00:00:00.000Z', 'dispatched');
+    writeStageProject(fixture.dataDir, event);
+    const trigger = vi.fn(async (request: any) => ({ ok: true, triggerId: 'unexpected', target: request.target }));
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      const report = { action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' };
+      const review = { action: 'report', dispatchRoot: 'om_work', content: '通过', reviewVerdict: 'pass', reviewRound: 1 };
+      for (const body of [report, report, review, review]) {
+        const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+        }, TEST_IPC_SECRET);
+        expect(response.status).toBe(200);
+      }
+      expect(trigger).not.toHaveBeenCalled();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'dispatched', triggerId: 'trigger_1', fingerprint: event.fingerprint }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance recovers once after normal startup restore and not from readiness setter', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    const calls: string[] = [];
+    setProjectStageAdvanceTriggerHandler(async request => {
+      calls.push(request.options?.turnIdempotencyKey ?? '');
+      return { ok: true, triggerId: 'trigger_startup', target: request.target };
+    });
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      setCoreOnlyReady();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(calls).toEqual([event.fingerprint]);
+      expect(readFileSync(resolve(process.cwd(), 'src/daemon.ts'), 'utf8')).toMatch(/sessionsRestored = true;[\s\S]{0,500}await reconcileProjectStageAdvanceEventsAfterRestore\(\)/);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance reconciles an expired accepted turn once with the same idempotency key', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture('2026-10-03T00:00:00.000Z', 'dispatching');
+    writeStageProject(fixture.dataDir, event);
+    const keys: string[] = [];
+    const trigger = vi.fn(async (request: any) => {
+      keys.push(request.options.turnIdempotencyKey);
+      return { ok: true, action: 'queued', triggerId: 'trigger_original', idempotent: true, target: request.target };
+    });
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(trigger).toHaveBeenCalledOnce();
+      expect(keys).toEqual([event.fingerprint]);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({
+          status: 'dispatched', targetSessionId: SESSION_ID, triggerId: 'trigger_original',
+          fingerprint: event.fingerprint,
+        }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance blocks interrupted terminal results and never replays them', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    const keys: string[] = [];
+    const trigger = vi.fn(async (request: any) => {
+      keys.push(request.options.turnIdempotencyKey);
+      return {
+        ok: false, state: 'interrupted', errorCode: 'no_output',
+        target: request.target,
+      };
+    });
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+        }, TEST_IPC_SECRET);
+        expect(response.status).toBe(200);
+      }
+      expect(trigger).toHaveBeenCalledOnce();
+      expect(keys).toEqual([event.fingerprint]);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({
+          status: 'blocked', attemptCount: 1, lastErrorCode: 'no_output', fingerprint: event.fingerprint,
+        }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance blocks session_not_found results and never retries them', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    const trigger = vi.fn(async (request: any) => ({
+      ok: false, errorCode: 'session_not_found', target: request.target,
+    }));
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'report', dispatchRoot: 'om_work', content: '完成', status: 'completed' }),
+        }, TEST_IPC_SECRET);
+        expect(response.status).toBe(200);
+      }
+      expect(trigger).toHaveBeenCalledOnce();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'blocked', lastErrorCode: 'session_not_found', attemptCount: 1 }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance schedules one bounded wake for an inherited lease expiry', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = {
+      ...stageEventFixture(),
+      status: 'dispatching' as const,
+      attemptCount: 1,
+      claimId: 'psac:inherited',
+      claimExpiresAt: new Date(Date.now() + 80).toISOString(),
+    };
+    writeStageProject(fixture.dataDir, event);
+    const trigger = vi.fn(async (request: any) => ({ ok: true, triggerId: 'trigger_expired', target: request.target }));
+    setProjectStageAdvanceTriggerHandler(trigger);
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      await new Promise(resolve => setTimeout(resolve, 180));
+      expect(trigger).toHaveBeenCalledOnce();
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ status: 'dispatched', triggerId: 'trigger_expired' }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance re-reads durable leases after a slow project drain', async () => {
+    const fixture = await setupProjectReportRoute();
+    const now = Date.now();
+    const expiring = {
+      ...stageEventFixture(), status: 'dispatching' as const, attemptCount: 1,
+      claimId: 'psac:expiring', targetSessionId: 'session_expiring',
+      claimExpiresAt: new Date(now + 80).toISOString(),
+    };
+    const slowIdentity = {
+      chatId: 'oc_slow', dispatchRoot: 'om_slow', kind: 'delivery_ready' as const, deliveryRound: 1,
+    };
+    const slow = {
+      ...expiring, ...slowIdentity,
+      fingerprint: projectStageAdvanceFingerprint(slowIdentity),
+      status: 'pending' as const, attemptCount: 0, targetSessionId: 'session_slow',
+      claimId: undefined, claimExpiresAt: undefined,
+    };
+    writeFileSync(join(fixture.dataDir, 'project-groups.json'), JSON.stringify({ schemaVersion: 3, projects: {
+      oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator', coordinatorSessionId: 'session_expiring',
+        title: 'expiring', goal: 'timer', phase: '执行', focus: '恢复', status: 'active', blockers: [], blockerRecords: [],
+        workstreams: [], stageAdvanceEvents: [expiring], milestones: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+      oc_slow: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_slow', larkAppId: 'cli_coordinator', coordinatorSessionId: 'session_slow',
+        title: 'slow', goal: 'timer', phase: '执行', focus: '恢复', status: 'active', blockers: [], blockerRecords: [],
+        workstreams: [], stageAdvanceEvents: [slow], milestones: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+    } }));
+    const calls: string[] = [];
+    setProjectStageAdvanceTriggerHandler(async request => {
+      calls.push(request.target.sessionId);
+      if (request.target.sessionId === 'session_slow') await new Promise(resolve => setTimeout(resolve, 170));
+      return { ok: true, triggerId: `trigger_${calls.length}`, target: request.target };
+    });
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      await new Promise(resolve => setTimeout(resolve, 180));
+      expect(calls.sort()).toEqual(['session_expiring', 'session_slow']);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents?.[0]?.status).toBe('dispatched');
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance drains a second already-expired backlog event without hot-looping one failure', async () => {
+    const fixture = await setupProjectReportRoute();
+    const first = {
+      ...stageEventFixture(), status: 'dispatching' as const, attemptCount: 1,
+      claimId: 'psac:expired_first', targetSessionId: 'session_expired_first',
+      claimExpiresAt: '2026-10-03T00:00:01.000Z',
+    };
+    const secondIdentity = {
+      chatId: 'oc_project', dispatchRoot: 'om_expired_second', kind: 'delivery_ready' as const, deliveryRound: 2,
+    };
+    const second = {
+      ...first, ...secondIdentity,
+      fingerprint: projectStageAdvanceFingerprint(secondIdentity),
+      claimId: 'psac:expired_second', targetSessionId: 'session_expired_second',
+    };
+    writeFileSync(join(fixture.dataDir, 'project-groups.json'), JSON.stringify({ schemaVersion: 3, projects: {
+      oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator',
+        coordinatorSessionId: 'session_expired_first', title: 'expired', goal: 'backlog', phase: '执行', focus: '恢复',
+        status: 'active', blockers: [], blockerRecords: [], workstreams: [], stageAdvanceEvents: [first, second],
+        milestones: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+    } }));
+    const calls: string[] = [];
+    setProjectStageAdvanceTriggerHandler(async request => {
+      calls.push(request.target.sessionId);
+      return { ok: true, triggerId: `trigger_${calls.length}`, target: request.target };
+    });
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(calls).toEqual(['session_expired_first', 'session_expired_second']);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ dispatchRoot: 'om_work', status: 'dispatched' }),
+        expect.objectContaining({ dispatchRoot: 'om_expired_second', status: 'dispatched' }),
+      ]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance carries the attempted fingerprint set across a backlog chain', async () => {
+    const fixture = await setupProjectReportRoute();
+    const first = stageEventFixture();
+    const secondIdentity = { chatId: 'oc_project', dispatchRoot: 'om_next', kind: 'delivery_ready' as const, deliveryRound: 2 };
+    const thirdIdentity = { chatId: 'oc_project', dispatchRoot: 'om_third', kind: 'delivery_ready' as const, deliveryRound: 3 };
+    const second = { ...first, ...secondIdentity, fingerprint: projectStageAdvanceFingerprint(secondIdentity) };
+    const third = { ...first, ...thirdIdentity, fingerprint: projectStageAdvanceFingerprint(thirdIdentity) };
+    writeFileSync(join(fixture.dataDir, 'project-groups.json'), JSON.stringify({ schemaVersion: 3, projects: {
+      oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator', coordinatorSessionId: SESSION_ID,
+        title: 'backlog', goal: 'chain', phase: '执行', focus: '恢复', status: 'active', blockers: [], blockerRecords: [],
+        workstreams: [], stageAdvanceEvents: [first, second, third], milestones: [],
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+    } }));
+    const calls: string[] = [];
+    setProjectStageAdvanceTriggerHandler(async request => {
+      const root = (request.envelope.payload as any).dispatchRoot as string;
+      calls.push(root);
+      return root === 'om_work'
+        ? { ok: false, triggerId: 'trigger_retryable', errorCode: 'trigger_failed', target: request.target }
+        : { ok: true, triggerId: `trigger_${root}`, target: request.target };
+    });
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      await new Promise(resolve => setTimeout(resolve, 80));
+      expect(calls).toEqual(['om_work', 'om_next', 'om_third']);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents).toEqual([
+        expect.objectContaining({ dispatchRoot: 'om_work', status: 'pending', attemptCount: 1 }),
+        expect.objectContaining({ dispatchRoot: 'om_next', status: 'dispatched' }),
+        expect.objectContaining({ dispatchRoot: 'om_third', status: 'dispatched' }),
+      ]);
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(calls).toEqual(['om_work', 'om_next', 'om_third', 'om_work']);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance does not mark a late successor attempted after onClaim warning', async () => {
+    const fixture = await setupProjectReportRoute();
+    const first = stageEventFixture();
+    writeStageProject(fixture.dataDir, first);
+    await mutateProjectGroup(fixture.dataDir, 'oc_project', current => {
+      current!.stageAdvanceEvents = [];
+      return current;
+    });
+    const secondIdentity = { chatId: 'oc_project', dispatchRoot: 'om_late_b', kind: 'delivery_ready' as const, deliveryRound: 2 };
+    const second = { ...first, ...secondIdentity, fingerprint: projectStageAdvanceFingerprint(secondIdentity) };
+    const originalClaim = projectCoordinator.claimStageAdvance.bind(projectCoordinator);
+    let injected = false;
+    const claimSpy = vi.spyOn(projectCoordinator, 'claimStageAdvance').mockImplementation(async (context, options) => {
+      if (!injected) {
+        injected = true;
+        await mutateProjectGroup(fixture.dataDir, 'oc_project', current => {
+          current!.stageAdvanceEvents = [first, second];
+          current!.revision += 1;
+          return current;
+        });
+      }
+      return originalClaim(context, options);
+    });
+    const calls: string[] = [];
+    setProjectStageAdvanceTriggerHandler(async request => {
+      const root = (request.envelope.payload as any).dispatchRoot as string;
+      calls.push(root);
+      return root === 'om_work'
+        ? { ok: false, triggerId: 'pre_a', errorCode: 'trigger_failed', error: 'known synchronous pre-dispatch refusal', target: request.target }
+        : { ok: true, triggerId: `ok_${root}`, target: request.target };
+    });
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(calls).toEqual(['om_work', 'om_late_b']);
+      expect(readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents?.map(item => item.status)).toEqual(['pending', 'dispatched']);
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      expect(calls).toEqual(['om_work', 'om_late_b', 'om_work']);
+    } finally {
+      claimSpy.mockRestore();
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance remembers a prospective fingerprint when claim fails before onClaim', async () => {
+    const fixture = await setupProjectReportRoute();
+    const event = stageEventFixture();
+    writeStageProject(fixture.dataDir, event);
+    await mutateProjectGroup(fixture.dataDir, 'oc_project', current => {
+      current!.stageAdvanceEvents = [];
+      return current;
+    });
+    let claimCalls = 0;
+    const claimSpy = vi.spyOn(projectCoordinator, 'claimStageAdvance').mockImplementation(async () => {
+      claimCalls += 1;
+      if (claimCalls === 1) {
+        await mutateProjectGroup(fixture.dataDir, 'oc_project', current => {
+          current!.stageAdvanceEvents = [event];
+          return current;
+        });
+      }
+      throw new Error('simulated_persistent_atomic_write_failure');
+    });
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      await new Promise(resolve => setTimeout(resolve, 35));
+      expect(claimCalls).toBe(1);
+    } finally {
+      claimSpy.mockRestore();
+      fixture.cleanup();
+    }
+  });
+
+  it('stage auto advance drains at most one pending event per project per reconcile', async () => {
+    const fixture = await setupProjectReportRoute();
+    const first = stageEventFixture();
+    const secondIdentity = {
+      chatId: 'oc_project', dispatchRoot: 'om_second', kind: 'review_passed' as const,
+      deliveryRound: 1, reviewRound: 1,
+    };
+    const second = {
+      ...first, ...secondIdentity,
+      fingerprint: projectStageAdvanceFingerprint(secondIdentity),
+    };
+    writeFileSync(join(fixture.dataDir, 'project-groups.json'), JSON.stringify({ schemaVersion: 3, projects: {
+      oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator', coordinatorSessionId: SESSION_ID,
+        title: '阶段推进', goal: '测试', phase: '执行', focus: '触发', status: 'active', blockers: [], blockerRecords: [],
+        workstreams: [], stageAdvanceEvents: [first, second], milestones: [],
+        createdAt: '2026-10-03T00:00:00.000Z', updatedAt: '2026-10-03T00:00:00.000Z',
+      },
+    } }));
+    const calls: string[] = [];
+    setProjectStageAdvanceTriggerHandler(async request => {
+      calls.push(request.options.turnIdempotencyKey);
+      return { ok: true, triggerId: `trigger_${calls.length}`, target: request.target };
+    });
+    try {
+      await reconcileProjectStageAdvanceEventsAfterRestore();
+      const events = readProjectGroup(fixture.dataDir, 'oc_project')?.stageAdvanceEvents ?? [];
+      expect(calls).toHaveLength(1);
+      expect(events.filter(event => event.status === 'dispatched')).toHaveLength(1);
+      expect(events.filter(event => event.status === 'pending')).toHaveLength(1);
+      expect(events.find(event => event.fingerprint === second.fingerprint)?.status).toBe('pending');
+    } finally {
+      fixture.cleanup();
+    }
+  });
 
   it.each([
     { reporterAppId: 'cli_reviewer' },

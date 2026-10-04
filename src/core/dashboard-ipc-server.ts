@@ -172,10 +172,14 @@ import {
   projectTaskControlCanaryFenceFingerprint,
   projectTaskControlCanaryFenceRecord,
   readProjectGroup,
+  listProjectGroups,
   TASK_CONTROL_CANARY_ABANDONED_CODE,
   TASK_CONTROL_CANARY_QUARANTINE_CODE,
   type ProjectTaskControlCanaryFenceInput,
 } from '../services/project-group-store.js';
+import {
+  buildProjectStageAdvanceTriggerRequest,
+} from '../services/project-stage-auto-advance.js';
 import {
   evaluateProjectDispatchPolicy,
   groupCollaborationModeConfigFingerprint,
@@ -213,7 +217,7 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
-import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import { validateTriggerRequest, type TriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import {
   listHeadlessSessions,
   readHeadlessSession,
@@ -334,6 +338,16 @@ export function setTaskControlCanaryPhaseASendHandler(
   handler: TaskControlCanaryPhaseASendHandler | null,
 ): void {
   taskControlCanaryPhaseASendHandler = handler;
+}
+
+type ProjectStageAdvanceTriggerHandler = (
+  request: TriggerRequest,
+  deps: { larkAppId: string; activeSessions: Map<string, import('./types.js').DaemonSession> },
+) => Promise<TriggerResponse>;
+let projectStageAdvanceTriggerHandler: ProjectStageAdvanceTriggerHandler = triggerSessionTurn;
+/** Test seam for the trusted project-stage trigger; production uses triggerSessionTurn. */
+export function setProjectStageAdvanceTriggerHandler(handler: ProjectStageAdvanceTriggerHandler | null): void {
+  projectStageAdvanceTriggerHandler = handler ?? triggerSessionTurn;
 }
 import {
   composeRowFromActive,
@@ -1237,7 +1251,216 @@ function composeDashboardSessionRows(opts?: { includeTokenUsage?: boolean }): Se
 // The daemon's own larkAppId, primed at startup. Required for the groups
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
-export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+let projectStageAdvanceReconcileTimer: ReturnType<typeof setTimeout> | undefined;
+function clearProjectStageAdvanceReconcileTimer(): void {
+  if (projectStageAdvanceReconcileTimer) clearTimeout(projectStageAdvanceReconcileTimer);
+  projectStageAdvanceReconcileTimer = undefined;
+}
+export function setLarkAppId(id: string): void {
+  cachedLarkAppId = id;
+  if (!id) clearProjectStageAdvanceReconcileTimer();
+}
+
+async function drainProjectStageAdvance(
+  chatId: string,
+  options?: {
+    excludeFingerprints?: ReadonlySet<string>;
+    onClaim?: (fingerprint: string) => void;
+  },
+): Promise<string | undefined> {
+  if (!cachedLarkAppId) return undefined;
+  const project = readProjectGroup(config.session.dataDir, chatId);
+  if (!project || project.larkAppId !== cachedLarkAppId) return undefined;
+  let claim;
+  try {
+    claim = await projectCoordinator.claimStageAdvance({
+      dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+      coordinatorSessionId: project.coordinatorSessionId,
+    }, options?.excludeFingerprints ? { excludeFingerprints: options.excludeFingerprints } : undefined);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  if (!claim) return undefined;
+  const event = claim.event;
+  options?.onClaim?.(event.fingerprint);
+  const targetSessionId = event.targetSessionId;
+  if (!targetSessionId) return 'project_stage_advance_target_invalid';
+  try {
+    const activeSessions = getActiveSessionsRegistry();
+    if (!activeSessions) {
+      await projectCoordinator.settleStageAdvance({
+        dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+        coordinatorSessionId: project.coordinatorSessionId,
+      }, { fingerprint: event.fingerprint, claimId: claim.claimId, targetSessionId, outcome: 'retryable_failure', errorCode: 'active_session_registry_unavailable' });
+      return 'active_session_registry_unavailable';
+    }
+    const request = buildProjectStageAdvanceTriggerRequest(project, event);
+    const result = await projectStageAdvanceTriggerHandler(request, {
+      larkAppId: cachedLarkAppId, activeSessions,
+    });
+    const responseTarget = result.target?.sessionId;
+    if (responseTarget && responseTarget !== targetSessionId) {
+      await projectCoordinator.settleStageAdvance({
+        dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+        coordinatorSessionId: project.coordinatorSessionId,
+      }, { fingerprint: event.fingerprint, claimId: claim.claimId, targetSessionId, outcome: 'blocked', errorCode: 'target_session_mismatch' });
+      return 'target_session_mismatch';
+    }
+    if (result.ok && result.triggerId) {
+      await projectCoordinator.settleStageAdvance({
+        dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+        coordinatorSessionId: project.coordinatorSessionId,
+      }, {
+        fingerprint: event.fingerprint, claimId: claim.claimId, outcome: 'dispatched',
+        targetSessionId, triggerId: result.triggerId,
+      });
+      return undefined;
+    }
+    const queuedActivationPreDispatch = result.errorCode === 'trigger_failed'
+      && result.turnIdempotencyKey === event.fingerprint
+      && typeof result.triggerId === 'string'
+      && result.triggerId.trim().length > 0
+      && result.error === 'session activation in progress; retry the idempotent follow-up shortly';
+    const deviceCredentialActivationPreDispatch = result.errorCode === 'trigger_failed'
+      && result.turnIdempotencyKey === event.fingerprint
+      && result.triggerId === undefined
+      && result.error === 'device credential activation in progress; retry the idempotent trigger shortly';
+    const workerRefusedPreDispatch = result.errorCode === 'trigger_failed'
+      && result.turnIdempotencyKey === event.fingerprint
+      && typeof result.triggerId === 'string'
+      && result.triggerId.trim().length > 0
+      && result.error === 'worker refused async trigger input before acceptance';
+    const queuedKnownShape = result.error === 'session activation in progress; retry the idempotent follow-up shortly';
+    const deviceKnownShape = result.error === 'device credential activation in progress; retry the idempotent trigger shortly';
+    const workerKnownShape = result.error === 'worker refused async trigger input before acceptance';
+    const malformedKnownPreDispatch = result.errorCode === 'trigger_failed'
+      && ((queuedKnownShape && !queuedActivationPreDispatch)
+        || (deviceKnownShape && !deviceCredentialActivationPreDispatch)
+        || (workerKnownShape && !workerRefusedPreDispatch));
+    const ambiguous = result.errorCode === 'idempotency_conflict'
+      || result.errorCode === 'session_not_found'
+      || malformedKnownPreDispatch
+      || (result.errorCode === 'trigger_failed'
+        && !queuedActivationPreDispatch
+        && !deviceCredentialActivationPreDispatch
+        && !workerRefusedPreDispatch
+        && (result.turnIdempotencyKey === event.fingerprint
+          || /terminal|persisted|commit[-_ ]unknown|after[-_ ]accept/i.test(result.error ?? '')))
+      || result.state === 'failed'
+      || result.state === 'interrupted';
+    await projectCoordinator.settleStageAdvance({
+      dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+      coordinatorSessionId: project.coordinatorSessionId,
+    }, {
+      fingerprint: event.fingerprint, claimId: claim.claimId,
+      targetSessionId,
+      outcome: ambiguous ? 'blocked' : 'retryable_failure',
+      errorCode: result.errorCode ?? 'stage_advance_trigger_failed',
+    });
+    return result.errorCode ?? 'stage_advance_trigger_failed';
+  } catch (error) {
+    const errorCode = error instanceof Error ? error.message : String(error);
+    try {
+      await projectCoordinator.settleStageAdvance({
+        dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+        coordinatorSessionId: project.coordinatorSessionId,
+      }, { fingerprint: event.fingerprint, claimId: claim.claimId, targetSessionId, outcome: 'blocked', errorCode: `trigger_unknown:${errorCode}` });
+    } catch (settleError) {
+      return `${errorCode}; settle=${settleError instanceof Error ? settleError.message : String(settleError)}`;
+    }
+    return errorCode;
+  }
+}
+
+export async function reconcileProjectStageAdvanceEventsAfterRestore(
+  attemptedByProject?: Map<string, Set<string>>,
+): Promise<void> {
+  if (!cachedLarkAppId) return;
+  if (!attemptedByProject) clearProjectStageAdvanceReconcileTimer();
+  const scanStartMs = Date.now();
+  let projects;
+  try {
+    projects = listProjectGroups(config.session.dataDir)
+      .filter(project => project.status === 'active' && project.larkAppId === cachedLarkAppId);
+  } catch (error) {
+    logger.warn(`[project] stage auto-advance readiness scan failed: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const chainAttemptedByProject = attemptedByProject ?? new Map<string, Set<string>>();
+  for (const project of projects) {
+    try {
+      const attempted = chainAttemptedByProject.get(project.chatId) ?? new Set<string>();
+      chainAttemptedByProject.set(project.chatId, attempted);
+      const excludeForClaim = new Set(attempted);
+      const durable = readProjectGroup(config.session.dataDir, project.chatId);
+      const beforeDrainNowMs = Date.now();
+      const prospective = durable?.stageAdvanceEvents?.find(event => (
+        !attempted.has(event.fingerprint)
+        && (event.status === 'pending'
+          || (event.status === 'dispatching' && !!event.claimExpiresAt
+            && Date.parse(event.claimExpiresAt) <= beforeDrainNowMs))
+      ));
+      if (prospective) attempted.add(prospective.fingerprint);
+      let claimedDuringDrain = false;
+      const warning = await drainProjectStageAdvance(project.chatId, {
+        excludeFingerprints: excludeForClaim,
+        onClaim: fingerprint => {
+          claimedDuringDrain = true;
+          attempted.add(fingerprint);
+        },
+      });
+      if (warning && !prospective && !claimedDuringDrain) {
+        const afterFailure = readProjectGroup(config.session.dataDir, project.chatId);
+        const lateEligible = afterFailure?.stageAdvanceEvents?.find(event => (
+          !attempted.has(event.fingerprint)
+          && (event.status === 'pending'
+            || (event.status === 'dispatching' && !!event.claimExpiresAt
+              && Date.parse(event.claimExpiresAt) <= Date.now()))
+        ));
+        if (lateEligible) attempted.add(lateEligible.fingerprint);
+      }
+    } catch (error) {
+      logger.warn(`[project] stage auto-advance drain failed for ${project.chatId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  let currentProjects: typeof projects;
+  try {
+    currentProjects = listProjectGroups(config.session.dataDir)
+      .filter(project => project.status === 'active' && project.larkAppId === cachedLarkAppId);
+  } catch (error) {
+    logger.warn(`[project] stage auto-advance lease rescan failed: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  clearProjectStageAdvanceReconcileTimer();
+  const nowMs = Date.now();
+  let immediateReconcile = false;
+  let nextExpiryMs: number | undefined;
+  for (const project of currentProjects) {
+    const attemptedFingerprints = chainAttemptedByProject.get(project.chatId) ?? new Set<string>();
+    for (const event of project.stageAdvanceEvents ?? []) {
+      const expiryMs = event.claimExpiresAt ? Date.parse(event.claimExpiresAt) : Number.NaN;
+      const eligible = event.status === 'pending'
+        || (event.status === 'dispatching' && Number.isFinite(expiryMs) && expiryMs <= nowMs);
+      if (eligible && !attemptedFingerprints.has(event.fingerprint)) {
+        immediateReconcile = true;
+        continue;
+      }
+      if (event.status === 'dispatching' && Number.isFinite(expiryMs) && expiryMs > nowMs
+        && (nextExpiryMs === undefined || expiryMs < nextExpiryMs)) {
+        nextExpiryMs = expiryMs;
+      }
+    }
+  }
+  if (!immediateReconcile && nextExpiryMs === undefined) return;
+  const timerAttemptedByProject = new Map(
+    [...chainAttemptedByProject].map(([chatId, fingerprints]) => [chatId, new Set(fingerprints)]),
+  );
+  projectStageAdvanceReconcileTimer = setTimeout(() => {
+    projectStageAdvanceReconcileTimer = undefined;
+    void reconcileProjectStageAdvanceEventsAfterRestore(timerAttemptedByProject);
+  }, immediateReconcile ? 1 : nextExpiryMs! - nowMs);
+  projectStageAdvanceReconcileTimer.unref?.();
+}
 
 async function handleDeviceIsolationActivationRoute(
   req: IncomingMessage,
@@ -2816,10 +3039,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
     };
     if (verifiedAction.action === 'report') {
       const { project, projectionWarning } = await projectCoordinator.runReport(context, verifiedAction);
+      const stageAdvanceWarning = await drainProjectStageAdvance(ds.chatId);
       if (projectionWarning) {
         logger.warn(`[project] report persisted but card projection failed: ${projectionWarning}`);
       }
-      return jsonRes(res, 200, { ok: true, project, ...(projectionWarning ? { projectionWarning } : {}) });
+      if (stageAdvanceWarning) {
+        logger.warn(`[project] report persisted but stage auto-advance failed: ${stageAdvanceWarning}`);
+      }
+      return jsonRes(res, 200, {
+        ok: true, project,
+        ...(projectionWarning ? { projectionWarning } : {}),
+        ...(stageAdvanceWarning ? { stageAdvanceWarning } : {}),
+      });
     }
     const project = await projectCoordinator.run(context, verifiedAction);
     return jsonRes(res, 200, { ok: true, project });
@@ -2906,7 +3137,11 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
       larkAppId: cachedLarkAppId,
       coordinatorSessionId: project.coordinatorSessionId,
     }, { action: 'refresh' });
-    return jsonRes(res, 200, { ok: true, project: refreshed });
+    const stageAdvanceWarning = await drainProjectStageAdvance(chatId);
+    return jsonRes(res, 200, {
+      ok: true, project: refreshed,
+      ...(stageAdvanceWarning ? { stageAdvanceWarning } : {}),
+    });
   } catch (error) {
     return jsonRes(res, 502, {
       ok: false,
