@@ -1327,9 +1327,9 @@ export interface LarkMessage {
   rootId: string;
   /** Lark thread_id; present only for real topic/thread replies. */
   threadId?: string;
-  /** Source chat the message came from. Populated for commands that run
-   *  without a session (e.g. `/group`) so the handler can reach the chat
-   *  roster without an active session to read `ds.chatId` from. */
+  /** Source chat the message came from. Populated by API-fetched messages and
+   *  commands that run without a session (e.g. `/group`) so callers can verify
+   *  routing without relying on an active session's `ds.chatId`. */
   chatId?: string;
   /** Immediate parent — set when the user used the Lark "quote/reply"
    *  UI to reference a specific earlier message. Empty otherwise. */

@@ -7605,3 +7605,227 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     expect(ds.session.ordinaryTurnRecovery?.status).toBe('attention_required');
   });
 });
+
+describe('terminalTurnOrigin proof through revoke→terminal pipe', () => {
+  it('passes terminalTurnOrigin to onTurnTerminal after live-capability revoke and consumes it exactly once', async () => {
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'revoke-test', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    // Publish managed turn origin first so the revoke has something to revoke.
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'live-cap',
+      turnId: 'turn-revoke-1',
+      dispatchAttempt: 2,
+    });
+
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-revoke-1',
+      dispatchAttempt: 2,
+    });
+    expect(ds.terminalTurnOrigin).toEqual({
+      turnId: 'turn-revoke-1',
+      dispatchAttempt: 2,
+      workerGeneration: ds.workerGeneration,
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-revoke-1',
+      dispatchAttempt: 2,
+      status: 'completed',
+    });
+    await Promise.resolve();
+
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(onTurnTerminal).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ turnId: 'turn-revoke-1', dispatchAttempt: 2 }),
+      expect.objectContaining({
+        workerGeneration: ds.workerGeneration,
+        terminalTurnOrigin: { turnId: 'turn-revoke-1', dispatchAttempt: 2, workerGeneration: ds.workerGeneration },
+      }),
+    );
+    expect(ds.terminalTurnOrigin).toBeUndefined();
+
+    // Repeat terminal must not reuse the consumed proof.
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-revoke-1',
+      dispatchAttempt: 2,
+      status: 'completed',
+    });
+    await Promise.resolve();
+
+    expect(onTurnTerminal).toHaveBeenCalledTimes(2);
+    expect(onTurnTerminal).toHaveBeenLastCalledWith(
+      ds,
+      expect.anything(),
+      expect.not.objectContaining({ terminalTurnOrigin: expect.anything() }),
+    );
+  });
+
+  it('rejects wrong-tuple terminal after revoke, preserves proof for the correct one', async () => {
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'wrong-tuple-test', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'live-cap-2',
+      turnId: 'turn-correct',
+      dispatchAttempt: 1,
+    });
+
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-correct',
+      dispatchAttempt: 1,
+    });
+    expect(ds.terminalTurnOrigin).toBeDefined();
+
+    // Wrong turnId.
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-wrong',
+      dispatchAttempt: 1,
+      status: 'completed',
+    });
+    await Promise.resolve();
+
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(onTurnTerminal).toHaveBeenCalledWith(
+      ds,
+      expect.anything(),
+      expect.not.objectContaining({ terminalTurnOrigin: expect.anything() }),
+    );
+    expect(ds.terminalTurnOrigin).toBeDefined();
+
+    // Correct terminal receives the proof.
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-correct',
+      dispatchAttempt: 1,
+      status: 'completed',
+    });
+    await Promise.resolve();
+
+    expect(onTurnTerminal).toHaveBeenCalledTimes(2);
+    expect(onTurnTerminal).toHaveBeenLastCalledWith(
+      ds,
+      expect.objectContaining({ turnId: 'turn-correct' }),
+      expect.objectContaining({
+        terminalTurnOrigin: expect.objectContaining({ turnId: 'turn-correct' }),
+      }),
+    );
+    expect(ds.terminalTurnOrigin).toBeUndefined();
+  });
+
+  it('clears terminalTurnOrigin when a new managed origin is published', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'clear-test', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.terminalTurnOrigin = { turnId: 'old-turn', workerGeneration: ds.workerGeneration };
+    expect(ds.terminalTurnOrigin).toBeDefined();
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'new-cap',
+      turnId: 'new-turn',
+    });
+    expect(ds.terminalTurnOrigin).toBeUndefined();
+  });
+
+  it('clears terminalTurnOrigin when a new worker generation starts', () => {
+    const ds = makeDs();
+    ds.terminalTurnOrigin = { turnId: 'stale-turn', workerGeneration: 5 };
+    forkWorker(ds, 'new-gen-test', false);
+    expect(ds.terminalTurnOrigin).toBeUndefined();
+  });
+});
+
+describe('hostile: normalized dispatchAttempt across unbound revoke and terminal', () => {
+  it.each([
+    { label: 'origin omitted, revoke and terminal use 1', originAttempt: undefined, revokeAttempt: 1, terminalAttempt: 1 },
+    { label: 'origin uses 1, revoke and terminal omit it', originAttempt: 1, revokeAttempt: undefined, terminalAttempt: undefined },
+  ])('$label', async ({ originAttempt, revokeAttempt, terminalAttempt }) => {
+    const onTurnTerminal = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hostile-normalized-attempt', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'live-cap-hostile',
+      turnId: 'turn-normalized-hostile',
+      ...(originAttempt !== undefined ? { dispatchAttempt: originAttempt } : {}),
+    });
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-normalized-hostile',
+      ...(revokeAttempt !== undefined ? { dispatchAttempt: revokeAttempt } : {}),
+    });
+
+    expect(ds.terminalTurnOrigin).toEqual(expect.objectContaining({
+      turnId: 'turn-normalized-hostile',
+      workerGeneration: ds.workerGeneration,
+    }));
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-normalized-hostile',
+      ...(terminalAttempt !== undefined ? { dispatchAttempt: terminalAttempt } : {}),
+      status: 'completed',
+    });
+    await Promise.resolve();
+
+    expect(onTurnTerminal).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ turnId: 'turn-normalized-hostile' }),
+      expect.objectContaining({
+        terminalTurnOrigin: expect.objectContaining({
+          turnId: 'turn-normalized-hostile',
+          workerGeneration: ds.workerGeneration,
+        }),
+      }),
+    );
+    expect(ds.terminalTurnOrigin).toBeUndefined();
+  });
+});

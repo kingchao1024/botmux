@@ -1,7 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import type {
+  ProjectDispatchReservationFactsV1,
+  ProjectDispatchReservationProofV1,
+} from './task-control-plane-project-group-mapping-source.js';
 
 export const TASK_CONTROL_MAPPING_TRUST_DOMAIN = 'botmux.task-control.mapping.v1';
 export const TASK_CONTROL_DELIVERY_RECEIPT_TRUST_DOMAIN = 'botmux.task-control.delivery-receipt.v1';
+export const PROJECT_DISPATCH_RESERVATION_TRUST_DOMAIN = 'botmux.task-control.project-dispatch-reservation.v1';
 
 export interface TaskControlMappingProof {
   schemaVersion: 'TaskControlMapping.v1';
@@ -74,12 +79,16 @@ function deliveryReceiptPayload(marker: Omit<TaskControlDeliveryReceiptMarker, '
 export class TaskControlMappingTrust {
   private readonly mappingKey: Buffer;
   private readonly deliveryReceiptKey: Buffer;
+  private readonly projectDispatchReservationKey: Buffer;
   private readonly previousMappingKey?: Buffer;
   private readonly previousDeliveryReceiptKey?: Buffer;
+  private readonly previousProjectDispatchReservationKey?: Buffer;
   readonly mappingKeyId: string;
   readonly deliveryReceiptKeyId: string;
+  readonly projectDispatchReservationKeyId: string;
   readonly previousMappingKeyId?: string;
   readonly previousDeliveryReceiptKeyId?: string;
+  readonly previousProjectDispatchReservationKeyId?: string;
   readonly larkAppId: string;
 
   constructor(private readonly input: { hostSecret: string; previousHostSecret?: string; larkAppId: string }) {
@@ -87,14 +96,20 @@ export class TaskControlMappingTrust {
     this.larkAppId = input.larkAppId;
     this.mappingKey = keyFor(input.hostSecret, TASK_CONTROL_MAPPING_TRUST_DOMAIN, input.larkAppId);
     this.deliveryReceiptKey = keyFor(input.hostSecret, TASK_CONTROL_DELIVERY_RECEIPT_TRUST_DOMAIN, input.larkAppId);
+    this.projectDispatchReservationKey = keyFor(input.hostSecret, PROJECT_DISPATCH_RESERVATION_TRUST_DOMAIN, input.larkAppId);
     if (input.previousHostSecret && input.previousHostSecret !== input.hostSecret) {
       this.previousMappingKey = keyFor(input.previousHostSecret, TASK_CONTROL_MAPPING_TRUST_DOMAIN, input.larkAppId);
       this.previousDeliveryReceiptKey = keyFor(input.previousHostSecret, TASK_CONTROL_DELIVERY_RECEIPT_TRUST_DOMAIN, input.larkAppId);
+      this.previousProjectDispatchReservationKey = keyFor(input.previousHostSecret, PROJECT_DISPATCH_RESERVATION_TRUST_DOMAIN, input.larkAppId);
     }
     this.mappingKeyId = keyId(this.mappingKey, 'tcm1');
     this.deliveryReceiptKeyId = keyId(this.deliveryReceiptKey, 'tcr1');
+    this.projectDispatchReservationKeyId = keyId(this.projectDispatchReservationKey, 'tcpr1');
     this.previousMappingKeyId = this.previousMappingKey ? keyId(this.previousMappingKey, 'tcm1') : undefined;
     this.previousDeliveryReceiptKeyId = this.previousDeliveryReceiptKey ? keyId(this.previousDeliveryReceiptKey, 'tcr1') : undefined;
+    this.previousProjectDispatchReservationKeyId = this.previousProjectDispatchReservationKey
+      ? keyId(this.previousProjectDispatchReservationKey, 'tcpr1')
+      : undefined;
   }
 
   issueMapping(facts: Record<string, unknown>, issuedAt = new Date().toISOString()): TaskControlMappingProof {
@@ -112,6 +127,49 @@ export class TaskControlMappingTrust {
     const key = proof.keyId === this.mappingKeyId ? this.mappingKey
       : proof.keyId === this.previousMappingKeyId ? this.previousMappingKey : undefined;
     return !!key && equalSignature(proof.signature, signature(key, mappingPayload(proof, facts)));
+  }
+
+  issueProjectDispatchReservation(
+    facts: ProjectDispatchReservationFactsV1,
+    issuedAt = new Date().toISOString(),
+  ): ProjectDispatchReservationProofV1 {
+    if (facts.larkAppId !== this.larkAppId || !Number.isFinite(Date.parse(issuedAt))) {
+      throw new Error('task_control_project_reservation_invalid');
+    }
+    const proof: Omit<ProjectDispatchReservationProofV1, 'signature'> = {
+      schemaVersion: 'ProjectDispatchReservationProof.v1',
+      larkAppId: this.larkAppId,
+      issuedAt: new Date(Date.parse(issuedAt)).toISOString(),
+      keyId: this.projectDispatchReservationKeyId,
+    };
+    return {
+      ...proof,
+      signature: signature(this.projectDispatchReservationKey, { ...proof, facts }),
+    };
+  }
+
+  verifyProjectDispatchReservation(
+    proof: ProjectDispatchReservationProofV1 | undefined,
+    facts: ProjectDispatchReservationFactsV1,
+    options: { allowedKeyIds?: readonly string[]; revokedKeyIds?: readonly string[] } = {},
+  ): boolean {
+    if (!proof || proof.schemaVersion !== 'ProjectDispatchReservationProof.v1'
+      || proof.larkAppId !== this.larkAppId || facts.larkAppId !== this.larkAppId
+      || !Number.isFinite(Date.parse(proof.issuedAt))
+      || options.revokedKeyIds?.includes(proof.keyId)
+      || (options.allowedKeyIds !== undefined && !options.allowedKeyIds.includes(proof.keyId))) return false;
+    const key = proof.keyId === this.projectDispatchReservationKeyId
+      ? this.projectDispatchReservationKey
+      : proof.keyId === this.previousProjectDispatchReservationKeyId
+        ? this.previousProjectDispatchReservationKey
+        : undefined;
+    return !!key && equalSignature(proof.signature, signature(key, {
+      schemaVersion: proof.schemaVersion,
+      larkAppId: proof.larkAppId,
+      issuedAt: proof.issuedAt,
+      keyId: proof.keyId,
+      facts,
+    }));
   }
 
   issueDeliveryReceiptMarker(input: { eventId: string; destinationId: string; issuedAt: string }): TaskControlDeliveryReceiptMarker {
@@ -150,15 +208,18 @@ export class TaskControlMappingTrust {
 /** Keep signer and verifier on one exact canonical mapping contract. */
 export function taskControlMappingFacts(input: {
   dispatchRoot: string; projectId: string; phaseId: string; phaseTaskGuids: readonly string[]; taskGuid: string; topicRootId: string;
-  ownerId: string; reviewerId: string; acceptorId: string; registrationRef: string; registrationVersion?: string; phaseRegistrationRefs?: Record<string, string>; controllerId: string; approvalGate: unknown; docToken?: string; docRevision?: number;
+  ownerId: string; reviewerId: string; acceptorId: string; registrationRef: string; registrationVersion?: string; phaseRegistrationRefs?: Record<string, string>; controllerId: string; approvalGate?: unknown; mappingAuthority?: unknown; docToken?: string; docRevision?: number;
 }): Record<string, unknown> {
-  return {
+  const common = {
     dispatchRoot: input.dispatchRoot, projectId: input.projectId, phaseId: input.phaseId, phaseTaskGuids: [...new Set(input.phaseTaskGuids)].sort(),
     taskGuid: input.taskGuid, topicRootId: input.topicRootId, ownerId: input.ownerId, reviewerId: input.reviewerId,
     acceptorId: input.acceptorId, registrationRef: input.registrationRef, ...(input.registrationVersion ? { registrationVersion: input.registrationVersion } : {}),
     ...(input.phaseRegistrationRefs ? { phaseRegistrationRefs: Object.fromEntries(Object.entries(input.phaseRegistrationRefs).sort(([a], [b]) => a.localeCompare(b))) } : {}),
-    controllerId: input.controllerId, approvalGate: input.approvalGate, ...(input.docToken ? { docToken: input.docToken } : {}), ...(input.docRevision ? { docRevision: input.docRevision } : {}),
+    controllerId: input.controllerId, ...(input.docToken ? { docToken: input.docToken } : {}), ...(input.docRevision ? { docRevision: input.docRevision } : {}),
   };
+  return input.mappingAuthority
+    ? { ...common, mappingAuthority: input.mappingAuthority }
+    : { ...common, approvalGate: input.approvalGate };
 }
 
 export function createTaskControlProductionMappingVerifier(input: {
@@ -169,6 +230,7 @@ export function createTaskControlProductionMappingVerifier(input: {
   const options = { allowedKeyIds: input.allowedKeyIds, revokedKeyIds: input.revokedKeyIds };
   return {
     minimumTaskCount: 2,
+    minimumProjectGroupTaskCount: 1,
     verifyMapping: (proof: TaskControlMappingProof | undefined, facts: Record<string, unknown>): boolean =>
       input.trust.verifyMapping(proof, facts, options),
   };

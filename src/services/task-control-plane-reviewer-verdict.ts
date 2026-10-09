@@ -17,6 +17,19 @@ export interface ReviewerConditionEvidence {
   observedAt: string;
 }
 
+export interface ReviewerProjectReportEvidence {
+  kind: 'project_report';
+  reportRequestId: string;
+  triggerId: string;
+  dispatchRoot: string;
+  sourceSessionId: string;
+  sourceTurnId: string;
+  reporterAppId: string;
+  targetSessionId: string;
+  projectRevision: number;
+  contentHash: string;
+}
+
 export interface DesignatedReviewerScope {
   projectId: string;
   phaseId: string;
@@ -59,8 +72,9 @@ export interface ReviewerVerdictV1 extends DesignatedReviewerScope {
   verdict?: ReviewerVerdictValue;
   conditionIds: readonly string[];
   resolvedConditionEvidence: Readonly<Record<string, ReviewerConditionEvidence>>;
-  docToken: string;
-  docRevision: number;
+  docToken?: string;
+  docRevision?: number;
+  artifactEvidence?: ReviewerProjectReportEvidence;
   issuedAt: string;
   expiresAt: string;
   /** Stable reviewer-signer selector carried in the signed production record. */
@@ -167,7 +181,8 @@ export function reviewerVerdictCanonicalPayload(record: Omit<ReviewerVerdictV1, 
     resolvedConditionEvidence: Object.fromEntries(Object.entries(record.resolvedConditionEvidence)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([conditionId, evidence]) => [conditionId, { evidenceRef: evidence.evidenceRef, observedAt: evidence.observedAt }])),
-    docToken: record.docToken, docRevision: record.docRevision, issuedAt: record.issuedAt,
+    docToken: record.docToken, docRevision: record.docRevision, artifactEvidence: record.artifactEvidence,
+    issuedAt: record.issuedAt,
     expiresAt: record.expiresAt, keyId: record.keyId, revokesVerdictId: record.revokesVerdictId,
     supersedesVerdictId: record.supersedesVerdictId,
   };
@@ -268,12 +283,29 @@ export function proveReviewerCommentSource(input: {
 function validVerdictShape(record: Omit<ReviewerVerdictV1, 'signature'>): boolean {
   try {
     const sourceCount = Number(!!record.sourceCommentId) + Number(!!record.sourceMessageId);
+    const documentEvidence = !!nonBlank(record.docToken)
+      && Number.isSafeInteger(record.docRevision) && record.docRevision! > 0
+      && record.artifactEvidence === undefined;
+    const projectEvidence = record.docToken === undefined && record.docRevision === undefined
+      && record.artifactEvidence?.kind === 'project_report'
+      && !!nonBlank(record.artifactEvidence.reportRequestId)
+      && !!nonBlank(record.artifactEvidence.triggerId)
+      && !!nonBlank(record.artifactEvidence.dispatchRoot)
+      && !!nonBlank(record.artifactEvidence.sourceSessionId)
+      && !!nonBlank(record.artifactEvidence.sourceTurnId)
+      && !!nonBlank(record.artifactEvidence.reporterAppId)
+      && !!nonBlank(record.artifactEvidence.targetSessionId)
+      && Number.isSafeInteger(record.artifactEvidence.projectRevision)
+      && record.artifactEvidence.projectRevision > 0
+      && /^sha256:[a-f0-9]{64}$/i.test(record.artifactEvidence.contentHash)
+      && record.sourceMessageId === record.artifactEvidence.triggerId
+      && record.sourceVersionHash === record.artifactEvidence.contentHash;
     const common = !!nonBlank(record.projectId) && !!nonBlank(record.phaseId) && !!nonBlank(record.taskGuid) && !!nonBlank(record.topicRootId)
       && !!nonBlank(record.designatedReviewerRef) && !!nonBlank(record.reviewerId) && !!nonBlank(record.reviewerBotAppId)
       && !!nonBlank(record.sessionId) && Number.isSafeInteger(record.workerGeneration) && record.workerGeneration > 0
       && !!nonBlank(record.keyId)
       && /^sha256:[a-f0-9]{64}$/i.test(record.capabilityHash) && /^sha256:[a-f0-9]{64}$/i.test(record.sourceVersionHash)
-      && !!nonBlank(record.docToken) && Number.isSafeInteger(record.docRevision) && record.docRevision > 0
+      && (documentEvidence || projectEvidence)
       && sourceCount === 1 && record.reviewRound >= 1 && Number.isFinite(Date.parse(record.issuedAt))
       && Number.isFinite(Date.parse(record.expiresAt)) && Date.parse(record.expiresAt) > Date.parse(record.issuedAt);
     if (!common) return false;
@@ -411,6 +443,7 @@ export function createDaemonReviewerVerdictVerifier(input: {
   revokedKeyIds?: readonly string[];
 }): {
   providerForApp(reviewerBotAppId: string): DaemonReviewerVerdictProvider | undefined;
+  designationProvider(): DaemonReviewerVerdictProvider | undefined;
   verifyDesignatedReviewer(value: DesignatedReviewerMapping): boolean;
   verifyVerdict(value: ReviewerVerdictV1): boolean;
 } {
@@ -437,6 +470,15 @@ export function createDaemonReviewerVerdictVerifier(input: {
   };
   return {
     providerForApp,
+    designationProvider: () => {
+      const candidates = [
+        deriveDaemonDesignatedReviewerProvider({ hostSecret: input.hostSecret, controllerBotAppId: input.controllerBotAppId, now: input.now }),
+        ...(input.previousHostSecret && input.previousHostSecret !== input.hostSecret
+          ? [deriveDaemonDesignatedReviewerProvider({ hostSecret: input.previousHostSecret, controllerBotAppId: input.controllerBotAppId, now: input.now })]
+          : []),
+      ];
+      return candidates.find(candidate => permitted(candidate.keyId));
+    },
     verifyDesignatedReviewer: verifyDesignation,
     verifyVerdict: value => {
       if (!permitted(value.keyId) || !validAppId(value.reviewerBotAppId)) return false;

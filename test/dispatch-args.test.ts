@@ -22,6 +22,7 @@ describe('parseDispatchArgs', () => {
       '--read-only',
       '--write-scope', '/repo/src',
       '--write-scope=/repo/docs',
+      '--task-control', 'audit-only',
     ])).toEqual({
       ok: true,
       value: {
@@ -38,6 +39,7 @@ describe('parseDispatchArgs', () => {
         steer: true,
         readOnly: true,
         writeScopes: ['/repo/src', '/repo/docs'],
+        taskControlMode: 'audit_only',
       },
     });
   });
@@ -105,8 +107,18 @@ describe('parseDispatchArgs', () => {
   it('defaults project access flags without changing legacy dispatch arguments', () => {
     expect(parseDispatchArgs(['--title', 'task', '--bot-app', 'cli_a'])).toMatchObject({
       ok: true,
-      value: { readOnly: false, writeScopes: [] },
+      value: { readOnly: false, writeScopes: [], taskControlMode: undefined },
     });
+  });
+
+  it('rejects unsupported TaskControl modes at the strict argument boundary', () => {
+    expect(parseDispatchArgs(['--title', 'task', '--bot-app', 'cli_a', '--task-control', 'writeback']))
+      .toEqual({
+        ok: false,
+        errorCode: 'INVALID_OPTION_VALUE',
+        error: '--task-control must be audit-only',
+        option: '--task-control',
+      });
   });
 
   it('keeps both brief sources so cmdDispatch retains brief-file precedence', () => {

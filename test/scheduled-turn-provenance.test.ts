@@ -341,6 +341,22 @@ describe('trustedCallerForScheduledTask', () => {
     });
   });
 
+  it('normalizes creator identity before propagating it to trustedCaller', () => {
+    expect(trustedCallerForScheduledTask({
+      ...base,
+      ownerOpenId: '  ou_owner  ',
+      ownerUnionId: '  on_owner  ',
+    }, 'cli_session')).toMatchObject({
+      requestUserOpenId: 'ou_owner',
+      requestUserUnionId: 'on_owner',
+    });
+    expect(trustedCallerForScheduledTask({
+      ...base,
+      ownerOpenId: 'ou_owner',
+      ownerUnionId: '   ',
+    }, 'cli_session')).toBeUndefined();
+  });
+
   it('falls back to the task app, then the session app, for the requesting app id', () => {
     expect(trustedCallerForScheduledTask({ ...base, ownerUnionId: 'on_owner', larkAppId: 'cli_target' }, 'cli_session'))
       .toEqual(expect.objectContaining({ requestLarkAppId: 'cli_target' }));

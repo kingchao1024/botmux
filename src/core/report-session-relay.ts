@@ -1,6 +1,12 @@
+import { createHash } from 'node:crypto';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
+import type {
+  TaskControlPhaseAFailedReportClaim,
+  TaskControlPhaseAOperation,
+  TaskControlTurnAdmissionClaim,
+} from './dispatch-registry.js';
 import type { ProjectWorkstreamStatus } from '../services/project-group-store.js';
 
 export const REPORT_SESSION_RELAY_ROUTE = '/api/report-relay';
@@ -50,6 +56,33 @@ export interface ReportSessionRelayTargetView {
   status?: string;
 }
 
+export interface ReportSessionRelayPhaseAContext {
+  fence: {
+    dispatchOperationId: string;
+    phaseA: {
+      historicalDispatchRoot: string;
+      historicalTaskGuid: string;
+      mappedWorkerAppId: string;
+      failedReportContent: string;
+      failedReportSha256: string;
+      instructionTemplateSha256: string;
+    };
+  };
+  fenceFingerprint: string;
+  operation: TaskControlPhaseAOperation | undefined;
+  turnAdmission: TaskControlTurnAdmissionClaim | undefined;
+  existingReport?: TaskControlPhaseAFailedReportClaim;
+}
+
+export interface ReportSessionRelayPhaseAReport {
+  operationId: string;
+  fenceFingerprint: string;
+  sourceSessionId: string;
+  sourceTurnId: string;
+  workerGeneration: number;
+  reportRequestId: string;
+}
+
 export type ReportSessionRelayFallbackDecision =
   | {
       ok: true;
@@ -90,6 +123,7 @@ export type ReportSessionRelayDecision =
         reviewVerdict?: 'pass' | 'fail';
         reviewRound?: number;
       };
+      phaseAReport?: ReportSessionRelayPhaseAReport;
     }
   | { ok: false; status: number; error: string };
 
@@ -100,6 +134,7 @@ export function authorizeReportSessionRelayRequest(input: {
   selfLarkAppId: string | undefined;
   registry: Record<string, unknown>;
   bindingSecret: string;
+  phaseA?: ReportSessionRelayPhaseAContext;
 }): ReportSessionRelayDecision {
   const body = input.raw && typeof input.raw === 'object' && !Array.isArray(input.raw)
     ? input.raw as Record<string, unknown>
@@ -199,7 +234,7 @@ export function authorizeReportSessionRelayRequest(input: {
   const projectRequired = !!registryEntry && typeof registryEntry === 'object' && !Array.isArray(registryEntry)
     && Object.hasOwn(registryEntry, 'access');
 
-  return {
+  const decision: Extract<ReportSessionRelayDecision, { ok: true }> = {
     ok: true,
     source: { sessionId: current.sessionId, larkAppId: current.larkAppId, turnId: liveTurnId },
     target: {
@@ -221,6 +256,84 @@ export function authorizeReportSessionRelayRequest(input: {
       ...(reviewVerdict ? { reviewVerdict, reviewRound: reviewRound as number } : {}),
     },
   };
+  if (!input.phaseA) return decision;
+
+  const phaseA = input.phaseA;
+  const operation = phaseA.operation;
+  const turnAdmission = phaseA.turnAdmission;
+  const rawContent = body.content;
+  const hasForbiddenOption = ['progress', 'remaining', 'milestone', 'reviewVerdict', 'reviewRound']
+    .some(key => Object.hasOwn(body, key));
+  const reportRequestId = `report:${createHash('sha256').update(JSON.stringify({
+    sourceSessionId: current.sessionId,
+    sourceTurnId: liveTurnId,
+    dispatchRoot,
+    reporterAppId: current.larkAppId,
+    content: rawContent,
+    projectUpdate: { status: 'failed' },
+  })).digest('hex')}`;
+  const contentHash = typeof rawContent === 'string'
+    ? createHash('sha256').update(rawContent).digest('hex')
+    : '';
+  const logicalEvidenceKey = `tcpar1:${createHash('sha256').update(JSON.stringify({
+    schemaVersion: 'TaskControlPhaseAFailedReport.v1',
+    operationId: phaseA.fence.dispatchOperationId,
+    sourceTurnId: liveTurnId,
+    reportRequestId,
+    contentHash,
+  })).digest('hex')}`;
+  const existingReport = phaseA.existingReport;
+  const exactExistingReport = existingReport?.schemaVersion === 'TaskControlPhaseAFailedReport.v1'
+    && existingReport.operationId === phaseA.fence.dispatchOperationId
+    && existingReport.fenceFingerprint === phaseA.fenceFingerprint
+    && existingReport.chatId === turnAdmission?.chatId
+    && existingReport.dispatchRoot === dispatchRoot
+    && existingReport.taskGuid === phaseA.fence.phaseA.historicalTaskGuid
+    && existingReport.reporterAppId === current.larkAppId
+    && existingReport.sourceSessionId === current.sessionId
+    && existingReport.sourceTurnId === liveTurnId
+    && existingReport.workerGeneration === turnAdmission?.workerGeneration
+    && existingReport.reportRequestId === reportRequestId
+    && existingReport.contentHash === contentHash
+    && existingReport.logicalEvidenceKey === logicalEvidenceKey
+    && Number.isFinite(Date.parse(existingReport.claimedAt))
+    && new Date(existingReport.claimedAt).toISOString() === existingReport.claimedAt;
+  const exactActiveTurn = turnAdmission?.state === 'active';
+  const exactReport = dispatchRoot === phaseA.fence.phaseA.historicalDispatchRoot
+    && current.larkAppId === phaseA.fence.phaseA.mappedWorkerAppId
+    && body.status === 'failed'
+    && !hasForbiddenOption
+    && typeof rawContent === 'string'
+    && rawContent === phaseA.fence.phaseA.failedReportContent
+    && contentHash === phaseA.fence.phaseA.failedReportSha256
+    && operation?.state === 'delivered'
+    && operation.operationId === phaseA.fence.dispatchOperationId
+    && operation.chatId === turnAdmission?.chatId
+    && operation.fenceFingerprint === phaseA.fenceFingerprint
+    && operation.historicalDispatchRoot === phaseA.fence.phaseA.historicalDispatchRoot
+    && operation.historicalTaskGuid === phaseA.fence.phaseA.historicalTaskGuid
+    && operation.targetAppId === phaseA.fence.phaseA.mappedWorkerAppId
+    && operation.payloadHash === phaseA.fence.phaseA.instructionTemplateSha256
+    && operation.messageId === liveTurnId
+    && turnAdmission.messageId === liveTurnId
+    && turnAdmission.dispatchRoot === dispatchRoot
+    && turnAdmission.targetAppId === current.larkAppId
+    && turnAdmission.sessionId === current.sessionId
+    && Number.isSafeInteger(turnAdmission.workerGeneration)
+    && turnAdmission.workerGeneration! > 0
+    && (exactActiveTurn || exactExistingReport);
+  if (!exactReport) {
+    return { ok: false, status: 403, error: 'project_task_control_phase_a_report_rejected' };
+  }
+  decision.phaseAReport = {
+    operationId: operation.operationId,
+    fenceFingerprint: phaseA.fenceFingerprint,
+    sourceSessionId: current.sessionId,
+    sourceTurnId: liveTurnId,
+    workerGeneration: turnAdmission.workerGeneration!,
+    reportRequestId,
+  };
+  return decision;
 }
 
 export function isReportRelayOriginalSessionUnavailable(input: {
@@ -348,6 +461,7 @@ export async function deliverReportSessionRelay(input: {
     projectSynced: boolean;
     projectSyncError?: string;
     deliveryRound?: number;
+    projectRevision?: number;
   }>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { decision } = input;

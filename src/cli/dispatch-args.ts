@@ -12,6 +12,7 @@ export interface DispatchArgs {
   standby: boolean;
   steer: boolean;
   readOnly: boolean;
+  taskControlMode?: 'audit_only';
   bots: string[];
   botApps: string[];
   writeScopes: string[];
@@ -20,7 +21,8 @@ export interface DispatchArgs {
 export type DispatchArgsErrorCode =
   | 'UNKNOWN_OPTION'
   | 'UNEXPECTED_ARGUMENT'
-  | 'OPTION_VALUE_REQUIRED';
+  | 'OPTION_VALUE_REQUIRED'
+  | 'INVALID_OPTION_VALUE';
 
 export type DispatchArgsResult =
   | { ok: true; value: DispatchArgs }
@@ -72,6 +74,7 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
     standby: false,
     steer: false,
     readOnly: false,
+    taskControlMode: undefined,
     bots: [],
     botApps: [],
     writeScopes: [],
@@ -89,6 +92,17 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
     const token = args[index]!;
     const equals = token.indexOf('=');
     const flag = equals >= 0 ? token.slice(0, equals) : token;
+
+    if (flag === '--task-control') {
+      const optionValue = equals >= 0 ? token.slice(equals + 1) : args[index + 1];
+      if (optionValue === undefined) return fail('OPTION_VALUE_REQUIRED', `${flag} requires a value`, flag);
+      if (equals < 0) index += 1;
+      if (optionValue !== 'audit-only') {
+        return fail('INVALID_OPTION_VALUE', '--task-control must be audit-only', flag);
+      }
+      value.taskControlMode = 'audit_only';
+      continue;
+    }
 
     const singletonKey = VALUE_FLAGS.get(flag);
     const repeatableKey = REPEATABLE_VALUE_FLAGS.get(flag);

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { DaemonTaskControlBridge } from '../src/services/task-control-plane-daemon-bridge.js';
+import {
+  TaskControlMappingTrust,
+  createTaskControlProductionMappingVerifier,
+  taskControlMappingFacts,
+} from '../src/services/task-control-plane-mapping-trust.js';
 
 function gate() {
   return {
@@ -29,6 +34,36 @@ function source() {
 }
 
 describe('DaemonTaskControlBridge', () => {
+  it('accepts a signed one-task project-group audit mapping without inventing a v3 gate', () => {
+    const trust = new TaskControlMappingTrust({ hostSecret: 'host-secret', larkAppId: 'app-1' });
+    const project = {
+      controllerId: 'app-1', projectId: 'project-group:oc_project', phaseId: 'workstream:task-project',
+      phaseTaskGuids: ['task-project'], taskGuid: 'task-project', topicRootId: 'om_projectroot',
+      ownerId: 'worker-1', reviewerId: 'reviewer-1', acceptorId: 'acceptor-1',
+      registrationRef: 'topic-message:om_projectroot',
+      mappingAuthority: {
+        kind: 'project_group' as const, chatId: 'oc_project', reservationId: 'reservation-1',
+        projectRevision: 4, acceptorAppId: 'acceptor-1', mode: 'audit_only' as const,
+      },
+    };
+    const facts = taskControlMappingFacts({ ...project, dispatchRoot: 'om_projectroot' } as any);
+    const bridge = new DaemonTaskControlBridge({
+      approvals: source(), larkAppId: 'app-1',
+      productionMapping: createTaskControlProductionMappingVerifier({ trust }),
+    });
+
+    expect(bridge.registerMapping('om_projectroot', {
+      ...project,
+      mappingProof: trust.issueMapping(facts),
+    } as any, 'app-1')).toBe(true);
+    expect(bridge.mapping('om_projectroot')).toMatchObject({ mappingAuthority: { kind: 'project_group' } });
+    expect(bridge.approval('om_projectroot', 'approval:any')).toBeUndefined();
+    expect(bridge.issueWriteExecutionGrant({
+      dispatchRoot: 'om_projectroot', grantRef: 'grant:1', projectId: project.projectId, phaseId: project.phaseId,
+      taskGuid: project.taskGuid, candidate: 'abc', action: 'git.commit', attempt: 1, operatorId: project.acceptorId,
+    })).toBeUndefined();
+  });
+
   it('requires a complete registered mapping and mints principals by fixed role', () => {
     const bridge = new DaemonTaskControlBridge({ approvals: source(), larkAppId: 'app-1' });
     expect(bridge.registerMapping('om_root', mapping(), 'controller-1')).toBe(true);

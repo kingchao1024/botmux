@@ -828,7 +828,12 @@ export interface WorkerPoolCallbacks {
   onTurnTerminal?: (
     ds: DaemonSession,
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
-    context: { workerGeneration: number },
+    context: {
+      workerGeneration: number;
+      /** One-shot, capability-free proof retained across the worker's required
+       * pre-terminal live-capability revoke. It is never valid for tool calls. */
+      terminalTurnOrigin?: NonNullable<DaemonSession['terminalTurnOrigin']>;
+    },
   ) => void | Promise<void>;
   /** Exact worker-generation input commit. Optional sidecars must never alter acceptance. */
   onTurnInputCommitted?: (
@@ -12627,6 +12632,7 @@ function setupWorkerHandlers(
   ) {
     throw new Error('worker generation reservation changed before IPC setup');
   }
+  ds.terminalTurnOrigin = undefined;
   ds.taskContinuationRpcProof = undefined;
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
@@ -15099,12 +15105,20 @@ function setupWorkerHandlers(
           break;
         }
         forgetScheduledTurnCaller(ds, msg.turnId);
+        const normalizedTerminalAttempt = msg.dispatchAttempt ?? 1;
+        const liveTurnMatchesTerminal = ds.managedTurnOrigin?.turnId === msg.turnId
+          && (ds.managedTurnOrigin.dispatchAttempt ?? 1) === normalizedTerminalAttempt;
+        const revokedTurnOrigin = ds.terminalTurnOrigin?.turnId === msg.turnId
+          && (ds.terminalTurnOrigin.dispatchAttempt ?? 1) === normalizedTerminalAttempt
+          && ds.terminalTurnOrigin.workerGeneration === workerGeneration
+          ? ds.terminalTurnOrigin
+          : undefined;
+        if (revokedTurnOrigin) ds.terminalTurnOrigin = undefined;
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
         // from clearing a capability already rotated for turn N+1.
-        if (ds.managedTurnOrigin?.turnId === msg.turnId
-          && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
+        if (liveTurnMatchesTerminal && ds.managedTurnOrigin) {
           ds.managedTurnOrigin = ds.managedTurnOrigin.policyCapability
             ? {
                 capability: randomBytes(32).toString('hex'),
@@ -15147,7 +15161,10 @@ function setupWorkerHandlers(
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
         try {
-          await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
+          await cb.onTurnTerminal?.(ds, msg, {
+            workerGeneration,
+            ...(revokedTurnOrigin ? { terminalTurnOrigin: revokedTurnOrigin } : {}),
+          });
         } catch (err: any) {
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
@@ -15444,6 +15461,11 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
+        // Any current-worker origin publication starts a newer authority
+        // attempt. Retire the prior terminal-only proof before validation or
+        // filesystem work so an invalid/failed publication cannot leave the
+        // predecessor reusable.
+        ds.terminalTurnOrigin = undefined;
         // Isolated children use one stable per-session pathname visible through
         // an exact Seatbelt/bwrap read carve-out.
         // Only the daemon handler for the CURRENT ChildProcess generation may
@@ -15541,7 +15563,7 @@ function setupWorkerHandlers(
         const unboundLiveRevoke = !msg.capability && !msg.policyCapability;
         if (unboundLiveRevoke
           && (origin.turnId !== msg.turnId
-            || origin.dispatchAttempt !== msg.dispatchAttempt)) {
+            || (origin.dispatchAttempt ?? 1) !== (msg.dispatchAttempt ?? 1))) {
           logger.warn(`[${t}] Ignored unbound stale managed turn origin revoke`);
           break;
         }
@@ -15557,6 +15579,17 @@ function setupWorkerHandlers(
         }
         if (!revokeLive && !revokePolicy) break;
         if (revokeLive) {
+          if (origin.turnId
+            && origin.turnId === msg.turnId
+            && (origin.dispatchAttempt ?? 1) === (msg.dispatchAttempt ?? 1)) {
+            ds.terminalTurnOrigin = {
+              turnId: origin.turnId,
+              ...(origin.dispatchAttempt !== undefined
+                ? { dispatchAttempt: origin.dispatchAttempt }
+                : {}),
+              workerGeneration,
+            };
+          }
           ds.managedTurnOrigin = origin.policyCapability && !revokePolicy
             ? {
                 capability: randomBytes(32).toString('hex'),

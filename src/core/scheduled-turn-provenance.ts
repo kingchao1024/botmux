@@ -87,10 +87,12 @@ export function trustedCallerForScheduledTask(
   task: ScheduledTask,
   larkAppId: string,
 ): TrustedCaller | undefined {
-  if (!task.ownerUnionId) return undefined;
+  const ownerUnionId = task.ownerUnionId?.trim();
+  if (!ownerUnionId) return undefined;
+  const ownerOpenId = task.ownerOpenId?.trim();
   return {
-    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
-    requestUserUnionId: task.ownerUnionId,
+    ...(ownerOpenId ? { requestUserOpenId: ownerOpenId } : {}),
+    requestUserUnionId: ownerUnionId,
     requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
     source: 'schedule_creator',
     taskId: task.id,

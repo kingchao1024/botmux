@@ -232,12 +232,31 @@ describe('schedule runtime state store', () => {
       dataDir,
     })).toThrow(/ledger_item_removed/);
 
-    const delivered = writeScheduleRuntimeState({
+    const sendingState = state('delivery', 'oc_other');
+    const sending = writeScheduleRuntimeState({
       kind: 'delivery',
       chatId: 'oc_other',
       expectedSha256: 'missing',
+      next: sendingState,
+      dataDir,
+    });
+    const sent = writeScheduleRuntimeState({
+      kind: 'delivery',
+      chatId: 'oc_other',
+      expectedSha256: sending.sha256,
       next: {
-        ...state('delivery', 'oc_other'),
+        ...sendingState,
+        status: 'sent',
+        messageId: 'om_sent',
+      },
+      dataDir,
+    });
+    const delivered = writeScheduleRuntimeState({
+      kind: 'delivery',
+      chatId: 'oc_other',
+      expectedSha256: sent.sha256,
+      next: {
+        ...sendingState,
         status: 'delivered',
         messageId: 'om_sent',
         deliveryVerifiedAt: '2026-09-27T10:00:02.000Z',
@@ -250,7 +269,7 @@ describe('schedule runtime state store', () => {
       expectedSha256: delivered.sha256,
       next: { ...state('delivery', 'oc_other'), status: 'sending', messageId: null },
       dataDir,
-    })).toThrow(/delivery_transition_invalid/);
+    })).toThrow(/delivery_already_delivered/);
   });
 
   it('allows exactly one independent process to win the same CAS', async () => {
@@ -397,5 +416,71 @@ describe('schedule runtime state store', () => {
     const dataDir = tempDataDir();
     writeFileSync(join(dataDir, 'project-groups.json'), '{broken');
     expect(() => isProjectActive('oc_demo', dataDir)).toThrow(/invalid_state_json/);
+  });
+});
+
+describe('hostile: claimedAt immutability across same-run retries', () => {
+  it('rejects rewriting claimedAt on a delivery_failed run to prevent dedupe-window extension', () => {
+    const dataDir = tempDataDir();
+    const chatId = 'oc_hostile';
+    const initial = {
+      schemaVersion: 1,
+      chatId,
+      hourlyTaskId: 'task1234',
+      runKey: 'task1234:2026-09-28T10:00:00.000Z',
+      status: 'sending',
+      claimedAt: '2026-09-28T10:00:01.000Z',
+      lastAttemptRunAt: '2026-09-28T10:00:01.000Z',
+      turnId: 'schedule:task1234:11111111-1111-4111-8111-111111111111',
+      messageId: null,
+      lastError: null,
+    };
+    const claimed = writeScheduleRuntimeState({
+      kind: 'delivery', chatId, expectedSha256: 'missing', next: initial, dataDir,
+    });
+    const failed = writeScheduleRuntimeState({
+      kind: 'delivery', chatId, expectedSha256: claimed.sha256,
+      next: { ...initial, status: 'delivery_failed', lastError: 'response lost' }, dataDir,
+    });
+
+    expect(() => writeScheduleRuntimeState({
+      kind: 'delivery', chatId, expectedSha256: failed.sha256,
+      next: {
+        ...failed.state,
+        claimedAt: '2026-09-28T12:00:00.000Z',
+        lastAttemptRunAt: '2026-09-28T12:00:00.000Z',
+      },
+      dataDir,
+    })).toThrow(/claimed_at/);
+
+    expect(readScheduleRuntimeState('delivery', chatId, dataDir).state?.claimedAt)
+      .toBe('2026-09-28T10:00:01.000Z');
+  });
+
+  it('rejects adding claimedAt when a legacy same-run state omitted it', () => {
+    const dataDir = tempDataDir();
+    const chatId = 'oc_legacy';
+    const initial = {
+      schemaVersion: 1,
+      chatId,
+      hourlyTaskId: 'task1234',
+      runKey: 'task1234:2026-09-28T10:00:00.000Z',
+      status: 'sending',
+      messageId: null,
+      lastError: null,
+    };
+    const claimed = writeScheduleRuntimeState({
+      kind: 'delivery', chatId, expectedSha256: 'missing', next: initial, dataDir,
+    });
+    const failed = writeScheduleRuntimeState({
+      kind: 'delivery', chatId, expectedSha256: claimed.sha256,
+      next: { ...initial, status: 'delivery_failed', lastError: 'legacy response lost' }, dataDir,
+    });
+
+    expect(() => writeScheduleRuntimeState({
+      kind: 'delivery', chatId, expectedSha256: failed.sha256,
+      next: { ...failed.state, claimedAt: '2026-09-28T12:00:00.000Z' }, dataDir,
+    })).toThrow(/delivery_claimed_at_changed/);
+    expect(readScheduleRuntimeState('delivery', chatId, dataDir).state?.claimedAt).toBeUndefined();
   });
 });

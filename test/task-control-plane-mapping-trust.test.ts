@@ -5,6 +5,7 @@ import {
   taskControlMappingFacts,
 } from '../src/services/task-control-plane-mapping-trust.js';
 import { DaemonTaskControlBridge } from '../src/services/task-control-plane-daemon-bridge.js';
+import type { ProjectDispatchReservationFactsV1 } from '../src/services/task-control-plane-project-group-mapping-source.js';
 
 const APP = 'app-production';
 const HOST_SECRET = 'host-only-task-control-test-secret';
@@ -25,6 +26,90 @@ function source() {
 }
 
 describe('task control production mapping trust', () => {
+  it('signs project dispatch reservations in an independent app-scoped domain', () => {
+    const facts: ProjectDispatchReservationFactsV1 = {
+      schemaVersion: 'ProjectDispatchReservation.v1',
+      larkAppId: APP,
+      chatId: 'oc_project_chat',
+      coordinatorSessionId: 'session-controller',
+      originTurnId: 'turn-1',
+      reservationId: 'reservation-1',
+      taskGuid: '11111111-1111-4111-8111-111111111111',
+      phaseId: 'workstream:11111111-1111-4111-8111-111111111111',
+      workerAppId: 'cli_worker_1234567890123456',
+      reviewerAppId: 'cli_review_1234567890123456',
+      acceptorAppId: 'cli_accept_1234567890123456',
+      access: { mode: 'write', scopes: ['/repo/src'] },
+      createdAt: '2026-09-29T00:00:00.000Z',
+      expiresAt: '2026-09-29T01:00:00.000Z',
+      dispatch: { seedText: 'seed', title: '任务', purpose: '验证', owners: [], botOpenIds: [], acceptanceRequested: true },
+    };
+    const trust = new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: APP });
+    const proof = trust.issueProjectDispatchReservation(facts, facts.createdAt);
+
+    expect(trust.verifyProjectDispatchReservation(proof, structuredClone(facts))).toBe(true);
+    expect(proof).toMatchObject({
+      schemaVersion: 'ProjectDispatchReservationProof.v1',
+      larkAppId: APP,
+      issuedAt: facts.createdAt,
+      keyId: expect.stringMatching(/^tcpr1:/),
+    });
+    expect(trust.verifyMapping(proof as never, facts as never)).toBe(false);
+    expect(trust.verifyProjectDispatchReservation(proof, { ...facts, taskGuid: '22222222-2222-4222-8222-222222222222' })).toBe(false);
+    expect(new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: 'app-other' })
+      .verifyProjectDispatchReservation(proof, facts)).toBe(false);
+  });
+
+  it('applies allow and revoke sets to project dispatch reservation keys', () => {
+    const facts: ProjectDispatchReservationFactsV1 = {
+      schemaVersion: 'ProjectDispatchReservation.v1', larkAppId: APP, chatId: 'oc_project_chat',
+      coordinatorSessionId: 'session-controller', originTurnId: 'turn-1', reservationId: 'reservation-1',
+      taskGuid: '11111111-1111-4111-8111-111111111111',
+      phaseId: 'workstream:11111111-1111-4111-8111-111111111111',
+      workerAppId: 'cli_worker_1234567890123456', reviewerAppId: 'cli_review_1234567890123456',
+      acceptorAppId: 'cli_accept_1234567890123456', access: { mode: 'write', scopes: ['/repo/src'] },
+      createdAt: '2026-09-29T00:00:00.000Z', expiresAt: '2026-09-29T01:00:00.000Z',
+      dispatch: { seedText: 'seed', title: '任务', purpose: '验证', owners: [], botOpenIds: [], acceptanceRequested: true },
+    };
+    const overlap = new TaskControlMappingTrust({
+      hostSecret: 'current-secret', previousHostSecret: 'previous-secret', larkAppId: APP,
+    });
+    const previous = new TaskControlMappingTrust({ hostSecret: 'previous-secret', larkAppId: APP });
+    const proof = previous.issueProjectDispatchReservation(facts, facts.createdAt);
+    expect(overlap.verifyProjectDispatchReservation(proof, facts, {
+      allowedKeyIds: [overlap.projectDispatchReservationKeyId, overlap.previousProjectDispatchReservationKeyId!],
+    })).toBe(true);
+    expect(overlap.verifyProjectDispatchReservation(proof, facts, {
+      allowedKeyIds: [overlap.projectDispatchReservationKeyId, overlap.previousProjectDispatchReservationKeyId!],
+      revokedKeyIds: [overlap.previousProjectDispatchReservationKeyId!],
+    })).toBe(false);
+  });
+
+  it('applies allow and revoke sets to project dispatch reservation keys', () => {
+    const facts: ProjectDispatchReservationFactsV1 = {
+      schemaVersion: 'ProjectDispatchReservation.v1', larkAppId: APP, chatId: 'oc_project_chat',
+      coordinatorSessionId: 'session-controller', originTurnId: 'turn-1', reservationId: 'reservation-1',
+      taskGuid: '11111111-1111-4111-8111-111111111111',
+      phaseId: 'workstream:11111111-1111-4111-8111-111111111111',
+      workerAppId: 'cli_worker_1234567890123456', reviewerAppId: 'cli_review_1234567890123456',
+      acceptorAppId: 'cli_accept_1234567890123456', access: { mode: 'write', scopes: ['/repo/src'] },
+      createdAt: '2026-09-29T00:00:00.000Z', expiresAt: '2026-09-29T01:00:00.000Z',
+      dispatch: { seedText: 'seed', title: '任务', purpose: '验证', owners: [], botOpenIds: [], acceptanceRequested: true },
+    };
+    const overlap = new TaskControlMappingTrust({
+      hostSecret: 'current-secret', previousHostSecret: 'previous-secret', larkAppId: APP,
+    });
+    const previous = new TaskControlMappingTrust({ hostSecret: 'previous-secret', larkAppId: APP });
+    const proof = previous.issueProjectDispatchReservation(facts, facts.createdAt);
+    expect(overlap.verifyProjectDispatchReservation(proof, facts, {
+      allowedKeyIds: [overlap.projectDispatchReservationKeyId, overlap.previousProjectDispatchReservationKeyId!],
+    })).toBe(true);
+    expect(overlap.verifyProjectDispatchReservation(proof, facts, {
+      allowedKeyIds: [overlap.projectDispatchReservationKeyId, overlap.previousProjectDispatchReservationKeyId!],
+      revokedKeyIds: [overlap.previousProjectDispatchReservationKeyId!],
+    })).toBe(false);
+  });
+
   it('signs exact two-task mappings with purpose/app domain separation and key allow/revoke fail-close', () => {
     const trust = new TaskControlMappingTrust({ hostSecret: HOST_SECRET, larkAppId: APP });
     const first = mapping('task-a', 'om_a', 'task-comment:101');

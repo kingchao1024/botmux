@@ -636,6 +636,14 @@ export interface DaemonSession {
      * these old descendants; the long-lived CLI root itself is the exception. */
     preexistingProcessIdentities?: string[];
   };
+  /** Capability-free, one-shot identity for the terminal IPC that immediately
+   * follows an exact managed-turn revoke. It cannot authorize tool calls and
+   * is consumed only by the matching turn/attempt/worker generation. */
+  terminalTurnOrigin?: {
+    turnId: string;
+    dispatchAttempt?: number;
+    workerGeneration: number;
+  };
   /** Authority snapshot captured when an explicit Lark IM message was
    * deterministically routed into this dedicated meeting receiver. */
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;

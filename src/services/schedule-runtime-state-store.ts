@@ -130,6 +130,17 @@ function validateStringList(value: unknown, field: string, unique = false): stri
   return items;
 }
 
+function deliveryRunAtMs(hourlyTaskId: string, runKey: string): number {
+  const prefix = `${hourlyTaskId}:`;
+  if (!runKey.startsWith(prefix)) throw new Error('invalid_run_key');
+  const runAt = runKey.slice(prefix.length);
+  const runAtMs = Date.parse(runAt);
+  if (!Number.isFinite(runAtMs) || new Date(runAtMs).toISOString() !== runAt) {
+    throw new Error('invalid_run_key');
+  }
+  return runAtMs;
+}
+
 function validateState(
   kind: ScheduleRuntimeStateKind,
   chatId: string,
@@ -156,14 +167,20 @@ function validateState(
     if (typeof next.hourlyTaskId !== 'string' || !next.hourlyTaskId.trim()) {
       throw new Error('invalid_hourly_task_id');
     }
-    if (typeof next.runKey !== 'string' || !next.runKey.startsWith(`${next.hourlyTaskId}:`)) {
+    if (typeof next.runKey !== 'string') {
       throw new Error('invalid_run_key');
     }
+    deliveryRunAtMs(next.hourlyTaskId, next.runKey);
     if (typeof next.status !== 'string' || !DELIVERY_STATUSES.has(next.status)) {
       throw new Error('invalid_delivery_status');
     }
     if (next.status === 'sending' && next.messageId !== null) {
       throw new Error('delivery_sending_message_must_be_null');
+    }
+    if (next.status === 'delivery_failed'
+      && next.messageId !== null
+      && (typeof next.messageId !== 'string' || !next.messageId.startsWith('om_'))) {
+      throw new Error('delivery_failed_message_invalid');
     }
     if ((next.status === 'sent' || next.status === 'delivered')
       && (typeof next.messageId !== 'string' || !next.messageId.startsWith('om_'))) {
@@ -184,7 +201,12 @@ function validateTransition(
   current: Record<string, unknown> | null,
   next: Record<string, unknown>,
 ): void {
-  if (!current) return;
+  if (!current) {
+    if (kind === 'delivery' && (next.status !== 'sending' || next.messageId !== null)) {
+      throw new Error('delivery_initial_state_invalid');
+    }
+    return;
+  }
   if (kind === 'human-action' || kind === 'coordinator-action') {
     const before = itemMap(current);
     const after = itemMap(next);
@@ -208,21 +230,43 @@ function validateTransition(
 
   if (current.hourlyTaskId !== next.hourlyTaskId) throw new Error('delivery_task_changed');
   if (current.runKey !== next.runKey) {
+    if (deliveryRunAtMs(next.hourlyTaskId as string, next.runKey as string)
+      <= deliveryRunAtMs(current.hourlyTaskId as string, current.runKey as string)) {
+      throw new Error('delivery_run_not_newer');
+    }
     if (next.status !== 'sending' || next.messageId !== null) {
       throw new Error('delivery_new_run_must_start_sending');
     }
     return;
   }
+  if (next.claimedAt !== current.claimedAt) {
+    throw new Error('delivery_claimed_at_changed');
+  }
   const currentStatus = current.status as string;
   const nextStatus = next.status as string;
+  if (currentStatus === 'delivered') {
+    throw new Error('delivery_already_delivered');
+  }
+  if (currentStatus === 'sending' && nextStatus === 'sending') {
+    throw new Error('delivery_already_claimed');
+  }
+  if (currentStatus === 'delivery_failed' && nextStatus === 'sending'
+    && current.messageId !== null) {
+    throw new Error('delivery_retry_message_exists');
+  }
   const allowed: Record<string, readonly string[]> = {
     sending: ['sending', 'sent', 'delivery_failed'],
     sent: ['sent', 'delivered', 'delivery_failed'],
-    delivery_failed: ['delivery_failed', 'delivered'],
+    delivery_failed: ['sending', 'delivery_failed', 'delivered'],
     delivered: ['delivered'],
   };
   if (!(allowed[currentStatus] ?? []).includes(nextStatus)) {
     throw new Error(`delivery_transition_invalid:${currentStatus}:${nextStatus}`);
+  }
+  if (current.messageId === null && typeof next.messageId === 'string'
+    && (currentStatus !== 'sending'
+      || (nextStatus !== 'sent' && nextStatus !== 'delivery_failed'))) {
+    throw new Error('delivery_message_introduction_invalid');
   }
   if (typeof current.messageId === 'string' && next.messageId !== current.messageId) {
     throw new Error('delivery_message_changed');

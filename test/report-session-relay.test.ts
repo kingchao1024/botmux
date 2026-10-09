@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
@@ -77,7 +78,124 @@ function authorize(
   });
 }
 
+function phaseAReportAuthorization(overrides: {
+  raw?: Record<string, unknown>;
+  session?: Partial<ReportSessionRelaySessionView>;
+  phaseA?: Record<string, unknown>;
+  selfLarkAppId?: string;
+} = {}) {
+  const failedReportContent = 'Phase A failed as frozen';
+  const fenceFingerprint = `tccq1:${'a'.repeat(64)}`;
+  const operationId = 'f'.repeat(50);
+  const phaseA = {
+    fence: {
+      dispatchOperationId: operationId,
+      phaseA: {
+        historicalDispatchRoot: 'om_dispatch',
+        historicalTaskGuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        mappedWorkerAppId: 'cli_source',
+        failedReportContent,
+        failedReportSha256: createHash('sha256').update(failedReportContent).digest('hex'),
+        instructionTemplateSha256: 'b'.repeat(64),
+      },
+    },
+    fenceFingerprint,
+    operation: {
+      schemaVersion: 'TaskControlPhaseAOperation.v1', operationId,
+      chatId: 'oc_project', fenceFingerprint,
+      historicalDispatchRoot: 'om_dispatch',
+      historicalTaskGuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      targetAppId: 'cli_source', payloadHash: 'b'.repeat(64), providerUuid: 'c'.repeat(50),
+      attempt: {
+        wallTime: '2026-09-30T00:00:00.000Z', bootId: 'boot-1',
+        processStartedAt: '2026-09-30T00:00:00.000Z', monotonicMs: 1,
+      },
+      state: 'delivered', messageId: 'turn-current',
+    },
+    turnAdmission: {
+      messageId: 'turn-current', chatId: 'oc_project', dispatchRoot: 'om_dispatch',
+      targetAppId: 'cli_source', sessionId: 'session-source', workerGeneration: 7,
+      state: 'active', createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:01.000Z',
+    },
+    ...overrides.phaseA,
+  };
+  return authorizeReportSessionRelayRequest({
+    raw: {
+      sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: failedReportContent,
+      status: 'failed', originCapability: CAPABILITY,
+      ...overrides.raw,
+    },
+    trustedHost: false,
+    session: session({
+      scope: 'thread', rootMessageId: 'om_dispatch', workerGeneration: 7,
+      ...overrides.session,
+    } as Partial<ReportSessionRelaySessionView>),
+    selfLarkAppId: overrides.selfLarkAppId ?? 'cli_source',
+    registry: REGISTRY,
+    bindingSecret: BINDING_SECRET,
+    phaseA,
+  } as any);
+}
+
 describe('report session relay authorization', () => {
+  it('binds the exact Phase A failed report to its durable instruction and active source turn', () => {
+    expect(phaseAReportAuthorization()).toMatchObject({
+      ok: true,
+      phaseAReport: {
+        operationId: 'f'.repeat(50),
+        fenceFingerprint: `tccq1:${'a'.repeat(64)}`,
+        sourceSessionId: 'session-source', sourceTurnId: 'turn-current', workerGeneration: 7,
+        reportRequestId: expect.stringMatching(/^report:[a-f0-9]{64}$/),
+      },
+    });
+  });
+
+  it.each([
+    ['wrong root', { raw: { dispatchRoot: 'om_other' }, session: { rootMessageId: 'om_other' } }],
+    ['wrong worker', { session: { larkAppId: 'cli_other' }, selfLarkAppId: 'cli_other' }],
+    ['wrong body', { raw: { content: 'Phase A failed as frozen ' } }],
+    ['wrong options', { raw: { progress: 40 } }],
+    ['wrong source turn', { session: { liveOrigin: {
+      capability: CAPABILITY, turnId: 'turn-other', dispatchAttempt: 2,
+    } } }],
+  ])('permanently rejects a Phase A report with %s', (_name, overrides) => {
+    expect(phaseAReportAuthorization(overrides as any)).toEqual({
+      ok: false, status: 403, error: 'project_task_control_phase_a_report_rejected',
+    });
+  });
+
+  it('replays the exact durable Phase A report claim after the source turn becomes terminal', () => {
+    const content = 'Phase A failed as frozen';
+    const operationId = 'f'.repeat(50);
+    const reportRequestId = `report:${createHash('sha256').update(JSON.stringify({
+      sourceSessionId: 'session-source', sourceTurnId: 'turn-current', dispatchRoot: 'om_dispatch',
+      reporterAppId: 'cli_source', content, projectUpdate: { status: 'failed' },
+    })).digest('hex')}`;
+    const contentHash = createHash('sha256').update(content).digest('hex');
+    const logicalEvidenceKey = `tcpar1:${createHash('sha256').update(JSON.stringify({
+      schemaVersion: 'TaskControlPhaseAFailedReport.v1', operationId,
+      sourceTurnId: 'turn-current', reportRequestId, contentHash,
+    })).digest('hex')}`;
+    expect(phaseAReportAuthorization({
+      phaseA: {
+        turnAdmission: {
+          messageId: 'turn-current', chatId: 'oc_project', dispatchRoot: 'om_dispatch',
+          targetAppId: 'cli_source', sessionId: 'session-source', workerGeneration: 7,
+          state: 'terminal', createdAt: '2026-09-30T00:00:00.000Z',
+          updatedAt: '2026-09-30T00:02:00.000Z', terminalAt: '2026-09-30T00:02:00.000Z',
+        },
+        existingReport: {
+          schemaVersion: 'TaskControlPhaseAFailedReport.v1', operationId,
+          fenceFingerprint: `tccq1:${'a'.repeat(64)}`, chatId: 'oc_project',
+          dispatchRoot: 'om_dispatch', taskGuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          reporterAppId: 'cli_source', sourceSessionId: 'session-source',
+          sourceTurnId: 'turn-current', workerGeneration: 7, reportRequestId, contentHash,
+          logicalEvidenceKey, claimedAt: '2026-09-30T00:01:30.000Z',
+        },
+      },
+    })).toMatchObject({ ok: true, phaseAReport: { reportRequestId } });
+  });
+
   it('accepts only paired review options on an explicit registry-backed route', () => {
     expect(parseProjectReviewOptions({ verdict: 'pass', round: '2', explicitDispatchRoot: true }))
       .toEqual({ ok: true, reviewVerdict: 'pass', reviewRound: 2 });
@@ -707,5 +825,11 @@ describe('report session relay wiring', () => {
     expect(daemonSource).toContain("const reportRequestId = 'report:' + createHash('sha256')");
     expect(daemonSource).toContain('sourceTurnId: decision.source.turnId');
     expect(daemonSource).toContain('triggerMeta: { ...triggerMeta, requestId: reportRequestId }');
+  });
+
+  it('keeps a trigger-accepted project CAS failure as signed UNKNOWN evidence', () => {
+    expect(daemonSource).toContain("delivered.body.triggerAccepted === true");
+    expect(daemonSource).toContain('projectWorkerEvidenceKindForReport({');
+    expect(daemonSource).toContain('projectSyncError');
   });
 });
