@@ -27,6 +27,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import {
   __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled,
+  suspendSettledScheduleRunWorker,
   suspendWorker,
 } from '../src/core/worker-pool.js';
 import { logger } from '../src/utils/logger.js';
@@ -263,5 +264,96 @@ describe('queued suspend claim lifecycle', () => {
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+});
+
+describe('temporary schedule-run terminal reclaim', () => {
+  function settledScheduleRun(overrides: Record<string, unknown> = {}) {
+    const worker = fakeWorker();
+    const ds: any = {
+      session: {
+        sessionId: 'sid-schedule-run',
+        status: 'active',
+        workerGeneration: 1,
+        deferredScheduleRun: {
+          taskId: 'task-1',
+          turnId: 'schedule:task-1:run-1',
+          routingAnchor: 'schedule-run:task-1:run-1',
+          createdAt: '2026-09-26T00:00:00.000Z',
+        },
+      },
+      initConfig: { backendType: 'tmux' },
+      worker,
+      workerGeneration: 1,
+      // A transcript terminal is stronger than a screen edge. The worker may
+      // still display its last "working" frame when the terminal IPC arrives.
+      lastScreenStatus: 'working',
+      exitEventEmitted: false,
+      ...overrides,
+    };
+    return { ds, worker };
+  }
+
+  it('reclaims only the completed temporary schedule-run and leaves it cold-resumable', () => {
+    const { ds, worker } = settledScheduleRun();
+
+    expect(suspendSettledScheduleRunWorker(ds, 'schedule:task-1:run-1', 1)).toBe(true);
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.worker).toBeNull();
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.suspendedColdResume).toBe(true);
+    expect(ds.hasHistory).toBe(true);
+  });
+
+  it('does not reclaim a replacement worker from an older terminal generation', () => {
+    const { ds, worker } = settledScheduleRun();
+    ds.workerGeneration = 2;
+    ds.session.workerGeneration = 2;
+
+    expect(suspendSettledScheduleRunWorker(ds, 'schedule:task-1:run-1', 1)).toBe(false);
+
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(worker);
+    expect(ds.session.suspendedColdResume).not.toBe(true);
+  });
+
+  it.each([
+    ['ordinary session', { session: { sessionId: 'sid-ordinary', status: 'active' } }],
+    ['persistent task schedule', { session: {
+      sessionId: 'sid-task', status: 'active', deferredScheduleRun: {
+        taskId: 'task-1', turnId: 'schedule:task-1:run-1', routingAnchor: 'schedule-task:task-1', createdAt: '2026-09-26T00:00:00.000Z',
+      },
+    } }],
+    ['different terminal turn', {}],
+  ])('does not reclaim a %s', (_label, overrides) => {
+    const { ds, worker } = settledScheduleRun(overrides as Record<string, unknown>);
+    const turnId = _label === 'different terminal turn' ? 'schedule:task-1:other' : 'schedule:task-1:run-1';
+
+    expect(suspendSettledScheduleRunWorker(ds, turnId, 1)).toBe(false);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(worker);
+  });
+
+  it.each([
+    ['a newer in-flight turn', { activeInteractiveTurn: { turnId: 'om_user' } }],
+    ['queued activation input', { session: {
+      sessionId: 'sid-schedule-run', status: 'active', workerGeneration: 1, deferredScheduleRun: {
+        taskId: 'task-1', turnId: 'schedule:task-1:run-1', routingAnchor: 'schedule-run:task-1:run-1', createdAt: '2026-09-26T00:00:00.000Z',
+      }, queuedActivationPending: true,
+    } }],
+    ['pending input', { pendingPrompt: 'user follow-up' }],
+    ['a live managed tool', { managedTurnOrigin: { capability: 'capability', turnId: 'om_tool' } }],
+    ['in-flight protected dispatch', { session: {
+      sessionId: 'sid-schedule-run', status: 'active', workerGeneration: 1, deferredScheduleRun: {
+        taskId: 'task-1', turnId: 'schedule:task-1:run-1', routingAnchor: 'schedule-run:task-1:run-1', createdAt: '2026-09-26T00:00:00.000Z',
+      }, codexAppDispatchLedger: [{ dispatchId: 'd-1', turnId: 't-1', state: 'prepared', content: 'owned' }],
+    } }],
+  ])('does not reclaim while %s', (_label, overrides) => {
+    const { ds, worker } = settledScheduleRun(overrides as Record<string, unknown>);
+
+    expect(suspendSettledScheduleRunWorker(ds, 'schedule:task-1:run-1', 1)).toBe(false);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(worker);
   });
 });

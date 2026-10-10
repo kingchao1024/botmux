@@ -573,6 +573,35 @@ describe('resumeSession', () => {
       expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('closed');
     });
 
+    it('keeps a terminally suspended unmaterialized schedule run as cold-resume evidence', async () => {
+      const hidden = sessionStore.createSession(
+        'oc_target',
+        'schedule-run:task-1:run-2',
+        'hidden schedule',
+        'group',
+      );
+      hidden.larkAppId = 'app_test';
+      hidden.scope = 'chat';
+      hidden.cliId = 'claude-code';
+      hidden.suspendedColdResume = true;
+      hidden.deferredScheduleRun = {
+        taskId: 'task-1',
+        turnId: 'schedule:task-1:run-2',
+        routingAnchor: 'schedule-run:task-1:run-2',
+        createdAt: '2026-07-21T00:00:00.000Z',
+      };
+      sessionStore.updateSession(hidden);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('schedule-run:task-1:run-2', 'app_test'));
+      expect(restored?.session.sessionId).toBe(hidden.sessionId);
+      expect(restored?.worker).toBeNull();
+      expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('active');
+      expect(sessionStore.getSession(hidden.sessionId)?.suspendedColdResume).toBe(true);
+    });
+
     it('restores a materialized lazy topic at its isolated virtual anchor', async () => {
       const materialized = sessionStore.createSession(
         'oc_target',

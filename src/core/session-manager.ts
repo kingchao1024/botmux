@@ -2966,7 +2966,7 @@ export async function restoreActiveSessions(
     };
     if (session.deferredScheduleRun) {
       const binding = readDeferredTopicBinding(config.session.dataDir, session.sessionId);
-      if (!binding) {
+      if (!binding && !session.suspendedColdResume) {
         // A daemon restart makes an unmaterialized hidden run ambiguous: there
         // is no visible conversation to resume and no safe user-facing place
         // to report recovery. Fence its backing process and close the audit row
@@ -2993,31 +2993,37 @@ export async function restoreActiveSessions(
         logger.info(`[${session.sessionId.substring(0, 8)}] Closed unmaterialized deferred schedule run during restore`);
         continue;
       }
-      const nowIso = new Date().toISOString();
-      const aliases = { ...(session.replyThreadAliases ?? {}) };
-      aliases[binding.rootMessageId] = {
-        createdAt: aliases[binding.rootMessageId]?.createdAt ?? binding.createdAt,
-        lastUsedAt: nowIso,
-      };
-      session.replyThreadAliases = aliases;
-      session.rootMessageId = binding.rootMessageId;
-      ds.replyThreadAliases = aliases;
-      // A materialized task-position run is promoted to an ordinary thread
-      // session before registration: write the root back onto the task, clear
-      // the deferred marker and flip scope so setActiveSessionSafe below
-      // registers at the real om_ key (sessionAnchorId reads the cleared
-      // marker + thread scope) instead of the stable virtual slot.
-      if (binding.routingAnchor.startsWith('schedule-task:')) {
-        scheduleStore.updateTask(
-          session.deferredScheduleRun.taskId,
-          { rootMessageId: binding.rootMessageId },
-          larkAppId,
-        );
-        session.scope = 'thread';
-        ds.scope = 'thread';
-        session.deferredScheduleRun = undefined;
+      if (binding) {
+        const nowIso = new Date().toISOString();
+        const aliases = { ...(session.replyThreadAliases ?? {}) };
+        aliases[binding.rootMessageId] = {
+          createdAt: aliases[binding.rootMessageId]?.createdAt ?? binding.createdAt,
+          lastUsedAt: nowIso,
+        };
+        session.replyThreadAliases = aliases;
+        session.rootMessageId = binding.rootMessageId;
+        ds.replyThreadAliases = aliases;
+        // A materialized task-position run is promoted to an ordinary thread
+        // session before registration: write the root back onto the task, clear
+        // the deferred marker and flip scope so setActiveSessionSafe below
+        // registers at the real om_ key (sessionAnchorId reads the cleared
+        // marker + thread scope) instead of the stable virtual slot.
+        if (binding.routingAnchor.startsWith('schedule-task:')) {
+          scheduleStore.updateTask(
+            session.deferredScheduleRun.taskId,
+            { rootMessageId: binding.rootMessageId },
+            larkAppId,
+          );
+          session.scope = 'thread';
+          ds.scope = 'thread';
+          session.deferredScheduleRun = undefined;
+        }
+        sessionStore.updateSession(session);
       }
-      sessionStore.updateSession(session);
+      // A terminally settled temporary schedule-run deliberately has no Lark
+      // root until it posts. Its worker was already suspended before restart,
+      // so keep this active virtual-anchor row as cold-resume evidence rather
+      // than treating it as an in-flight invisible process to tear down.
     }
     // Literal pending-repo passthroughs have an empty init prompt and therefore
     // no Codex ledger entry. Their setup journal is the exact replay owner; the
@@ -3806,7 +3812,7 @@ export async function executeScheduledTask(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
   additionalPrompt?: string,
-): Promise<void> {
+): Promise<string | undefined> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
   const allBots = getAllBots();
@@ -3814,7 +3820,7 @@ export async function executeScheduledTask(
     // Expected at startup before bot configs finish loading; scheduler will
     // re-fire on the next cron tick. Not actionable.
     logger.debug('No bots configured, skipping scheduled task');
-    return;
+    return undefined;
   }
   const bot = task.larkAppId
     ? allBots.find(b => b.config.larkAppId === task.larkAppId)
@@ -4238,7 +4244,7 @@ export async function executeScheduledTask(
               scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
             )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-              return;
+              return scheduledTurnId;
             }
           } catch (err: any) {
             logger.warn(`[scheduler] Live injection threw (${err.message}); cold-resuming registered session`);
@@ -4255,7 +4261,7 @@ export async function executeScheduledTask(
           throw err;
         }
         logger.info(`[scheduler] Task "${task.name}" cold-resumed session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-        return;
+        return scheduledTurnId;
       }
 
       // Not a resumable conversation. A daemon-command scratch has no CLI
@@ -4361,6 +4367,7 @@ export async function executeScheduledTask(
     ds.pendingPrompt = undefined;
 
     logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+    return scheduledTurnId;
   });
 }
 

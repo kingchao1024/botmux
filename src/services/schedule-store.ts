@@ -22,7 +22,7 @@ import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import type { RunRecord, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
 /** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
  *  here because this module is the storage layer and must not depend on the CLI
@@ -36,6 +36,558 @@ const SCHEDULE_REASONING_EFFORTS: readonly ScheduleReasoningEffort[] = [
 export function isScheduleReasoningEffort(value: unknown): value is ScheduleReasoningEffort {
   return typeof value === 'string'
     && SCHEDULE_REASONING_EFFORTS.includes(value as ScheduleReasoningEffort);
+}
+
+/**
+ * Line-separator regex matching LF, CR, CRLF, U+2028 (line separator),
+ * and U+2029 (paragraph separator).  Applied FIRST so credential patterns
+ * that span lines are already split before we scan for secrets.
+ */
+const LINE_SEPARATOR_RE = /\r\n|\n|\r|\u2028|\u2029/;
+
+/**
+ * Bounded scanner that redacts credential values from a terminal error line.
+ *
+ * For each credential keyword encountered in the string:
+ *  - If the value starts with a quote (\" or '), the scanner advances past
+ *    backslash-escaped characters until the matching close quote, then
+ *    replaces everything between (and including) the quotes.
+ *  - If the value is unquoted, it matches the next contiguous non-whitespace
+ *    token (\\S+) and replaces it.
+ *
+ * URL credentials (https://user:pass@host) are handled separately.
+ */
+function isPlainFieldStartAfter(line: string, pos: number): boolean {
+  const tail = line.slice(pos);
+  return /^\s+[A-Za-z][A-Za-z0-9_-]*\s*(?:=(?!=)|:)/.test(tail);
+}
+
+function consumeCredentialValue(input: string, start: number, slashRun?: number, expectedQuote = '"'): number {
+  // Callers which already consumed a JSON wrapper (Authorization/Basic/Bearer
+  // schemes) still carry its slash run.  Scan to that same-layer close rather
+  // than treating the first word of a multi-word credential as unquoted.
+  if (slashRun !== undefined) {
+    for (let pos = start; pos < input.length; pos++) {
+      if (input[pos] !== expectedQuote) continue;
+      let preceding = 0;
+      for (let i = pos - 1; i >= start && input[i] === '\\'; i--) preceding++;
+      const tail = input.slice(pos + 1).trimStart();
+      if (preceding === slashRun && (!tail || ',;|&)}]'.includes(tail[0]) || isPlainFieldStartAfter(input, pos + 1))) return pos + 1;
+    }
+  }
+  const wrapper = input.slice(start).match(/^(\\*)["']/);
+  if (wrapper) {
+    const expectedRun = slashRun ?? wrapper[1].length;
+    const quote = wrapper[0].at(-1)!;
+    for (let pos = start + wrapper[0].length; pos < input.length; pos++) {
+      if (input[pos] !== quote) continue;
+      let preceding = 0;
+      for (let i = pos - 1; i >= start && input[i] === '\\'; i--) preceding++;
+      if (preceding === expectedRun) return pos + 1;
+    }
+  }
+  // A truncated wrapper is bounded at the next structural delimiter.  This
+  // remains fail-closed for the value without consuming adjacent context.
+  for (let pos = start; pos < input.length; pos++) {
+    if (/\s|[,;}\]]/.test(input[pos])) return pos;
+  }
+  return input.length;
+}
+
+/** A named secret must start in a field key, not inside an already-assigned value. */
+function isCredentialKeyPosition(input: string, start: number): boolean {
+  let fieldStart = 0;
+  let quote: { char: string; slashRun: number } | undefined;
+  let slashRun = 0;
+  for (let pos = 0; pos < start; pos++) {
+    const char = input[pos];
+    if (char === '\\') {
+      slashRun++;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      if (quote?.char === char && quote.slashRun === slashRun) quote = undefined;
+      else if (!quote) quote = { char, slashRun };
+    } else if (!quote && ',;|&([{'.includes(char)) {
+      fieldStart = pos + 1;
+    }
+    slashRun = 0;
+  }
+  const prefix = input.slice(fieldStart, start);
+  const assignment = Math.max(prefix.lastIndexOf('='), prefix.lastIndexOf(':'));
+  if (assignment < 0) return true;
+
+  if (prefix[assignment] === '=') return false;
+  const beforeAssignment = prefix.slice(0, assignment).trimEnd();
+  const afterAssignment = prefix.slice(assignment + 1);
+  // JSON (including escaped JSON) wraps a field value in quotes.  Plain
+  // message/status/detail assignments are also value positions even if the
+  // value happens to look like a sensitive key name.
+  if (afterAssignment.includes('"') || beforeAssignment.endsWith('\\"')) return false;
+  const fieldName = beforeAssignment.match(/([A-Za-z][A-Za-z0-9_-]*)$/)?.[1]?.toLowerCase();
+  return !['message', 'status', 'detail'].includes(fieldName ?? '');
+}
+
+function hasCredentialKeyPrefix(input: string, start: number): boolean {
+  return start > 0 && /[A-Za-z0-9_-]/.test(input[start - 1]);
+}
+
+interface CredentialRedaction {
+  start: number;
+  end: number;
+  replacement: string;
+}
+
+interface QuotedSpan {
+  start: number;
+  end: number;
+  contentStart: number;
+  contentEnd: number;
+}
+
+interface StructuredQuotedField {
+  key: string;
+  keySpan: QuotedSpan;
+  valueSpan: QuotedSpan;
+}
+
+interface PlainField {
+  key: string;
+  keyStart: number;
+  valueStart: number;
+}
+
+interface ParsedField {
+  key: string;
+  keyStart: number;
+  valueStart: number;
+  nextFieldStart: number;
+}
+
+function isPrimarySeparatorAt(line: string, pos: number): boolean {
+  let keyStart = pos;
+  while (keyStart > 0 && /[A-Za-z0-9_-]/.test(line[keyStart - 1])) keyStart--;
+  return keyStart === 0 || ',;|&({'.includes(line[keyStart - 1]);
+}
+
+function keyBeforePrimarySeparator(line: string, pos: number): string | undefined {
+  if (!isPrimarySeparatorAt(line, pos)) return undefined;
+  let keyStart = pos;
+  while (keyStart > 0 && /[A-Za-z0-9_-]/.test(line[keyStart - 1])) keyStart--;
+  return line.slice(keyStart, pos).toLowerCase();
+}
+
+/** Scan the original line once, keeping quote style and escape layer together. */
+function collectQuotedSpans(line: string): QuotedSpan[] {
+  const spans: QuotedSpan[] = [];
+  let active: { start: number; quoteAt: number; char: string; slashRun: number } | undefined;
+  let slashRun = 0;
+  for (let pos = 0; pos < line.length; pos++) {
+    const char = line[pos];
+    if (char === '\\') {
+      slashRun++;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      const tail = line.slice(pos + 1).trimStart();
+      const structuralClose = !tail || ':,;|&)}]'.includes(tail[0]);
+      const schemeBoundary = /^\s+(?:basic|bearer)\s+/i.test(line.slice(pos + 1));
+      if (active?.char === char && active.slashRun === slashRun
+        && (structuralClose || schemeBoundary || isPlainFieldStartAfter(line, pos + 1))) {
+        spans.push({ start: active.start, end: pos + 1, contentStart: active.quoteAt + 1, contentEnd: pos - slashRun });
+        active = undefined;
+      } else if (!active) {
+        active = { start: pos - slashRun, quoteAt: pos, char, slashRun };
+      }
+    }
+    slashRun = 0;
+  }
+  return spans;
+}
+
+function collectPlainFields(line: string, spans: readonly QuotedSpan[]): PlainField[] {
+  const starts = new Set<number>([0]);
+  const insideQuotedSpan = (index: number): boolean => spans.some(span => index >= span.start && index < span.end);
+  for (let pos = 0; pos < line.length; pos++) {
+    if (',;|&({'.includes(line[pos])) starts.add(pos + 1);
+    if (!/\s/.test(line[pos]) || insideQuotedSpan(pos)) continue;
+    let previous = pos - 1;
+    while (previous >= 0 && /\s/.test(line[previous])) previous--;
+    // Whitespace immediately after a field's assignment belongs to its value;
+    // it is not evidence of a second field start.
+    const parentKey = line[previous] === '=' || line[previous] === ':'
+      ? keyBeforePrimarySeparator(line, previous)
+      : undefined;
+    if (parentKey && ['message', 'status', 'detail'].includes(parentKey)) continue;
+    let next = pos;
+    while (/\s/.test(line[next] ?? '')) next++;
+    if (!insideQuotedSpan(next) && /^[A-Za-z][A-Za-z0-9_-]*\s*(?:=(?!=)|:)/.test(line.slice(next))) {
+      starts.add(next);
+    }
+  }
+  for (const span of spans) {
+    starts.add(span.contentStart);
+    let pos = span.end;
+    while (/\s/.test(line[pos] ?? '')) pos++;
+    if (pos > span.end) starts.add(pos);
+  }
+  const fields: PlainField[] = [];
+  for (const start of starts) {
+    let pos = start;
+    while (/\s/.test(line[pos] ?? '')) pos++;
+    const match = line.slice(pos).match(/^([A-Za-z][A-Za-z0-9_-]*)\s*(?:=(?!=)|:)\s*/);
+    if (match) fields.push({ key: match[1].toLowerCase(), keyStart: pos, valueStart: pos + match[0].length });
+  }
+  return fields;
+}
+
+function collectStructuredQuotedFields(line: string, spans: readonly QuotedSpan[]): StructuredQuotedField[] {
+  const byStart = new Map(spans.map(span => [span.start, span]));
+  const fields: StructuredQuotedField[] = [];
+  for (const keySpan of spans) {
+    let pos = keySpan.end;
+    while (/\s/.test(line[pos] ?? '')) pos++;
+    if (line[pos] !== ':') continue;
+    pos++;
+    while (/\s/.test(line[pos] ?? '')) pos++;
+    const valueSpan = byStart.get(pos);
+    if (!valueSpan) continue;
+    fields.push({ key: line.slice(keySpan.contentStart, keySpan.contentEnd).toLowerCase(), keySpan, valueSpan });
+  }
+  return fields;
+}
+
+function tokenizeFields(
+  structured: readonly StructuredQuotedField[],
+  plain: readonly PlainField[],
+): ParsedField[] {
+  const tokens = [
+    ...structured.map(field => ({ key: field.key, keyStart: field.keySpan.contentStart, valueStart: field.valueSpan.start })),
+    ...plain,
+  ].sort((a, b) => a.keyStart - b.keyStart);
+  return tokens.map((token, index) => ({ ...token, nextFieldStart: tokens[index + 1]?.keyStart ?? Number.POSITIVE_INFINITY }));
+}
+
+function collectProtectedValueRanges(
+  line: string,
+  fields: readonly StructuredQuotedField[],
+  plainFields: readonly PlainField[],
+  spans: readonly QuotedSpan[],
+): Array<[number, number]> {
+  const protectedRanges = fields
+    .filter(field => ['message', 'status', 'detail'].includes(field.key))
+    .map(field => [field.valueSpan.start, field.valueSpan.end] as [number, number]);
+  const byStart = new Map(spans.map(span => [span.start, span]));
+  for (const field of plainFields) {
+    if (!['message', 'status', 'detail'].includes(field.key)) continue;
+    const quoted = byStart.get(field.valueStart);
+    if (quoted) {
+      protectedRanges.push([quoted.start, quoted.end]);
+      continue;
+    }
+    const nextField = plainFields
+      .filter(next => next.keyStart > field.valueStart)
+      .map(next => next.keyStart)
+      .sort((a, b) => a - b)[0];
+    let end = nextField ?? line.length;
+    for (let pos = field.valueStart; pos < end; pos++) {
+      if (',;|&)}]'.includes(line[pos])) { end = pos; break; }
+    }
+    protectedRanges.push([field.valueStart, end]);
+  }
+  return protectedRanges;
+}
+
+function isInsideRanges(index: number, ranges: readonly [number, number][]): boolean {
+  return ranges.some(([start, end]) => index >= start && index < end);
+}
+
+function applyCredentialRedactions(line: string, redactions: CredentialRedaction[]): string {
+  const ordered = redactions.sort((a, b) => a.start - b.start || b.end - a.end);
+  let offset = 0;
+  let result = '';
+  for (const redaction of ordered) {
+    if (redaction.start < offset) continue;
+    result += line.slice(offset, redaction.start) + redaction.replacement;
+    offset = redaction.end;
+  }
+  return result + line.slice(offset);
+}
+
+function collectAuthorizationRedactions(
+  line: string,
+  fields: readonly ParsedField[],
+  redactions: CredentialRedaction[],
+): void {
+  for (const [index, field] of fields.entries()) {
+    const rawValue = line.slice(field.valueStart);
+    const wrapper = rawValue.match(/^(\\*)["']/);
+    const schemeStart = field.valueStart + (wrapper?.[0].length ?? 0);
+    const schemeMatch = line.slice(schemeStart).match(/^(basic|bearer)\s+/i);
+    const scheme = schemeMatch?.[1];
+    if (!scheme) continue;
+    let end: number;
+    if (wrapper) {
+      end = consumeCredentialValue(line, field.valueStart, wrapper[1].length, wrapper[0].at(-1)!);
+    } else {
+      // Basic/Bearer plain credentials are one opaque token. The token's
+      // trailing `=`/`==` is padding, not a field separator; only the next
+      // whitespace-delimited field can begin a new token.
+      end = schemeStart + schemeMatch![0].length;
+      while (end < line.length && !/\s/.test(line[end])) end++;
+    }
+    while (end > schemeStart && /\s/.test(line[end - 1])) end--;
+    const normalized = `${scheme[0].toUpperCase()}${scheme.slice(1).toLowerCase()}`;
+    redactions.push({
+      start: field.key === 'authorization' ? field.keyStart : field.valueStart,
+      end,
+      replacement: field.key === 'authorization' ? `Authorization: ${normalized} [redacted]` : `${normalized} [redacted]`,
+    });
+  }
+}
+
+function redactCredentialsLine(line: string): string {
+  interface CredentialScanner {
+    /** Keyword pattern to locate.  Matched case-insensitively. */
+    keyword: RegExp;
+    /** Replacement text for the keyword + value portion. */
+    replacement: string;
+    /** Whether the keyword expects a value after [=:\\s]* (set to false for URL). */
+    hasValue: boolean;
+    /** Bare schemes use whitespace; named credential keys require = or :. */
+    allowWhitespace?: boolean;
+  }
+
+  const scanners: CredentialScanner[] = [
+    { keyword: /\baws_secret_access_key\b/gi, replacement: 'AWS_SECRET_ACCESS_KEY=[redacted]', hasValue: true },
+    { keyword: /password\b/gi, replacement: 'password=[redacted]', hasValue: true },
+    { keyword: /\bbearer\b(?!\s*\[redacted\])/gi, replacement: 'Bearer [redacted]', hasValue: true, allowWhitespace: true },
+    { keyword: /\baccess_token\b/gi, replacement: 'access_token=[redacted]', hasValue: true },
+    { keyword: /\brefresh_token\b/gi, replacement: 'refresh_token=[redacted]', hasValue: true },
+    { keyword: /\bclient_secret\b/gi, replacement: 'client_secret=[redacted]', hasValue: true },
+    { keyword: /\baccessToken\b/g, replacement: 'accessToken=[redacted]', hasValue: true },
+    { keyword: /\brefreshToken\b/g, replacement: 'refreshToken=[redacted]', hasValue: true },
+    { keyword: /\bclientSecret\b/g, replacement: 'clientSecret=[redacted]', hasValue: true },
+    { keyword: /api[_-]?key\b/gi, replacement: 'api_key=[redacted]', hasValue: true },
+    { keyword: /token\b/gi, replacement: 'token=[redacted]', hasValue: true },
+    { keyword: /secret[_-]?(?:key)?\b/gi, replacement: 'secret=[redacted]', hasValue: true },
+    // URL credentials: https://user:pass@host
+    { keyword: /\/\/[^/\s@:]+:[^/\s@]+@/g, replacement: '//[redacted]@', hasValue: false },
+  ];
+
+  const redactions: CredentialRedaction[] = [];
+  const spans = collectQuotedSpans(line);
+  const fields = collectStructuredQuotedFields(line, spans);
+  const plainFields = collectPlainFields(line, spans);
+  const fieldTokens = tokenizeFields(fields, plainFields);
+  const protectedRanges = collectProtectedValueRanges(line, fields, plainFields, spans);
+  const fieldByKeyStart = new Map(fieldTokens.map(field => [field.keyStart, field]));
+  collectAuthorizationRedactions(line, fieldTokens, redactions);
+
+  for (const { keyword, replacement, hasValue, allowWhitespace } of scanners) {
+    if (!hasValue) {
+      let match: RegExpExecArray | null;
+      keyword.lastIndex = 0;
+      while ((match = keyword.exec(line)) !== null) {
+        redactions.push({ start: match.index, end: keyword.lastIndex, replacement });
+      }
+      continue;
+    }
+
+    // Each family scans the immutable source. Applying one family's replacement
+    // first can otherwise move or remove wrapper quotes before the next family
+    // decides where its value ends.
+    keyword.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = keyword.exec(line)) !== null) {
+      const afterKw = line.slice(match.index + match[0].length);
+
+      let tokenStart = match.index;
+      while (tokenStart > 0 && /[A-Za-z0-9_-]/.test(line[tokenStart - 1])) tokenStart--;
+      const parsedField = fieldByKeyStart.get(tokenStart);
+      if (!allowWhitespace && (isInsideRanges(match.index, protectedRanges)
+        || (!parsedField && hasCredentialKeyPrefix(line, match.index)
+          && !isCredentialKeyPosition(line, match.index)))) {
+        continue;
+      }
+
+      if (parsedField) {
+        const end = Math.min(parsedField.nextFieldStart, line.length);
+        redactions.push({ start: tokenStart, end, replacement });
+        keyword.lastIndex = end;
+        continue;
+      }
+
+      const whitespace = afterKw.match(/^\s+/)?.[0];
+      if (!allowWhitespace || !whitespace) continue;
+      const value = afterKw.slice(whitespace.length);
+      const end = match.index + match[0].length + whitespace.length + consumeCredentialValue(value, 0);
+      redactions.push({ start: match.index, end, replacement });
+      keyword.lastIndex = end;
+    }
+  }
+
+  return applyCredentialRedactions(line, redactions);
+}
+
+/**
+ * Sanitise a terminal error for persistent storage.
+ *
+ * Processing order:
+ * 1. Split on all line separators (LF, CR, CRLF, U+2028, U+2029) and take the
+ *    first non-empty line.
+ * 2. Redact credential values via bounded scanner (password, token, Bearer,
+ *    api_key, secret, URL credentials).
+ * 3. Cap at 500 characters.
+ *
+ * Returns undefined when the input is empty or produces an empty result after
+ * trimming.
+ */
+function sanitiseTerminalError(error?: string): string | undefined {
+  if (!error) return undefined;
+  // Take the first non-empty line (not just the first split result which may
+  // be empty if the input starts with a line separator).
+  const firstLine = error.split(LINE_SEPARATOR_RE).find(line => line.trim())?.trim();
+  if (!firstLine) return undefined;
+  const sanitised = redactCredentialsLine(firstLine);
+  return sanitised.length > 500 ? sanitised.slice(0, 497) + '...' : sanitised;
+}
+
+/**
+ * Validate and sanitise a lastRunSettledErrors record during deserialization.
+ * Each value is passed through sanitiseTerminalError.
+ */
+function sanitiseErrorRecord(raw: Record<string, unknown>): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  let hasEntry = false;
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof k !== 'string' || !k) continue;
+    const sanitised = sanitiseTerminalError(typeof v === 'string' ? v : undefined);
+    if (sanitised) {
+      out[k] = sanitised;
+      hasEntry = true;
+    }
+  }
+  return hasEntry ? out : undefined;
+}
+
+/**
+ * Validate a record of string→string during deserialization.
+ */
+function stringRecord(raw: Record<string, unknown>): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  let hasEntry = false;
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof k !== 'string' || !k) continue;
+    if (typeof v === 'string' && v.trim()) {
+      out[k] = v.trim();
+      hasEntry = true;
+    }
+  }
+  return hasEntry ? out : undefined;
+}
+
+/** Bound historic run state without dropping a source that can still recover. */
+function pruneSettledRunRecords(task: ScheduledTask): void {
+  if (!task.runRecords) return;
+  for (const [runId, record] of Object.entries(task.runRecords)) {
+    if (runId === task.lastRunId) continue;
+    const bindings = Object.keys(record.turnBindings ?? {});
+    const errors = Object.keys(record.perTargetErrors ?? {});
+    // A dispatch-failed target never gained a worker turn and can never own
+    // ordinary recovery. Its synthetic source must not pin history forever.
+    if (bindings.length > 0 && errors.length > 0
+      && bindings.every(id => id.startsWith('dispatch-failed:'))
+      && errors.every(id => id.startsWith('dispatch-failed:'))) {
+      delete task.runRecords[runId];
+      continue;
+    }
+    if (bindings.length > 0) continue;
+    if (errors.length > 0) continue;
+    delete task.runRecords[runId];
+  }
+  if (Object.keys(task.runRecords).length === 0) delete task.runRecords;
+}
+
+// ─── Per-run record deserialization ────────────────────────────────────
+
+/**
+ * Deserialize runRecords from raw JSON or migrate legacy per-run fields.
+ * New format: raw.runRecords is a Record<string, RunRecord>.
+ * Legacy migration: if raw.lastRunTargetCount / lastRunSettledCount /
+ * lastRunSettledErrors / lastRunTurnBindings exist and lastRunId is set,
+ * construct a single RunRecord from them.
+ */
+function deserializeRunRecords(
+  raw: Record<string, unknown>,
+): Record<string, RunRecord> | undefined {
+  // New format first
+  const rawRecords = raw.runRecords;
+  if (rawRecords && typeof rawRecords === 'object' && !Array.isArray(rawRecords)) {
+    const out: Record<string, RunRecord> = {};
+    for (const [runId, v] of Object.entries(rawRecords as Record<string, unknown>)) {
+      if (!runId || typeof v !== 'object' || v === null) continue;
+      const rec = v as Record<string, unknown>;
+      const targetCount = typeof rec.targetCount === 'number' && rec.targetCount > 0
+        ? rec.targetCount : 0;
+      const settledTurnIds = Array.isArray(rec.settledTurnIds)
+        ? rec.settledTurnIds.filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
+        : [];
+      const perTargetErrors = rec.perTargetErrors && typeof rec.perTargetErrors === 'object'
+        && !Array.isArray(rec.perTargetErrors)
+        ? sanitiseErrorRecord(rec.perTargetErrors as Record<string, unknown>) ?? {}
+        : {};
+      const turnBindings = rec.turnBindings && typeof rec.turnBindings === 'object'
+        && !Array.isArray(rec.turnBindings)
+        ? stringRecord(rec.turnBindings as Record<string, unknown>) ?? {}
+        : {};
+      const recoveryAttempts = rec.recoveryAttempts && typeof rec.recoveryAttempts === 'object'
+        && !Array.isArray(rec.recoveryAttempts)
+        ? stringRecord(rec.recoveryAttempts as Record<string, unknown>)
+        : undefined;
+      if (targetCount > 0 || settledTurnIds.length > 0 || Object.keys(perTargetErrors).length > 0 || Object.keys(turnBindings).length > 0) {
+        out[runId] = { targetCount, settledTurnIds, perTargetErrors, turnBindings, ...(recoveryAttempts ? { recoveryAttempts } : {}) };
+      }
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  // Legacy migration: build from old per-run task-level fields
+  const lastRunId = typeof raw.lastRunId === 'string' && raw.lastRunId.trim()
+    ? raw.lastRunId.trim() : undefined;
+  if (!lastRunId) return undefined;
+
+  const targetCount = typeof raw.lastRunTargetCount === 'number' && raw.lastRunTargetCount > 0
+    ? raw.lastRunTargetCount : 0;
+  if (targetCount <= 0) return undefined;
+
+  const perTargetErrors = raw.lastRunSettledErrors && typeof raw.lastRunSettledErrors === 'object'
+    && !Array.isArray(raw.lastRunSettledErrors)
+    ? sanitiseErrorRecord(raw.lastRunSettledErrors as Record<string, unknown>) ?? {}
+    : {};
+  const turnBindings = raw.lastRunTurnBindings && typeof raw.lastRunTurnBindings === 'object'
+    && !Array.isArray(raw.lastRunTurnBindings)
+    ? stringRecord(raw.lastRunTurnBindings as Record<string, unknown>) ?? {}
+    : {};
+
+  // Legacy didn't track individual settled turnIds; treat all targets as settled
+  // if settledCount >= targetCount (conservative).
+  const settledCount = typeof raw.lastRunSettledCount === 'number' && raw.lastRunSettledCount >= 0
+    ? raw.lastRunSettledCount : 0;
+  const allKeys = new Set<string>();
+  for (const k of Object.keys(perTargetErrors)) allKeys.add(k);
+  for (const k of Object.keys(turnBindings)) allKeys.add(k);
+  // Fill remaining slots with synthetic ids to reach settledCount
+  const settledTurnIds: string[] = [...allKeys];
+  while (settledTurnIds.length < settledCount && settledTurnIds.length < targetCount) {
+    settledTurnIds.push(`legacy:${lastRunId}:${settledTurnIds.length}`);
+  }
+  // Truncate to targetCount
+  const finalSettled = settledTurnIds.slice(0, targetCount);
+
+  return {
+    [lastRunId]: { targetCount, settledTurnIds: finalSettled, perTargetErrors, turnBindings },
+  };
 }
 
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
@@ -231,6 +783,12 @@ interface FileState {
 
 const fileStates = new Map<string, FileState>();
 let scopeAppId: string | null = null;
+let taskRemovedHook: ((taskId: string) => void) | undefined;
+
+/** Runtime-only observer for every durable task deletion path. */
+export function setScheduleStoreTaskRemovedHook(hook: ((taskId: string) => void) | undefined): void {
+  taskRemovedHook = hook;
+}
 
 /** Bind the store's default file to one bot. Daemon: own bot at startup.
  *  CLI: the session's bot / explicit --lark-app-id before any store call. */
@@ -379,6 +937,23 @@ function migrate(raw: any): ScheduledTask | null {
     lastRunId: raw.lastRunId,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
+    lastTerminalStatus: raw.lastTerminalStatus === 'ok' || raw.lastTerminalStatus === 'error'
+      ? raw.lastTerminalStatus
+      : undefined,
+    lastTerminalAt: typeof raw.lastTerminalAt === 'string' && raw.lastTerminalAt.trim()
+      ? raw.lastTerminalAt.trim()
+      : undefined,
+    lastTerminalError: typeof raw.lastTerminalError === 'string' && raw.lastTerminalError.trim()
+      ? sanitiseTerminalError(raw.lastTerminalError)
+      : undefined,
+    lastTerminalRunId: typeof raw.lastTerminalRunId === 'string' && raw.lastTerminalRunId.trim()
+      ? raw.lastTerminalRunId.trim()
+      : undefined,
+    lastTerminalTurnId: typeof raw.lastTerminalTurnId === 'string' && raw.lastTerminalTurnId.trim()
+      ? raw.lastTerminalTurnId.trim()
+      : undefined,
+    // Per-run records: new format first, then legacy migration.
+    runRecords: deserializeRunRecords(raw),
     repeat: raw.repeat,
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
@@ -700,6 +1275,7 @@ export function removeTask(id: string, appId?: string): boolean {
     return { result: removed, changed: removed };
   }, appId);
   if (existed) logger.info(`[schedule-store] Removed task ${id}`);
+  if (existed) taskRemovedHook?.(id);
   return existed;
 }
 
@@ -767,6 +1343,11 @@ export function claimRun(
       lastError: undefined,
       lastDeliveryError: undefined,
     });
+    if (task) pruneSettledRunRecords(task);
+    // Per-run: don't clear old run records — recovery terminals for prior
+    // runs need those bindings.  Old records are cleaned up when all targets
+    // are settled and no pending recovery sources remain.  A new run record
+    // entry is created on first setRunTargetCount or bindRunTurnId.
     return { result: { ok: true, task } as const, changed: true };
   }, appId);
 }
@@ -802,6 +1383,288 @@ export function markSkipped(id: string, nextRunAt?: string, runId?: string): voi
     task.lastError = undefined;
     task.lastDeliveryError = undefined;
     if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
+    return { result: undefined, changed: true };
+  });
+}
+
+/**
+ * Settle the durable terminal result of a run.  Must be called from the
+ * turn_terminal path (not the dispatcher).
+ *
+ * Per-run partitioning: all aggregation reads/writes only `runRecords[runId]`.
+ * Recovery is detected purely by explicit `sourceTurnId !== turnId` mapping;
+ * settledCount/targetCount heuristics are never used for recovery detection.
+ *
+ * Guards:
+ * 1. Missing task → false
+ * 2. `runId` required — fail-closed when absent (no legacy fallback)
+ * 3. `sourceTurnId` duplicate → false (unless recovery redo)
+ * 4. Stale: `runId !== task.lastRunId` AND `sourceTurnId` not found in any
+ *    run record → false.  Old-run terminals with a known source update the
+ *    old record but never project to task.lastTerminal*.
+ *
+ * Projection: only when `task.lastRunId === runId` AND all target sources
+ * are settled.  Success writes `lastTerminalStatus='ok'`; any per-target
+ * error writes `'error'`.  Partial settlement defers projection.
+ *
+ * Returns true when terminal state was persisted, false when rejected.
+ *
+ * @param id          Task identifier.
+ * @param runId       Scheduler run identity (required; fail-closed).
+ * @param turnId      This attempt's turn id (may be undefined for dispatch-failed targets).
+ * @param success     Whether this terminal is a success.
+ * @param error       Error message (only meaningful when success=false).
+ * @param sourceTurnId The logical source target. Defaults to `turnId` for
+ *                     normal targets; set to the original failed turnId for
+ *                     recovery retries.
+ */
+export function settleTerminalRun(
+  id: string,
+  runId: string,
+  success: boolean,
+  error?: string,
+  turnId?: string,
+  sourceTurnId?: string,
+  recoveryAttemptTurnId?: string,
+  consumeNormalBinding = false,
+): boolean {
+  const source = sourceTurnId ?? turnId;
+  if (!source) {
+    // Dispatch-failed target with no source identity — cannot track.
+    // These are handled by the daemon directly calling with a synthetic
+    // sourceTurnId (e.g. "dispatch-failed:<chatId>").
+    return false;
+  }
+
+  return mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: false, changed: false };
+
+    // The terminal path must name an already-dispatched run.  Creating a
+    // record here lets a late terminal manufacture ownership after a newer
+    // claim, which is exactly the cross-run contamination this guard blocks.
+    const runRec = task.runRecords?.[runId];
+    if (!runRec) return { result: false, changed: false };
+
+    const isCurrentRun = runId === task.lastRunId;
+    const isRecovery = turnId !== undefined && sourceTurnId !== undefined && sourceTurnId !== turnId;
+    if (recoveryAttemptTurnId && (!isRecovery || runRec.recoveryAttempts?.[source] !== recoveryAttemptTurnId)) {
+      return { result: false, changed: false };
+    }
+
+    // ── Stale guard ─────────────────────────────────────────────────────
+    // Non-current run: only allow terminals for known sources (old-run
+    // terminals or recovery) — they update the old record only.
+    // Unknown sources for old runs are stale and rejected.
+    if (!isCurrentRun) {
+      if (!runRec.turnBindings?.[source]) {
+        return { result: false, changed: false }; // stale: source unknown
+      }
+      // Old-run terminal: update record only, never project.
+    }
+
+    // ── Dedup / recovery redo ───────────────────────────────────────────
+    const alreadySettled = runRec.settledTurnIds.includes(source);
+    if (alreadySettled) {
+      if (!isRecovery) {
+        return { result: false, changed: false }; // duplicate normal terminal
+      }
+      // Recovery redo: source already settled, just update per-target error.
+    } else if (isRecovery) {
+      // A recovery is a correction of an existing source outcome.  It must
+      // never create a new settled source when its terminal races ahead.
+      return { result: false, changed: false };
+    }
+
+    // ── Settle the source ───────────────────────────────────────────────
+    if (!alreadySettled) {
+      runRec.settledTurnIds.push(source);
+    }
+
+    // A preceding all-success terminal may have pruned this empty container.
+    // Recreate it before recording a later target failure in the same run.
+    if (!runRec.perTargetErrors) runRec.perTargetErrors = {};
+    if (success) {
+      delete runRec.perTargetErrors[source];
+    } else {
+      runRec.perTargetErrors[source] = sanitiseTerminalError(error) ?? 'unknown error';
+    }
+
+    // Clean up empty perTargetErrors
+    if (Object.keys(runRec.perTargetErrors).length === 0) {
+      delete (runRec as any).perTargetErrors;
+    }
+
+    // Persist the record
+    task.runRecords![runId] = runRec;
+
+    // Recovery terminal + authority consumption is one schedules.json
+    // mutation. A write failure rolls back both result and permissions.
+    if (recoveryAttemptTurnId) {
+      delete runRec.turnBindings[recoveryAttemptTurnId];
+      if (runRec.recoveryAttempts) {
+        delete runRec.recoveryAttempts[source];
+        if (Object.keys(runRec.recoveryAttempts).length === 0) delete runRec.recoveryAttempts;
+      }
+      if (success) delete runRec.turnBindings[source];
+      pruneSettledRunRecords(task);
+    } else if (consumeNormalBinding && turnId) {
+      delete runRec.turnBindings[turnId];
+      pruneSettledRunRecords(task);
+    }
+
+    // ── Projection (current run only) ───────────────────────────────────
+    if (!isCurrentRun) return { result: true, changed: true };
+    const hasErrors = Object.keys(runRec.perTargetErrors ?? {}).length > 0;
+    const allTargetsSettled = runRec.targetCount === 0
+      ? true : runRec.settledTurnIds.length >= runRec.targetCount;
+    if (!hasErrors && allTargetsSettled) {
+      const now = new Date().toISOString();
+      task.lastTerminalStatus = 'ok'; task.lastTerminalAt = now;
+      task.lastTerminalError = undefined; task.lastTerminalRunId = runId;
+      if (turnId) task.lastTerminalTurnId = turnId;
+    } else if (hasErrors) {
+      const now = new Date().toISOString();
+      task.lastTerminalStatus = 'error'; task.lastTerminalAt = now;
+      task.lastTerminalError = Object.values(runRec.perTargetErrors!)[0];
+      task.lastTerminalRunId = runId;
+      if (turnId) task.lastTerminalTurnId = turnId;
+    } else if (turnId) task.lastTerminalTurnId = turnId;
+
+    return { result: true, changed: true };
+  });
+}
+
+/** Set the expected target count for the current run.  The daemon calls this
+ *  after dispatch so `settleTerminalRun` can defer writing terminal ok until
+ *  all targets have settled.  Resets `lastRunSettledCount` to 0; rejects when
+ *  `runId` no longer matches the current claim. */
+export function setRunTargetCount(
+  id: string,
+  count: number,
+  runId: string,
+): void {
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
+    if (task.lastRunId !== runId) return { result: undefined, changed: false };
+    if (!task.runRecords) task.runRecords = {};
+    if (!task.runRecords[runId]) {
+      task.runRecords[runId] = { targetCount: 0, settledTurnIds: [], perTargetErrors: {}, turnBindings: {} };
+    }
+    task.runRecords[runId].targetCount = count;
+    return { result: undefined, changed: true };
+  });
+}
+
+/**
+ * Persist a turnId → runId binding so recovery continuations can restore
+ * the binding after daemon restart (the in-memory map is empty on restart).
+ * A record created before a later claim remains writable: recovery after a
+ * daemon restart must retain the original source → run identity.  A missing
+ * non-current record is rejected, so a stale terminal cannot invent one.
+ */
+export function bindRunTurnId(
+  id: string,
+  turnId: string,
+  runId: string,
+): boolean {
+  return mutateTasks(working => {
+    const task = working.get(id);
+    if (!task || task.lastRunId !== runId) return { result: false, changed: false };
+    if (!task.runRecords) task.runRecords = {};
+    if (!task.runRecords[runId]) {
+      task.runRecords[runId] = { targetCount: 0, settledTurnIds: [], perTargetErrors: {}, turnBindings: {} };
+    }
+    task.runRecords[runId].turnBindings[turnId] = runId;
+    return { result: true, changed: true };
+  });
+}
+
+/** Atomically claim one recovery continuation for a persisted failed source. */
+export function claimRecoveryAttempt(
+  id: string,
+  runId: string,
+  sourceTurnId: string,
+  attemptTurnId: string,
+): boolean {
+  return mutateTasks(working => {
+    const task = working.get(id);
+    const rec = task?.runRecords?.[runId];
+    if (!rec || rec.turnBindings?.[sourceTurnId] !== runId
+      || !rec.perTargetErrors?.[sourceTurnId] || rec.recoveryAttempts?.[sourceTurnId]) {
+      return { result: false, changed: false };
+    }
+    if (!rec.recoveryAttempts) rec.recoveryAttempts = {};
+    rec.recoveryAttempts[sourceTurnId] = attemptTurnId;
+    rec.turnBindings[attemptTurnId] = runId;
+    return { result: true, changed: true };
+  });
+}
+
+/** Undo only an attempt that was never accepted by the worker. */
+export function releaseRecoveryAttempt(
+  id: string,
+  runId: string,
+  sourceTurnId: string,
+  attemptTurnId: string,
+): boolean {
+  return mutateTasks(working => {
+    const rec = working.get(id)?.runRecords?.[runId];
+    if (!rec || rec.recoveryAttempts?.[sourceTurnId] !== attemptTurnId) {
+      return { result: false, changed: false };
+    }
+    delete rec.turnBindings[attemptTurnId];
+    delete rec.recoveryAttempts[sourceTurnId];
+    if (Object.keys(rec.recoveryAttempts).length === 0) delete rec.recoveryAttempts;
+    return { result: true, changed: true };
+  });
+}
+
+/** Terminal recovery cannot continue: release attempt, source, error and old record atomically. */
+export function abandonRecoveryAttempt(
+  id: string, runId: string, sourceTurnId: string, attemptTurnId: string,
+): boolean {
+  return mutateTasks(working => {
+    const task = working.get(id);
+    const rec = task?.runRecords?.[runId];
+    if (!task || !rec || rec.turnBindings?.[sourceTurnId] !== runId
+      || (rec.recoveryAttempts?.[sourceTurnId] !== undefined
+        && rec.recoveryAttempts[sourceTurnId] !== attemptTurnId)) {
+      return { result: false, changed: false };
+    }
+    delete rec.turnBindings[attemptTurnId];
+    delete rec.turnBindings[sourceTurnId];
+    delete rec.perTargetErrors[sourceTurnId];
+    if (rec.recoveryAttempts) {
+      delete rec.recoveryAttempts[sourceTurnId];
+      if (Object.keys(rec.recoveryAttempts).length === 0) delete rec.recoveryAttempts;
+    }
+    if (Object.keys(rec.perTargetErrors).length === 0) delete (rec as any).perTargetErrors;
+    pruneSettledRunRecords(task);
+    return { result: true, changed: true };
+  });
+}
+
+/** Remove one durable source binding after a terminal no longer needs recovery. */
+export function unbindRunTurnId(id: string, turnId: string, runId: string): void {
+  unbindRunTurnIds(id, [turnId], runId);
+}
+
+/** Atomically remove one terminal attempt and, when applicable, its source. */
+export function unbindRunTurnIds(id: string, turnIds: readonly string[], runId: string): void {
+  mutateTasks(working => {
+    const task = working.get(id);
+    const runRec = task?.runRecords?.[runId];
+    if (!runRec) return { result: undefined, changed: false };
+    let changed = false;
+    for (const turnId of turnIds) {
+      if (!runRec.turnBindings?.[turnId]) continue;
+      delete runRec.turnBindings[turnId];
+      changed = true;
+    }
+    if (!changed) return { result: undefined, changed: false };
+    pruneSettledRunRecords(task!);
     return { result: undefined, changed: true };
   });
 }
@@ -850,6 +1713,7 @@ export function markRun(
   });
   if (completedRepeat !== undefined) {
     logger.info(`[schedule-store] Task ${id} removed after completing ${completedRepeat} runs`);
+    taskRemovedHook?.(id);
   }
 }
 
@@ -997,6 +1861,7 @@ export function startExternalWriteWatcher(): void {
         }
         for (const id of before.keys()) {
           if (!current.has(id)) {
+            taskRemovedHook?.(id);
             dashboardEventBus.publish({ type: 'schedule.deleted', body: { id } });
           }
         }

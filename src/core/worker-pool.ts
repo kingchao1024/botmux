@@ -704,6 +704,7 @@ import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
+import { abandonRecoveryTurn, bindRecoveryTurn, releaseRecoveryTurn } from '../services/schedule-turn-binding.js';
 
 type WorkerStartupState = {
   ready: boolean;
@@ -866,7 +867,7 @@ export interface WorkerPoolCallbacks {
    * adapters use the existing debounced idle edge as a compatibility fallback. */
   onDeferredScheduleTurnSettled?: (
     ds: DaemonSession,
-    context: { turnId: string; source: 'terminal' | 'idle' },
+    context: { turnId: string; source: 'terminal' | 'idle'; workerGeneration: number },
   ) => void | Promise<void>;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
@@ -1667,6 +1668,9 @@ export function ensureOrdinaryTurnRecoveryAttached(
     cancel: timer => clearTimeout(timer),
     persist: () => sessionStore.updateSession(ds.session),
     mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
+    bindRecoveryTurn,
+    releaseRecoveryTurn,
+    abandonRecoveryTurn,
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
       // A scheduled logical turn continues as the same scheduled turn: same
@@ -6877,6 +6881,44 @@ function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
   ds.pendingSuspendReason = undefined;
   ds.pendingSuspendGeneration = undefined;
   logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
+}
+
+/**
+ * Reclaim only the per-fire, hidden `schedule-run:` worker after its exact
+ * turn has settled. A task-position schedule (`schedule-task:`), an ordinary
+ * chat/thread session, or a user/queue/tool that arrived at the boundary must
+ * keep its live worker. The common suspend path preserves the Session, rollout,
+ * and message evidence and marks it for cold resume.
+ */
+export function suspendSettledScheduleRunWorker(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+): boolean {
+  const run = ds.session.deferredScheduleRun;
+  if (run?.turnId !== turnId || !run.routingAnchor.startsWith('schedule-run:')) return false;
+  if (
+    ds.workerGeneration !== workerGeneration
+    || ds.session.workerGeneration !== workerGeneration
+  ) return false;
+  if (ds.session.status !== 'active') return false;
+  // The exact terminal is stronger than the last screen frame: some adapters
+  // publish it while their final rendered status still says "working".
+  // A terminal of the scheduled turn can race an ordinary reply, a queued
+  // activation, or a managed tool. Do not turn that later work into a cold
+  // resume; its own normal lifecycle will decide when it is safe to reclaim.
+  if (ds.activeInteractiveTurn || ds.principalLaneRunningTurn || ds.managedTurnOrigin?.turnId) return false;
+  if (hasQueuedActivationAdmissionGate(ds)) return false;
+  if (
+    ds.pendingRepo
+    || ds.pendingRepoCommitInFlight
+    || ds.worktreeCreating
+    || ds.pendingPrompt !== undefined
+    || ds.pendingRawInput !== undefined
+    || ds.pendingFollowUpInput !== undefined
+    || (ds.pendingFollowUps?.length ?? 0) > 0
+  ) return false;
+  return suspendWorker(ds, 'schedule_run_terminal');
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
@@ -13801,7 +13843,11 @@ function setupWorkerHandlers(
             && msg.turnId
             && ds.session.deferredScheduleRun?.turnId === msg.turnId
           ) {
-            void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
+            void cb.onDeferredScheduleTurnSettled?.(ds, {
+              turnId: msg.turnId,
+              source: 'idle',
+              workerGeneration,
+            });
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
@@ -15382,7 +15428,11 @@ function setupWorkerHandlers(
           });
         }
         try {
-          await cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'terminal' });
+          await cb.onDeferredScheduleTurnSettled?.(ds, {
+            turnId: msg.turnId,
+            source: 'terminal',
+            workerGeneration,
+          });
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }

@@ -119,6 +119,11 @@ import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
+import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
+import {
+  ScheduleTurnBindingOwner,
+  setScheduleTurnBindingOwner,
+} from './services/schedule-turn-binding.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
 import { ensureSchedulePreconditionRoot } from './services/schedule-precondition-store.js';
 import {
@@ -312,6 +317,7 @@ import {
   pruneSteerFanoutState,
   ensureAutomaticTaskContinuationLease,
   ensurePrincipalLaneInboundTurnBinding,
+  suspendSettledScheduleRunWorker,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
@@ -3589,7 +3595,7 @@ async function promoteMaterializedTaskPositionSession(
 
 function scheduleDeferredScheduleSettlement(
   ds: DaemonSession,
-  context: { turnId: string; source: 'terminal' | 'idle' },
+  context: { turnId: string; source: 'terminal' | 'idle'; workerGeneration: number },
 ): void {
   const run = ds.session.deferredScheduleRun;
   if (!run || run.turnId !== context.turnId) return;
@@ -3611,14 +3617,13 @@ function scheduleDeferredScheduleSettlement(
     deferredScheduleSettleTimers.delete(sessionId);
     void settleDeferredScheduleRun(ds, context, {
       reconcile: reconcileDeferredTopicBinding,
-      // Background path: no user surface, so a residual/refusal must at least be
-      // logged with its remote id instead of being discarded.
-      closeSession: (id: string) => closeSessionForBackgroundCleanup(
-        id,
-        'deferred-schedule settlement',
+      suspend: (session, turnId) => suspendSettledScheduleRunWorker(
+        session,
+        turnId,
+        context.workerGeneration,
       ),
     }).then((result) => {
-      if (result.action === 'materialized') {
+      if (result.action !== 'ignored' && result.rootMessageId) {
         logger.info(
           `[scheduler] Deferred topic materialized session=${sessionId.slice(0, 8)} root=${result.rootMessageId.slice(0, 12)}`,
         );
@@ -3637,21 +3642,17 @@ function scheduleDeferredScheduleSettlement(
             );
           });
         }
-        return;
       }
-      if (result.action === 'close_refused') {
-        // Must NOT print "Auto-closed": the row is still active and its remote
-        // session may still be running. Two contradictory log lines about the same
-        // session is exactly how a false success hides.
-        logger.error(
-          `[scheduler] Deferred run close REFUSED (${result.error ?? 'unknown'}); session stays `
-          + `ACTIVE session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
+      if (result.action === 'retained') {
+        logger.info(
+          `[scheduler] Deferred schedule run retained because a live turn, queued input, or tool still owns it `
+          + `session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
         );
         return;
       }
-      if (result.action === 'closed') {
+      if (result.action === 'suspended') {
         logger.info(
-          `[scheduler] Auto-closed silent deferred run with no botmux send `
+          `[scheduler] Suspended settled temporary schedule-run worker; session evidence is retained for cold resume `
           + `session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
         );
       }
@@ -27733,6 +27734,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
     },
   );
+  const scheduleBindings = new ScheduleTurnBindingOwner();
+  setScheduleTurnBindingOwner(scheduleBindings);
+
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -27872,6 +27876,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
       }
+      // Settle schedule terminal state when a scheduled turn completes.
+      const scheduledTaskId = parseScheduledTurnId(terminal.turnId);
+      if (scheduledTaskId) {
+        // Use the production thin adapter: parse → lookup → settle → cleanup.
+        // This replaces the old inline path with its sibling-scan fallback.
+        // Recovery continuations are bound at dispatch time via
+        // bindDispatchedTurn + lookupTaskRunId (see ensureOrdinaryTurnRecoveryAttached).
+        scheduleBindings.settle(
+          terminal.turnId,
+          terminal.status as 'completed' | 'failed' | 'cancelled' | 'ambiguous',
+          terminal.status !== 'completed' ? terminal.errorCode : undefined,
+        );
+      }
+
       const shouldAdvanceCrossPrincipal = completedTurnHasCrossPrincipalFollower(ds, terminal);
       const principalLaneTerminalOwned = !ds.session.principalLane
         || principalLaneRunningTurnMatches(ds, terminal.turnId, context.workerGeneration);
@@ -28559,6 +28577,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Build the dispatcher now for authorization replay, but start it only
     // after restore has published every durable route owner.
+
     const botEventHandlers: EventHandlers = {
       handleCardAction: (data, appId, askReceiptProvenance) => withBotTurnAdmission(
         appId,
@@ -28984,6 +29003,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // each filters to only execute tasks whose `larkAppId` matches its bot
   // (unmatched tasks are handled by the owning bot's daemon instead; a
   // missing larkAppId falls through to bot-0 as a legacy fallback).
+
   scheduler.setExecuteCallback(async (task, executionContext) => {
     const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
     let targetResults: ScheduleRunTargetResult[] | undefined;
@@ -29019,30 +29039,70 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     };
 
+    // Record taskId → runId so recovery continuations can bind their
+    // turnIds to the correct runId (see ensureOrdinaryTurnRecoveryAttached).
+    scheduleBindings.beginRun(task.id, executionContext.runId);
+
     try {
+      // Resolve targets and initialize the expected count BEFORE any
+      // target's turn becomes visible to the worker.  This ensures
+      // settleTerminalRun can apply multi-target deferred-ok semantics
+      // for the very first terminal.
+      const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
+      if (targetChatIds.length > 0) {
+        scheduleStore.setRunTargetCount(
+          task.id, targetChatIds.length, executionContext.runId,
+        );
+      }
+
       const outcome = await executeScheduledTaskWithPrecondition(
         task,
         effectiveAppId,
         async (additionalPrompt) => {
-          const targetChatIds = scheduleStore.effectiveScheduleChatIds(task);
           try {
             const results = await executeScheduledTaskForTargets(
               task,
               targetChatIds,
               targetTask => withBotTurnAdmission(
                 effectiveAppId,
-                () => executeScheduledTask(
-                  targetTask,
-                  activeSessions,
-                  refreshCliVersion,
-                  additionalPrompt,
-                ),
+                async () => {
+                  const turnId = await executeScheduledTask(
+                    targetTask,
+                    activeSessions,
+                    refreshCliVersion,
+                    additionalPrompt,
+                  );
+                  // Bind turnId → runId immediately, before withBotTurnAdmission
+                  // releases the gate and the turn becomes visible to the worker.
+                  // This eliminates the terminal-before-binding race (P1-2).
+                  if (turnId) {
+                    scheduleBindings.bindDispatch(turnId, executionContext.runId);
+                  }
+                  return turnId;
+                },
               ),
+              true,
             );
             if (targetChatIds.length > 1) targetResults = results;
           } catch (error) {
             if (error instanceof ScheduleTargetExecutionError) {
               targetResults = error.targetResults;
+              // Settle failed targets immediately — they have no turnId but
+              // must count toward settled total and write the terminal error
+              // so later success terminals from dispatched targets are
+              // blocked by the error-sticky guard (P1-3).
+              for (const r of error.targetResults) {
+                if (r.outcome === 'error') {
+                  const sourceTurnId = `dispatch-failed:${r.chatId}`;
+                  scheduleStore.bindRunTurnId(task.id, sourceTurnId, executionContext.runId);
+                  scheduleStore.settleTerminalRun(
+                    task.id, executionContext.runId, false,
+                    r.error ?? 'dispatch failed',
+                    undefined,
+                    sourceTurnId,
+                  );
+                }
+              }
             }
             throw error;
           }
@@ -29051,14 +29111,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         observation => { precondition = observation; },
       );
       appendExecutionLog(outcome === 'executed' ? 'model_dispatched' : 'precondition_skipped');
+
+      // If the task was auto-removed (finite repeat completed), clean up
+      // any remaining bindings.  Normal-path terminals would have already
+      // been consumed by onTurnTerminal.
+      if (!scheduleStore.getTask(task.id)) {
+        scheduleBindings.deleteTask(task.id);
+      }
+
       return outcome;
     } catch (error) {
       appendExecutionLog(
         'error',
         resolveScheduleRunLogErrorDetails(precondition.precondition, error),
       );
+      // If the task was removed as a side-effect of error handling, clean up.
+      if (!scheduleStore.getTask(task.id)) {
+        scheduleBindings.deleteTask(task.id);
+      }
       throw error;
     }
+  });
+  // Wire the remove-task hook so the scheduler can notify the daemon to
+  // clean up in-memory turnId→runId binding maps when a task is deleted
+  // (via dashboard, admin command, or auto-removal with finite repeats).
+  scheduler.setRemoveTaskHook((taskId: string) => {
+    scheduleBindings.deleteTask(taskId);
   });
   scheduler.setOwnerFilter(cfg.larkAppId, idx === 0);
   scheduler.startScheduler();

@@ -33,6 +33,7 @@ export interface ScheduleRunTargetResult {
   chatId: string;
   outcome: ScheduleRunTargetOutcome;
   error?: string;
+  turnId?: string;
 }
 
 export interface ScheduleRunLogEntry {
