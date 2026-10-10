@@ -128,7 +128,18 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     replyStyle: normalizeSparseReplyStyleConfig(j?.replyStyle).config ?? null,
     // 同上：非法手改值 fail-soft 丢掉，缺省（compact）以 null 表达。
     askOptionLayout: normalizeAskOptionLayout(j?.askOptionLayout).layout ?? null,
-    sandbox: j?.sandbox === true,
+    sandbox: j?.sandbox === true || j?.sandbox === 'oncall' || j?.sandbox === 'scratch',
+    sandboxMode: j?.sandboxMode === 'off' || j?.sandboxMode === 'oncall' || j?.sandboxMode === 'scratch'
+      ? j.sandboxMode
+      : (j?.sandbox === 'scratch' ? 'scratch' : j?.sandbox === true || j?.sandbox === 'oncall' ? 'oncall' : 'off'),
+    scratchStorage: j?.scratchStorage === 'disk' || j?.scratchStorage === 'tmpfs' ? j.scratchStorage : null,
+    // tmpfs-vs-disk selection exists only on Linux (full-root overlay). On
+    // macOS scratch is always APFS clonefile COW (disk-backed, swap-backed);
+    // the UI hides the storage segmented control there.
+    scratchStorageSelectable: process.platform === 'linux',
+    scratchTmpfsSizeMb: typeof j?.scratchTmpfsSizeMb === 'number' ? j.scratchTmpfsSizeMb : null,
+    scratchDenyPaths: Array.isArray(j?.scratchDenyPaths) ? j.scratchDenyPaths.filter((x: unknown) => typeof x === 'string') : null,
+    scratchSupported: j?.scratchSupported === true,
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
           readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],
@@ -163,6 +174,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommandEnabled: j?.groupJoinCommandEnabled === true,
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
+    autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
       ?? defaultSummaryRangePrefs(),
@@ -181,6 +193,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,
+    grantRequestToOwnerDm: j?.grantRequestToOwnerDm === true,
     grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'
       && GRANT_DURATION_OPTIONS.includes(j.grantDefaultDurationMs as (typeof GRANT_DURATION_OPTIONS)[number])
       ? j.grantDefaultDurationMs
@@ -189,6 +202,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
     replyDelivery: j?.replyDelivery === 'transcript' ? 'transcript' : 'send',
+    promptInjection: j?.promptInjection === 'none' ? 'none' : 'default',
     replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',
     replyDeliverySupported: j?.replyDeliverySupported === true,
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',

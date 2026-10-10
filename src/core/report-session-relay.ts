@@ -93,6 +93,43 @@ export type ReportSessionRelayDecision =
     }
   | { ok: false; status: number; error: string };
 
+/** The host already owns the exact transcript turn and reply root. Resolve
+ * only its signed dispatch binding; never guess a lead from recent activity. */
+export function prepareAutomaticDispatchReport(input: {
+  registry: Record<string, unknown>;
+  bindingSecret: string;
+  dispatchRoot?: string;
+  sourceSessionId: string;
+  sourceLarkAppId: string;
+  /** fork 决策类型要求 source.turnId（回执幂等哈希消费）；调用点本就持有当前 turnId。 */
+  sourceTurnId: string;
+  content: string;
+}): Extract<ReportSessionRelayDecision, { ok: true }> | undefined {
+  if (!input.dispatchRoot || !input.content.trim()) return undefined;
+  const resolved = resolveVerifiedDispatchReportTarget({ registry: input.registry,
+    secret: input.bindingSecret, dispatchRoot: input.dispatchRoot });
+  if (!resolved.ok || resolved.binding.targetSessionId === input.sourceSessionId) return undefined;
+  const binding = resolved.binding;
+  // fork 决策类型必填字段：reporter 即源会话所属 App；projectRequired 与 authorize 路径同规则。
+  const registryEntry = input.registry[input.dispatchRoot];
+  const projectRequired = !!registryEntry && typeof registryEntry === 'object' && !Array.isArray(registryEntry)
+    && Object.hasOwn(registryEntry, 'access');
+  return {
+    ok: true,
+    source: { sessionId: input.sourceSessionId, larkAppId: input.sourceLarkAppId, turnId: input.sourceTurnId },
+    target: { sessionId: binding.targetSessionId, larkAppId: binding.targetLarkAppId },
+    targetChatId: binding.targetChatId,
+    targetScope: binding.targetScope,
+    dispatchRoot: input.dispatchRoot,
+    sourceName: binding.sourceName,
+    content: input.content,
+    reporterAppId: input.sourceLarkAppId,
+    projectRequired,
+    // A final answer may be a question or progress. Do not infer completion.
+    projectUpdate: {},
+  };
+}
+
 export function authorizeReportSessionRelayRequest(input: {
   raw: unknown;
   trustedHost: boolean;
@@ -303,10 +340,13 @@ export function resolveReportRelayFallbackTarget(input: {
 
 export function buildOrchestratorReportTrigger(
   decision: Extract<ReportSessionRelayDecision, { ok: true }>,
-  meta: { requestId: string; receivedAt: string },
+  meta: { requestId: string; receivedAt: string; turnIdempotencyKey?: string },
   target = decision.target,
 ): Record<string, unknown> {
   return {
+    ...(meta.turnIdempotencyKey ? { options: {
+      turnIdempotencyKey: meta.turnIdempotencyKey,
+    } } : {}),
     source: {
       type: 'ui',
       connectorId: 'botmux-report',
@@ -340,9 +380,19 @@ interface ReportRelayHttpResponse {
   json(): Promise<unknown>;
 }
 
+/** A separate retry budget for the lead sink; never replay the Lark sink.
+ * The caller freezes the entire trigger payload before entering this loop. */
+export async function retryAutomaticDispatchReport(deliver: () => Promise<void>): Promise<void> {
+  for (const delay of [0, 1000, 5000]) {
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    try { await deliver(); return; }
+    catch (error) { if (delay === 5000) throw error; }
+  }
+}
+
 export async function deliverReportSessionRelay(input: {
   decision: Extract<ReportSessionRelayDecision, { ok: true }>;
-  triggerMeta: { requestId: string; receivedAt: string };
+  triggerMeta: { requestId: string; receivedAt: string; turnIdempotencyKey?: string };
   fetchTarget(path: string, init: RequestInit): Promise<ReportRelayHttpResponse>;
   postProjectUpdate(target: { larkAppId: string; sessionId: string }): Promise<{
     projectSynced: boolean;

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   authorizeReportSessionRelayRequest,
+  prepareAutomaticDispatchReport,
   buildOrchestratorReportTrigger,
   deliverReportSessionRelay,
   isReportRelayOriginalSessionUnavailable,
@@ -707,5 +708,21 @@ describe('report session relay wiring', () => {
     expect(daemonSource).toContain("const reportRequestId = 'report:' + createHash('sha256')");
     expect(daemonSource).toContain('sourceTurnId: decision.source.turnId');
     expect(daemonSource).toContain('triggerMeta: { ...triggerMeta, requestId: reportRequestId }');
+  });
+});
+
+
+describe('automatic zero-injection dispatch report', () => {
+  it('returns to the signed lead session without assuming task completion', () => {
+    const input = { registry: REGISTRY, bindingSecret: BINDING_SECRET, dispatchRoot: 'om_dispatch',
+      sourceSessionId: 'sub', sourceLarkAppId: 'cli_sub', sourceTurnId: 'turn-1', content: '测试通过' };
+    const decision = prepareAutomaticDispatchReport(input)!;
+    expect(decision.target).toEqual({ sessionId: 'session-orchestrator', larkAppId: 'cli_orchestrator' });
+    expect(decision.source).toEqual({ sessionId: 'sub', larkAppId: 'cli_sub', turnId: 'turn-1' });
+    expect(decision.content).toBe('测试通过');
+    expect(decision.projectUpdate).toEqual({});
+    expect(prepareAutomaticDispatchReport({ ...input, bindingSecret: 'forged' })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, dispatchRoot: undefined })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, sourceSessionId: 'session-orchestrator' })).toBeUndefined();
   });
 });

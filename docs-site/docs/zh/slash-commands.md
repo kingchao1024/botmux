@@ -17,6 +17,7 @@
 | `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
+| `/dismiss` | 专属会话群顶层专用：二次确认后关闭会话并解散整个群（仅建群者本人且具备操作权限；代码与 worktree 保留；私聊、普通群、子话题、adopt 会话不支持）。只想关闭会话、保留群聊请用 `/close` |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
 | `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
@@ -168,10 +169,13 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 
 | 命令 | 说明 |
 |------|------|
-| `/login` | 飞书用户授权，授权后可下载第三方卡片图片、以你身份调云文档/日历等 API |
+| `/login` | 飞书基础用户授权：消息读取、资源访问和授权续期；不默认申请云文档、通讯录或日历权限 |
+| `/login --scope <权限名> [更多权限名]` | 在基础权限上按需追加指定权限，例如 `/login --scope docx:document:readonly` |
 | `/login status` | 查看授权状态 |
 | `/login tags` | 会话群标签专项授权（消息分组权限），授权后新建会话群自动进入侧边栏分组（p2pMode=group + feed-group 标签模式用，feed-group 为默认标签模式） |
 | `/pair <配对码>` | 把 Web/Dashboard 端的会话与你的飞书身份配对（在网页端拿配对码，话题里发 `/pair <码>` 认领） |
+
+基础授权需要应用开通 `im:message:readonly`、`im:resource`、`offline_access`。其它操作若返回 `missing_scope`，按错误中的权限名使用 `/login --scope ...` 补授权，并由应用管理员先在开发者后台开通相应的用户权限。资源不可见或无访问权需要处理该资源的授权，重复 `/login` 不能解决。
 
 ## 🎭 角色（人设）
 

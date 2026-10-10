@@ -17,6 +17,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/stop` | Interrupt the current turn while keeping the session; same as the streaming card's Stop button |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
+| `/dismiss` | Top level of a dedicated session group only: after confirmation, closes the session and disbands the whole group (the creator with operator permission only; code and worktrees are kept; not supported in DMs, ordinary groups, subtopics, or adopted sessions). To keep the chat, use `/close` |
 | `/cleanup-wt <ID>` | Retry a persisted worktree cleanup after a final removal failure; revalidates authorization, active sessions, worktree identity, and safety state before deleting |
 | `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family, Codex terminal, or TraeX terminal mode) |
 | `/forklist` | Re-post the current session's forked-task panel with live/closed status and links to the child topics |
@@ -168,10 +169,13 @@ Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
 | Command | Description |
 |------|------|
-| `/login` | Lark user authorization; once authorized, you can download third-party card images and call cloud docs/calendar and other APIs as yourself |
+| `/login` | Basic Lark user authorization: read messages, access resources, and renew authorization; does not request docs, contacts, or calendar permissions by default |
+| `/login --scope <scope> [more scopes]` | Add only the requested permissions to the basic scopes, e.g. `/login --scope docx:document:readonly` |
 | `/login status` | View authorization status |
 | `/login tags` | Session-group tag authorization (feed-group scopes); once granted, new session groups auto-join your sidebar feed group (for p2pMode=group with the feed-group tag mode — the default) |
 | `/pair <pairing code>` | Pair a Web/Dashboard-side session with your Lark identity (get the pairing code on the web side, then send `/pair <code>` in the topic to claim it) |
+
+Basic authorization requires the app to enable `im:message:readonly`, `im:resource`, and `offline_access`. If another operation returns `missing_scope`, request the names reported by the error with `/login --scope ...`; the app administrator must first enable those user permissions in the developer console. Resource visibility/access errors require access to that resource, not another `/login`.
 
 ## 🎭 Roles (Personas)
 

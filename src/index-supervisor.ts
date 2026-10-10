@@ -59,6 +59,7 @@ async function main(): Promise<void> {
   const { decodeFleetLaunchPlan, FLEET_LAUNCH_PLAN_ENV } = await import('./core/fleet-launch-plan.js');
   const { drainFleetCommands } = await import('./core/fleet-command-queue.js');
   const { logger } = await import('./utils/logger.js');
+  const { FLEET_DAEMON_KILL_TIMEOUT_MS } = await import('./core/shutdown-budgets.js');
 
   // Every supervised member: the bot daemons from the validated immutable
   // launch plan PLUS the dashboard.
@@ -79,6 +80,7 @@ async function main(): Promise<void> {
     cwd: configDir,
     daemonNodeArgs: fleetDaemonNodeArgs(),
     logDir: fleetLogDir(),
+    killTimeoutMs: FLEET_DAEMON_KILL_TIMEOUT_MS,
     log: (m) => logger.info(`[supervisor] ${m}`),
   });
 

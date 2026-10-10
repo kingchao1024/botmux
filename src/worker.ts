@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { GOAL_ENV } from './workflows/v3/contract.js';
+import { supportsZeroPromptInjection } from './core/prompt-injection.js';
+import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 /**
  * Worker process: manages a single CLI PTY session + web terminal.
  * Forked by the daemon, communicates via Node.js IPC.
@@ -76,10 +79,13 @@ import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
+  firstPromptSeedStillWaiting,
+  shouldArmFirstPromptTimeoutPromptSeed,
   shouldArmPostHookPromptEvidenceFallback,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
+  screenShowsFramedPrompt,
   POST_HOOK_EVIDENCE_FALLBACK_MS,
   POST_HOOK_EVIDENCE_RETRY_MS,
 } from './utils/input-gate.js';
@@ -307,9 +313,10 @@ import {
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
-import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
+import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import { ompSessionDir } from './adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.js';
@@ -371,6 +378,19 @@ import {
   sandboxEnabled,
   localSandboxApplies,
 } from './adapters/backend/sandbox.js';
+import {
+  prepareScratchSandbox,
+  attachScratchSession,
+  scratchHostView,
+  type ScratchStorage,
+} from './adapters/backend/scratch-sandbox.js';
+import {
+  prepareMacScratchSandbox,
+  attachMacScratchSession,
+} from './adapters/backend/scratch-sandbox-darwin.js';
+import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
+import { resolveSandboxMode } from './adapters/cli/sandbox-mode.js';
+import { registerScratchView, scratchViewPath, scratchLinuxMappings, type ScratchPathMapping } from './services/scratch-host-view.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -483,6 +503,18 @@ import {
 } from './utils/runtime-screen-status.js';
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
 import { provisionCodexAuth, type CodexAuthSyncMode } from './services/codex-auth-sync.js';
+import {
+  CLAUDE_AUTH_OVERRIDE_ENV_KEYS,
+  claudeAuthOverrideKeys,
+  claudeAuthOverridesInSettingsLayers,
+  claudeStateAuthOverrides,
+  planCredentialSource,
+  readCredentialSource,
+  readCredentialSourceStamp,
+  reconcileClaudeAccountState,
+  writeCredentialSourceStamp,
+  writeFileAtomic0600,
+} from './services/cli-credential-source.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
 // (CLAUDE_CONFIG_DIR / CODEX_HOME): a stale pm2 dump can resurrect the daemon
@@ -1303,6 +1335,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(engineEnv);
     applyCodexInstanceEnv(engineEnv, cfg.cliInstanceBinding);
     // Session identity is host-owned. Pin it after the config-controlled merge,
     // matching every other backend and preventing stale owner resurrection.
@@ -1627,6 +1660,11 @@ let tmuxRestartTimer: NodeJS.Timeout | null = null;
  *  lifecycle so a 4× crash loop does not spam the Lark thread with 4 copies
  *  of the same warning. */
 let resumeFallbackNotified = false;
+/** True once the claude-family transcript bridge has SEEN the CLI session's
+ *  JSONL file exist (at attach, or lazily on first appearance). A first-turn
+ *  launch that dies before the CLI writes anything leaves no user-visible
+ *  history; its resume-fallback is a recovery detail, not context loss. */
+let cliTranscriptEverExisted = false;
 /** Skill catalog to attach to the first user turn after a prompt-less CLI restart. */
 let deferredPluginSkillCatalog: string | null = null;
 
@@ -1659,6 +1697,10 @@ function refreshCliPluginGeneration(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
 ): void {
+  if (cfg.promptInjection === 'none' && (!supportsZeroPromptInjection(cfg.cliId, cfg)
+    || process.env[GOAL_ENV.V3_MARKER] === '1')) {
+    throw new Error('零注入需要本地 CLI 支持自动获取最终回复，暂不支持远端后端或 v3 workflow');
+  }
   const bot = resolvePluginGenerationBot(cfg);
 
   const generation = prepareCliPluginGeneration({
@@ -1671,6 +1713,7 @@ function refreshCliPluginGeneration(
     workingDir: cfg.workingDir,
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
+    promptInjection: cfg.promptInjection,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
   if (generation.fatal) {
@@ -1792,6 +1835,10 @@ function provisionIsolatedBotHome(
   hookInstall: HookInstallConfig | undefined,
   codexAuthSync: CodexAuthSyncMode,
   log: (m: string) => void,
+  /** Set when `credentialsSourceDir` supplies this bot's Claude login: the shared
+   *  credential must NOT be seeded (the caller copies the source afterwards and
+   *  fails closed on error, outside this best-effort block). */
+  claudeCredFromSource = false,
 ): void {
   try {
     if (isClaude) {
@@ -1809,6 +1856,7 @@ function provisionIsolatedBotHome(
             ...hookInstall,
             configPath: isolatedSettingsPath,
             inheritClaudeEnvFrom: join(homedir(), '.claude', 'settings.json'),
+            ...(claudeCredFromSource ? { inheritClaudeEnvExclude: CLAUDE_AUTH_OVERRIDE_ENV_KEYS } : {}),
           }, hookCommandFor(cliId));
         } catch (e) {
           log(`[read-isolation] WARN per-bot settings/hook install failed: ${(e as Error).message}`);
@@ -1819,8 +1867,9 @@ function provisionIsolatedBotHome(
       // on EVERY spawn (verified: Claude logs in from that file). Refreshing here (not
       // just seeding once) means a re-login elsewhere self-heals on the next cold
       // spawn — no separate sync step needed. Same shared account for every bot.
-      const fresh = freshestClaudeCred();
+      const fresh = claudeCredFromSource ? null : freshestClaudeCred();
       if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
+      else if (claudeCredFromSource) { /* copied by the caller from credentialsSourceDir */ }
       else if (
         !existsSync(join(cdir, '.credentials.json'))
         && !claudeSettingsHasProviderAuth(isolatedSettingsPath)
@@ -2316,6 +2365,18 @@ let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 function replyDeliveryMode(): 'send' | 'transcript' {
   return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
 }
+
+function zeroPromptTerminalSync(): boolean {
+  return lastInitConfig?.promptInjection === 'none' && !lastInitConfig.adoptMode
+    && !lastInitConfig.apiOnly;
+}
+
+function notifyTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
+  if (zeroPromptTerminalSync()) {
+    send({ type: 'terminal_turn_started', turnId: turn.turnId, startedAtMs: turn.markTimeMs ?? Date.now(),
+      ...(turn.replyContextTurnId ? { replyContextTurnId: turn.replyContextTurnId } : {}) });
+  }
+}
 let closeRequested = false;
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
@@ -2584,6 +2645,14 @@ const FIRST_PROMPT_STARTUP_RECHECK_MS = 5_000;
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
+/** Last byte forwarded from a writable web-terminal client straight to the
+ *  backend. Such input bypasses the queue and in-flight tracking, so fallbacks
+ *  that trust a quiet screen must also treat it as activity. */
+let lastWebTerminalInputAtMs = 0;
+/** Monotonic count of those forwards (timestamps can collide within a millisecond). */
+let webTerminalInputGeneration = 0;
+/** webTerminalInputGeneration at the latest SessionStart boundary. */
+let webTerminalInputGenerationAtBoundary = 0;
 /** After the SessionStart signal fires, Ink's startup rendering or sibling
  *  hooks may still be active — typing immediately can trip Claude's
  *  paste-burst heuristic and the `\` soft-newline markers (claude-code
@@ -4711,7 +4780,7 @@ let bridgeStalePidStateSessionId: string | undefined;
 const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
-const bridgeQueue = new BridgeTurnQueue();
+const bridgeQueue = new BridgeTurnQueue(notifyTerminalTurnStarted);
 /** Counts background Agent/Task dispatches whose completion notification has
  *  not yet arrived. Consulted at the PTY idle edge (markPromptReady): a main
  *  turn that only went quiet because it is awaiting a background sub-agent must
@@ -4825,6 +4894,9 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   if (entries.length === 0) return;
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
+    // Preserve the previous turn's trailing update before a steer/new turn
+    // replaces the accumulator inside the throttle window.
+    flushThinkingUpdate();
     thinkingTurnKey = key;
     thinkingTurn = { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt };
     thinkingEntries = [];
@@ -4866,18 +4938,25 @@ function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn
 function scheduleThinkingEmit(): void {
   if (thinkingEmitTimer) return;
   const wait = Math.max(0, THINKING_EMIT_INTERVAL_MS - (Date.now() - thinkingLastEmitMs));
-  thinkingEmitTimer = setTimeout(() => {
-    thinkingEmitTimer = null;
-    if (!thinkingTurn || thinkingEntries.length === 0) return;
-    thinkingLastEmitMs = Date.now();
-    send({
-      type: 'thinking_update',
-      ...(sessionId ? { sessionId } : {}),
-      entries: thinkingEntries.slice(),
-      turnId: thinkingTurn.turnId,
-      ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
-    });
-  }, wait);
+  thinkingEmitTimer = setTimeout(flushThinkingUpdate, wait);
+}
+
+/** Drain a pending update synchronously before its terminal IPC. A short turn
+ * can be read in one batch; emitting after turn_terminal would open a bubble
+ * that never receives its completion. */
+function flushThinkingUpdate(): void {
+  if (!thinkingEmitTimer) return;
+  clearTimeout(thinkingEmitTimer);
+  thinkingEmitTimer = null;
+  if (!thinkingTurn || thinkingEntries.length === 0) return;
+  thinkingLastEmitMs = Date.now();
+  send({
+    type: 'thinking_update',
+    ...(sessionId ? { sessionId } : {}),
+    entries: thinkingEntries.slice(),
+    turnId: thinkingTurn.turnId,
+    ...(thinkingTurn.dispatchAttempt !== undefined ? { dispatchAttempt: thinkingTurn.dispatchAttempt } : {}),
+  });
 }
 
 function resetThinkingChannel(): void {
@@ -4906,16 +4985,28 @@ let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
-const codexBridgeQueue = new CodexBridgeQueue();
-// Structured rollout CoT: Codex response items and TraeX history mutations emit
+const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
+// Structured rollout CoT: Codex/Pi messages and TraeX history mutations emit
 // rollout reasoning/tool events attributed to the collecting turn, feeding
-// the same thinking channel as Claude's transcript attribution. Other
-// structured bridges (cursor/pi/…) never emit 'cot' events, so this observer
-// is inert for them. Local (adopt) turns are skipped for the same reason as
+// the same thinking channel as Claude's transcript attribution. The observer
+// is inert for bridges without 'cot' events. Local (adopt) turns are skipped for the same reason as
 // Claude's: no Lark turn to anchor the bubble to.
 codexBridgeQueue.setCotObserver((entries, turn) => {
   if (turn.isLocal) return;
   observeCotEntries(entries, turn);
+});
+codexBridgeQueue.setCotSupersededObserver((turn) => {
+  if (!sessionId || turn.isLocal || thinkingTurn?.turnId !== turn.turnId
+    || thinkingTurn.dispatchAttempt !== turn.dispatchAttempt) return;
+  // A successor may answer without ever producing CoT. Flush and close the
+  // retired timeline at the queue's confirmed steer edge, not its successor's
+  // first update/terminal. Never synthesize a durable terminal for this UI.
+  flushThinkingUpdate();
+  send({
+    type: 'thinking_superseded', sessionId, turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+  });
+  resetThinkingChannel();
 });
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
@@ -4983,6 +5074,8 @@ let codexAdoptStartMs: number | undefined;
  * recovery, where a few seconds of latency is acceptable. */
 let grokBridgePidProbeLastMs = 0;
 const GROK_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
+let traexBridgePidProbeLastMs = 0;
+const TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
 
 /** Adopt-only: 一次性发送的 "/adopt 前最后一轮" preamble 是否已经触发过。
  *  codexBridgeAttach 在 split-live 分支会查 history 取最后一对 user/assistant
@@ -5371,6 +5464,11 @@ function scheduleHerdrAdoptBridgeQuietEmit(): void {
 
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
+  // The transcript file exists (or just appeared): this CLI session HAS
+  // user-visible history. Recorded here so the resume-fallback notice can
+  // distinguish real context loss from a first-turn launch that died before
+  // the CLI ever wrote its session file.
+  cliTranscriptEverExisted = true;
   if (!lastInitConfig?.adoptMode) {
     // Restart recovery: if the previous generation left pending Lark turns in
     // the durable journal (worker/daemon died mid-turn), re-mark them and
@@ -6494,7 +6592,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // provider error through transcript fallback (regardless of send markers).
     if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (turn.isLocal && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+    if (turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
       continue;
@@ -6519,7 +6617,8 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
-    const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText };
+    const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText,
+      forwardLocalFinal: zeroPromptTerminalSync() };
     notifyExplicitRepliesObserved(
       turn.turnId,
       attributableExplicitReplyMarkersForTurnWindow(
@@ -6557,7 +6656,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     const postText = bridgePostText(assistantText, adoptMode);
     if (!adoptMode && postText.trim().length === 0) continue;
 
-    if (turn.isLocal) {
+    if (turn.isLocal && !zeroPromptTerminalSync()) {
       if (turn.userUuid) {
         // Local turn (adopt mode only): also surface the user prompt so the
         // Lark thread shows both sides of the exchange. User text comes from
@@ -6614,6 +6713,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       content: deliveredText,
       lastUuid,
       turnId: turn.turnId,
+      ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
     });
   }
@@ -6905,7 +7005,7 @@ function codexBridgeStartTimer(): void {
         const path = resolveFileBridgePath(lastInitConfig?.cliId, {
           sessionId: codexBridgePendingSessionId,
           cwd: lastInitConfig?.workingDir,
-          pid: codexAdoptPendingPid,
+          pid: lastInitConfig?.adoptMode ? codexAdoptPendingPid : undefined,
         });
         // Codex/TRAE defense-in-depth: resolveFileBridgePath resolves
         // sessionId-first, so a pending sid that is actually a shared-home
@@ -7341,8 +7441,7 @@ function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean)
 /** TRAE counterpart of currentCodexObservedPid: the pid of the TRAE process
  *  this worker observes (spawned child or adopted pane). Same resolution order
  *  — the wired backend.cliPid first, then the live pane child pid, then the
- *  adopt-pending pid (which is populated for TRAE too, see the codex/traex
- *  branch around line 3674). backend.cliPid is already sandbox-resolved at wire
+ *  adopt-only pending pid. backend.cliPid is already sandbox-resolved at wire
  *  time; the getChildPid() fallback is not, so descend it here too (no-op
  *  outside launcher shapes / when already a leaf). */
 function currentTraexObservedPid(): number | undefined {
@@ -7602,7 +7701,11 @@ function maybeFollowGrokSessionRotationViaPid(): void {
  * adopted pane. `codexBridgeNotifyCliSessionId` performs the drain-before-
  * detach switch and persists the newly observed native session id. */
 function maybeFollowTraexSessionRotationViaPid(): void {
-  if (!structuredBridgeIsTraex() || !codexBridgeRolloutPath || !backend) return;
+  if (lastInitConfig?.adoptMode !== true
+    || !structuredBridgeIsTraex() || !codexBridgeRolloutPath || !backend) return;
+  const now = Date.now();
+  if (now - traexBridgePidProbeLastMs < TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS) return;
+  traexBridgePidProbeLastMs = now;
   const pid = (backend as { cliPid?: number }).cliPid
     ?? backend.getChildPid?.()
     ?? codexAdoptPendingPid;
@@ -8225,12 +8328,13 @@ function emitReadyCodexTurns(): void {
     // no pending Lark fingerprint and must be forwarded like terminal
     // `/adopt`, including both the App prompt and its final reply.
     const adoptMode = terminalAdoptMode
-      || (sharedAppServerBridge && turn.isLocal === true);
+      || (sharedAppServerBridge && turn.isLocal === true && !zeroPromptTerminalSync());
     const sourceHermesSessionId = structuredBridgeIsHermes() ? turn.sourceSessionId : undefined;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     const gateInput = {
       markTimeMs: turn.markTimeMs,
       isLocal: turn.isLocal,
+      forwardLocalFinal: zeroPromptTerminalSync(),
       finalText: turn.finalText,
       terminalStatus: turn.terminalStatus,
       terminalErrorCode: turn.terminalErrorCode,
@@ -8299,7 +8403,7 @@ function emitReadyCodexTurns(): void {
     // already refuses to interpret the sentinel under adoptMode.
     const postContent = bridgePostText(content, adoptMode);
     if (!adoptMode && postContent.trim().length === 0) continue;
-    if (turn.isLocal) {
+    if (turn.isLocal && !zeroPromptTerminalSync()) {
       // Local turn (adopt only): user typed in iTerm. Surface both sides
       // so the Lark thread sees a complete exchange instead of an orphan
       // reply. formatLocalTurnFields caps both texts to keep within
@@ -8328,6 +8432,7 @@ function emitReadyCodexTurns(): void {
       content: postContent,
       lastUuid: turn.turnId,
       turnId: turn.turnId,
+      ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
       // Failure-fallback notice (not a model answer): lets the daemon add a
       // human @mention so e.g. a model-gateway outage doesn't scroll by
@@ -8392,6 +8497,7 @@ function stopCodexBridge(): void {
   codexAdoptPendingPid = undefined;
   codexAdoptStartMs = undefined;
   grokBridgePidProbeLastMs = 0;
+  traexBridgePidProbeLastMs = 0;
 }
 
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
@@ -8682,6 +8788,81 @@ function armPostHookPromptEvidenceFallback(
     // markIdle('screen') → markPromptReadyFromPty() 链路清除等待标记。
     if (idleDetector?.seedReadyEvidence()) {
       log(`Post-SessionStart evidence fallback: screen quiet ${quietMs}ms with readyPattern on screen; accepting existing prompt`);
+    }
+  }, delayMs);
+  postHookEvidenceFallbackTimer.unref?.();
+}
+
+/** 当前渲染画面里，最后一个提示符是否落在上下都有横线的输入框里（见 screenShowsFramedPrompt）。
+ *  必须 preserveFormatting：默认的 rawSnapshot() 会把 ─ 清洗成空格，框线判据永远不成立。 */
+function screenShowsFramedReadyPrompt(): boolean {
+  const pattern = cliAdapter?.readyPattern;
+  if (!pattern) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  return screenShowsFramedPrompt(screen, pattern);
+}
+
+/**
+ * First-prompt-timeout fallback: the SessionStart boundary never saw a fresh
+ * prompt and nothing was queued (see shouldArmFirstPromptTimeoutPromptSeed).
+ * Shares the post-hook fallback's timer so every spawn/kill path that clears
+ * that one clears this too. It only accepts a screen frozen since arming: any
+ * PTY output, queued or in-flight input, or a prompt that became ready by
+ * itself stops it (see firstPromptSeedStillWaiting). From then on the normal
+ * idle path owns the prompt; seeding evidence under a live turn — including
+ * one submitted straight into the web terminal, which no queue records —
+ * could finish it early.
+ */
+function armFirstPromptTimeoutPromptSeed(
+  observedBackend: SessionBackend,
+  armed: {
+    at: number;
+    outputGeneration: number;
+    webInputGeneration: number;
+    turnId: string | undefined;
+  } = {
+    at: Date.now(),
+    outputGeneration: ptyOutputGeneration.snapshot(),
+    webInputGeneration: webTerminalInputGeneration,
+    turnId: currentBotmuxTurnId,
+  },
+  delayMs: number = 0,
+): void {
+  clearPostHookEvidenceFallback();
+  postHookEvidenceFallbackTimer = setTimeout(() => {
+    postHookEvidenceFallbackTimer = null;
+    // Web-terminal input counts as activity for the quiet window too: a
+    // submission typed just before arming may not have produced output yet.
+    const quietMs = Date.now() - Math.max(lastPtyOutputAtMs, lastWebTerminalInputAtMs);
+    const decision = decidePostHookPromptEvidence({
+      stillWaiting: firstPromptSeedStillWaiting({
+        sameBackend: backend === observedBackend,
+        promptReady: isPromptReady,
+        hasPendingInput: hasPendingInputForFlush(),
+        hasUnackedInput: inflightInputs.hasUnacked(),
+        // Real PTY chunks only. An authoritative screen resync (observer
+        // reconnect) is not activity: it resets the idle detector without
+        // feeding it, so stopping here would strand the prompt again. It still
+        // restarts the quiet window, and the framed-prompt check reads the
+        // resynced screen.
+        outputSinceArm: !ptyOutputGeneration.isCurrent(armed.outputGeneration),
+        inputSinceArm: webTerminalInputGeneration !== armed.webInputGeneration
+          || currentBotmuxTurnId !== armed.turnId,
+      }),
+      // The window restarts with a resync (the only screen change that does not
+      // stop this fallback), so a late resync still gets its full quiet window.
+      elapsedMs: Date.now() - Math.max(armed.at, lastPtyOutputAtMs),
+      quietMs,
+      screenHasReadyPattern: screenShowsFramedReadyPrompt(),
+    });
+    if (decision.action === 'stop') return;
+    if (decision.action === 'retry') {
+      armFirstPromptTimeoutPromptSeed(observedBackend, armed, decision.retryInMs ?? POST_HOOK_EVIDENCE_RETRY_MS);
+      return;
+    }
+    if (idleDetector?.seedReadyEvidence()) {
+      log(`First-prompt-timeout evidence fallback: screen quiet ${quietMs}ms with a framed prompt on screen; accepting existing prompt`);
     }
   }, delayMs);
   postHookEvidenceFallbackTimer.unref?.();
@@ -9538,6 +9719,15 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   if (backend !== targetBackend || currentBotmuxTurnId !== turnId) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
+  }
+  if (delivered) {
+    // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
+    // only this exact turn BEFORE acknowledging interruption to the daemon;
+    // otherwise the caller sees interrupted while auto-restart executes it again.
+    inflightInputs.retireTurn(turnId);
+    for (let i = pendingMessages.length - 1; i >= 0; i--) {
+      if (pendingMessages[i].turnId === turnId) pendingMessages.splice(i, 1);
+    }
   }
   send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
   if (delivered) {
@@ -12192,6 +12382,20 @@ function codexAppRuntimeTypeAheadReady(): boolean {
     && codexAppInputReady;
 }
 
+/** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
+ *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
+ *  must stop while the exact native turn is awaiting activation, active, or
+ *  still hydrating its terminal. The queued follow-up is re-driven by the
+ *  normal terminal -> idle path and starts as its own turn afterwards. */
+function directRpcTurnBlocksTypeAhead(): boolean {
+  return codexRpcEngine !== undefined && (
+    rpcTurnsAwaitingActivation.size > 0
+    || rpcActiveOwners.size > 0
+    || settlingRpcTerminalOwners.size > 0
+    || rpcTerminalHydrationOwners.size > 0
+  );
+}
+
 async function flushPending(): Promise<void> {
   if (idleDetector?.isStartupPending()) return;
   // destroySession() may be asynchronous while `backend` still references the
@@ -12275,26 +12479,25 @@ async function flushPending(): Promise<void> {
   // so the gate window is correct), Claude bridge can run with type-ahead
   // again.
   //
-  // CoCo (0.120.32+) and Codex (0.134.0+) also tolerate type-ahead, but for a
-  // different reason than Claude: they park a submit-while-busy message in the
-  // TUI's own queue (CoCo: "↑ Press up to edit queued messages"; Codex:
+  // CoCo (0.120.32+) and PTY Codex (0.134.0+) also tolerate type-ahead, but for
+  // a different reason than Claude: they park a submit-while-busy message in
+  // the TUI's own queue (CoCo: "↑ Press up to edit queued messages"; Codex:
   // "Messages to be submitted after next tool call"). CoCo writes the queued
   // user event only at DEQUEUE time, so its transcript stays strictly
-  // interleaved (user1 → asst1 → user2 → asst2). Codex is an active-turn STEER:
-  // a tool-running turn pulls the queued input into the SAME turn and emits one
-  // merged final (user1 → user2 → assistant_final). CodexBridgeQueue copes with
-  // both via HOL-block-drop (see codex-bridge-queue.ts) plus the markTimeMs
-  // dequeue-time override — no queued_command upgrade like Claude's. (The
-  // submit log history.jsonl, which the adapter's writeInput verification
-  // polls, IS written at submit time even for a parked message, so verification
-  // doesn't spuriously fail either.) All behaviours verified empirically —
-  // Codex on codex-cli 0.134.0.
+  // interleaved (user1 → asst1 → user2 → asst2). PTY Codex is an active-turn
+  // STEER: a tool-running turn pulls the queued input into the SAME turn and
+  // emits one merged final (user1 → user2 → assistant_final). CodexBridgeQueue
+  // copes with both via HOL-block-drop (see codex-bridge-queue.ts) plus the
+  // markTimeMs dequeue-time override. Hybrid direct RPC is deliberately
+  // excluded while its current turn is unresolved: it only implements serial
+  // turn/start, not the Codex App runner's ordered turn/steer contract.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
     cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
     durableTurnInFlight,
     pendingMessages[0],
+    directRpcTurnBlocksTypeAhead(),
   ) && !activeTurnBlocks(pendingMessages[0] ?? {});
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
@@ -13127,16 +13330,13 @@ async function flushPending(): Promise<void> {
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
       // identically to `role:user`; CoCo parks queued submits in its TUI queue
       // and writes the user event at dequeue time (transcript stays interleaved);
-      // Codex parks them too but steers them into the active turn (which can
-      // merge into one final), and CodexBridgeQueue's HOL-block-drop attributes
-      // that correctly. Durable receiver attempts are the exception: they and
-      // adjacent IM turns wait for separate idle edges so neither can be
-      // HOL-dropped or steered into the other.
+      // PTY Codex parks them too and steers them into the active turn (which can
+      // merge into one final). Hybrid direct RPC stops here after one accepted
+      // turn/start; its queued successor waits for the native terminal and a new
+      // idle edge. Durable receiver attempts likewise stay on separate edges.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
-      // `turn/start` acknowledgement is not a terminal edge. In RPC mode a
-      // later ordinary message must wait for the exact native terminal instead
-      // of beginning a second start and receiving the same native id.
-      if (writeRpcEngine) break;
+      if (directRpcTurnBlocksTypeAhead()) break;
+      if (item.taskContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       // A type-ahead adapter may accept several queued submits in one flush.
       // Keep that optimization only within one authenticated principal: a
@@ -13249,6 +13449,7 @@ function sendToPty(
     cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
     durableTurnInFlight,
     next,
+    directRpcTurnBlocksTypeAhead(),
   ) && !activeTurnBlocks(next);
   const shouldMergeQueued = opts.dispatchAttempt === undefined && !durableTurnInFlight
     && !isFlushing && !shouldWriteNow({
@@ -13284,9 +13485,9 @@ function sendToPty(
   }
   // See flushPending: type-ahead adapters flush even while the CLI is busy.
   // Claude attributes `attachment(queued_command)` identically to `role:user`;
-  // CoCo parks queued submits and writes the user event at dequeue time; Codex
-  // parks them but steers into the active turn — CodexBridgeQueue's
-  // HOL-block-drop attributes the (possibly merged) result correctly.
+  // CoCo parks queued submits and writes the user event at dequeue time; PTY
+  // Codex parks them but steers into the active turn. Hybrid direct RPC is
+  // forced serial by directRpcTurnBlocksTypeAhead() until native terminal.
   // Type-ahead lets the message write while the CLI is BUSY — but only once the
   // TUI has booted. First-ready or positive initialization evidence proves
   // this; keep that evidence available to messages arriving after the startup
@@ -14424,17 +14625,33 @@ async function spawnCli(
       : undefined,
   );
   const riffRemoteBackend = remoteBackendFullyOffBox;
-  if (riffRemoteBackend && (cfg.sandbox === true || cfg.readIsolation === true)) {
-    log(`Sandbox flag set but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
+  // Resolve the tri-state once: 'off' | 'oncall' (fs-policy whitelist) |
+  // 'scratch' (full-root COW, adapters/backend/scratch-sandbox.ts). The env
+  // override is the operator's global force switch; legacy readIsolation
+  // implies oncall.
+  const sandboxMode = !riffRemoteBackend
+    ? resolveSandboxMode({
+      configSandbox: cfg.sandbox,
+      readIsolation: cfg.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    })
+    : 'off' as const;
+  if (riffRemoteBackend && sandboxMode !== 'off') {
+    log(`Sandbox flag set (${sandboxMode}) but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
   }
-  if (effectiveBackendType === 'mojo' && !remoteBackendFullyOffBox
-      && (cfg.sandbox === true || cfg.readIsolation === true)) {
+  if (effectiveBackendType === 'mojo' && !remoteBackendFullyOffBox && sandboxMode !== 'off') {
     // Loud on purpose: this is the combination where a mojo bot DOES execute
     // locally, so the local sandbox stays on rather than being skipped.
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
-  const sandboxRequested = !riffRemoteBackend
-    && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  const scratchRequested = sandboxMode === 'scratch';
+  const sandboxRequested = sandboxMode !== 'off';
+  if (scratchRequested && process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw new Error('sandbox "scratch" is supported only on Linux (full-root COW overlay) and macOS (APFS clonefile); use "oncall" or turn the sandbox off');
+  }
+  if (scratchRequested && cfg.readIsolation === true) {
+    throw new Error('sandbox "scratch" cannot be combined with the legacy readIsolation flag');
+  }
   if (cfg.cliLaunchMode === 'forge-traex' && sandboxRequested) {
     throw new Error('Forge x TraeX does not support sandbox/readIsolation yet');
   }
@@ -14609,13 +14826,48 @@ async function spawnCli(
   // the redirect (and its env) can't be guaranteed there → not redirected.
   const legacyHomePolicy = !cfg.cliInstanceBinding || cfg.cliInstanceBinding.source === 'legacy';
   const isolatedCodexHomeRequested = legacyHomePolicy && cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
-  const willRedirectCliData = legacyHomePolicy && shouldRedirectCliData({
+  // scratch deliberately reads the CLI's NATIVE ~/.claude/~/.codex (zero-config
+  // is the mode's point); the oncall BOT_HOME redirect does not apply there.
+  if (scratchRequested && isolatedCodexHomeRequested) {
+    throw new Error('codexAuthSync "isolated" cannot be combined with sandbox "scratch" (scratch uses the native CLI home)');
+  }
+  const willRedirectCliData = !scratchRequested && legacyHomePolicy && shouldRedirectCliData({
     sandboxRequested,
     forcePerBotHome: isolatedCodexHomeRequested,
     supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
     wrapperCli: cfg.wrapperCli,
     sessionDataDir: process.env.SESSION_DATA_DIR,
   });
+  // Per-bot credential source: decided before any provisioning so a refused
+  // plan never leaves a half-seeded data root behind. See
+  // services/cli-credential-source.ts for the fail-closed contract.
+  const credentialSourcePlan = planCredentialSource({
+    sourceDir: cfg.credentialsSourceDir,
+    cliId: cfg.cliId,
+    codexAuthSync: cfg.codexAuthSync,
+    sandboxRequested,
+    willRedirectCliData,
+    wrapperCli: cfg.wrapperCli,
+    supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
+    sessionDataDirPresent: !!process.env.SESSION_DATA_DIR,
+    isClaudeFamily: !!claudeDataDir,
+    perBotEnv: cfg.env,
+  });
+  if (credentialSourcePlan.kind === 'ineffective') {
+    log(`[credentials-source] WARN ${credentialSourcePlan.warning}`);
+  } else if (credentialSourcePlan.kind === 'refuse') {
+    throw new Error(`[credentials-source] refusing to start bot ${cfg.larkAppId}: ${credentialSourcePlan.reason}`);
+  }
+  const credentialSourceDir = credentialSourcePlan.kind === 'copy' ? credentialSourcePlan.sourceDir : undefined;
+  const credentialSourceFiles = credentialSourcePlan.kind === 'copy'
+    ? (() => {
+        try {
+          return readCredentialSource(credentialSourcePlan.sourceDir, credentialSourcePlan.family);
+        } catch (e) {
+          throw new Error(`[credentials-source] refusing to start bot ${cfg.larkAppId}: ${(e as Error).message}`);
+        }
+      })()
+    : undefined;
   if (isolatedCodexHomeRequested && !willRedirectCliData) {
     const reason = cfg.wrapperCli
       ? 'wrapperCli cannot guarantee CODEX_HOME propagation'
@@ -14654,30 +14906,79 @@ async function spawnCli(
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
-    provisionIsolatedBotHome(
-      isolationBotHome,
-      cfg.workingDir,
-      isClaudeFam,
-      cfg.cliId,
-      cliAdapter.hookInstall,
-      cfg.codexAuthSync ?? 'shared',
-      log,
-    );
-    if (isClaudeFam && effectiveReadyHookInstall) {
-      effectiveReadyHookInstall = {
-        ...effectiveReadyHookInstall,
-        configPath: join(claudeDataDir!, 'settings.json'),
-      };
-    }
-    if (cliAdapter.mcpGateway) {
-      const isolatedConfigPath = isClaudeFam
-        ? join(claudeDataDir!, '.claude.json')
-        : join(isolationBotHome, 'codex', 'config.toml');
-      const report = ensureGatewayEntry({
-        id: cliAdapter.id,
-        mcpGateway: { ...cliAdapter.mcpGateway, configPath: isolatedConfigPath },
-      });
-      if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+    // Every writer of the per-bot data root runs inside one closure: in
+    // credential-source mode it is serialized per bot (sibling sessions share
+    // <BOT_HOME>/claude), so a concurrent spawn cannot re-install a stale
+    // snapshot (shared oauthAccount / primaryApiKey) after this one's
+    // reconcile, and the post-check below sees the final state.
+    const botHome = isolationBotHome;
+    const adapter = cliAdapter;
+    const provisionBotHome = (): void => {
+      provisionIsolatedBotHome(
+        botHome,
+        cfg.workingDir,
+        isClaudeFam,
+        cfg.cliId,
+        adapter.hookInstall,
+        cfg.codexAuthSync ?? 'shared',
+        log,
+        credentialSourceFiles !== undefined,
+      );
+      if (credentialSourceFiles && claudeDataDir) {
+        // Outside provisionIsolatedBotHome's best-effort catch on purpose: a
+        // failed copy must stop the spawn, not leave an older (possibly shared-
+        // account) credential in place. Atomic 0600 replace: never writes
+        // through a planted leaf symlink, never keeps a loose mode.
+        for (const [name, raw] of Object.entries(credentialSourceFiles)) {
+          writeFileAtomic0600(join(claudeDataDir, name), `${raw}\n`);
+        }
+        // The per-bot .claude.json was seeded once from the global state: align
+        // its account identity with the source and drop any API-key login.
+        reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!);
+      }
+      if (isClaudeFam && effectiveReadyHookInstall) {
+        effectiveReadyHookInstall = {
+          ...effectiveReadyHookInstall,
+          configPath: join(claudeDataDir!, 'settings.json'),
+        };
+      }
+      if (adapter.mcpGateway) {
+        const isolatedConfigPath = isClaudeFam
+          ? join(claudeDataDir!, '.claude.json')
+          : join(botHome, 'codex', 'config.toml');
+        const report = ensureGatewayEntry({
+          id: adapter.id,
+          mcpGateway: { ...adapter.mcpGateway, configPath: isolatedConfigPath },
+        });
+        if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      }
+      if (credentialSourceFiles && claudeDataDir) {
+        // Post-condition, independent of the (best-effort) settings merge: no
+        // auth override may remain where the CLI reads it.
+        const overrides = [
+          ...claudeAuthOverridesInSettingsLayers({
+            userSettingsPath: join(claudeDataDir, 'settings.json'),
+            workingDir: cfg.workingDir,
+          }),
+          ...claudeStateAuthOverrides(join(claudeDataDir, '.claude.json')).map((k) => `.claude.json:${k}`),
+          ...claudeAuthOverrideKeys(process.env).map((k) => `worker env:${k}`),
+        ];
+        if (overrides.length) {
+          throw new Error(
+            `[credentials-source] refusing to start bot ${cfg.larkAppId}: auth overrides would bypass `
+            + `${credentialSourceDir}: ${overrides.join(', ')}`,
+          );
+        }
+        log(`[credentials-source] copied ${Object.keys(credentialSourceFiles).join(', ')} from ${credentialSourceDir}`);
+      }
+    };
+    if (credentialSourceFiles) {
+      // Lock lives in the worker data dir, outside the sandbox's reach.
+      const provisionLock = join(config.session.dataDir, 'credentials-source', `${cfg.larkAppId}.provision`);
+      mkdirSync(dirname(provisionLock), { recursive: true, mode: 0o700 });
+      withFileLockSync(provisionLock, provisionBotHome);
+    } else {
+      provisionBotHome();
     }
     if (!isClaudeFam) {
       isolatedCodexHome = join(isolationBotHome, 'codex');
@@ -15084,6 +15385,62 @@ async function spawnCli(
     }
   }
 
+  // Credential-source gate: a surviving persistent pane keeps the login its CLI
+  // started with. Reattach only when that generation's recorded source equals
+  // the configured one (both absent ≡ shared login → historical behaviour).
+  // Otherwise kill + cold-spawn so the freshly copied credential takes effect.
+  if (willReattachPersistent && persistentSessionName && effectiveBackendType !== 'pty') {
+    const launchedWith = readCredentialSourceStamp(config.session.dataDir, cfg.sessionId);
+    if (launchedWith !== (credentialSourceDir ?? null)) {
+      log(`[credentials-source] persistent pane ${cfg.sessionId} was launched with a different credential source — killing + cold-spawning`);
+      const persistentBackendType = effectiveBackendType as PersistentBackendType;
+      const persistentTarget = selectedBackend.persistentBackendTarget;
+      if (effectiveBackendType === 'zmx') {
+        ZmxBackend.killManagedSession(
+          persistentSessionName,
+          cfg.sessionId,
+          resolvedZmxSessionPid,
+          zmxEnv(process.env, resolvedZmxSocketDir),
+        );
+      } else if (persistentTarget) {
+        killPersistentBackendTarget(persistentTarget, cfg.sessionId);
+      } else {
+        killPersistentSession(persistentBackendType, persistentSessionName, cfg.sessionId);
+      }
+      const postKillProbe = effectiveBackendType === 'zmx'
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
+        : (persistentTarget
+          ? probePersistentBackendTarget(persistentTarget)
+          : probePersistentSession(persistentBackendType, persistentSessionName));
+      // Only an authoritative `missing` proves the old-account CLI is gone.
+      if (postKillProbe !== 'missing') {
+        throw new Error(
+          `[credentials-source] refusing to start session ${cfg.sessionId}: `
+          + `could not confirm stale ${effectiveBackendType} pane termination (post-kill probe: ${postKillProbe})`,
+        );
+      }
+      if (effectiveBackendType === 'zmx') {
+        resolvedZmxSessionProbe = postKillProbe;
+        resolvedZmxSessionPid = undefined;
+      } else if (effectiveBackendType === 'zellij') {
+        resolvedZellijSessionProbe = 'missing';
+      }
+      selectedBackend = selectBackend();
+      isTmuxMode = selectedBackend.isTmuxMode;
+      isPipeMode = selectedBackend.isPipeMode;
+      isZellijMode = selectedBackend.isZellijMode;
+      backend = selectedBackend.backend;
+      cliLifetimeNonce++;
+      persistentSessionName = selectedBackend.persistentSessionName;
+      willReattachPersistent = selectedBackend.isReattach === true;
+      if (willReattachPersistent) {
+        throw new Error(
+          `[credentials-source] refusing to start session ${cfg.sessionId}: backend still selects reattach after killing the stale pane`,
+        );
+      }
+    }
+  }
+
   // A pane created before asymmetric control framing has no persisted public
   // identity capable of answering this worker's fresh challenge. Never fall
   // back to terminal OSC trust: terminate it and cold-spawn a signed runner.
@@ -15100,6 +15457,13 @@ async function spawnCli(
       throw new Error(`Refusing unauthenticated Codex App reattach: could not kill stale pane (${err?.message ?? err})`);
     }
     willReattachPersistent = false;
+  }
+
+  // Record which credential source this CLI generation launches with, before
+  // spawn, so the next worker's reattach gate above can compare. A reattach
+  // keeps the existing record (it was verified equal).
+  if (!willReattachPersistent) {
+    writeCredentialSourceStamp(config.session.dataDir, cfg.sessionId, credentialSourceDir);
   }
 
   // The worker establishes trust before any runner output can be parsed. A
@@ -15292,7 +15656,17 @@ async function spawnCli(
     }
     // Single human-visible warning. Spam guard: at most once per worker
     // lifecycle (a 4× crash loop otherwise duplicates the notice).
-    if (!resumeFallbackNotified) {
+    // claude-family only: when the transcript bridge never saw the session's
+    // JSONL file, the "history" that would not carry over never existed — the
+    // fallback is recovering a first-turn launch failure, and the pending
+    // first prompt is re-queued, not lost. Notifying the user about context
+    // they never had is a false alarm. Other CLIs (no JSONL bridge) keep the
+    // legacy always-notify behavior.
+    const suppressFallbackNotice =
+      (tier1ProbeFalse || tier2ForceFresh) && claudeDataDir !== undefined && !cliTranscriptEverExisted;
+    if (suppressFallbackNotice) {
+      log(`Resume fallback notice suppressed: no CLI transcript ever existed for this session (first-turn launch recovery); nothing user-visible was lost`);
+    } else if (!resumeFallbackNotified) {
       resumeFallbackNotified = true;
       send({
         type: 'user_notify',
@@ -15491,6 +15865,7 @@ async function spawnCli(
     }
   }
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
   const cliExtra = cliAdapter.allowExtraArgs === false
     ? ''
     : (process.env.CLI_EXTRA_ARGS ?? '').trim();
@@ -15561,6 +15936,7 @@ async function spawnCli(
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
     // replyDelivery=transcript + solo：daemon 冻结在 init 上的值，系统提示改口用。
     replyDelivery: cfg.replyDelivery,
+    promptInjection: cfg.promptInjection,
     solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
@@ -15676,6 +16052,7 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
@@ -15956,7 +16333,8 @@ async function spawnCli(
   // Three-tier deny-by-default whitelist compiled to Seatbelt (darwin) or bwrap
   // (linux). Cross-bot read isolation is inherent (siblings' data simply isn't
   // exposed) — no enumeration, no deny-list to keep in sync.
-  if (sandboxRequested) {
+  // SCRATCH (Linux only) branches to its own full-root COW setup BELOW.
+  if (sandboxRequested && !scratchRequested) {
     const dataDir = process.env.SESSION_DATA_DIR;
     // FAIL-SAFE (not fail-open): a requested sandbox that can't be established
     // must be a HARD ERROR, never a silent unconfined run.
@@ -16133,6 +16511,9 @@ async function spawnCli(
     // Claude statusline 快照目录：沙盒内 `botmux statusline` 原子写 latest.json（tmp+rename
     // 需要目录可写），fs-policy 授的是这个目录；bwrap 不能 bind 不存在的源，先建好。
     try { mkdirSync(statuslineDir(dataDir, cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
+    // `botmux send` 的轮次防重登记：fs-policy 只授本会话的 turn-send-ledger/<sessionId>/
+    // 目录（记录是 tmp+rename 原子写，外加同目录的 .lock），先建好给 bwrap 当 bind 源。
+    try { mkdirSync(turnSendLedgerSessionDir(dataDir, cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
     try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }
     // (Schedules moved into each bot's BOT_HOME — the whole dir is already
     // bound readWrite for the owner, so no per-file pre-create is needed.)
@@ -16533,6 +16914,7 @@ async function spawnCli(
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,
+        useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!sbx) {
         // FAIL-SAFE: never silently run unsandboxed.
@@ -16558,6 +16940,201 @@ async function spawnCli(
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
     }
   }
+
+  // ── SCRATCH sandbox: full-root COW overlay (Linux) ──
+  // The CLI sees the whole real fs; every write copy-ups into a throwaway
+  // upper. No FsPolicy, no BOT_HOME redirect (native CLI data dirs), but the
+  // same outbox relay / seccomp marker / credential masks. Host-side readers of
+  // CLI-written files must go through the scratch path mappings (Linux merged
+  // root, macOS clone trees).
+  let scratchMergedHost: string | undefined;
+  let scratchMappings: import('./services/scratch-host-view.js').ScratchPathMapping[] | undefined;
+  /** The clone HOME the worker points its own transcript readers at (both
+   *  platforms; on Linux equals scratchMergedHost + real $HOME). */
+  let scratchHostHome: string | undefined;
+  /** In-sandbox cwd: on macOS the clone path (project key differs from host);
+   *  undefined on Linux where the in-container cwd path == the host path. */
+  let scratchChdirInSandbox: string | undefined;
+  /** NATIVE host codex/trae home for the prepare-time child env force. */
+  let scratchNativeCodexHome: string | undefined;
+  let scratchNativeTraeHome: string | undefined;
+  if (scratchRequested) {
+    const scratchDataDir = process.env.SESSION_DATA_DIR;
+    if (!scratchDataDir) {
+      throw new Error('Sandbox ENABLED (scratch) but SESSION_DATA_DIR is unset — aborting spawn to avoid an unsandboxed run');
+    }
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
+      const msg = `Sandbox ENABLED (scratch) but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn`;
+      log(msg);
+      throw new Error(msg);
+    }
+    const scratchCanonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+    const scratchHome = scratchCanonical(homedir());
+    // NATIVE host CLI-home values the child must keep seeing (captured before
+    // the worker repoints its own copies at the merged tree below).
+    const nativeCodexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
+    const nativeTraeHome = process.env.TRAE_HOME?.trim() || undefined;
+
+    // Fixed transport-credential masks (bots.json + sidecars, dashboard
+    // secret, …) + the per-session sandbox tree itself, plus user denies.
+    const credentialRules = buildCredentialIsolationRules({
+      homeDir: scratchHome,
+      botmuxHome: scratchCanonical(configuredBotmuxHome),
+      defaultBotmuxHome: scratchCanonical(defaultBotmuxHome),
+      sessionDataDir: scratchCanonical(scratchDataDir),
+    });
+    // Complete transport-credential mask. NOT just device files: enumerate
+    // bots.json + sidecars, dashboard secret, per-bot send-cred.json, webhook
+    // keys, external BOTS_CONFIG and the shared lark-cli keystore from the
+    // on-disk layout — a hand-built list once drifted and left bots.json
+    // readable inside scratch (PR #1513 review).
+    const scratchSecrets = enumerateScratchSecretPaths({
+      botmuxHomes: [...new Set([defaultBotmuxHome, configuredBotmuxHome])].map(scratchCanonical),
+      dataDirs: [scratchDataDir].map(scratchCanonical),
+      botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
+      homeDir: scratchHome,
+      sessionId: cfg.sessionId,
+    });
+    const scratchDeny = [...new Set<string>([
+      ...credentialRules.denyPaths.map(scratchCanonical),
+      ...scratchSecrets.denyPaths,
+      join(scratchCanonical(scratchDataDir), 'sandboxes', cfg.sessionId),
+      ...(cfg.scratchDenyPaths ?? [])
+        .filter((p): p is string => typeof p === 'string' && !!p)
+        .map(p => scratchCanonical(p.replace(/^~(?=\/|$)/, scratchHome))),
+    ])];
+    // This session's own trigger-user identity files (under the sealed
+    // cli-identity dir) must stay readable for the governed CLI / relay.
+    const scratchReadOnlyCarves = scratchSecrets.readOnlyCarvePaths.map(scratchCanonical);
+
+    scratchNativeCodexHome = nativeCodexHome;
+    scratchNativeTraeHome = nativeTraeHome;
+
+    if (willReattachPersistent) {
+      // Live pane across a daemon restart: the overlay/clone + pane survive;
+      // only re-wire the outbox watcher. Never remount/re-clone here.
+      if (process.platform === 'darwin') {
+        const att = attachMacScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxRelayOutbox = att.outbox;
+          scratchMappings = att.mappings;
+          scratchHostHome = att.clonedHome;
+          scratchChdirInSandbox = att.chdirInSandbox;
+          sandboxStopWatcher = startOutboxWatcher(
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          );
+          publishSandboxRelayCapability();
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+        } else {
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): no clone found — reattaching live pane as-is`);
+        }
+      } else {
+        const att = attachScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxRelayOutbox = att.outbox;
+          scratchMergedHost = att.mergedHostPath;
+          scratchMappings = scratchLinuxMappings(att.mergedHostPath);
+          scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
+          sandboxStopWatcher = startOutboxWatcher(
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          );
+          publishSandboxRelayCapability();
+          log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+        } else {
+          log(`Scratch REATTACH (${cfg.cliId}): no scratch tree found — reattaching live pane as-is`);
+        }
+      }
+    } else if (process.platform === 'darwin') {
+      // ── macOS: APFS clonefile COW clone + Seatbelt ──
+      const sbx = prepareMacScratchSandbox({
+        sessionId: cfg.sessionId,
+        dataDir: scratchDataDir,
+        chdir: cfg.workingDir,
+        home: scratchHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        denyPaths: scratchDeny,
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        net: cfg.sandboxNetwork !== false,
+      });
+      if (!sbx) {
+        throw new Error('scratch sandbox (macOS) could not be established (clonefile/Seatbelt setup failed; check same-volume and free space) — aborting, never bare-running');
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      scratchMappings = sbx.mappings;
+      scratchHostHome = sbx.clonedHome;
+      scratchChdirInSandbox = sbx.chdirInSandbox;
+      spawnCwd = sbx.chdirInSandbox;
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, scratch APFS clone): home=${sbx.clonedHome} outbox=${sbx.outbox}`);
+    } else {
+      // ── Linux: full-root COW overlay ──
+      const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
+      const sbx = prepareScratchSandbox({
+        sessionId: cfg.sessionId,
+        dataDir: scratchDataDir,
+        storage,
+        tmpfsSizeMb: cfg.scratchTmpfsSizeMb,
+        net: cfg.sandboxNetwork !== false,
+        chdir: cfg.workingDir,
+        home: scratchHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        denyPaths: scratchDeny,
+        shimBindTargets: [defaultGatewayEntry().command],
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
+        readOnlyCarvePaths: scratchReadOnlyCarves,
+      });
+      if (!sbx) {
+        throw new Error('scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot) — start a new session; never bare-running');
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      scratchMergedHost = sbx.mergedHostPath;
+      scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
+      scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, scratch full-root COW, ${storage}): merged=${sbx.mergedHostPath} outbox=${sbx.outbox}`);
+    }
+    // Host-side reads of CLI-written files (transcript bridge, rollouts, cwd
+    // products) resolve through the scratch mappings for this spawn.
+    registerScratchView(cfg.sessionId, scratchMappings);
+    if (scratchMappings && scratchHostHome) {
+      // The worker is a PER-SESSION process, so repointing these env vars here
+      // only affects THIS session's transcript finders (codex/traex honor them
+      // dynamically). The sandboxed child got its OWN values: on Linux the
+      // native homes forced back via childEnvForce; on macOS the prepare module
+      // sets HOME (and we derive the cloned codex/trae homes below).
+      const hostView = (hostPath: string): string => scratchViewPath(scratchMappings, hostPath);
+      process.env.CODEX_HOME = hostView(scratchNativeCodexHome!);
+      process.env.TRAE_HOME = hostView(scratchNativeTraeHome ?? join(homedir(), '.trae'));
+      // CLAUDE_CONFIG_DIR is deliberately NOT set: the claude bridge receives
+      // the remapped data dir explicitly at the bridge site below.
+    }
+  }
+
   // Fresh spawn on a persistent backend: write a PENDING generation proof BEFORE
   // the pane is created, then COMMIT it after spawn only once the fresh generation
   // is attributably established (see the post-spawn commit below). pty needs no
@@ -17293,7 +17870,6 @@ async function spawnCli(
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-        codexAdoptPendingPid = realPid;
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -17325,7 +17901,6 @@ async function spawnCli(
     const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, traexLauncherActive) : cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-    if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
   }
 
@@ -17358,7 +17933,6 @@ async function spawnCli(
           const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, traexLauncherActive) : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
-          if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
@@ -17390,12 +17964,23 @@ async function spawnCli(
   // fallbacks that fire for non-Claude CLIs (below).
   if (claudeDataDir && effectiveAdapterSessionId) {
     const claudeBridgeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
-    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir, claudeDataDir);
+    // Scratch: Claude writes into its NATIVE ~/.claude inside the COW view; the
+    // host-side bridge tails the same subtree THROUGH the merged root.
+    const bridgeClaudeDataDir = scratchMappings
+      ? scratchViewPath(scratchMappings, claudeDataDir)
+      : claudeDataDir;
+    // On macOS the clone cwd is a different path and Claude keys its project
+    // dir by the realpath of ITS cwd; Linux keeps the identical path. Resolve
+    // via the glob-aware helper so a long (>200-char) truncated+hashed project
+    // slug still points at the real jsonl (falls back to the slug path).
+    const bridgeCwd = scratchChdirInSandbox ?? cfg.workingDir;
+    const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
+      ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
     startBridgeWatcher(claudeJsonl, {
       cliPid: cliPid ?? undefined,
-      cliCwd: cfg.workingDir,
+      cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
-      dataDir: claudeDataDir,
+      dataDir: bridgeClaudeDataDir,
     });
   }
 
@@ -17414,6 +17999,9 @@ async function spawnCli(
   // Mode uses effectiveResume: when the resume probe flipped us to FRESH, we
   // must NOT baseline the "restored" cursor against an empty / absent store
   // (would otherwise swallow the fresh session's first turn).
+  if (zeroPromptTerminalSync()) {
+    codexBridgeQueue.setLocalTurns(true, Date.now());
+  }
   if (cfg.cliId === 'hermes') {
     hermesBridgeAttach(effectiveResume ? 'baseline-existing' : 'fresh-empty');
   } else if (cfg.cliId === 'codex') {
@@ -17961,6 +18549,7 @@ async function spawnCli(
       return;
     }
 
+    const wasAwaitingPostHookPrompt = awaitingPostSessionStartPromptEvidence;
     awaitingFirstPrompt = false;
     awaitingPostSessionStartPromptEvidence = false;
     clearPostHookEvidenceFallback();
@@ -17990,7 +18579,13 @@ async function spawnCli(
     // the previous code only logged "forcing flush" without actually flushing
     // for non-type-ahead adapters.
     if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush') {
+      const armPromptSeed = shouldArmFirstPromptTimeoutPromptSeed({
+        wasAwaitingPostHookPrompt,
+        hasPendingInput: hasPendingInputForFlush(),
+        webInputSinceBoundary: webTerminalInputGeneration !== webTerminalInputGenerationAtBoundary,
+      });
       flushPending();
+      if (armPromptSeed && backend) armFirstPromptTimeoutPromptSeed(backend);
       return;
     }
     markPromptReady();
@@ -18799,6 +19394,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
               auditTerminalInput(auditUser, msg.data);
+              lastWebTerminalInputAtMs = Date.now();
+              webTerminalInputGeneration++;
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
@@ -20361,6 +20958,9 @@ function emitTurnTerminal(
   // Revoke before publishing terminal. A stale terminal from a superseded
   // same-principal steer must not clear the newer turn's authority.
   releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+  if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
+    flushThinkingUpdate();
+  }
   send({
     type: 'turn_terminal',
     sessionId,
@@ -20659,8 +21259,8 @@ process.on('message', async (raw: unknown) => {
       // must not be appended to the bot's chat-session registry.  The
       // workflow's own event log is the source of truth for run state.
       if (msg.larkAppId && process.env.BOTMUX_WORKFLOW !== '1') {
-        // owner:false —— worker 可能由仍在跑旧代码的 daemon 从新 dist spawn 出来，
-        // 不许它首启导入/建 .db（引擎切换只能由 daemon 自己做），只按 db-else-json 读。
+        // owner:false —— worker 不得首启导入/建 .db（引擎切换只能由 daemon 自己做）。
+        // 无 .db 而有 leftover JSON 时 load() 记为 unmigrated，getSession 抛错。
         sessionStore.init(msg.larkAppId, { owner: false });
       }
       if (msg.cliId === 'codex-app') {
@@ -21683,6 +22283,7 @@ process.on('message', async (raw: unknown) => {
         readyPatternSeenDuringHold = false;
         idleDetector?.resetReadyEvidence();
         lastPtyOutputAtMs = Date.now();
+        webTerminalInputGenerationAtBoundary = webTerminalInputGeneration;
         log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
         if (armPostHookFallback) armPostHookPromptEvidenceFallback();
       }

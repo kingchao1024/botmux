@@ -2092,6 +2092,32 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — autoStartExcludedChats', () => {
+  it('validates IDs, normalizes duplicates, exposes saved values and supports clearing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-exclusions-'));
+    const prev = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = join(dir, 'bots.json');
+      writeFileSync(process.env.BOTS_CONFIG, JSON.stringify([{ larkAppId: 'app_exclusions', larkAppSecret: 'secret', cliId: 'claude-code' }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId('app_exclusions');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const save = (ids: unknown) => fetch(`${base}/api/bot-card-prefs`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ autoStartExcludedChats: ids }) });
+      expect((await save([' oc_one ', 'oc_one', 'oc_two'])).status).toBe(200);
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ autoStartExcludedChats: ['oc_one', 'oc_two'] });
+      for (const invalid of ['oc_one', [42], ['om_message'], ['oc_']]) expect((await save(invalid)).status).toBe(400);
+      expect(getBot('app_exclusions').config.autoStartExcludedChats).toEqual(['oc_one', 'oc_two']);
+      expect((await save([])).status).toBe(200);
+      expect(getBot('app_exclusions').config.autoStartExcludedChats).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — autoInviteOwnerOnGroupAdd', () => {
   it('is default-on, persists explicit false, and rejects non-boolean values fail-closed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-invite-owner-'));
@@ -2877,6 +2903,65 @@ describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
       expect(bogus.status).toBe(400);
       expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].p2pOpen).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-grant-prefs — grantRequestToOwnerDm (申请卡转投 owner 私聊)', () => {
+  it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-owner-dm-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-owner-dm-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.grantRequestToOwnerDm).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).grantRequestToOwnerDm).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
+
+      const bogus = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: 'on' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -3790,7 +3875,7 @@ describe('GET /api/sessions', () => {
     } finally {
       usageSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3836,7 +3921,7 @@ describe('GET /api/sessions', () => {
       });
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -3919,6 +4004,57 @@ describe('GET /api/sessions/:sessionId/usage', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/live-stage', () => {
+  const path = '/api/sessions/handoff-fixture/live-stage';
+  const event = { turnId: 'trg_fixture', sequence: 1, kind: 'stage', title: '等待验证' };
+
+  it('requires host authentication before forwarding a validated event', async () => {
+    const ds = { session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group' } as any;
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const body = JSON.stringify(event);
+      const denied = await requestJson(handle.port, path, { method: 'POST', body });
+      expect(denied.status).toBe(401);
+      expect(update).not.toHaveBeenCalled();
+      const accepted = await requestJson(handle.port, path, {
+        method: 'POST', body, headers: trustedHostHeaders('POST', path, handle.port),
+      });
+      expect(accepted.status).toBe(200);
+      expect(update).toHaveBeenCalledExactlyOnceWith(ds, event);
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('rejects malformed, missing and API-only targets without card effects', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const post = (value: unknown) => requestJson(handle!.port, path, { method: 'POST', body: JSON.stringify(value) });
+      expect((await post({ ...event, kind: 'complete' })).status).toBe(400);
+      expect((await post(event)).json.error).toBe('session_not_active');
+      find.mockReturnValue({ session: { status: 'active' }, chatId: 'http_async_fixture', scope: 'chat', chatType: 'group' } as any);
+      expect((await post(event)).json.error).toBe('live_stage_unavailable');
+      expect(update).not.toHaveBeenCalled();
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('returns a conflict when a delayed connector event belongs to an old turn', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group',
+    } as any);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockRejectedValue(new Error('stale_live_stage'));
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await requestJson(handle.port, path, { method: 'POST', body: JSON.stringify(event) });
+      expect(res.status).toBe(409);
+      expect(res.json).toEqual({ ok: false, error: 'stale_live_stage' });
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/rename', () => {
   it.each([
     ['codex', '/bin/codex'],
@@ -3932,7 +4068,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
     let findSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       const session = sessionStore.createSession('oc_rename', 'om_rename', 'Old title', 'group');
       session.cliId = cliId;
       session.cliPathOverride = cliPathOverride;
@@ -3998,7 +4134,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
     } finally {
       findSpy?.mockRestore();
       off();
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4029,7 +4165,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
     const off = dashboardEventBus.subscribe(e => seen.push(e));
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       const session = sessionStore.createSession('oc_lock', 'om_lock', 'lock me', 'group');
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -4058,7 +4194,7 @@ describe('POST /api/sessions/:sessionId/lock', () => {
       expect(sessionStore.getSession(session.sessionId)?.locked).toBeUndefined();
     } finally {
       off();
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -4163,7 +4299,7 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
         getActiveCount: () => 0,
         closeSession: vi.fn(),
       });
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = previousDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -4958,7 +5094,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     let handle: IpcServerHandle | undefined;
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume_null', 'om_resume_null', 'resume null body', 'group');
@@ -5062,7 +5198,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       replySpy.mockRestore();
       deleteSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -5075,7 +5211,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_listener', 'oc_listener', '[Meeting] meeting-42', 'group');
@@ -5110,7 +5246,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -5124,7 +5260,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
@@ -5150,7 +5286,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -5166,7 +5302,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry);
 
       const session = sessionStore.createSession('oc_resume', 'om_resume', 'resume topic', 'group');
@@ -5191,7 +5327,7 @@ describe('POST /api/sessions/:sessionId/resume', () => {
     } finally {
       forkSpy.mockRestore();
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -5245,7 +5381,7 @@ describe('GET /api/events', () => {
     const registry = new Map<string, any>();
     try {
       config.session.dataDir = dataDir;
-      sessionStore.init();
+      sessionStore.init('test-app');
       workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
 
       const session = sessionStore.createSession('oc_zombie', 'om_zombie', 'zombie topic', 'group');
@@ -5265,7 +5401,7 @@ describe('GET /api/events', () => {
       expect(typeof ev!.body.session.closedAt).toBe('number');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
@@ -7877,6 +8013,82 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists, validates, cold-reads and clears dshProfile through bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-dsh-profile-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-dsh-profile-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'dsh',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-agent`;
+
+      const invalid = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '../outside' }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'invalid_dsh_profile' });
+
+      const saved = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '  custom-profile_1  ' }),
+      });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, dshProfile: 'custom-profile_1' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBe('custom-profile_1');
+      expect(getBot(appId).config.dshProfile).toBe('custom-profile_1');
+      expect(botRegistry.loadBotConfigAtIndex(0).dshProfile).toBe('custom-profile_1');
+
+      // Old clients omit the field; retain the configured profile on dsh.
+      const preserved = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '' }),
+      });
+      expect(preserved.status).toBe(200);
+      expect(await preserved.json()).toMatchObject({ dshProfile: 'custom-profile_1' });
+
+      const cleared = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '   ' }),
+      });
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ dshProfile: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBeUndefined();
+      expect(getBot(appId).config.dshProfile).toBeUndefined();
+
+      await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: 'custom' }),
+      });
+      const switched = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'claude-code', model: '' }),
+      });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ dshProfile: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBeUndefined();
+      expect(getBot(appId).config.dshProfile).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unsettled Codex App session before config/readIsolation mutation or close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-pending-ipc-'));
     const dataDir = join(dir, 'data');
@@ -7951,7 +8163,7 @@ describe('PUT /api/bot-agent', () => {
       expect(send).not.toHaveBeenCalled();
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -8009,7 +8221,7 @@ describe('PUT /api/bot-agent', () => {
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliId).toBe('traex');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -8059,7 +8271,7 @@ describe('PUT /api/bot-agent', () => {
       expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(false);
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -8420,7 +8632,7 @@ describe('PUT /api/bot-agent riff backend pairing', () => {
         .toHaveProperty('closedMismatchedFailed');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -10782,6 +10994,51 @@ describe('PUT /api/bot-idle-suspend-minutes — 空闲会话自动休眠 TTL', (
       expect(await clear.json()).toMatchObject({ ok: true, idleSuspendMinutes: null });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].idleSuspendMinutes).toBeUndefined();
       expect(getBot(appId).config.idleSuspendMinutes).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — tool result preference', () => {
+  it('persists tool result visibility without changing CoT visibility', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-modes-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-reply-modes-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+      }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
+      for (const [patch, enabled] of [
+        [{ thinkingCardToolResult: false }, true],
+        [{ thinkingCardToolResult: true }, true],
+      ] as const) {
+        const result = await fetch(url, {
+          method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),
+        });
+        expect(result.status).toBe(200);
+        expect(await result.json()).toMatchObject({ ok: true, cotEnabled: enabled });
+        expect(loadBotConfigs()[0].cotEnabled !== false).toBe(enabled);
+        const stored = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (patch.thinkingCardToolResult === false) {
+          expect(stored.thinkingCardToolResult).toBe(false);
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBe(false);
+        } else {
+          expect(stored).not.toHaveProperty('thinkingCardToolResult');
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBeUndefined();
+        }
+      }
+      expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;

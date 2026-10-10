@@ -52,6 +52,10 @@ export interface OnlineDaemonInfo {
   receiptAuthorityActivationEpoch?: string;
   /** Exact graceful-shutdown protocol armed by this daemon generation. */
   supervisorShutdownProtocol?: string;
+  /** Presence-based session-store capability. Copy only; never a write permit. */
+  sessionStoreProtocol?: string;
+  /** Running binary version. Copy only; never compared by size. */
+  botmuxVersion?: string;
   botName?: string;
   cliId?: string;
   botAvatarUrl?: string;
@@ -379,6 +383,14 @@ function parseDescriptor(
       : {}),
     ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
       ? { workflowIpcProtocol: d.workflowIpcProtocol }
+      : {}),
+    // 上游新增能力字段（8271df51 会话库协议收口）：透传给 dashboard 的版本/
+    // 协议展示与升级可见性，fork 的 generation 发现架构不能把它们吃掉。
+    ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
+      ? { sessionStoreProtocol: d.sessionStoreProtocol }
+      : {}),
+    ...(typeof d.botmuxVersion === 'string' && d.botmuxVersion
+      ? { botmuxVersion: d.botmuxVersion }
       : {}),
     ...(typeof d.receiptAuthorityProtocolVersion === 'number'
       ? { receiptAuthorityProtocolVersion: d.receiptAuthorityProtocolVersion }

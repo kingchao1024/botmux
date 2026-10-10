@@ -123,9 +123,13 @@ export const messages: Record<string, string> = {
   'card.grant.body_request': '发送方 **{name}** 申请在本群使用我。<at id={owner}></at> 是否允许 ta 在本群与我对话？',
   'card.grant.body_owner': '是否授权 **{name}** 在本群与我对话？（<at id={owner}></at>）',
   'card.grant.body_owner_multi': '是否授权 {names} 在本群与我对话？（<at id={owner}></at>）',
+  'card.grant.body_request_p2p': '**{name}** 在私聊中申请与我对话，是否允许？',
+  'card.grant.body_request_remote': '**{name}** 在群「{chat}」@ 了我并申请使用；该群没有 Bot 管理员，申请已转到你的私聊。是否允许 ta 在该群与我对话？',
   'card.grant.btn_chat': '授权本群对话',
   'card.grant.btn_global': '全局授权对话',
   'card.grant.btn_deny': '拒绝',
+  'card.grant.btn_chat_p2p': '授权私聊对话',
+  'card.grant.btn_chat_remote': '授权该群对话',
   'card.grant.duration_label': '有效期',
   'card.grant.duration_3600000': '1 小时',
   'card.grant.duration_28800000': '8 小时',
@@ -148,6 +152,12 @@ export const messages: Record<string, string> = {
   'card.grant.partial_failed': '⚠️ 以下目标授权失败（可重新 /grant 重试）：{names}',
   'card.grant.notify_chat': '✅ {at} 已获授权在本群使用我，发消息 @ 我即可。',
   'card.grant.notify_global': '✅ {at} 已获全局授权，在任意群发消息 @ 我即可。',
+  'card.grant.notify_owner_p2p': '✅ 已授权 {at} 私聊与我对话。',
+  'card.grant.notify_owner_remote': '✅ 已授权 {at} 在群「{chat}」与我对话。',
+  'card.grant.request_forwarded': '已向 Bot 管理员提交使用申请，通过后会自动继续处理你的消息。',
+  'card.grant.requester_granted_p2p': '✅ 管理员已同意你的使用申请，可以直接私聊我了。',
+  'card.grant.requester_denied_p2p': '你的使用申请未通过。',
+  'card.grant.requester_denied_chat': '{at} 的使用申请未通过。',
   'card.grant.notify_quota_suffix': '（消息额度 {n} 条，用尽后自动收回授权）',
   'card.grant.notify_expiry_suffix': '（有效至 {time}）',
   'card.grant.result_expiry': '有效至：{time}',
@@ -155,6 +165,7 @@ export const messages: Record<string, string> = {
 
   // 消息额度用尽
   'quota.exhausted_notify': '⚠️ {at} 的消息额度已用尽（{limit}/{limit}），已收回与我的对话授权。如需继续，请联系 owner 重新 /grant。',
+  'quota.exhausted_notify_reapply': '⚠️ {at} 的消息额度已用尽（{limit}/{limit}），已收回与我的对话授权。再发消息会自动向 Bot 管理员申请新的额度。',
 
   // 被授权人命令限制（restrictGrantCommands 开启时）
   'cmd.grant_restricted': '⚠️ 当前授权仅允许普通对话，不能使用 {cmd} 等命令。如需放开请联系 owner。',
@@ -307,6 +318,19 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.close.tag_updated': '🏷️ 当前群已移入「{name}」。',
+  'cmd.close.tag_failed': '⚠️ 会话已关闭，但标签切换未完成；群聊与历史保留，请检查标签授权或手动调整分组。',
+  'cmd.dismiss.owner_only': '⚠️ 仅建群用户本人且具备 Bot 操作权限时可以解散会话群。',
+  'cmd.dismiss.unsupported': '⚠️ /dismiss 仅支持当前 Bot 创建的专属会话群顶层，不适用于私聊、普通群、子话题或接入的共享会话。',
+  'cmd.dismiss.usage': '用法：发送 `/dismiss`，阅读影响说明后再发送返回的确认命令。',
+  'cmd.dismiss.confirm': '⚠️ 将关闭当前会话并解散整个会话群，所有群成员都会受影响，无法通过恢复会话重建原群。代码和 worktree 不会删除。\n\n确认继续，请发送：\n`{command}`\n\n只想关闭会话并保留群聊，请用 `/close`。',
+  'cmd.dismiss.other_sessions': '⚠️ 群里还有其它活跃会话，未解散群。请先逐一处理其它会话，再发送 /dismiss。',
+  'cmd.dismiss.changed': '⚠️ 群的会话状态发生变化，未解散群。请重新发送 /dismiss 确认。',
+  'cmd.dismiss.close_failed': '⚠️ 未能确认当前会话安全关闭，未解散群。请检查会话状态后重试。',
+  'cmd.dismiss.residual': '⚠️ 会话关闭后仍有未确认清理的运行时残留，未解散群。请先人工检查。',
+  'cmd.dismiss.disband_failed': '⚠️ 当前会话已关闭，但飞书未确认群解散。请检查 Bot 是否有群主或创建者代群主权限，再发送 /dismiss 重试。',
+  'cmd.dismiss.dismissed': '✅ 当前会话已关闭，会话群已解散。代码和 worktree 保留。',
+  'cmd.dismiss.unavailable': '⚠️ 无法确认操作结果，未继续解散。请检查群及会话状态后重试 /dismiss。',
   'cmd.close.refused': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话可能仍在运行，请稍后重试 /close。',
   'cmd.close.refused_with_task': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话 id：`{taskId}`。远端会话可能仍在运行，请稍后重试 /close。',
   'cmd.insight.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /insight。',
@@ -457,7 +481,7 @@ export const messages: Record<string, string> = {
   // 以及怎么补。只说「拒绝」会让人反复重试同一条命令。
   // bytedcli 走 ByteCloud SSO，跟飞书是两个身份提供方，必须各授权一次。
   'cmd.login.scope_title': '🔐 飞书用户授权（追加权限）',
-  'cmd.login.scope_usage': '用法：/login --scope <权限名> [更多权限名]\n例如：/login --scope docx:document\n权限名可以从命令的报错里直接抄——飞书被拒时会告诉你缺哪个。',
+  'cmd.login.scope_usage': '用法：/login --scope <权限名> [更多权限名]\n例如：/login --scope docx:document:readonly\n权限名可以从命令的报错里直接抄——飞书被拒时会告诉你缺哪个。',
   'cmd.login.scope_unknown': '❌ 这些不是有效的飞书权限名：{scopes}\n拼错会让整个授权链接失效。请照着报错里的 missing_scopes 原样填。',
   'cmd.login.scope_footer': '本次额外申请：{scopes}\n授权完成后重试刚才的操作即可。',
   'cmd.login.bytedcli_title': '🔐 ByteCloud（bytedcli）授权',
@@ -674,6 +698,7 @@ export const messages: Record<string, string> = {
   'config.label.disableCliBypass': '关绕过·更安全',
   'config.label.restrictGrantCommands': '被授权人仅对话',
   'config.label.p2pOpen': '私聊全开',
+  'config.label.grantRequestToOwnerDm': '申请卡转投私聊',
   'card.config.note': '🟢=开 ⚪=关，点一下即切换并刷新（model/cli 下个新会话起效）。语言：`/botconfig zh`｜`/botconfig en`。\n更多字段点「✏️ 文本设置」；allowedUsers / oncall 用 `/botconfig help`。',
   'card.config.text_btn': '✏️ 文本设置',
   'card.config.text_title': '✏️ {name} · 文本设置',
@@ -790,6 +815,7 @@ export const messages: Record<string, string> = {
 
   // ─── /help ───────────────────────────────────────────────────────────────
   'help.heading_session': '📌 会话管理：',
+  'help.dismiss': '/dismiss    - 二次确认后关闭会话并解散专属会话群',
   'help.close': '/close      - 关闭当前会话，终止 {cliName} 进程',
   'help.cleanup_wt': '/cleanup-wt <ID> - 重试失败的 worktree 清理任务',
   'help.lane': '/lane status|close - 查看或安全关闭本人的独立 lane（关闭前会保护未提交和未推送成果）',
@@ -902,7 +928,7 @@ export const messages: Record<string, string> = {
   // 转发，系统提示彻底不提 botmux send——intro 换成下面这条，usage_* 只留
   // helpers / silence（见 shared-hints.ts）。
   'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，直接作答即可。',
-  'ai.send.after_success_hint': '若还有要发给用户的内容，继续 `botmux send`；没有了就让最终回复只输出 BOTMUX_NOTHING_TO_SEND。',
+  'ai.send.after_success_hint': '本次发送已完成。若本轮 final 后仍需补充，请使用 `botmux send --response-kind auxiliary`；没有了就让最终回复只输出 BOTMUX_NOTHING_TO_SEND。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
   // 提示模型完成时用 --response-kind final 发完整答复。
   'ai.send.after_success_unified': '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。',
@@ -1104,6 +1130,21 @@ export const messages: Record<string, string> = {
   'card.action.stop_sent': '⏹ 已发送停止信号（^C），会话保留',
   'card.action.stop_unsupported': '⚠️ 当前 CLI 模式不支持卡片停止（实验性 RPC 输入 / App Runner），请用 /close 关闭会话',
   'card.action.stop_no_worker': '⚠️ CLI 未运行，无法停止',
+  'card.effort.select': '思考强度',
+  'card.effort.low': '低',
+  'card.effort.medium': '中',
+  'card.effort.high': '高',
+  'card.effort.xhigh': '很高',
+  'card.effort.max': '最高（max）',
+  'card.effort.ultra': '极高（ultra）',
+  'card.effort.scope': '仅当前会话 · 空闲时可保存，下次冷启动生效',
+  'card.effort.pending': '待生效 · 已保存，下次冷启动应用；当前进程与服务保持运行',
+  'card.effort.saved': '已保存当前会话强度；下次冷启动生效，不重启当前服务。',
+  'card.effort.busy': '本轮仍在执行或准备中，请结束后再切换。',
+  'card.effort.unsupported': '当前会话不支持卡片切换思考强度。',
+  'card.effort.invalid': '当前模型不支持该思考强度。',
+  'card.effort.stale': '卡片已更新，请在最新会话卡片上选择。',
+  'card.effort.unavailable': '会话不可用或你没有操作权限。',
   'card.action.compact_sent': '🗜️ 已发送 /compact 到 {cliName}',
   'card.action.compact_no_worker': '⚠️ CLI 未运行，无法压缩',
   'card.action.compact_unsupported': '⚠️ 当前环境不支持卡片压缩，请直接发送 /compact',

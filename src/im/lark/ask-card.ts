@@ -709,7 +709,8 @@ function appendActionRows(
 ): void {
   if (layout === 'vertical') {
     // 竖放：一行一按钮。单列 column_set（flex_mode:'none' + weighted 列宽）让按钮
-    // 占满整行宽度，长选项标签不被同排按钮挤压。
+    // 单列排布，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
+    // 受支持，无需迁移 schema 2.0。
     for (const action of actions) {
       elements.push({
         tag: 'column_set',
@@ -723,6 +724,7 @@ function appendActionRows(
   // compact：一行最多 MAX_BUTTONS_PER_ACTION_ROW 个按钮。Card JSON 2.0 废弃了
   // 旧版 `tag:'action'` 容器，横排用 column_set（flex_mode:'flow' + width:'auto'
   // 列，按钮按内容宽度排列）表达，与 turn-reply-ask-elements 的内联 ask 同款。
+  // （canonical 有意与上游保持差异：上游 compact 仍是 1.0 action 行，见 48af7e43。）
   for (let i = 0; i < actions.length; i += MAX_BUTTONS_PER_ACTION_ROW) {
     elements.push({
       tag: 'column_set',

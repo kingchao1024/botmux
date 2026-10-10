@@ -23,8 +23,9 @@ describe('daemon Codex App workflow prompt lanes', () => {
       .toBeLessThan(block.indexOf('content = workflowGrillPrompt;'));
     // 话题上下文 (topicThreadContext) 必须双 lane 下发：既进 legacy promptContent，
     // 也进 codex-app 结构化 sidecar codexAppMessageContext，否则 codex-app bot 静默丢话题历史。
+    // fork 侧恢复路径会重算回写这两个变量，故声明为 let（上游为 const）。
     expect(block).toContain("let codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');");
-    expect(block).toContain('let promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
+    expect(block).toContain(': topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
     expect(block).toContain('pendingCodexAppText: codexAppVisibleText');
     expect(source).toContain('codexAppText: ds.pendingCodexAppText');
     expect(block.match(/forkReservedInitialSession\(ds, availableBots, trustedCaller\)/g)).toHaveLength(2);
@@ -42,6 +43,7 @@ describe('daemon Codex App workflow prompt lanes', () => {
     expect(block).toContain(
       'rewrittenCodexAppMessageContext = initialCodexAppMessageContext + workflowPrompt;',
     );
+    // 同上：fork 恢复路径会重算回写，声明为 let（上游为 const）。
     expect(block).toMatch(
       /let codexAppMessageContext = rewrittenCodexAppMessageContext\s*\?\? initialCodexAppMessageContext;/,
     );

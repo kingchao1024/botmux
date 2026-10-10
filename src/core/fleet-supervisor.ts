@@ -46,6 +46,7 @@ import { readDeviceIsolationRosterSnapshot } from '../services/device-isolation-
 import { FileLockTimeoutError } from '../utils/file-lock.js';
 import { botProcessName } from '../setup/bot-config-editor.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import { FLEET_DAEMON_KILL_TIMEOUT_MS } from './shutdown-budgets.js';
 
 export interface FleetBotSpec {
   /** botmux-<index> process name (or 'botmux-dashboard' for the dashboard). */
@@ -210,7 +211,7 @@ export class FleetSupervisor {
 
   constructor(private readonly opts: FleetSupervisorOptions) {
     this.policy = opts.policy ?? DEFAULT_RESTART_POLICY;
-    this.killTimeoutMs = opts.killTimeoutMs ?? 8000;
+    this.killTimeoutMs = opts.killTimeoutMs ?? FLEET_DAEMON_KILL_TIMEOUT_MS;
     this.startupAdmissionLockWaitMs = opts.startupAdmissionLockWaitMs ?? 5_000;
     this.startupAdmissionRetryMs = opts.startupAdmissionRetryMs ?? 250;
     this.log = opts.log ?? ((m) => console.error(`[fleet-supervisor] ${m}`));
