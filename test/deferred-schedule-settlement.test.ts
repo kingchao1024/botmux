@@ -27,54 +27,64 @@ function makeSession(): DaemonSession {
 }
 
 describe('deferred schedule turn settlement', () => {
-  it('auto-closes an unmaterialized hidden run at exact terminal completion', async () => {
-    const closeSession = vi.fn(async () => ({ ok: true as const }));
-    const result = await settleDeferredScheduleRun(makeSession(), {
+  it('suspends an unmaterialized hidden run at exact terminal completion without closing its evidence', async () => {
+    const ds = makeSession();
+    const suspend = vi.fn(() => true);
+    const result = await settleDeferredScheduleRun(ds, {
       turnId: 'schedule:task-1:run-1', source: 'terminal',
-    }, { reconcile: () => undefined, closeSession });
+    }, { reconcile: () => undefined, suspend });
 
-    expect(result).toEqual({ action: 'closed' });
-    expect(closeSession).toHaveBeenCalledWith('sess-deferred');
+    expect(result).toEqual({ action: 'suspended' });
+    expect(suspend).toHaveBeenCalledWith(ds, 'schedule:task-1:run-1');
+    expect(ds.session.status).toBe('active');
   });
 
-  it('retains a materialized session for human follow-ups', async () => {
-    const closeSession = vi.fn(async () => ({ ok: true as const }));
+  it('suspends a materialized run after preserving its reply-thread evidence', async () => {
+    const suspend = vi.fn(() => true);
     const result = await settleDeferredScheduleRun(makeSession(), {
       turnId: 'schedule:task-1:run-1', source: 'terminal',
-    }, { reconcile: () => 'om_materialized', closeSession });
+    }, { reconcile: () => 'om_materialized', suspend });
 
-    expect(result).toEqual({ action: 'materialized', rootMessageId: 'om_materialized' });
-    expect(closeSession).not.toHaveBeenCalled();
+    expect(result).toEqual({ action: 'suspended', rootMessageId: 'om_materialized' });
+    expect(suspend).toHaveBeenCalledTimes(1);
   });
 
   it('ignores stale turn edges and non-idle screen fallbacks', async () => {
     const ds = makeSession();
-    ds.lastScreenStatus = 'working';
-    const closeSession = vi.fn(async () => ({ ok: true as const }));
-    const deps = { reconcile: vi.fn(() => undefined), closeSession };
+    const suspend = vi.fn(() => true);
+    const deps = { reconcile: vi.fn(() => undefined), suspend };
 
     expect(await settleDeferredScheduleRun(ds, {
       turnId: 'schedule:task-1:stale', source: 'terminal',
     }, deps)).toEqual({ action: 'ignored' });
+    ds.lastScreenStatus = 'working';
     expect(await settleDeferredScheduleRun(ds, {
       turnId: 'schedule:task-1:run-1', source: 'idle',
     }, deps)).toEqual({ action: 'ignored' });
     expect(deps.reconcile).not.toHaveBeenCalled();
-    expect(closeSession).not.toHaveBeenCalled();
+    expect(suspend).not.toHaveBeenCalled();
   });
 
+  it('settles a matching idle edge for a screen-only adapter', async () => {
+    const ds = makeSession();
+    const suspend = vi.fn(() => true);
 
-  it('does NOT report closed when the close is refused', async () => {
-    // A refused close leaves the row ACTIVE. Reporting it as `closed` is the same
-    // false success this work removes, only at the settlement seam — and the
-    // daemon would then log "Auto-closed" for a session that is still running.
-    const closeSession = vi.fn(async () => ({ ok: false as const, error: 'mojo_cancel_failed' }));
+    const result = await settleDeferredScheduleRun(ds, {
+      turnId: 'schedule:task-1:run-1', source: 'idle',
+    }, { reconcile: () => undefined, suspend });
+
+    expect(result).toEqual({ action: 'suspended' });
+    expect(suspend).toHaveBeenCalledWith(ds, 'schedule:task-1:run-1');
+  });
+
+  it('retains the worker when a newer turn, queued input, or tool still owns it', async () => {
+    const suspend = vi.fn(() => false);
 
     const result = await settleDeferredScheduleRun(makeSession(), {
       turnId: 'schedule:task-1:run-1', source: 'terminal',
-    }, { reconcile: () => undefined, closeSession });
+    }, { reconcile: () => undefined, suspend });
 
-    expect(closeSession).toHaveBeenCalledWith('sess-deferred');
-    expect(result).toEqual({ action: 'close_refused', error: 'mojo_cancel_failed' });
+    expect(suspend).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ action: 'retained' });
   });
 });

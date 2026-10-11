@@ -19,6 +19,10 @@ export interface ScheduleExecutionContext {
 
 // Callback set by daemon to execute a scheduled task
 let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>) | null = null;
+// Callback set by daemon to clean up in-memory bindings when a task is removed.
+// The callback receives the task ID; the daemon should call cleanupTaskBindings
+// for every in-memory map it owns (dispatchedTurnRunIds, durable map, etc.).
+let removeTaskHook: ((taskId: string) => void) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
 // Last effective schedule timezone seen by the tick loop. When it changes
 // (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
@@ -65,6 +69,14 @@ export function setExecuteCallback(
   executeCallback = cb;
 }
 
+/** Register a hook that the daemon calls to clean up in-memory binding maps
+ *  when a task is removed (via dashboard, admin command, or auto-removal).
+ *  The callback receives the task ID so the daemon can call
+ *  cleanupTaskBindings for every map it owns. */
+export function setRemoveTaskHook(cb: (taskId: string) => void): void {
+  removeTaskHook = cb;
+}
+
 function createExecutionContext(
   trigger: ScheduleExecutionContext['trigger'],
   startedAt = new Date().toISOString(),
@@ -104,7 +116,10 @@ function cleanupRemovedTaskSidecars(task: ScheduledTask): void {
 }
 
 function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
-  if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
+  if (!scheduleStore.getTask(task.id)) {
+    cleanupRemovedTaskSidecars(task);
+    removeTaskHook?.(task.id);
+  }
 }
 
 function recordDispatchOutcome(
@@ -826,7 +841,11 @@ export function removeTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
   const removed = scheduleStore.removeTask(id);
-  if (removed) cleanupRemovedTaskSidecars(task);
+  if (removed) {
+    cleanupRemovedTaskSidecars(task);
+    // Notify the daemon to clean up in-memory turnId→runId binding maps.
+    removeTaskHook?.(id);
+  }
   return removed;
 }
 

@@ -1374,6 +1374,26 @@ export interface ParsedSchedule {
 
 export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic' | 'task';
 
+/** Per-run state for multi-target and recovery tracking.  Keyed by runId;
+ *  survives claimRun so recovery terminals can update their original run's
+ *  record even after a new run has been claimed. */
+export interface RunRecord {
+  /** Number of turnIds dispatched for this run. */
+  targetCount: number;
+  /** Set of turnIds that have settled for this run.  Used for per-turnId
+   *  dedup within the run (a turn is only settled once per run). */
+  settledTurnIds: string[];
+  /** Per-target error for this run (turnId → sanitised error).
+   *  Recovery terminals that succeed remove their source target's entry. */
+  perTargetErrors: Record<string, string>;
+  /** All dispatched turnId → runId bindings for this run.
+   *  Persisted so daemon restart can restore recovery bindings (P1-3). */
+  turnBindings: Record<string, string>;
+  /** One in-flight recovery continuation per failed source.  Persisted so a
+   * restart cannot race a second attempt for the same source. */
+  recoveryAttempts?: Record<string, string>;
+}
+
 export interface ScheduledTask {
   id: string;
   /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
@@ -1454,6 +1474,31 @@ export interface ScheduledTask {
   lastRunId?: string;
   lastError?: string;
   lastDeliveryError?: string;
+  /** Last terminal (completed) status — 'ok' or 'error'.  Distinct from
+   *  `lastStatus` which reflects the most recent claim/run state including
+   *  'running' and 'skipped'.  Consumers that need "what was the last
+   *  completed result" should read this instead of `lastStatus`. */
+  lastTerminalStatus?: 'ok' | 'error';
+  /** ISO timestamp of when `lastTerminalStatus` was last written. */
+  lastTerminalAt?: string;
+  /** Sanitised error message for the last terminal failure.  Only set
+   *  when `lastTerminalStatus` is 'error'.  Long or multi-line raw errors
+   *  are capped at the first line to avoid leaking internal details into
+   *  the persistent task record. */
+  lastTerminalError?: string;
+  /** Opaque run identity stored when `lastTerminalStatus` was last written.
+   *  Compared against `lastRunId` to reject a same-run double-settle. */
+  lastTerminalRunId?: string;
+  /** The turnId of the last settled terminal.  Prevents duplicate settlement
+   *  of the same turn.  When combined with a caller-supplied `runId` in
+   *  `settleTerminalRun`, the runId-vs-lastRunId check provides the stale
+   *  guard (rejecting terminals from old dispatch cycles). */
+  lastTerminalTurnId?: string;
+  /** Per-run records keyed by runId.  Survive claimRun so recovery
+   *  terminals can update the original run's state even after a new run
+   *  has been claimed.  Old runs are cleaned up when all targets are
+   *  settled and no recovery owners remain. */
+  runRecords?: Record<string, RunRecord>;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
   repeat?: { times: number | null; completed: number };
   /** Delivery target:

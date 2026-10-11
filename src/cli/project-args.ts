@@ -38,6 +38,84 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
     || subcommand === 'help' || subcommand === '--help' || subcommand === '-h' || !subcommand) {
     return { ok: true, help: true };
   }
+  if (subcommand === 'gate') {
+    const operation = args[0];
+    const gateArgs = args.slice(1);
+    let allowed: Set<string> | undefined;
+    if (operation === 'add') {
+      allowed = new Set(['--id', '--source-chat-id', '--dispatch-root', '--task-guid', '--label', '--session-id', '--json']);
+    } else if (operation === 'status') {
+      allowed = new Set(['--session-id', '--json']);
+    } else if (operation === 'retire') {
+      allowed = new Set(['--id', '--expected-fingerprint', '--authorization-ref', '--reason', '--session-id', '--json']);
+    } else if (operation === 'replace') {
+      allowed = new Set([
+        '--id', '--expected-fingerprint', '--new-id', '--source-chat-id', '--dispatch-root',
+        '--task-guid', '--label', '--authorization-ref', '--reason', '--session-id', '--json',
+      ]);
+    }
+    if (!allowed) return { ok: false, error: 'project gate 只支持 add、status、retire 或 replace' };
+    for (let i = 0; i < gateArgs.length; i += 1) {
+      const token = gateArgs[i]!;
+      if (!token.startsWith('-')) return { ok: false, error: `不支持位置参数: ${token}` };
+      const flag = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+      if (!allowed.has(flag)) return { ok: false, error: `未知选项: ${flag}` };
+      if (flag === '--json') {
+        if (token.includes('=')) return { ok: false, error: '--json 不接受值' };
+        continue;
+      }
+      const value = token.includes('=') ? token.slice(token.indexOf('=') + 1) : gateArgs[++i];
+      if (value === undefined || !value.trim() || value.startsWith('--')) {
+        return { ok: false, error: `${flag} 需要一个值` };
+      }
+    }
+    const sessionId = one(gateArgs, '--session-id');
+    const json = has(gateArgs, '--json');
+    if (operation === 'status') {
+      return { ok: true, help: false, sessionId, json: true, action: { action: 'status' } };
+    }
+    const gateId = one(gateArgs, '--id')?.trim();
+    const expectedDefinitionFingerprint = one(gateArgs, '--expected-fingerprint')?.trim();
+    const authorizationRef = one(gateArgs, '--authorization-ref')?.trim();
+    const reason = one(gateArgs, '--reason')?.trim();
+    if (operation === 'retire') {
+      if (!gateId || !expectedDefinitionFingerprint || !authorizationRef || !reason) {
+        return { ok: false, error: 'project gate retire 需要 --id、--expected-fingerprint、--authorization-ref 和 --reason' };
+      }
+      return {
+        ok: true, help: false, sessionId, json,
+        action: { action: 'retire_completion_gate', gateId, expectedDefinitionFingerprint, authorizationRef, reason },
+      };
+    }
+    const sourceChatId = one(gateArgs, '--source-chat-id')?.trim();
+    const dispatchRoot = one(gateArgs, '--dispatch-root')?.trim();
+    const taskGuid = one(gateArgs, '--task-guid')?.trim();
+    const label = one(gateArgs, '--label')?.trim();
+    if (operation === 'replace') {
+      const newGateId = one(gateArgs, '--new-id')?.trim();
+      if (!gateId || !expectedDefinitionFingerprint || !newGateId || !sourceChatId
+        || !dispatchRoot || !taskGuid || !label || !authorizationRef || !reason) {
+        return {
+          ok: false,
+          error: 'project gate replace 需要 --id、--expected-fingerprint、--new-id、--source-chat-id、--dispatch-root、--task-guid、--label、--authorization-ref 和 --reason',
+        };
+      }
+      return {
+        ok: true, help: false, sessionId, json,
+        action: {
+          action: 'replace_completion_gate', gateId, expectedDefinitionFingerprint, newGateId,
+          sourceChatId, dispatchRoot, taskGuid, label, authorizationRef, reason,
+        },
+      };
+    }
+    if (!gateId || !sourceChatId || !dispatchRoot || !taskGuid || !label) {
+      return { ok: false, error: 'project gate add 需要 --id、--source-chat-id、--dispatch-root、--task-guid 和 --label' };
+    }
+    return {
+      ok: true, help: false, sessionId, json,
+      action: { action: 'add_completion_gate', gateId, sourceChatId, dispatchRoot, taskGuid, label },
+    };
+  }
   const allowedByCommand: Record<string, Set<string>> = {
     init: new Set(['--title', '--goal', '--phase', '--focus', '--remaining', '--session-id', '--json']),
     status: new Set(['--session-id', '--json']),

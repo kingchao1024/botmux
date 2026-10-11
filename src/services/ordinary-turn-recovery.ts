@@ -126,6 +126,16 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
    *  keep a scheduled turn's `schedule:<taskId>:<uuid>` provenance on its
    *  continuation, so the continuation authenticates exactly like the fire. */
   mintContinuationTurnId?: (logicalTurnId: string, continuation: number) => string | undefined;
+  /** Bind a recovery continuation turnId to its scheduler runId.  Called
+   *  inside enqueue BEFORE the turn is dispatched to the worker so the
+   *  terminal can be authoritatively matched.  Receives the new
+   *  continuation turnId and the original logicalTurnId this continuation
+   *  is recovering. */
+  bindRecoveryTurn?: (turnId: string, logicalTurnId: string) => boolean;
+  /** Undo the recovery binding when the worker declines the continuation. */
+  releaseRecoveryTurn?: (turnId: string) => void;
+  /** Release an exact attempt/source when recovery has reached a terminal state. */
+  abandonRecoveryTurn?: (turnId: string, logicalSourceTurnId: string) => void;
   now?: () => number;
   randomId?: () => string;
   backoffMs?: readonly number[];
@@ -142,6 +152,8 @@ type AttachedRecovery = {
   session: OrdinaryTurnRecoverySession;
   coordinator: OrdinaryTurnRecoveryCoordinator<any>;
   dispose: () => void;
+  releaseRecoveryTurn?: (turnId: string) => void;
+  abandonRecoveryTurn?: (turnId: string, logicalSourceTurnId: string) => void;
 };
 
 const attachedRecoveries = new Map<string, AttachedRecovery>();
@@ -440,30 +452,52 @@ export function attachOrdinaryTurnRecovery<TTimer>(
       }
     },
     enqueue: dispatch => {
-      let contextCopied = false;
-      const sourceContext = session.turnReplyContexts?.[dispatch.logicalTurnId];
-      if (sourceContext !== undefined) {
-        session.turnReplyContexts = {
-          ...(session.turnReplyContexts ?? {}),
-          [dispatch.turnId]: structuredClone(sourceContext),
-        };
-        contextCopied = true;
+      // Bind the recovery continuation turnId BEFORE dispatching so
+      // onTurnTerminal can authoritatively match it to the runId.
+      let bound = false;
+      let copiedContext = false;
+      let copiedTarget = false;
+      try {
+        if (deps.bindRecoveryTurn?.(dispatch.turnId, dispatch.logicalTurnId) === false) return false;
+        bound = deps.bindRecoveryTurn !== undefined;
+        let contextCopied = false;
+        const sourceContext = session.turnReplyContexts?.[dispatch.logicalTurnId];
+        if (sourceContext !== undefined) {
+          session.turnReplyContexts = {
+            ...(session.turnReplyContexts ?? {}),
+            [dispatch.turnId]: structuredClone(sourceContext),
+          };
+          copiedContext = true;
+          contextCopied = true;
+        }
+        const sourceTarget = session.replyTargets?.[dispatch.logicalTurnId];
+        if (sourceTarget !== undefined) {
+          session.replyTargets = {
+            ...(session.replyTargets ?? {}),
+            [dispatch.turnId]: structuredClone(sourceTarget),
+          };
+          copiedTarget = true;
+          contextCopied = true;
+        }
+        // `botmux send` runs in the CLI child and reads this routing context from
+        // the session store. Land the inherited destination before IPC can make
+        // the continuation executable.
+        if (contextCopied && session.ordinaryTurnRecovery) {
+          deps.persist(session.ordinaryTurnRecovery);
+        }
+        const enqueued = deps.enqueue(dispatch);
+        if (!enqueued) {
+          if (copiedContext) delete session.turnReplyContexts?.[dispatch.turnId];
+          if (copiedTarget) delete session.replyTargets?.[dispatch.turnId];
+          if (bound) deps.releaseRecoveryTurn?.(dispatch.turnId);
+        }
+        return enqueued;
+      } catch {
+        if (copiedContext) delete session.turnReplyContexts?.[dispatch.turnId];
+        if (copiedTarget) delete session.replyTargets?.[dispatch.turnId];
+        if (bound) deps.releaseRecoveryTurn?.(dispatch.turnId);
+        return false;
       }
-      const sourceTarget = session.replyTargets?.[dispatch.logicalTurnId];
-      if (sourceTarget !== undefined) {
-        session.replyTargets = {
-          ...(session.replyTargets ?? {}),
-          [dispatch.turnId]: structuredClone(sourceTarget),
-        };
-        contextCopied = true;
-      }
-      // `botmux send` runs in the CLI child and reads this routing context from
-      // the session store. Land the inherited destination before IPC can make
-      // the continuation executable.
-      if (contextCopied && session.ordinaryTurnRecovery) {
-        deps.persist(session.ordinaryTurnRecovery);
-      }
-      return deps.enqueue(dispatch);
     },
   };
   coordinator = new OrdinaryTurnRecoveryCoordinator(wrapped);
@@ -471,6 +505,8 @@ export function attachOrdinaryTurnRecovery<TTimer>(
     session,
     coordinator,
     dispose: () => coordinator.dispose(),
+    releaseRecoveryTurn: deps.releaseRecoveryTurn,
+    abandonRecoveryTurn: deps.abandonRecoveryTurn,
   });
   if (session.ordinaryTurnRecovery) {
     if (session.ordinaryTurnRecovery.status === 'dispatching') {
@@ -507,7 +543,18 @@ export function handleOrdinaryTurnRecoveryTerminal(
   const attached = attachedRecoveries.get(session.sessionId);
   const current = session.ordinaryTurnRecovery;
   if (!attached || !current) return current;
-  return attached.coordinator.onTerminal(current, terminal);
+  const next = attached.coordinator.onTerminal(current, terminal);
+  if (next.currentTurnId === terminal.turnId && next.status === 'backoff') {
+    // A failed recovery attempt remains the scheduler's settled-attempt
+    // witness until ordinary recovery decides to retry. Release that exact
+    // attempt before the next timer claims the same logical source again.
+    attached.releaseRecoveryTurn?.(terminal.turnId);
+  }
+  if (next.currentTurnId === terminal.turnId
+    && (next.status === 'attention_required' || next.status === 'exhausted' || next.status === 'cancelled')) {
+    attached.abandonRecoveryTurn?.(terminal.turnId, current.logicalTurnId);
+  }
+  return next;
 }
 
 /** Positive proof that this exact terminal currently has an attached recovery

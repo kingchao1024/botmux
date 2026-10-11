@@ -1,7 +1,7 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleRunTargetResult } from './schedule-run-log-store.js';
 
-export type ScheduledTaskTargetExecutor = (task: ScheduledTask) => Promise<void>;
+export type ScheduledTaskTargetExecutor = (task: ScheduledTask) => Promise<string | undefined>;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -17,6 +17,7 @@ function taskForTarget(task: ScheduledTask, chatId: string): ScheduledTask {
  * Executes every target independently and waits for all targets to settle.
  * A single-target rejection is rethrown unchanged to preserve the legacy
  * scheduler error path. Multi-target failures carry every per-chat result.
+ * Each result includes the scheduled turnId returned by the executor.
  */
 export class ScheduleTargetExecutionError extends Error {
   readonly targetResults: ScheduleRunTargetResult[];
@@ -36,6 +37,7 @@ export async function executeScheduledTaskForTargets(
   task: ScheduledTask,
   targetChatIds: readonly string[],
   execute: ScheduledTaskTargetExecutor,
+  normalizeSingleTargetFailure = false,
 ): Promise<ScheduleRunTargetResult[]> {
   if (targetChatIds.length === 0) {
     throw new Error('Scheduled task has no target chats');
@@ -48,13 +50,13 @@ export async function executeScheduledTaskForTargets(
   );
   const targetResults = settled.map<ScheduleRunTargetResult>((result, index) => (
     result.status === 'fulfilled'
-      ? { chatId: targetChatIds[index]!, outcome: 'model_dispatched' }
-      : { chatId: targetChatIds[index]!, outcome: 'error', error: errorMessage(result.reason) }
+      ? { chatId: targetChatIds[index]!, outcome: 'model_dispatched' as const, turnId: result.value }
+      : { chatId: targetChatIds[index]!, outcome: 'error' as const, error: errorMessage(result.reason) }
   ));
   const failed = settled.find(result => result.status === 'rejected');
   if (!failed) return targetResults;
 
-  if (targetChatIds.length === 1 && failed.status === 'rejected') {
+  if (targetChatIds.length === 1 && failed.status === 'rejected' && !normalizeSingleTargetFailure) {
     throw failed.reason;
   }
   throw new ScheduleTargetExecutionError(targetResults);
