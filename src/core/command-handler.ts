@@ -1,3 +1,4 @@
+import { parseGroupCreationArgs, resolveGroupCreationAgents, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
@@ -8,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
@@ -32,7 +33,9 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadFile, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import type { OutboundMessageOptions } from '../im/lark/client.js';
+import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -62,12 +65,12 @@ import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSe
 import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, listAuthorizedUsers, resolveOAuthRedirectUri, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
-import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { DocSubscriptionPermissionError, fetchDocTitle, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
-  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
+  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription, isPollingDocTriggerMode,
   type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import {
@@ -138,6 +141,7 @@ import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
+import { runGroupContextSlashCommand } from './group-context-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -157,7 +161,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue', '/cleanup-wt', '/dismiss']);
+export { SESSIONLESS_DAEMON_COMMANDS } from './command-schema.js';
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -186,7 +190,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/lane', '/stop', '/rename', '/fork', '/forklist', '/quote']);
+export { EXISTING_SESSION_ONLY_DAEMON_COMMANDS } from './command-schema.js';
 
 function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   const runtime = snapshotCliRuntime(resolveCliRuntime({
@@ -210,7 +214,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   };
 }
 
-function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string, promptInjection: PromptInjection): string | undefined {
+function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean; sandbox?: boolean | 'off' | 'oncall' | 'scratch' }, cliId: string, promptInjection: PromptInjection): string | undefined {
   if (promptInjection === 'none' && !supportsZeroPromptInjection(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
   if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
   if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';
@@ -311,12 +315,9 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-export interface SlashCommandInvocation {
-  cmd: string;
-  content: string;
-}
-
-const MULTILINE_COMMANDS = new Set(['/schedule', '/role', '/fork']);
+// 斜杠命令的解析与分类住在 ./command-router.js（leaf，纯函数，schema 驱动）；这里重新导出，
+// 让既有调用方（daemon.ts、cli、event-dispatcher、tests）在同一个模块面上拿到它。
+export { parseSlashCommandInvocation, type SlashCommandInvocation } from './command-router.js';
 
 // `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
 // import without the daemon graph); re-exported here for existing callers.
@@ -486,11 +487,9 @@ function buildCloseWorktreeConfirmCard(args: {
 // for existing callers, same as `validateWorkingDir` above.
 export { resolveRepoSelection } from './repo-selection.js';
 
-// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让原本
-// 找 `parseForceTopicInvocation` 的调用方在同一个模块面上拿到它的升级版。
-//
-// 主路由由 `parseTopicHeader` 负责可读标题与指令头；旧解析器只保留为
-// `/th`、`/tw`、`/t here|worktree` 生命周期兼容面的纯函数与测试入口。
+// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让命令面上的
+// 调用方在同一个模块面上拿到它。`/th` `/tw` `/t here|worktree` 生命周期变体同样由它解析
+//（`header.lifecycle`），不再有第二份正则。
 export {
   parseTopicHeader,
   isTopicHeader,
@@ -503,61 +502,6 @@ export {
   type TopicHeaderParse,
   type TopicHeaderDirective,
 } from './topic-header.js';
-
-export type ForceTopicMode = 'default' | 'here' | 'worktree';
-
-/** Parse lifecycle aliases retained by the worktree command surface. */
-export function parseForceTopicInvocation(content: string): { prompt: string; mode: ForceTopicMode } | null {
-  const trimmed = content.trimStart();
-  const alias = /^\/(th|tw)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (alias) return {
-    prompt: (alias[2] ?? '').trim(),
-    mode: alias[1]!.toLowerCase() === 'tw' ? 'worktree' : 'here',
-  };
-  const match = /^\/(t|topic)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (!match) return null;
-  const rawPrompt = (match[2] ?? '').trim();
-  const variant = /^(here|worktree)(?:\s+([\s\S]*))?$/i.exec(rawPrompt);
-  return variant
-    ? {
-        prompt: (variant[2] ?? '').trim(),
-        mode: variant[1]!.toLowerCase() === 'worktree' ? 'worktree' : 'here',
-      }
-    : { prompt: rawPrompt, mode: 'default' };
-}
-
-/** Parse a user-authored slash command after leading @mentions have already
- *  been stripped. Messages that look like command examples or command lists
- *  are intentionally left for the CLI instead of being intercepted by the
- *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
- *  trigger real daemon actions. */
-export function parseSlashCommandInvocation(content: string): SlashCommandInvocation | null {
-  // trim BOTH ends: a trailing newline/space rides into the returned `content`
-  // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
-  // typed as a literal trailing newline — which breaks the CLI's slash-command
-  // detection (it sees a multi-line message, not a `/cmd`). Internal newlines for
-  // MULTILINE_COMMANDS are preserved (trim only touches the ends).
-  const trimmed = content.trim();
-  if (!trimmed.startsWith('/')) return null;
-
-  const lines = trimmed.split(/\r?\n/);
-  const firstLine = (lines[0] ?? '').trimEnd();
-  const [cmdRaw] = firstLine.split(/\s+/);
-  const cmd = cmdRaw?.toLowerCase();
-  if (!cmd) return null;
-
-  // Treat angle-bracket placeholders as documentation, not an invocation.
-  if (/<[^>\r\n]+>/.test(firstLine)) return null;
-
-  const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
-  if (restNonBlank.length > 0) {
-    // A list of slash commands is almost certainly discussion / planning text.
-    if (restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd)) return null;
-  }
-
-  return { cmd, content: trimmed };
-}
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
@@ -1219,6 +1163,19 @@ async function applyAllowedUsersSet(
   await reply(t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc));
 }
 
+function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
+  const policy = botConfig.triggerUserAuth;
+  const enabled = triggerUserAuthApplies(policy, 'bytedcli');
+  const lines = [
+    t('cmd.login.bytedcli_ok', undefined, locale),
+    t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
+  ];
+  if (enabled && policy?.gitHost) {
+    lines.push(t('cmd.login.bytedcli_git_enabled', { host: policy.gitHost }, locale));
+  }
+  return lines.join('\n');
+}
+
 /**
  * `/botconfig` —— owner/allowedUsers 远程改本 bot 运营字段。sessionless：只认 larkAppId，
  * 不需活跃会话。严格 admin 闸（拒绝开放模式 bot），写盘 + 内存热更新，无需重启。
@@ -1666,7 +1623,7 @@ export async function handleCotCommand(
         await updateTurnReplyCard(ds, update.turnId, {
           kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
           activity: publicReplyCardActivity(update.entries),
-        }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
+        }, (body, type, uuid, beforeWrite) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid, beforeWrite }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
         return;
       }
@@ -3563,6 +3520,8 @@ export async function handleCommand(
         break;
       }
 
+      // 两条入口在 classifySlash 之后直接派发 /sessions，进不到这个 case。
+      // 留着是 schema↔switch 对齐守卫的锚点，删了测试会红。
       case '/sessions': {
         const chatId = ds?.chatId ?? message.chatId ?? '';
         await handleGroupSessionsCommand(message, rootId, chatId, deps, larkAppId);
@@ -3726,7 +3685,7 @@ export async function handleCommand(
           if (bytedPending) {
             const { state, detail } = await completeBytedcliLogin(loginOpenId, bytedPending);
             doneLines.push(state === 'authorized'
-              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              ? bytedcliLoginSuccessReply(botCfg2, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
                 : state === 'unavailable'
@@ -3841,7 +3800,7 @@ export async function handleCommand(
             }
             const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
             await sessionReply(rootId, state === 'authorized'
-              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              ? bytedcliLoginSuccessReply(botCfg2, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
                 : state === 'unavailable'
@@ -3909,7 +3868,7 @@ export async function handleCommand(
         const anchor = sessionAnchorId(ds);
         const dataDir = config.session.dataDir;
         const modeLabel = (m: CommentTriggerMode) =>
-          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : m === 'owner-mention' ? 'cmd.subdoc.mode_owner_mention' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (arg === 'list' || arg === '列表') {
           const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor)
@@ -4013,7 +3972,7 @@ export async function handleCommand(
         const request = parseDocWatchCommand(message.content);
         const dataDir = config.session.dataDir;
         const modeLabel = (m: CommentTriggerMode) =>
-          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : m === 'owner-mention' ? 'cmd.subdoc.mode_owner_mention' : 'cmd.subdoc.mode_mention', undefined, loc);
 
         if (request.kind === 'usage' || request.kind === 'invalid') {
           const prefix = request.kind === 'invalid' && request.reason === 'conflicting_modes'
@@ -4100,9 +4059,11 @@ export async function handleCommand(
           let pollCursorAt: number | undefined;
           let pollCursorReplyId: string | undefined;
           let pollBaselineReady: boolean | undefined;
-          if (mode === 'all') {
+          if (isPollingDocTriggerMode(mode)) {
+            // 轮询模式（all / owner-mention）共用游标基线；在两种轮询模式之间互切可
+            // 直接复用，从 mention-only 切进来才需要新建/置待建。
             const canReuseBaseline = existing?.managedBy === 'watch-comment'
-              && existing.commentTriggerMode === 'all'
+              && isPollingDocTriggerMode(existing.commentTriggerMode)
               && existing.pollBaselineReady === true;
             if (canReuseBaseline) {
               pollCursorAt = existing.pollCursorAt;
@@ -4137,7 +4098,13 @@ export async function handleCommand(
             pollBaselineReady,
             createdAt: existing?.createdAt ?? Date.now(),
           };
-          const { previous } = putDocSubscription(dataDir, larkAppId, subscription);
+          // 标题快照 best-effort，取不到留 undefined。放 put 前一起写省一次盘写。
+          const fetchedTitle = await fetchDocTitle(larkAppId, file);
+          if (fetchedTitle) subscription.docTitle = fetchedTitle;
+          else if (existing?.docTitle) subscription.docTitle = existing.docTitle;
+          // inheritRuntime：重登记延续投递计数/最近结局；溯源三字段刻意不传——owner
+          // 主动 /watch-comment 意味着这条不再是陌生人 @ 出来的 auto-sub。
+          const { previous } = putDocSubscription(dataDir, larkAppId, subscription, { inheritRuntime: true });
           const rebound = previous && previous.sessionAnchor !== anchor;
           let replyText = t(!ds ? 'cmd.watch.started_lazy' : rebound ? 'cmd.watch.started_moved' : 'cmd.watch.started', {
             title: file.fileToken.slice(0, 12),
@@ -4302,9 +4269,11 @@ export async function handleCommand(
             const result = await resumeSession(managedTarget.sessionId, activeSessions);
             if (result.ok) {
               const cliName = sessionCliDisplayName(result.ds);
-              const resumeMsg = resumeStartsFresh(result.ds.session)
-                ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-                : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+              const resumeMsg = result.recoveryPending
+                ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
+                : resumeStartsFresh(result.ds.session)
+                  ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+                  : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
               await sessionReply(rootId, resumeMsg);
             } else if (result.error === 'not_closed') {
               await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
@@ -4319,6 +4288,10 @@ export async function handleCommand(
               await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
             } else if (result.error === 'resume_cancelled') {
               await sessionReply(rootId, t('card.action.resume_cancelled', undefined, loc));
+            } else if (result.error === 'resume_start_failed') {
+              await sessionReply(rootId, t('card.action.resume_start_failed', undefined, loc));
+            } else if (result.error === 'resume_reconciliation_required') {
+              await sessionReply(rootId, t('card.action.resume_reconciliation_required', undefined, loc));
             } else {
               await sessionReply(rootId, t('cmd.adopt.resume_not_found', undefined, loc));
             }
@@ -4486,6 +4459,77 @@ export async function handleCommand(
         }
 
         await sessionReply(rootId, t('cmd.oncall.unknown_sub', { sub }, loc));
+        break;
+      }
+
+      case '/context-sharing': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        const chatId = message.chatId ?? ds?.chatId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.context_sharing.no_bot', undefined, loc));
+          break;
+        }
+        if (!chatId) {
+          await sessionReply(rootId, t('cmd.context_sharing.no_chat', undefined, loc));
+          break;
+        }
+
+        let result;
+        try {
+          const bot = getBot(appId);
+          result = await runGroupContextSlashCommand({
+            content: message.content,
+            larkAppId: appId,
+            chatId,
+            senderId: message.senderId,
+            senderIsBot: message.senderType !== 'user'
+              || isKnownPeerBot(config.session.dataDir, appId, message.senderId),
+            resolvedAllowedUsers: bot.resolvedAllowedUsers,
+          }, {
+            dataDir: config.session.dataDir,
+            getChatMode: getChatModeStrict,
+          });
+        } catch (error) {
+          await sessionReply(rootId, t('cmd.context_sharing.failed', {
+            reason: error instanceof Error ? error.message : String(error),
+          }, loc));
+          break;
+        }
+
+        if (result.kind === 'error') {
+          const errorKey = {
+            usage: 'cmd.context_sharing.usage',
+            unexpected_arguments: 'cmd.context_sharing.unexpected_arguments',
+            invalid_chat: 'cmd.context_sharing.invalid_chat',
+            chat_lookup_failed: 'cmd.context_sharing.chat_lookup_failed',
+            group_required: 'cmd.context_sharing.group_required',
+            no_owner: 'cmd.context_sharing.no_owner',
+            not_admin: 'cmd.context_sharing.not_admin',
+          }[result.error];
+          await sessionReply(rootId, t(errorKey, { value: result.detail ?? '' }, loc));
+          break;
+        }
+
+        if (result.kind === 'status') {
+          const recallNote = t(`cmd.context_sharing.recall.${result.recall.state}`, undefined, loc)
+            + (result.recall.stale ? `\n${t('cmd.context_sharing.recall.stale', undefined, loc)}` : '');
+          await sessionReply(rootId, t(result.settings.enabled
+            ? 'cmd.context_sharing.status_on'
+            : 'cmd.context_sharing.status_off', {
+            max: String(result.settings.maxContextChars),
+          }, loc) + `\n\n${recallNote}`);
+          break;
+        }
+
+        const responseKey = result.enabled
+          ? (result.changed ? 'cmd.context_sharing.enabled' : 'cmd.context_sharing.already_enabled')
+          : (result.changed ? 'cmd.context_sharing.disabled' : 'cmd.context_sharing.already_disabled');
+        const recallNote = result.enabled && result.recall
+          ? `\n\n${t(`cmd.context_sharing.recall.${result.recall.state}`, undefined, loc)}`
+            + (result.recall.stale ? `\n${t('cmd.context_sharing.recall.stale', undefined, loc)}` : '')
+          : '';
+        await sessionReply(rootId, t(responseKey, { max: String(result.settings.maxContextChars) }, loc) + recallNote);
+        logger.info(`[${logTag}] /context-sharing ${result.enabled ? 'on' : 'off'} chat=${chatId}`);
         break;
       }
 
@@ -4724,17 +4768,33 @@ export async function handleCommand(
         for (const m of mentions) {
           if (m.name) rawArgs = rawArgs.split(`@${m.name}`).join(' ');
         }
-        let roleProfileId: string | undefined;
-        const roleProfileArg = rawArgs.match(/(?:^|\s)--role-profile(?:=|\s+)(\S+)/);
-        if (roleProfileArg) {
-          if (!isValidRoleProfileId(roleProfileArg[1])) {
-            await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
-            break;
+        let groupArgs: GroupCreationArgs;
+        let configuredAgentIds: string[] = [];
+        try {
+          groupArgs = parseGroupCreationArgs(rawArgs, getBot(creatorAppId).config.groupCreation);
+          // Keep @ election/invites, and complete the configured team even when
+          // only its creator was mentioned. Explicit --agents/--no-agents have
+          // already overridden defaults in the parser; Set below deduplicates.
+          if (groupArgs.agents?.length) {
+            const configs = loadBotConfigs();
+            const p = join(config.session.dataDir, 'bots-info.json');
+            let bots: Parameters<typeof resolveGroupCreationAgents>[2] = [];
+            try {
+              const cached: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
+              if (Array.isArray(cached)) bots = cached.filter(b => b && typeof b === 'object');
+            } catch { /* Names can be unavailable; app IDs still resolve against config. */ }
+            configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, configs, bots);
           }
-          roleProfileId = roleProfileArg[1];
-          rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
+        } catch (err: any) {
+          await sessionReply(rootId, t('cmd.group.invalid_options', { reason: err?.message ?? String(err) }, loc));
+          break;
         }
-        const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const { roleProfileId } = groupArgs;
+        if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
+          await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+          break;
+        }
+        const firstLine = groupArgs.name;
         let baseGroupName: string;
         if (firstLine) {
           baseGroupName = firstLine;
@@ -4747,7 +4807,7 @@ export async function handleCommand(
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
-        const larkAppIdsForGroup = mentionedBotAppIds.length > 0 ? mentionedBotAppIds : [creatorAppId];
+        const larkAppIdsForGroup = [...new Set([creatorAppId, ...mentionedBotAppIds, ...configuredAgentIds])];
 
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
@@ -4759,6 +4819,9 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
+            ...((groupArgs.tag || groupArgs.avatar === 'name') ? {
+              customization: { tag: groupArgs.tag, avatar: groupArgs.avatar, userOpenId: senderOpenId },
+            } : {}),
           });
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
@@ -4767,6 +4830,8 @@ export async function handleCommand(
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
           const hints: string[] = [];
+          if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
+          if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
           if (result.invalidUserIds.includes(senderOpenId)) {
             hints.push(t('cmd.group.warn_invite_rejected', undefined, loc));
           } else if (result.transferError) {
@@ -5666,6 +5731,7 @@ export async function handleCommand(
         break;
       }
 
+      // 前置特判已派发 /card。case 是 schema↔switch 对齐守卫的锚点，两条入口都不可达。
       case '/card': {
         // Existing-session path. New topics route /card via handleCardCommand at
         // the router (so no phantom session is created). off/on work without a
@@ -5680,6 +5746,7 @@ export async function handleCommand(
         break;
       }
 
+      // 前置特判已派发 /cot。case 是 schema↔switch 对齐守卫的锚点，两条入口都不可达。
       case '/cot': {
         // Existing-session path. New topics route /cot via handleCotCommand at
         // the router (so no phantom session is created). All subcommands work
@@ -5760,6 +5827,7 @@ export async function handleCommand(
         break;
       }
 
+      // 前置特判已派发 /term。case 是 schema↔switch 对齐守卫的锚点，两条入口都不可达。
       case '/term': {
         // Existing-session path. New topics route /term via handleTermLinkCommand
         // at the router (daemon.ts) so no phantom worker=null session is created.
@@ -5940,6 +6008,7 @@ export async function handleCommand(
           t('help.heading_group', undefined, loc),
           t('help.group', undefined, loc),
           t('help.project', undefined, loc),
+          t('help.context_sharing', undefined, loc),
           '',
           t('help.list_slash', undefined, loc),
           t('help.help', undefined, loc),
@@ -6372,6 +6441,22 @@ export async function startResumeImportSession(
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
 }
 
+/** Freeze the command's source before attachment preparation or panel delivery. */
+function forkSourceWriteOptions(
+  appId: string, parentDs: DaemonSession, sourceMessageId?: string,
+): OutboundMessageOptions | undefined {
+  if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return undefined;
+  const threadBound = (parentDs.session.scope ?? parentDs.scope ?? 'thread') !== 'chat';
+  const rootId = threadBound ? parentDs.session.rootMessageId : undefined;
+  return { beforeWrite: async () => {
+    if ((threadBound && (!rootId || rootId.startsWith('oc_'))) || sourceMessageId?.startsWith('oc_')) {
+      throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', '缺少原话题消息依据，暂停发送。');
+    }
+    await assertSendTopicsAvailable(appId, [sourceMessageId, rootId],
+      (id, messageId) => getMessageDetail(id, messageId, { userCardContent: false, timeoutMs: 10000 }), 'stop');
+  } };
+}
+
 type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
@@ -6404,6 +6489,7 @@ export async function startForkSubtopicSession(
     type: senderIsBot ? 'bot' : 'user',
     ...(message.senderName ? { name: message.senderName } : {}),
   };
+  const sourceOptions = forkSourceWriteOptions(appId, parentDs, message.messageId);
   let anchorId: string | undefined;
 
   const recallAnchor = async (): Promise<boolean> => {
@@ -6453,7 +6539,9 @@ export async function startForkSubtopicSession(
         ]],
       },
     });
-    anchorId = await sendMessage(appId, chatId, seedPost, 'post');
+    anchorId = sourceOptions
+      ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
+      : await sendMessage(appId, chatId, seedPost, 'post');
     const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
 
     const childIntro = t('cmd.fork.child_intro', {
@@ -6464,6 +6552,9 @@ export async function startForkSubtopicSession(
     const availableBots = await getAvailableBots(appId, chatId);
     const childCliId = parentSession.cliLaunchSnapshot?.cliId ?? parentSession.cliId ?? botCfg.cliId;
     const { forkSession } = await import('./worker-pool.js');
+    // Seed publication may outlive its source during thread/bot lookup.
+    // Recheck before handing the first executable task to the child session.
+    if (sourceOptions?.beforeWrite) await sourceOptions.beforeWrite();
     const forkResult = await forkSession(
       parentSession.sessionId,
       chatId,
@@ -6515,7 +6606,7 @@ export async function startForkSubtopicSession(
       }
     }
     try {
-      await upsertForkPanelCard(parentDs, loc);
+      await upsertForkPanelCard(parentDs, loc, { sourceOptions });
     } catch (err) {
       logger.warn(
         `[${parentSession.sessionId.substring(0, 8)}] /fork panel refresh failed: `
@@ -6548,7 +6639,7 @@ export async function startForkSubtopicSession(
 async function upsertForkPanelCard(
   parentDs: DaemonSession,
   loc: Locale,
-  opts?: { allowEmpty?: boolean; preferredReplyToMessageId?: string },
+  opts?: { allowEmpty?: boolean; preferredReplyToMessageId?: string; sourceOptions?: OutboundMessageOptions },
 ): Promise<void> {
   const appId = parentDs.larkAppId;
   const chatId = parentDs.chatId;
@@ -6570,44 +6661,26 @@ async function upsertForkPanelCard(
   if (children.length === 0 && !opts?.allowEmpty) return;
 
   const staleCardId = parentDs.session.forkPanelCardId;
-  if (staleCardId) {
-    try {
-      await deleteMessage(appId, staleCardId);
-    } catch {
-      // It may already be withdrawn or past Lark's recall window. Posting the
-      // fresh panel is still more useful than keeping the command silent.
-    }
-  }
-
-  // Post the panel. Primary: reply-in-thread to the session's root message so
-  // the panel anchors to this conversation. Fallback: if that reply fails (the
-  // most common cause is the root message aging past Lark's reply window —
-  // surfaces as HTTP 400 — but also covers a withdrawn root), post the card flat
-  // to the chat instead. The panel IS the user-visible output of /forklist, so a
-  // swallowed failure looks like the command silently did nothing; the flat send
-  // keeps it visible. Only if BOTH transports fail do we give up (and warn).
+  const sourceOptions = opts?.sourceOptions
+    ?? forkSourceWriteOptions(appId, parentDs, opts?.preferredReplyToMessageId);
+  const stopOnFailure = getBot(appId).config.topicUnavailablePolicy === 'stop';
   const cardBody = buildForkPanelCard(children, loc);
-  // Reply targets are tried in order, then a flat send as the last resort:
-  //   1) the FRESH triggering command message (when /forklist or /fork passes
-  //      it) — a just-arrived message is never past Lark's reply window, and in
-  //      a 话题群 it keeps the panel inside the current topic;
-  //   2) the session root message — the historical target, but it can age past
-  //      the reply window (HTTP 400) or be withdrawn;
-  //   3) a flat chat sendMessage — always delivers, though in a 话题群 it starts
-  //      a new sibling topic rather than threading. The panel is the user-visible
-  //      output of /forklist, so a visible-but-flat panel beats silent nothing.
+  // Legacy may try another reply target or a flat send. Stop keeps the original
+  // target and error, including inconclusive provider/network failures.
+  const rootId = parentDs.session.rootMessageId?.startsWith('oc_')
+    ? undefined : parentDs.session.rootMessageId;
   const replyTargets: string[] = [];
   if (opts?.preferredReplyToMessageId) replyTargets.push(opts.preferredReplyToMessageId);
-  if (parentDs.session.rootMessageId
-    && parentDs.session.rootMessageId !== opts?.preferredReplyToMessageId) {
-    replyTargets.push(parentDs.session.rootMessageId);
-  }
+  if (rootId && rootId !== opts?.preferredReplyToMessageId) replyTargets.push(rootId);
   let cardId: string | undefined;
   for (const target of replyTargets) {
     try {
-      cardId = await replyMessage(appId, target, cardBody, 'interactive', true);
+      cardId = sourceOptions
+        ? await replyMessage(appId, target, cardBody, 'interactive', true, undefined, undefined, sourceOptions)
+        : await replyMessage(appId, target, cardBody, 'interactive', true);
       break;
     } catch (replyErr) {
+      if (stopOnFailure) throw replyErr;
       logger.warn(
         `[fork-panel] reply to ${target} failed `
         + `(${replyErr instanceof Error ? replyErr.message : replyErr})`,
@@ -6617,8 +6690,11 @@ async function upsertForkPanelCard(
   if (!cardId) {
     logger.warn('[fork-panel] all reply targets failed; falling back to a flat chat message');
     try {
-      cardId = await sendMessage(appId, chatId, cardBody, 'interactive');
+      cardId = sourceOptions
+        ? await sendMessage(appId, chatId, cardBody, 'interactive', undefined, undefined, sourceOptions)
+        : await sendMessage(appId, chatId, cardBody, 'interactive');
     } catch (sendErr) {
+      if (stopOnFailure) throw sendErr;
       logger.warn(
         `[fork-panel] failed to post panel card via both reply and flat send: `
         + `${sendErr instanceof Error ? sendErr.message : sendErr}`,
@@ -6626,6 +6702,11 @@ async function upsertForkPanelCard(
     }
   }
   if (cardId) {
+    // Keep the old panel until a replacement has a provider-confirmed id.
+    if (staleCardId && staleCardId !== cardId) {
+      try { await deleteMessage(appId, staleCardId); }
+      catch { /* Already withdrawn or past the recall window. */ }
+    }
     // Local guard: a write-store failure here must not bubble to /forklist's
     // outer catch (which would look like the command errored even though the
     // panel already posted). Losing only the stale-card id just means the next

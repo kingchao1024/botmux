@@ -28,7 +28,7 @@ describe('plugin service restart lifecycle', () => {
     // Post-pm2: the "core start" step is the supervisor restart, not a pm2 start
     // transaction. The lifecycle invariant is unchanged — auto plugin services are
     // (optionally) stopped before the core comes up, and ALWAYS reconciled after.
-    const coreStart = 'restartFleet(launchPlan, { refreshPersistedEnv, readFailureFallback })';
+    const coreStart = 'restartFleet(launchPlan, { timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS, refreshPersistedEnv, readFailureFallback })';
     const ensure = 'await reconcilePluginServicesForCli(undefined, { autoOnly: true });';
 
     expect(source).toContain(stop);

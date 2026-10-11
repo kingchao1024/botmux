@@ -75,6 +75,7 @@ import {
   createSession,
   createSessionWithOwnedMutation,
   getSession,
+  getSessionFresh,
   getOwnedSession,
   listSessions,
   listSessionsStrict,
@@ -1404,6 +1405,39 @@ describe('principal lane durable store', () => {
         'SELECT COUNT(*) AS n FROM principal_workspace_members WHERE source_session_id = ?',
       ).get(source.sessionId) as { n: number }).n).toBe(2);
     } finally { db.close(); }
+  });
+
+  it('freezes the network policy in shadow lanes and restores it without the XPI ingress flag', () => {
+    const source = sourceSession('root-shadow-network', 'on_source', 'ou_source');
+    source.backendType = 'pty';
+    source.sandbox = true;
+    source.sandboxNetwork = true;
+    source.sandboxNetworkPolicy = {
+      version: 1, public: { mode: 'allow' },
+      private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
+      dnsServers: ['1.1.1.1'],
+    };
+    const frozen = structuredClone(source.sandboxNetworkPolicy);
+    updateSession(source);
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' }, now,
+    }).status).toBe('ready');
+    const shadow = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' }, now,
+    });
+    if (shadow.status !== 'ready') throw new Error('expected ready shadow lane');
+    expect(shadow.session).toMatchObject({ sandbox: true, sandboxNetwork: true, sandboxNetworkPolicy: frozen });
+    // Mutate the actual stored source, including nested arrays: copying only
+    // the outer object must not weaken the child policy.
+    const storedSource = getOwnedSession(source.sessionId)!;
+    storedSource.sandboxNetworkPolicy!.private.rules![0]!.ports!.push(80);
+    storedSource.sandboxNetworkPolicy!.dnsServers!.push('8.8.8.8');
+    updateSession(storedSource);
+    expect(shadow.session.sandboxNetworkPolicy).toEqual(frozen);
+    init(appId);
+    expect(getOwnedSession(shadow.session.sessionId)?.sandboxNetworkPolicy).toEqual(frozen);
   });
 
   it('publishes one isolated worktree proof atomically and hydrates only that shadow cwd', async () => {
@@ -3180,6 +3214,52 @@ describe('createSession()', () => {
     const data = readPersistedRows(tempDir, 'test-app');
     expect(data[session.sessionId]).toBeDefined();
     expect(data[session.sessionId].title).toBe('Persisted');
+  });
+
+  it('round-trips provider-neutral remote state and usage across store reloads', () => {
+    const session = createSession('chat-remote', 'root-remote', 'Remote Runner');
+    session.backendType = 'remote-runner';
+    session.remoteBackendState = {
+      version: 1,
+      provider: 'example-provider',
+      generation: 4,
+      remoteSessionId: 'compute-4',
+      agentThreadId: 'thread-stable',
+      providerState: { runtimeSubpath: 'sessions/four' },
+    };
+    session.remoteRunnerUsage = {
+      generation: 4,
+      snapshot: {
+        context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+        tokens: { in: 10, out: 2 },
+        model: 'provider-model',
+        reasoningEffort: 'provider-effort',
+      },
+    };
+    updateSession(session);
+
+    init('other-app');
+    init('test-app');
+    expect(getSessionFresh(session.sessionId)).toMatchObject({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'example-provider',
+        generation: 4,
+        remoteSessionId: 'compute-4',
+        agentThreadId: 'thread-stable',
+        providerState: { runtimeSubpath: 'sessions/four' },
+      },
+      remoteRunnerUsage: {
+        generation: 4,
+        snapshot: {
+          context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+          tokens: { in: 10, out: 2 },
+          model: 'provider-model',
+          reasoningEffort: 'provider-effort',
+        },
+      },
+    });
   });
 
   it('should default chatType to undefined when not provided', () => {

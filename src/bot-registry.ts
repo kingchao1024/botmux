@@ -1,3 +1,6 @@
+import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
+import { readGlobalConfig } from './global-config.js';
+import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -11,6 +14,10 @@ import {
 import type { BackendType } from './adapters/backend/types.js';
 import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
+import {
+  normalizeRemoteRunnerConfig,
+  type RemoteRunnerConfig,
+} from './adapters/backend/remote-runner-config.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
   normalizeCliRuntimeConfig,
@@ -36,6 +43,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeEnvPolicy, type EnvPolicy } from './core/env-policy.js';
 import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
 import {
   resolveBotmuxConfigDir,
@@ -1441,6 +1449,8 @@ export interface BotConfig {
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
   oncallGroup?: OncallGroupPolicy;
+  /** Opt-in defaults for explicit /g group creation. */
+  groupCreation?: GroupCreationDefaults;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -1589,6 +1599,8 @@ export interface BotConfig {
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
+  /** Absent preserves existing routing; stop opts into source-topic checks. */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -1712,6 +1724,7 @@ export interface BotConfig {
    * rely only on already-mounted local inputs.
    */
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
@@ -1736,6 +1749,9 @@ export interface BotConfig {
    * model, inject a JWT, or force `--cloud` execution.
    */
   mojo?: MojoConfig;
+  /** Protocol expectations for the external provider selected by
+   * `cliPathOverride`. No provider credentials belong in this block. */
+  remoteRunner?: RemoteRunnerConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -1865,6 +1881,8 @@ export interface BotConfig {
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
+  /** Per-chat override of `soloGroupMentionBypass`; explicit true/false wins over the bot default. */
+  chatSoloGroupMentionBypass?: { [chatId: string]: boolean };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
@@ -1995,6 +2013,8 @@ export interface BotConfig {
    * the shared tmux/zellij server env. Missing/empty → undefined.
    */
   env?: Record<string, string>;
+  /** Explicit process inheritance policy; missing retains historical behavior. */
+  envPolicy?: EnvPolicy;
   /**
    * Optional per-bot priority skill policy. Missing means botmux does not alter
    * the underlying CLI's native skill discovery or spawn arguments.
@@ -2002,7 +2022,7 @@ export interface BotConfig {
   skills?: BotSkillPolicy;
   /**
    * Custom footer brand label for cards this bot sends. Three states:
-   *   • `undefined` (unset)  → default `[botmux](github)` link
+   *   • `undefined` (unset)  → default `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`
    *   • `''` (empty)         → brand suppressed (footer shows only 发送给 if any)
    *   • any other string     → rendered verbatim (markdown allowed)
    * Resolved via {@link resolveBrandLabel}. Pure cosmetic — does not affect
@@ -2250,11 +2270,13 @@ export interface BotConfig {
    *                               multi-bot / multi-person groups: a default
    *                               responder that yields when you address someone
    *                               else.
-   * Governs the shared-topic fold-back + the top-level @ gate. `new-topic` /
-   * 话题群 topics own their own thread and continue without @ regardless (that
-   * is the mode's defining behavior, not affected by this policy).
+   * Governs the shared-topic fold-back and the @ gate in regular/topic groups.
+   * The separate single-human/single-bot exception is controlled by
+   * `soloGroupMentionBypass` / `chatSoloGroupMentionBypass`.
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
+  /** Allow the single-human/single-bot group exception to the @ policy (default true). */
+  soloGroupMentionBypass?: boolean;
   /**
    * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
    * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
@@ -2899,13 +2921,40 @@ function botsConfigDiskPath(): string | null {
 }
 
 /**
+ * Machine-wide switch for the reply-card footer brand signature
+ * (`~/.botmux/config.json` → `dashboard.cardBrandLabel`). Default ON; only an
+ * explicit stored `false` disables. Read live (readGlobalConfig has a 2s TTL)
+ * so a Dashboard Settings flip reaches the next card render without a restart.
+ *
+ * A sandboxed / one-shot child (`botmux send`) can't read config.json
+ * (deny-by-default → EPERM, readGlobalConfig then sees `{}` = enabled), so the
+ * worker bridges the resolved value as `BOTMUX_CARD_BRAND_ENABLED`; it's only
+ * honoured for THIS bot's own child process — the same own-appId gate used for
+ * `BOTMUX_BRAND_LABEL` — never on a value inherited from an unrelated process.
+ */
+export function isCardBrandLabelEnabled(larkAppId?: string): boolean {
+  if (larkAppId !== undefined
+    && process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && process.env.BOTMUX_CARD_BRAND_ENABLED === 'false') {
+    return false;
+  }
+  return readGlobalConfig().dashboard?.cardBrandLabel !== false;
+}
+
+/**
  * The configured brand label for a bot, or `undefined` when unset (`''` = off
  * is preserved). Prefers the in-memory registry (daemon hot path); falls back
  * to a mtime-cached read of bots.json so the CLI process — which never loads
  * the registry — still resolves the sending bot's brand. Callers feed the
  * result into {@link brandFooterSegment} for the unset→default / ''→off rule.
+ *
+ * The machine-wide {@link isCardBrandLabelEnabled} switch is applied HERE, the
+ * single choke point every card builder funnels through: when off it returns
+ * `''` for every bot — a custom label included — so callers suppress the brand
+ * rather than falling back to the default botmux link (`undefined`).
  */
 export function resolveBrandLabel(larkAppId: string): string | undefined {
+  if (!isCardBrandLabelEnabled(larkAppId)) return '';
   // A sandboxed one-shot `botmux send` can't read bots.json (deny-by-default),
   // so it has no in-memory registry and would fall through to a bots.json read
   // that EPERMs → role footer lost. The worker injects THIS bot's resolved
@@ -3560,6 +3609,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatMentionModes = out;
     }
 
+    let chatSoloGroupMentionBypass: { [chatId: string]: boolean } | undefined;
+    if (entry.chatSoloGroupMentionBypass && typeof entry.chatSoloGroupMentionBypass === 'object' && !Array.isArray(entry.chatSoloGroupMentionBypass)) {
+      const out: { [chatId: string]: boolean } = {};
+      for (const [cid, enabled] of Object.entries(entry.chatSoloGroupMentionBypass)) {
+        if (cid.trim() && typeof enabled === 'boolean') out[cid] = enabled;
+      }
+      if (Object.keys(out).length > 0) chatSoloGroupMentionBypass = out;
+    }
+
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
     // 丢弃空列表。未配置或全部非法 → undefined。
     let chatGrants: { [chatId: string]: string[] } | undefined;
@@ -3682,6 +3740,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
 
     // env：per-bot 环境变量（如代理 / 第三方服务商端点 ANTHROPIC_BASE_URL+AUTH_TOKEN）。
     // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
+    const envPolicy = normalizeEnvPolicy(entry.envPolicy);
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
@@ -3788,6 +3847,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       feedback: entry.feedback === undefined
         ? undefined
@@ -3844,6 +3904,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
+      topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid
@@ -3855,6 +3916,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
       credentialsSourceDir,
+      remoteRunner: entry.remoteRunner === undefined
+        ? undefined
+        : normalizeRemoteRunnerConfig(entry.remoteRunner),
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       // Wire representation stays backwards compatible: oncall = legacy `true`;
@@ -3873,6 +3937,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
+      ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
@@ -3922,6 +3987,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
       chatMentionModes,
+      chatSoloGroupMentionBypass,
       chatGrants,
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
@@ -3942,6 +4008,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       tuiSlashAllow,
       startupCommands,
       env,
+      envPolicy,
       skills,
       plugins,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
@@ -4053,6 +4120,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         || entry.regularGroupMentionMode === 'ambient'
         ? entry.regularGroupMentionMode
         : undefined,
+      soloGroupMentionBypass: entry.soloGroupMentionBypass === false ? false : undefined,
       substituteMode,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。

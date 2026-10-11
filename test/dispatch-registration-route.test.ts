@@ -67,6 +67,8 @@ function harness(failure?: Failure, projectMode = true) {
       update() { return this; }, digest: () => 'operation-id',
     }),
     initialDispatchLifecycle: () => ({ status: 'dispatched', transportState: 'dispatched', acceptanceState: 'requested', errorCode: null }),
+    isMultiTopicOrchestrationEnabled: () => true,
+    sessionTopicWriteOptions: () => undefined,
     taskControlIntegration: undefined, logger: { warn: vi.fn() }, config: { session: { dataDir: '/data' } },
   };
   const run = new Function('scope', 'with (scope) { ' + code + '; return handler; }')(scope);

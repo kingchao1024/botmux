@@ -16,7 +16,7 @@ import {
   type AskPersistenceIntegrityV1,
   type SignedAskReceiptV1,
 } from './ask-receipt.js';
-import type { AskQuestion, AskResult } from './ask-types.js';
+import type { AskQuestion, AskResult, CreateAskInput } from './ask-types.js';
 
 export const ASK_STORE_SENTINEL = '.botmux-ask-store';
 export const HANDOFF_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -62,7 +62,7 @@ interface PersistedAskFields {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
-  replyCardTarget?: { turnId: string; dispatchAttempt?: number };
+  replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
   selections: ReadonlyArray<ReadonlyArray<string>>;

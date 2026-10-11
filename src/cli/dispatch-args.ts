@@ -12,6 +12,8 @@ export interface DispatchArgs {
   standby: boolean;
   steer: boolean;
   readOnly: boolean;
+  delegates?: string[];
+  noDelegates?: string[];
   bots: string[];
   botApps: string[];
   writeScopes: string[];
@@ -43,6 +45,9 @@ const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps' | 'writeScopes
   ['--bot-app', 'botApps'],
   ['--write-scope', 'writeScopes'],
 ]);
+
+const DELEGATE_FLAG = '--delegate';
+const NO_DELEGATE_FLAG = '--no-delegate';
 
 const BOOLEAN_FLAGS = new Map<string, 'standby' | 'steer' | 'readOnly' | 'help'>([
   ['--standby', 'standby'],
@@ -92,6 +97,16 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
 
     const singletonKey = VALUE_FLAGS.get(flag);
     const repeatableKey = REPEATABLE_VALUE_FLAGS.get(flag);
+    if (flag === DELEGATE_FLAG || flag === NO_DELEGATE_FLAG) {
+      const optionValue = equals >= 0 ? token.slice(equals + 1) : args[index + 1];
+      if (optionValue === undefined || optionValue === '') {
+        return fail('OPTION_VALUE_REQUIRED', `${flag} requires a value`, flag);
+      }
+      if (equals < 0) index += 1;
+      if (flag === DELEGATE_FLAG) (value.delegates ??= []).push(optionValue);
+      else (value.noDelegates ??= []).push(optionValue);
+      continue;
+    }
     if (singletonKey || repeatableKey) {
       const optionValue = equals >= 0 ? token.slice(equals + 1) : args[index + 1];
       // Preserve argValue's historical treatment of dash-prefixed values. A

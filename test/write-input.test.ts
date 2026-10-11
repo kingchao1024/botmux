@@ -93,6 +93,8 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { codexHistoryPath } from '../src/services/codex-paths.js';
+import { codexTerminalSessionIsBound } from '../src/services/codex-terminal-session.js';
+import * as codexTranscript from '../src/services/codex-transcript.js';
 
 // ── Speed: collapse the adapters' real-time submit waits ───────────────────
 // writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
@@ -1665,6 +1667,109 @@ describe('genius writeInput submission confirmation', () => {
 });
 
 describe('codex writeInput submission confirmation', () => {
+  it('uses live footer identity for consecutive messages without adding any status command', async () => {
+    resetCodexHistory();
+    let sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const other = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const sendText = vi.fn();
+    const keys: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), sendText,
+      captureCurrentScreen: vi.fn(() => ''),
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      pasteText(text) { pasted = text; },
+      sendSpecialKeys(key) { keys.push(key); appendCodexHistory(pasted, sid); },
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    sid = other;
+    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other, ownershipProven: true });
+    expect(keys).toEqual(['Enter', 'Enter']);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pty.captureCurrentScreen).not.toHaveBeenCalled();
+  });
+
+  it('confirms daemon-backed tmux input against its live footer, rejecting another pane with identical text', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const calls: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write() { throw new Error('Unexpected raw write'); },
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      sendText(text) { calls.push(text); },
+      sendSpecialKeys(key) {
+        calls.push(key);
+        appendCodexHistory(pasted, foreign);
+        appendCodexHistory(pasted, sid);
+      },
+      pasteText(text) { pasted = text; calls.push('paste:' + text); },
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    // The live footer identity is positive ownership evidence.
+    expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    expect(calls).toEqual(['paste:hi', 'Enter']);
+    expect(codexTerminalSessionIsBound(pty, sid)).toBe(true);
+    expect(codexTerminalSessionIsBound(pty, foreign)).toBe(false);
+  });
+
+  it('submits without a footer ID and confirms the owned history', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    const owned = new Set<string>();
+    const ownership = vi.spyOn(codexTranscript, 'findCodexRolloutSetByPid').mockReturnValue(owned);
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write: vi.fn(), pasteText: vi.fn(), sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => {
+        owned.add(sid);
+        appendCodexHistory('hi', foreign);
+        appendCodexHistory('hi', sid);
+      }),
+      captureInputState: vi.fn(() => ({
+        viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+        cursor: { x: 2, y: 1 },
+      })),
+    };
+    try {
+      const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+      expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+      expect(pty.captureInputState).toHaveBeenCalledTimes(1);
+      expect(pty.write).not.toHaveBeenCalled();
+      expect(pty.pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    } finally {
+      ownership.mockRestore();
+    }
+  });
+
+  it('writes without a terminal snapshot and confirms history without ownership proof', async () => {
+    resetCodexHistory();
+    const pasteText = vi.fn();
+    const sendText = vi.fn();
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), pasteText, sendText,
+      sendSpecialKeys: vi.fn(() => appendCodexHistory('hi', 'foreign-session')),
+      captureCurrentScreen: () => '', captureInputState: () => null,
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    expect(result).toEqual({ submitted: true });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+  });
+
   it('buildArgs resumes with the persisted Codex thread id', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');

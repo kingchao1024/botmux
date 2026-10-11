@@ -7,6 +7,8 @@
 
 import type { ServerResponse } from 'node:http';
 import { registerAsk } from './ask-broker.js';
+import { parseOption, parseAskQuestions } from './ask-questions.js';
+export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
 import { isSupportedAskTimeoutMs } from './ask-limits.js';
 
@@ -125,6 +127,7 @@ export function validateAskRouteContract(
 
 export type AskApiBodyError =
   | 'bad_body'
+  | 'unsupported_fields'
   | 'bad_sessionId'
   | 'bad_chatId'
   | 'bad_larkAppId'
@@ -138,7 +141,9 @@ export type AskApiBodyError =
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
+  | 'bad_inputMode'
   | 'bad_multiSelect'
+  | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
   | 'bad_notBeforeMs'
   | 'bad_expiresAtMs'
@@ -164,46 +169,28 @@ function hasOnlyKeys(
   return Object.keys(record).every(key => allowedSet.has(key));
 }
 
-/** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
-function parseOption(
-  o: unknown,
-  options: { exact?: boolean } = {},
-): AskOption | AskApiBodyError {
-  if (!o || typeof o !== 'object') return 'bad_option_shape';
-  const oo = o as Record<string, unknown>;
-  if (options.exact && !hasOnlyKeys(oo, ['key', 'label'])) return 'unexpected_field';
-  if (typeof oo.key !== 'string' || !oo.key.trim()) return 'bad_option_key';
-  if (typeof oo.label !== 'string') return 'bad_option_label';
-  return { key: oo.key, label: oo.label };
-}
-
-/** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
+/** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。
+ *  解析本体复用 ask-questions 模块；S1 控制器契约（exact）额外要求封闭
+ *  schema，拒绝 inputMode/defaultSelectedKeys 等普通 Ask 新增字段。 */
 function parseQuestions(
   arr: unknown[],
   options: { exact?: boolean } = {},
 ): AskQuestion[] | AskApiBodyError {
-  const result: AskQuestion[] = [];
-  for (const q of arr) {
-    if (!q || typeof q !== 'object' || Array.isArray(q)) return 'bad_question_shape';
-    const qq = q as Record<string, unknown>;
-    if (options.exact && !hasOnlyKeys(qq, ['prompt', 'multiSelect', 'options'])) {
-      return 'unexpected_field';
+  if (options.exact) {
+    for (const q of arr) {
+      if (!q || typeof q !== 'object' || Array.isArray(q)) continue; // 交给 parseAskQuestions 报 bad_question_shape
+      const qq = q as Record<string, unknown>;
+      if (!hasOnlyKeys(qq, ['prompt', 'multiSelect', 'options'])) return 'unexpected_field';
+      if (!Array.isArray(qq.options)) continue; // 同上，交给 parseAskQuestions
+      for (const o of qq.options) {
+        if (o && typeof o === 'object'
+            && !hasOnlyKeys(o as Record<string, unknown>, ['key', 'label'])) {
+          return 'unexpected_field';
+        }
+      }
     }
-    if (typeof qq.prompt !== 'string' || !qq.prompt.trim()) return 'bad_question_shape';
-    if (typeof qq.multiSelect !== 'boolean') return 'bad_multiSelect';
-    if (!Array.isArray(qq.options) || qq.options.length < 2) return 'bad_options';
-    const opts: AskOption[] = [];
-    const seen = new Set<string>();
-    for (const o of qq.options) {
-      const parsed = parseOption(o, options);
-      if (typeof parsed === 'string') return parsed;
-      if (seen.has(parsed.key)) return 'duplicate_option_key';
-      seen.add(parsed.key);
-      opts.push(parsed);
-    }
-    result.push({ prompt: qq.prompt, multiSelect: qq.multiSelect, options: opts });
   }
-  return result;
+  return parseAskQuestions(arr);
 }
 
 /** Validate the request body. Returns either the parsed body or an error code
@@ -269,7 +256,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   } else if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseQuestions(r.questions);
+    const parsed = parseAskQuestions(r.questions);
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {
@@ -384,7 +371,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (r.rootMessageId !== null && typeof r.rootMessageId !== 'string') {
     return { error: 'bad_rootMessageId' };
   }
-  return {
+  const parsed: AskApiBody = {
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,
@@ -396,6 +383,15 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
       ? { deprecatedOriginKindHint: r.originKind as 'explicit' | 'hook' }
       : {}),
   };
+  // Reject semantics this receiver did not parse instead of silently creating
+  // a different kind of Ask. Identity claims remain on the raw body for the
+  // route's authorization checks; options/prompt are normalized above.
+  // originKind is validated above and folded into deprecatedOriginKindHint.
+  const routeFields = new Set(['prompt', 'options', 'originKind', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
+  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+    return { error: 'unsupported_fields' };
+  }
+  return parsed;
 }
 
 /** The response, not IncomingMessage.close, tracks the long-poll lifetime:

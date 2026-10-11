@@ -128,10 +128,10 @@ const CONSUMERS: Record<string, Rule> = {
     count: 2,
   },
   'core/session-manager.ts::resumeSession::closeSession': {
-    category: 'impossible_by_invariant',
-    why: 'Closes only a worker:null daemon-command scratch placeholder occupying '
-      + 'the anchor (isRelayableRealSession is excluded), which has no CLI session '
-      + 'and therefore no remote lineage to leave behind.',
+    category: 'user_surface',
+    why: 'All three calls close only worker:null daemon-command scratch/registration '
+      + 'losers with no remote lineage. A rejected Remote Runner rebuild now rolls '
+      + 'the row back directly, so it cannot recursively wake a second provider.',
     count: 3,
   },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
