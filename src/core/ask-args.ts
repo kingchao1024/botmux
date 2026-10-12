@@ -6,12 +6,14 @@
  * (`cmdAsk`) lives in cli.ts and calls these helpers.
  */
 
+import { parseAskQuestions } from './ask-questions.js';
 import type { AskOption } from './ask-types.js';
 import { ASK_MAX_TIMEOUT_MS } from './ask-limits.js';
 
 export class AskArgsError extends Error {
   constructor(
     public readonly code:
+      | 'questions_invalid'
       | 'options_missing'
       | 'options_too_few'
       | 'options_empty_key'
@@ -285,20 +287,38 @@ export function findMissingAskEnv(
   options: { s1Controller?: boolean; s1Phase?: 'binding' | 'execution' } = {},
 ): string | null {
   let required: string[];
-  if (!options.s1Controller) {
+  if (options.s1Controller) {
+    // S1-controller asks bind by explicit app/chat selection, then optionally
+    // carry trusted session/root execution hints only in execution phase.
+    required = options.s1Phase === 'execution'
+      ? ['BOTMUX_LARK_APP_ID', 'BOTMUX_SESSION_ID', 'BOTMUX_ROOT_MESSAGE_ID']
+      : ['BOTMUX_LARK_APP_ID'];
+  } else {
     required = [
       'BOTMUX_SESSION_ID',
       'BOTMUX_CHAT_ID',
       'BOTMUX_LARK_APP_ID',
-      'BOTMUX_ROOT_MESSAGE_ID',
     ];
-  } else if (options.s1Phase === 'execution') {
-    required = ['BOTMUX_LARK_APP_ID', 'BOTMUX_SESSION_ID', 'BOTMUX_ROOT_MESSAGE_ID'];
-  } else {
-    required = ['BOTMUX_LARK_APP_ID'];
   }
   for (const k of required) {
     if (!env[k] || !env[k]!.trim()) return k;
   }
+  // Chat sessions have no message root; worker intentionally omits it.
+  // S1-controller asks manage their own context above, so the session-root
+  // fallback only applies to ordinary asks.
+  if (!options.s1Controller
+      && env.BOTMUX_SESSION_SCOPE !== 'chat' && !env.BOTMUX_ROOT_MESSAGE_ID?.trim()) {
+    return 'BOTMUX_ROOT_MESSAGE_ID';
+  }
   return null;
+}
+
+/** Shared with the daemon validator so file input cannot silently lose defaults. */
+export function parseAskQuestionsFile(raw: string) {
+  let input: unknown;
+  try { input = JSON.parse(raw); }
+  catch { throw new AskArgsError('questions_invalid', '--questions-file 必须是有效 JSON 问题数组'); }
+  const questions = parseAskQuestions(input);
+  if (typeof questions === 'string') throw new AskArgsError('questions_invalid', `--questions-file: ${questions}`);
+  return questions.map(q => ({ ...q, defaultSelectedKeys: q.defaultSelectedKeys ?? [] }));
 }

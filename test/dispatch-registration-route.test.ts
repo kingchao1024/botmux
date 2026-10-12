@@ -111,6 +111,8 @@ function harness(failure?: Failure, projectMode = true) {
     }),
     createDispatchOperationId: () => 'operation-id',
     initialDispatchLifecycle: () => ({ status: 'dispatched', transportState: 'dispatched', acceptanceState: 'requested', errorCode: null }),
+    isMultiTopicOrchestrationEnabled: () => true,
+    sessionTopicWriteOptions: () => undefined,
     taskControlIntegration: undefined, logger: { warn: vi.fn() }, config: { session: { dataDir: '/data' } },
     PROJECT_DISPATCH_RESERVATION_TTL_MS: 120_000,
     activeTaskControlPlaneFlags: { ledgerEnabled: false, shadowEnabled: false, pumpEnabled: false, freezeEnforcement: false },

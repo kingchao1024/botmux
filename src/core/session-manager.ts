@@ -1,3 +1,4 @@
+import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
  * Handles working directory resolution, attachment downloads, prompt building,
@@ -10,7 +11,9 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
+import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -228,6 +231,7 @@ async function resumeRestoredPendingRepoSetup(
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
         whiteboardId: ds.session.whiteboardId,
+        promptInjection: sessionPromptInjection(ds),
         substituteTrigger: ds.pendingSubstituteTrigger,
         codexAppText: ds.pendingCodexAppText,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
@@ -1170,6 +1174,7 @@ function buildCodexAppTurnInput(opts: {
   availableBotsBlock?: string;
   chatContextPolicyBlock?: string;
   chatContextBlock?: string;
+  groupHistoryBlock?: string;
   applicationContextBlock?: string;
   messageContextBlock?: string;
   bufferedFollowUpsBlock?: string;
@@ -1186,6 +1191,7 @@ function buildCodexAppTurnInput(opts: {
   addCodexAppContext(additionalContext, 'botmux_available_bots', opts.availableBotsBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_chat_context_policy', opts.chatContextPolicyBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_chat_context', opts.chatContextBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_group_history', opts.groupHistoryBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_application_context', opts.applicationContextBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_message_context', opts.messageContextBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_buffered_followups', opts.bufferedFollowUpsBlock ?? '', 'untrusted');
@@ -1214,21 +1220,51 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
-/** Whether this bot enabled trigger-user CLI auth, for the inline-prompt path.
- *  Absent bot / unreadable config → false: an uncertain answer must not add a
- *  block claiming a boundary that is not configured. */
-function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
-  if (!larkAppId) return false;
-  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
-  catch { return false; }
+function credentialBoundaryForPrompt(larkAppId: string | undefined, locale?: Locale): string {
+  if (!larkAppId) return '';
+  try { return buildCredentialBoundaryBlock(getBot(larkAppId).config.triggerUserAuth, locale); }
+  catch { return ''; }
 }
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
  *  core/reply-delivery.ts）。缺参 / bot 未加载 / 任何异常 → 'send'（fail-closed：
  *  信封字节等于今天）。noTransport 的优先级由各调用点自己叠加。 */
-function replyDeliveryFor(larkAppId?: string, cliId?: string): ReplyDelivery {
+function replyDeliveryFor(larkAppId?: string, cliId?: string, promptInjection?: PromptInjection): ReplyDelivery {
   if (!larkAppId || !cliId) return 'send';
-  try { return effectiveReplyDelivery(larkAppId, cliId); } catch { return 'send'; }
+  try { return effectiveReplyDelivery(larkAppId, cliId, promptInjection); } catch { return 'send'; }
+}
+
+/** All public builders share the durable session policy, including callers
+ * outside the daemon (repo selection, scheduled turns and comment replies). */
+function inputPromptInjection(sessionId: string, larkAppId?: string, cliId?: string): PromptInjection {
+  const session = sessionStore.getSession(sessionId);
+  if (session) return session.promptInjection ?? 'default';
+  // Pure/new-input callers may render before a session row exists.
+  return zeroPromptInjectionForBot(larkAppId, cliId) ? 'none' : 'default';
+}
+
+/** Only an already-authorized, message-bound group activation may add history. */
+function backgroundForInput(sessionId: string, cliId: string | undefined, opts?: {
+  larkAppId?: string; chatId?: string; turnId?: string; promptInjection?: PromptInjection;
+}) {
+  if (!opts?.larkAppId || !opts.chatId?.startsWith('oc_') || !opts.turnId
+    || sessionIsNoTransport(opts.larkAppId, opts.chatId)
+    || zeroPromptInjectionForBot(opts.larkAppId, cliId, opts.promptInjection)) return undefined;
+  const nativeSession = sessionStore.getSession(sessionId);
+  const nativeId = nativeSession?.cliSessionId;
+  return groupContextForPrompt({
+    appId: opts.larkAppId, chatId: opts.chatId, turnId: opts.turnId, sessionId,
+    epoch: groupContextEpoch(sessionId, nativeId, cliId, opts.turnId),
+    ...(nativeSession?.workerGeneration !== undefined ? { workerGeneration: nativeSession.workerGeneration } : {}),
+    promptInjection: opts.promptInjection,
+  });
+}
+
+function mergeBackgroundAttachments(current: LarkAttachment[] | undefined, background: LarkAttachment[] | undefined): LarkAttachment[] | undefined {
+  if (!background?.length) return current;
+  const merged = new Map((current ?? []).map(item => [item.path, item]));
+  for (const item of background) if (!merged.has(item.path)) merged.set(item.path, item);
+  return [...merged.values()];
 }
 
 /** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
@@ -1236,11 +1272,13 @@ function replyDeliveryFor(larkAppId?: string, cliId?: string): ReplyDelivery {
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
  *  sidecar 绑定；sessionBackendType 取会话冻结的后端类型（远端后端无本地 hook 进程）。 */
 type NewTopicOpts = {
+  promptInjection?: PromptInjection;
   larkAppId?: string;
   chatId?: string;
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
   chatContext?: ChatContext;
+  sharedGroupContext?: string;
   turnId?: string;
   sessionBackendType?: BackendType;
   /** replyDelivery=transcript 且本轮是 solo 会话（daemon 算好的 ds.soloSession）：
@@ -1252,7 +1290,7 @@ type NewTopicOpts = {
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
-  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
+  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
 
@@ -1274,12 +1312,15 @@ function buildNewTopicBlocks(
   opts?: NewTopicOpts,
   hookMode = false,
 ): Array<{ key: NewTopicBlockKey; text: string }> {
+  if (zeroPromptInjectionForBot(opts?.larkAppId, cliId, opts?.promptInjection)) {
+    return [{ key: 'userMessage', text: buildZeroPromptInput([userMessage, ...(followUps ?? [])].join('\n\n'), attachments) }];
+  }
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   if (adapter.inputEnvelope === 'service-user') {
     // service-user 适配器（ebsd）自带完整外壳，不参与分块：包成单块返回，
     // join 后与历史字符串逐字一致；hook 模式下该块不在 ENVELOPE_KEYS 里，
     // 全部留在 PTY 文本（且 service-user 适配器本就不满足 hook 模式前置条件）。
-    return [{ key: 'userMessage', text: buildServiceUserPrompt([userMessage, ...(followUps ?? [])].join('\n\n')) }];
+    return [{ key: 'userMessage', text: buildServiceUserPrompt([opts?.sharedGroupContext, userMessage, ...(followUps ?? [])].filter(Boolean).join('\n\n')) }];
   }
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
   // (Claude Code builds its own via --append-system-prompt). Source hints
@@ -1290,7 +1331,7 @@ function buildNewTopicBlocks(
   // replyDelivery=transcript 只在有传输的会话上生效（noTransport 优先）；bare =
   // transcript + solo，首轮同样去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
-  const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId);
+  const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
   const bare = replyDelivery === 'transcript' && opts?.solo === true;
   const hints = adapter.injectsSessionContext
     ? []
@@ -1308,7 +1349,7 @@ function buildNewTopicBlocks(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  if (!adapter.injectsSessionContext && adapter.skillsDir) {
+  if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
@@ -1401,9 +1442,8 @@ function buildNewTopicBlocks(
     // hook-capable this is the difference between the agent seeing the boundary
     // and not. An envelope the CLI cannot read drops the block silently —
     // nothing errors when a constraint is merely absent.
-    if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
-      blocks.push({ key: 'credentials', text: buildCredentialBoundaryBlock(locale) });
-    }
+    const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, locale);
+    if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
@@ -1411,6 +1451,7 @@ function buildNewTopicBlocks(
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
   if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
   if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
+  if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
 
   blocks.push({ key: 'userMessage', text: userBlock });
 
@@ -1451,6 +1492,7 @@ export function buildNewTopicPrompt(
   sender?: ResolvedSender,
   opts?: NewTopicOpts,
 ): string {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
   return buildNewTopicBlocks(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
     availableBots, followUps, botIdentity, locale, sender, opts,
@@ -1475,6 +1517,7 @@ export function buildNewTopicCliInput(
   locale?: Locale,
   sender?: ResolvedSender,
   opts?: {
+    promptInjection?: PromptInjection;
     larkAppId?: string;
     chatId?: string;
     whiteboardId?: string;
@@ -1485,6 +1528,7 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    sharedGroupContext?: string;
     /** Host-resolved identity for this turn. Only the caller knows where the
      *  turn came from, so it is passed in rather than derived here. */
     trustedCaller?: CliTurnPayload['trustedCaller'];
@@ -1498,6 +1542,12 @@ export function buildNewTopicCliInput(
     sessionBackendType?: BackendType;
   },
 ): CliTurnPayload {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
+  const background = backgroundForInput(sessionId, cliId, opts);
+  if (background) {
+    opts = { ...opts, sharedGroupContext: background.body };
+    attachments = mergeBackgroundAttachments(attachments, background.attachments);
+  }
   // 调用点漏传 locale 时回落该 bot 的 per-bot 语言（与 buildFollowUpCliInput /
   // buildReforkCliInput 同一兜底）；bot 未配 lang 时 localeForBot 即进程默认，
   // 与旧行为一致。否则首轮按 bot 语言、续轮回落进程默认会造成同会话语言混排。
@@ -1511,6 +1561,7 @@ export function buildNewTopicCliInput(
     cliId,
     cliPathOverride,
     sessionBackendType: opts?.sessionBackendType,
+    promptInjection: opts?.promptInjection,
     larkAppId: opts?.larkAppId,
   }) === 'hook' && hookTurnId) {
     const blocks = buildNewTopicBlocks(
@@ -1545,7 +1596,7 @@ export function buildNewTopicCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
-    replyDelivery: replyDeliveryFor(opts?.larkAppId, cliId),
+    replyDelivery: replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection),
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
@@ -1572,6 +1623,7 @@ export function buildNewTopicCliInput(
       availableBotsBlock,
       chatContextPolicyBlock,
       chatContextBlock,
+      groupHistoryBlock: opts?.sharedGroupContext,
       applicationContextBlock: opts?.codexAppApplicationContext,
       messageContextBlock: opts?.codexAppMessageContext,
       bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
@@ -1585,7 +1637,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1594,6 +1646,7 @@ type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'w
 /** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
  *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
 type FollowUpOpts = {
+  promptInjection?: PromptInjection;
   attachments?: LarkAttachment[];
   mentions?: LarkMention[];
   isAdoptMode?: boolean;
@@ -1608,6 +1661,7 @@ type FollowUpOpts = {
   codexAppText?: string;
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
+  sharedGroupContext?: string;
   /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
    *  Claude hook 进程，强制 inline 模式。 */
   sessionBackendType?: BackendType;
@@ -1631,12 +1685,15 @@ function buildFollowUpBlocks(
   opts?: FollowUpOpts,
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
+  if (zeroPromptInjectionForBot(opts?.larkAppId, opts?.cliId, opts?.promptInjection)) {
+    return [{ key: 'userMessage', text: buildZeroPromptInput(content, opts?.attachments) }];
+  }
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
   // 转发，续轮不再注入 <botmux_reminder>；noTransport 优先（HTTP 虚拟会话照旧走
   // reminder_no_transport）。bare = transcript + solo → 信封去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
-  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId) === 'transcript';
+  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection) === 'transcript';
   const bare = transcript && opts?.solo === true;
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
@@ -1688,6 +1745,8 @@ function buildFollowUpBlocks(
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
+  if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
+
   // bare（transcript + solo）：裸文本 + `[附件]`/`[@提及]` 行，附件/提及已折进正文，
   // 下面的 sender / senderNote / attachments / mentions 块一并跳过；substitute 保留。
   // hook 模式（#794 后续）：PTY 文本只保留用户正文，不再包 <user_message> 外壳。
@@ -1731,14 +1790,16 @@ export function buildFollowUpContent(
   sessionId: string,
   opts?: FollowUpOpts,
 ): string {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
   // 同 buildFollowUpCliInput 的 locale 兜底：public 入口自保，调用点漏传时
   // 按该 bot 配置的语言渲染（buildRefork* 外层也有同构兜底）。
   opts = opts ? { ...opts, locale: opts.locale ?? localeForBot(opts.larkAppId) } : opts;
   if (
     opts?.cliId
+    && !zeroPromptInjectionForBot(opts.larkAppId, opts.cliId, opts.promptInjection)
     && createCliAdapterSync(opts.cliId, opts.cliPathOverride).inputEnvelope === 'service-user'
   ) {
-    return buildServiceUserPrompt(content);
+    return buildServiceUserPrompt([opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'));
   }
   return buildFollowUpBlocks(content, sessionId, opts).map((b) => b.text).join('\n\n');
 }
@@ -1771,6 +1832,7 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
  * NewTopicOpts 的结构化子集，两边都满足。
  */
 type EnvelopeInjectionCfg = {
+  promptInjection?: PromptInjection;
   cliId?: CliId;
   cliPathOverride?: string;
   sessionBackendType?: BackendType;
@@ -1778,7 +1840,7 @@ type EnvelopeInjectionCfg = {
 };
 
 function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
-  if (!cfg?.cliId) return 'inline';
+  if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId, cfg.promptInjection)) return 'inline';
   // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
   // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
@@ -1847,6 +1909,13 @@ export function buildFollowUpCliInput(
   sessionId: string,
   opts?: FollowUpOpts,
 ): CliTurnPayload {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
+  const background = backgroundForInput(sessionId, opts.cliId, opts);
+  if (background) opts = {
+    ...opts, sharedGroupContext: background.body,
+    attachments: mergeBackgroundAttachments(opts.attachments, background.attachments),
+  };
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
   // 兜底 locale：活 worker 普通续轮、worker-null re-fork、XPI 重放、文档评论等
   // 调用点若漏传，首轮（buildNewTopicCliInput 已按 per-bot 语言渲染）与续轮就会
   // 语言混排。统一在此按 bot 配置补齐；bot 未配 lang 时即进程默认，与旧行为一致。
@@ -1886,7 +1955,7 @@ export function buildFollowUpCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
-    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId),
+    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection),
     locale: opts.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId, opts.locale);
@@ -1909,6 +1978,7 @@ export function buildFollowUpCliInput(
       mentionBlock,
       applicationContextBlock: opts.codexAppApplicationContext,
       messageContextBlock: opts.codexAppMessageContext,
+      groupHistoryBlock: opts.sharedGroupContext,
       attachments: opts.attachments,
     }),
   };
@@ -1927,6 +1997,18 @@ export function buildFollowUpCliInput(
  * carries over, but the format avoids any wording that would prompt the
  * model to call `botmux send` / route through botmux tooling.
  */
+export function buildGroupContextBridgeInput(content: string, sessionId: string, opts: {
+  larkAppId?: string; chatId?: string; turnId?: string; cliId?: CliId; promptInjection?: PromptInjection;
+  attachments?: LarkAttachment[]; mentions?: LarkMention[]; selfMention?: { name?: string | null; openId?: string | null }; locale?: Locale;
+}): string {
+  // Native commands are not model activations and must remain raw commands.
+  const background = /^\s*[/!]/.test(content) ? undefined : backgroundForInput(sessionId, opts.cliId, opts);
+  return buildBridgeInputContent(content, {
+    ...opts, sharedGroupContext: background?.body,
+    attachments: mergeBackgroundAttachments(opts.attachments, background?.attachments),
+  });
+}
+
 export function buildBridgeInputContent(
   content: string,
   opts?: {
@@ -1934,6 +2016,7 @@ export function buildBridgeInputContent(
     mentions?: LarkMention[];
     selfMention?: { name?: string | null; openId?: string | null };
     locale?: Locale;
+    sharedGroupContext?: string;
   },
 ): string {
   const selfMention = opts?.selfMention;
@@ -1979,7 +2062,7 @@ export function buildBridgeInputContent(
     return out;
   };
 
-  const parts: string[] = [stripLeadingSelfMentions(content)];
+  const parts: string[] = [opts?.sharedGroupContext, stripLeadingSelfMentions(content)].filter((part): part is string => part !== undefined);
 
   if (opts?.attachments && opts.attachments.length > 0) {
     const lines = opts.attachments.map(a => `- ${a.name} (${a.path})`);
@@ -2049,6 +2132,7 @@ export function buildReforkPrompt(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds),
     solo: ds.soloSession,
     selfMention: opts?.selfMention,
   });
@@ -2077,7 +2161,9 @@ export function buildReforkCliInput(
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
   if (ds.adoptedFrom) {
     return {
-      content: buildBridgeInputContent(content, {
+      content: buildGroupContextBridgeInput(content, ds.session.sessionId, {
+        larkAppId: ds.larkAppId, chatId: ds.chatId, turnId: opts?.turnId, cliId: opts?.cliId,
+        promptInjection: sessionPromptInjection(ds),
         attachments: opts?.attachments,
         mentions: opts?.mentions,
         selfMention: opts?.selfMention,
@@ -2097,6 +2183,7 @@ export function buildReforkCliInput(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds),
     turnId: opts?.turnId,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
@@ -2680,7 +2767,7 @@ export async function restoreActiveSessions(
       // as an ordinary session, NOT an adopt row. Doing the conversion here (not
       // via a worker-pool side-effect after announceSessionRow) keeps daemon
       // orchestration state consistent.
-      let adoptBotCfg: { sandbox?: boolean; readIsolation?: boolean; apiOnly?: boolean } = {};
+      let adoptBotCfg: { sandbox?: boolean | 'off' | 'oncall' | 'scratch'; readIsolation?: boolean; apiOnly?: boolean } = {};
       try { adoptBotCfg = getBot(session.larkAppId ?? '').config; } catch { /* unknown bot → only the frozen decision matters */ }
       if (adoptSandboxBlocked(adoptBotCfg, session)) {
         logger.warn(`[${session.sessionId.substring(0, 8)}] isolated/no-transport session persisted as adopt — converting to cold-start (a sandbox / apiOnly bot can't wrap a live external CLI)`);
@@ -3009,7 +3096,7 @@ export async function restoreActiveSessions(
         // registers at the real om_ key (sessionAnchorId reads the cleared
         // marker + thread scope) instead of the stable virtual slot.
         if (binding.routingAnchor.startsWith('schedule-task:')) {
-          scheduleStore.updateTask(
+          updateRuntimeTaskState(
             session.deferredScheduleRun.taskId,
             { rootMessageId: binding.rootMessageId },
             larkAppId,
@@ -3486,8 +3573,8 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
-): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -3513,6 +3600,8 @@ export async function resumeSession(
   if (session.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(session)) {
     return { ok: false, error: 'adopt_unsupported' };
   }
+  let remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
   const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
@@ -3533,6 +3622,8 @@ export async function resumeSession(
     return { ok: false as const, error: 'adopt_unsupported' as const };
   }
   session = latest;
+  remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   // In-memory occupant check. A daemon-command scratch (e.g. an unconfirmed
   // `/relay` picker, a bare `/help`) parks a worker:null placeholder at this
@@ -3705,8 +3796,76 @@ export async function resumeSession(
     }
     return { ok: false, error: 'resume_cancelled' };
   }
+  if (remoteRunnerResume) {
+    // Local sessions may stay worker-less until the next message. A remote
+    // Resume button has stronger semantics: start the provider immediately so
+    // it can materialize a replacement remote generation (for example a new
+    // sandbox) from the persisted opaque state. Merely flipping the durable row
+    // to active recreates the ghost-active failure this path is meant to avoid.
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    const preResumeRemoteState = JSON.stringify(session.remoteBackendState ?? null);
+    const rollbackUnstartedRemoteResume = (): boolean => {
+      const current = sessionStore.getOwnedSession(sessionId);
+      if (!current || current.status !== 'active') return current?.status === 'closed';
+      if (JSON.stringify(current.remoteBackendState ?? null) !== preResumeRemoteState) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} changed lineage before startup failed; `
+          + 'leaving the row active for explicit reconciliation',
+        );
+        return false;
+      }
+      try {
+        sessionStore.closeSession(sessionId);
+      } catch (error) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} could not restore the durable closed row: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return false;
+      }
+      const closed = sessionStore.getOwnedSession(sessionId);
+      if (!closed || closed.status !== 'closed') return false;
+      Object.assign(ds.session, closed);
+      for (const [registeredKey, candidate] of activeSessions) {
+        if (candidate === ds) activeSessions.delete(registeredKey);
+      }
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: { sessionId, patch: { status: 'closed', workerPid: null, webPort: null } },
+      });
+      return true;
+    };
+    let started = false;
+    try {
+      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
+        deferDuringDeviceIsolation: false,
+        onAdmission: value => { admission = value; },
+        onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
+        onRemoteBackendStartupExit: rollbackUnstartedRemoteResume,
+      });
+    } catch (error) {
+      logger.warn(
+        `Remote resume ${sessionId.substring(0, 8)} failed to start: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!started || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      // No provider process was synchronously admitted, so no remote recovery
+      // can be in flight. Restore the row directly instead of calling the
+      // generic close path: that path may wake a worker-less remote session to
+      // cancel it, which would create a second rebuild attempt during rollback.
+      if (!rollbackUnstartedRemoteResume()) {
+        return { ok: false, error: 'resume_reconciliation_required' };
+      }
+      return { ok: false, error: 'resume_start_failed' };
+    }
+  }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
-  return { ok: true, ds };
+  return {
+    ok: true,
+    ds,
+    ...(remoteRunnerResume ? { recoveryPending: true as const } : {}),
+  };
   });
 }
 
@@ -3812,6 +3971,9 @@ export async function executeScheduledTask(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
   additionalPrompt?: string,
+  runtime?: {
+    prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  },
 ): Promise<string | undefined> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
@@ -3841,7 +4003,12 @@ export async function executeScheduledTask(
   // Runs before position/scope resolution so the rest of the fire path sees
   // an ordinary retained-topic / new-topic task.
   const taskBeforeFollowActive = task;
-  task = applyFollowActive(task);
+  const persistLanding = (id: string, rootMessageId: string, appId?: string) => {
+    if (!updateRuntimeTaskState(id, { rootMessageId }, appId)) {
+      throw new Error(`schedule task ${id} no longer exists`);
+    }
+  };
+  task = applyFollowActive(task, { persist: persistLanding });
   const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
@@ -3914,7 +4081,7 @@ export async function executeScheduledTask(
       // next fire stays here (step 3) instead of opening one more topic. A
       // silent fresh topic has no real root yet (deferred until the first
       // `botmux send`), so it is not recorded and the next fire re-resolves.
-      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
+      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor, persistLanding);
     }
   } else if (executionPosition === 'task') {
     // Dedicated per-task topic, first fire: the task has no materialized root
@@ -3969,7 +4136,7 @@ export async function executeScheduledTask(
           // Write the root straight into the task row (store call, not the
           // scheduler wrapper/event bus): every later fire resolves to this
           // exact thread and resumes the session created below.
-          scheduleStore.updateTask(task.id, { rootMessageId: seed }, larkAppId);
+          updateRuntimeTaskState(task.id, { rootMessageId: seed }, larkAppId);
           return { anchor: seed, rootMessageId: seed, isContinuation: false };
         },
       );
@@ -4090,6 +4257,9 @@ export async function executeScheduledTask(
           anchor = task.rootMessageId;
           isContinuation = true;
         } catch (err: any) {
+          // A failed source lookup or reply must not silently retarget a
+          // retained-topic schedule under the opt-in stop policy.
+          if (bot.config.topicUnavailablePolicy === 'stop') throw err;
           logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
           anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
         }
@@ -4149,6 +4319,7 @@ export async function executeScheduledTask(
           activeSessions,
           refreshCliVersion,
           additionalPrompt,
+          runtime,
         );
       }
     }
@@ -4224,9 +4395,11 @@ export async function executeScheduledTask(
           chatId: task.chatId,
           whiteboardId: existing.session.whiteboardId,
           sessionBackendType: existing.session.backendType,
+          promptInjection: sessionPromptInjection(existing),
           turnId: scheduledTurnId,
           trustedCaller: scheduledTrustedCaller,
         });
+        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
@@ -4342,7 +4515,7 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, trustedCaller: scheduledTrustedCaller });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, trustedCaller: scheduledTrustedCaller, promptInjection: sessionPromptInjection(ds) });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -4358,6 +4531,7 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
+      await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -4448,6 +4622,7 @@ async function forkOrShowRepoCard(
       larkAppId,
       chatId: ds.chatId,
       whiteboardId: ds.session.whiteboardId,
+      promptInjection: sessionPromptInjection(ds),
       codexAppText: ds.pendingCodexAppText,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,

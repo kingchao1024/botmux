@@ -46,7 +46,7 @@ describe('dashboard bot payload helpers', () => {
       'summaryRange', 'summaryMemory', 'summaryMemoryPath',
       'regularGroupReplyMode', 'regularGroupMentionMode', 'docSubscribeDefaultMode',
       'substituteMode', 'feedback', 'replyStyle', 'askOptionLayout',
-      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen',
+      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen', 'grantRequestToOwnerDm',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
       'envelopeInjection', 'replyDelivery', 'replyDeliveryDefault', 'replyDeliverySupported', 'codexAuthSync', 'triggerUserAuth',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
@@ -201,6 +201,15 @@ describe('dashboard bot payload helpers', () => {
     const daemon = { larkAppId: 'cli_vendor', cliId: 'codex', cliRuntime };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({ cliRuntime });
     expect(botDefaultsPayload(daemon, undefined, 'offline')).toMatchObject({ cliRuntime, error: 'offline' });
+  });
+
+  it('keeps dshProfile in both success and degraded Bot Defaults rows', () => {
+    const daemon = { larkAppId: 'cli_dsh', cliId: 'dsh', dshProfile: 'custom-profile' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ dshProfile: 'custom-profile' });
+    expect(botDefaultsPayload(daemon, undefined, 'offline')).toMatchObject({
+      dshProfile: 'custom-profile',
+      error: 'offline',
+    });
   });
 
   it('includes authoritative cliId in /api/bots success and error rows', () => {
@@ -445,6 +454,17 @@ describe('dashboard bot payload helpers', () => {
     });
     expect(botDefaultsPayload(daemon, { autoGrantRequestCards: false })).toMatchObject({
       autoGrantRequestCards: false,
+    });
+  });
+
+  it('defaults owner-DM request forwarding off and preserves explicit on', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ grantRequestToOwnerDm: false });
+    expect(botDefaultsPayload(daemon, { grantRequestToOwnerDm: true })).toMatchObject({
+      grantRequestToOwnerDm: true,
+    });
+    expect(botDefaultsPayload(daemon, { grantRequestToOwnerDm: 'yes' })).toMatchObject({
+      grantRequestToOwnerDm: false,
     });
   });
 

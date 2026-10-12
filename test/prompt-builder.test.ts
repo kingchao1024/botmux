@@ -76,7 +76,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getOwnerOpenId: vi.fn(() => undefined),
 }));
 
+const mockGetSession = vi.fn(() => undefined as any);
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: (...args: any[]) => mockGetSession(...args),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -109,6 +111,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
 import { config } from '../src/config.js';
+import { buildExternalEventApplicationContext, buildExternalEventDataContext, buildExternalEventVisibleText, buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
+import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { setBotLookup, setDefaultLocale } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -1241,4 +1245,94 @@ describe('builder locale fallback when the caller omits locale', () => {
     });
     expect(content).toContain('Respond to messages addressed to you');
   });
+});
+
+
+describe('per-bot zero prompt injection', () => {
+  afterEach(() => { delete mockBotConfig.promptInjection; delete mockBotConfig.envelopeInjection; mockGetSession.mockReset(); });
+
+  it.each(['default', 'none'] as const)('keeps persisted %s policy through bot toggles and cold resume', mode => {
+    mockGetSession.mockReturnValue({ sessionId: 'frozen', promptInjection: mode });
+    mockBotConfig.promptInjection = mode === 'none' ? 'default' : 'none';
+    const opts = { larkAppId: 'app_test', cliId: 'claude-code' as const, chatId: 'oc_group' };
+    const followUp = buildFollowUpCliInput('task', 'frozen', opts).content;
+    const opening = buildNewTopicCliInput('task', 'frozen', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, opts).content;
+    if (mode === 'none') {
+      expect(followUp).toBe('task');
+      expect(opening).toBe('task');
+    } else {
+      expect(followUp).toContain('<botmux_reminder>');
+      expect(opening).toContain('<user_message>');
+    }
+  });
+
+  it('preserves default mode on historical sessions with no snapshot', () => {
+    mockGetSession.mockReturnValue({ sessionId: 'old' });
+    mockBotConfig.promptInjection = 'none';
+    expect(buildFollowUpCliInput('task', 'old', { larkAppId: 'app_test', cliId: 'codex' }).content)
+      .toContain('<botmux_reminder>');
+  });
+
+  for (const cliId of ['codex', 'claude-code', 'traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'] as const) {
+    it(`${cliId}: opening, follow-up, hook and refork preserve only the task and attachment facts`, () => {
+      mockBotConfig.promptInjection = 'none';
+      mockBotConfig.envelopeInjection = 'auto';
+      const task = '检查 <botmux_reminder> 字样，保留用户原文';
+      const opts = { larkAppId: 'app_test', chatId: 'oc_group', whiteboardId: 'board',
+        cliId, sessionBackendType: 'pty' as const, turnId: 'om_turn',
+        sender: { type: 'bot' as const, openId: 'ou_lead', name: 'Lead' },
+        attachments: [{ type: 'file' as const, name: 'spec.md', path: '/tmp/spec.md' }] };
+      const expected = task + '\n\n[file] spec.md: /tmp/spec.md';
+      const opening = buildNewTopicCliInput(task, 'sid', cliId, undefined, opts.attachments,
+        undefined, undefined, undefined, { name: 'Sub', openId: 'ou_sub' }, 'zh', opts.sender, opts);
+      expect(opening.content).toBe(expected);
+      expect(buildFollowUpCliInput(task, 'sid', opts).content).toBe(expected);
+      const ds = { larkAppId: 'app_test', session: { sessionId: 'sid', chatId: 'oc_group', backendType: 'pty', promptInjection: 'none' } } as DaemonSession;
+      expect(buildReforkPrompt(ds, task, opts)).toBe(expected);
+      expect(buildNewTopicPrompt(task, 'sid', cliId, undefined, undefined, undefined,
+        undefined, ['第二条'], undefined, 'zh', undefined, opts)).toBe(task + '\n\n第二条');
+      delete mockBotConfig.promptInjection;
+      expect(buildFollowUpCliInput('原有 bot', 'sid', opts).content).toContain(cliId === 'ebsd' ? 'BotMux service user message' : '<botmux_reminder>');
+    });
+  }
+});
+
+
+describe('async group message input contract', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => [false, true].map(allowChatMessages => ({ cliId, allowChatMessages }))))(
+    '$cliId carries allowChatMessages=$allowChatMessages through the real builder', ({ cliId, allowChatMessages }) => {
+      const req: TriggerRequest = {
+        source: { type: 'ui', connectorId: 'test' },
+        target: { kind: 'turn', sessionId: 'sid' },
+        envelope: { format: 'text', sourceName: 'test', trusted: false, rawText: 'untrusted event data' },
+        instruction: 'Perform the authorized task',
+        options: { asyncReturnSessionId: true, allowChatMessages },
+      };
+      const application = buildExternalEventApplicationContext(req);
+      const out = buildFollowUpCliInput(buildUntrustedEventPrompt(req, 'trg_test'), 'sid', {
+        cliId, larkAppId: 'app_test', chatId: 'oc_group',
+        codexAppText: buildExternalEventVisibleText(req),
+        codexAppApplicationContext: application,
+        codexAppMessageContext: buildExternalEventDataContext(req, 'trg_test'),
+      });
+      const expected = allowChatMessages ? 'may call botmux send' : 'Do not call botmux send; do not post';
+      if (cliId === 'codex-app') {
+        const entries = Object.entries(out.codexAppInput!.additionalContext!);
+        const policy = entries.filter(([key]) => key.startsWith('botmux_application_context'));
+        expect(policy.every(([, entry]) => entry.kind === 'application')).toBe(true);
+        expect(policy.map(([, entry]) => entry.value).join('')).toBe(application);
+        expect(application).toContain(expected);
+        expect(application).not.toContain('untrusted event data');
+        const data = entries.filter(([key]) => key.startsWith('botmux_message_context'));
+        expect(data.every(([, entry]) => entry.kind === 'untrusted')).toBe(true);
+        expect(data.map(([, entry]) => entry.value).join('')).toContain('untrusted event data');
+        expect(out.codexAppInput!.text).not.toContain('botmux_http_response_mode');
+      } else {
+        expect(out.codexAppInput).toBeUndefined();
+        expect(out.content).toContain(expected);
+        expect(out.content).toContain('untrusted event data');
+        expect(out.content).toContain('BOTMUX_NOTHING_TO_SEND');
+      }
+    });
 });

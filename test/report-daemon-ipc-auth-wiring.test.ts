@@ -68,6 +68,8 @@ describe('botmux report daemon IPC auth wiring', () => {
     expect(dispatchSource).toContain('seedText: built.seedText');
     expect(dispatchSource).toContain('const seedId = registrationBody?.dispatchRoot');
     expect(dispatchSource).not.toContain('const seedId = await sendMessage(appId, targetChatId, built.seedText');
-    expect(daemonSource).toContain("sendMessage(ds.larkAppId, targetChatId, seedText, 'text', dispatchOperationId)");
+    expect(daemonSource).toContain(
+      "ds.larkAppId, targetChatId, seedText, 'text', dispatchOperationId, undefined, sourceWriteOptions",
+    );
   });
 });

@@ -17,6 +17,10 @@ export interface DaemonInfo {
   bootInstanceId?: string;
   /** Auth protocol advertised atomically with the boot identity. */
   workflowIpcProtocol?: string;
+  /** Presence-based session-store capability. Copy only; never a write permit. */
+  sessionStoreProtocol?: string;
+  /** Running binary version. Copy only; never compared by size. */
+  botmuxVersion?: string;
   lastHeartbeat: number;
   /**
    * open_ids of users the bot's allowedUsers list was resolved to (post-email
