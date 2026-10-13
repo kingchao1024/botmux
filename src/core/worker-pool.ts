@@ -874,6 +874,18 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { turnId: string; source: 'terminal' | 'idle'; workerGeneration: number },
   ) => void | Promise<void>;
+  /** The exact generation has a real child, root, bot identity, and cwd. This
+   * fence must settle before the first worker IPC message is dispatched. */
+  onWorkerGenerationStarted?: (
+    ds: DaemonSession,
+    context: {
+      sessionId: string;
+      workerGeneration: number;
+      dispatchRoot?: string;
+      workerAppId: string;
+      workingDir: string;
+    },
+  ) => void | Promise<void>;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
   onWorkerExit?: (
@@ -12384,15 +12396,34 @@ export function forkWorker(
   setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
 
   ds.worker = worker;
-  initializeWorkerIpcBootstrap(worker);
-  rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
-  if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
-    sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted);
-  } else {
-    afterWorkerIpcBootstrap(worker, () => {
-      onIpcDispatchAttempted?.();
-      worker.send(initMsg);
+  const generationReady = cb.onWorkerGenerationStarted?.(ds, {
+    sessionId: ds.session.sessionId,
+    workerGeneration,
+    dispatchRoot: ds.session.rootMessageId,
+    workerAppId: ds.larkAppId,
+    workingDir: cwd,
+  });
+  const dispatchFirstIpc = (): void => {
+    if (ds.worker !== worker) return;
+    initializeWorkerIpcBootstrap(worker);
+    rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
+    if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
+      sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted);
+    } else {
+      afterWorkerIpcBootstrap(worker, () => {
+        onIpcDispatchAttempted?.();
+        worker.send(initMsg);
+      });
+    }
+  };
+  if (generationReady) {
+    void generationReady.then(dispatchFirstIpc, error => {
+      logger.error(`[${tag(ds)}] Worker generation lease fence failed before first IPC: ${String(error)}`);
+      if (ds.worker === worker) ds.worker = null;
+      try { worker.kill(); } catch { /* best-effort generation fence */ }
     });
+  } else {
+    dispatchFirstIpc();
   }
   if (prompt.length > 0) {
     recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId ?? `admitted-turn-${randomUUID()}`, {
@@ -17698,11 +17729,30 @@ export function forkAdoptWorker(
   };
   setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
   ds.worker = worker;
-  initializeWorkerIpcBootstrap(worker);
-  afterWorkerIpcBootstrap(worker, () => {
-    opts?.onIpcDispatchAttempted?.();
-    worker.send(initMsg);
+  const generationReady = cb.onWorkerGenerationStarted?.(ds, {
+    sessionId: ds.session.sessionId,
+    workerGeneration,
+    dispatchRoot: ds.session.rootMessageId,
+    workerAppId: ds.larkAppId,
+    workingDir: adoptCwd,
   });
+  const dispatchFirstIpc = (): void => {
+    if (ds.worker !== worker) return;
+    initializeWorkerIpcBootstrap(worker);
+    afterWorkerIpcBootstrap(worker, () => {
+      opts?.onIpcDispatchAttempted?.();
+      worker.send(initMsg);
+    });
+  };
+  if (generationReady) {
+    void generationReady.then(dispatchFirstIpc, error => {
+      logger.error(`[${tag(ds)}] Adopt worker generation lease fence failed before first IPC: ${String(error)}`);
+      if (ds.worker === worker) ds.worker = null;
+      try { worker.kill(); } catch { /* best-effort generation fence */ }
+    });
+  } else {
+    dispatchFirstIpc();
+  }
   } catch (err) {
     if (ds.worker === worker) ds.worker = null;
     try { worker.kill(); } catch { /* best-effort pre-init child fence */ }

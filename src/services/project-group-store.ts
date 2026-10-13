@@ -8,6 +8,7 @@ import type {
   ProjectDispatchReservationFactsV1,
   ProjectDispatchReservationProofV1,
 } from './task-control-plane-project-group-mapping-source.js';
+import type { RepositoryLeaseRef } from './repository-control-store.js';
 import {
   normalizeProjectStageAdvanceEvents,
   type ProjectStageAdvanceEvent,
@@ -195,6 +196,7 @@ export interface ProjectWorkstream {
   workerAppIds?: string[];
   reviewerAppIds?: string[];
   access?: ProjectDispatchAccess;
+  repositoryLeaseRef?: RepositoryLeaseRef;
   delivery?: ProjectWorkstreamDelivery;
   review?: ProjectWorkstreamReview;
   status: ProjectWorkstreamStatus;
@@ -211,6 +213,7 @@ export interface ProjectDispatchReservation {
   reservationId: string;
   targetAppIds: string[];
   access: ProjectDispatchAccess;
+  repositoryLeaseRef?: RepositoryLeaseRef;
   createdAt: string;
   expiresAt: string;
   stage?: 'reserved' | 'root_created';

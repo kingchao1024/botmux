@@ -1,9 +1,20 @@
 import { realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative } from 'node:path';
+import {
+  resolveRepositoryIdentity,
+  worktreeRootFor,
+  type RepositoryIdentity,
+} from '../services/git-worktree.js';
 
 export type ProjectDispatchAccess =
   | Readonly<{ mode: 'read_only' }>
   | Readonly<{ mode: 'write'; scopes: string[] }>;
+
+export interface DispatchRepositoryLeaseRequirement {
+  identity: RepositoryIdentity;
+  workingDir: string;
+  scopes: string[];
+}
 
 export function normalizeDispatchWriteScopes(scopes: readonly string[]): string[] {
   const normalized = [...new Set(scopes.map(scope => {
@@ -32,4 +43,20 @@ export function projectDispatchAccessConflicts(
   return _left.scopes.some(left => _right.scopes.some(right => (
     pathContains(left, right) || pathContains(right, left)
   )));
+}
+
+export async function resolveDispatchRepositoryLeaseRequirement(
+  access: ProjectDispatchAccess,
+): Promise<DispatchRepositoryLeaseRequirement | null> {
+  if (access.mode === 'read_only') return null;
+  const scopes = normalizeDispatchWriteScopes(access.scopes);
+  if (scopes.length === 0) throw new Error('write_scope_required');
+  const identities = await Promise.all(scopes.map(scope => resolveRepositoryIdentity(scope)));
+  const identity = identities[0]!;
+  if (identities.some(candidate => candidate.repoKey !== identity.repoKey)) {
+    throw new Error('write_scope_spans_multiple_repositories');
+  }
+  const root = await worktreeRootFor(scopes[0]!);
+  if (!root) throw new Error('repository_worktree_root_unavailable');
+  return { identity, workingDir: realpathSync(root), scopes };
 }

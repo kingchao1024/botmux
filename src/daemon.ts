@@ -398,7 +398,11 @@ import {
   type TaskControlProviderAttemptCoordinates,
 } from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
-import { normalizeDispatchWriteScopes, type ProjectDispatchAccess } from './core/dispatch-write-scope.js';
+import {
+  normalizeDispatchWriteScopes,
+  resolveDispatchRepositoryLeaseRequirement,
+  type ProjectDispatchAccess,
+} from './core/dispatch-write-scope.js';
 import { buildTaskControlKickoffContent, partitionProjectDispatchRoles } from './core/dispatch.js';
 import { projectCoordinator } from './services/project-coordinator-runtime.js';
 import {
@@ -417,6 +421,20 @@ import {
   TASK_CONTROL_CANARY_QUARANTINE_CODE,
   withProjectTaskControlChatLockSync,
 } from './services/project-group-store.js';
+import {
+  abandonRepositoryWriter,
+  acquireRepositoryWriter,
+  readRepositoryControl,
+  recordRepositoryLeaseReconcileRequired,
+  rebindRepositoryWriterDispatchRoot,
+  releaseRepositoryWriter,
+  type RepositoryLeaseRef,
+} from './services/repository-control.js';
+import {
+  RepositoryLeaseRuntime,
+  type RepositoryLeaseRuntimeBinding,
+  type RepositoryLeaseRuntimeHandle,
+} from './services/repository-lease-runtime.js';
 import {
   auditProjectGroupTaskControl,
   planProjectGroupTaskControlReconciliation,
@@ -488,6 +506,8 @@ import {
   removeDaemonDescriptorPublication,
   type DaemonDescriptorPublication,
 } from './utils/daemon-discovery.js';
+import { runtimeBuildIdentity } from './utils/runtime-build-id.js';
+import { consumeRepositoryReleaseProbes } from './core/repository-release-command.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
@@ -685,6 +705,18 @@ let selfDaemonLarkAppId: string | undefined;
 let taskControlPlane: TaskControlPlaneLifecycle | undefined;
 let taskControlIntegration: DaemonTaskControlIntegration | undefined;
 let projectWorkerEvidenceRelay: ProjectWorkerEvidenceRelay | undefined;
+type ActiveRepositoryLeaseGenerationBinding = Omit<
+  RepositoryLeaseRuntimeBinding,
+  'identity' | 'leaseRef' | 'dispatchRoot'
+> & {
+  dispatchRoot?: string;
+  identity?: RepositoryIdentity;
+  leaseRef?: RepositoryLeaseRef;
+  replaceExisting?: boolean;
+};
+let bindActiveRepositoryLeaseGeneration: ((
+  binding: ActiveRepositoryLeaseGenerationBinding,
+) => RepositoryLeaseRuntimeHandle | undefined) | undefined;
 let projectTaskControlAuditTimer: NodeJS.Timeout | undefined;
 let projectTaskControlAuditRunning = false;
 let activeTaskControlAllowedKeyIds: readonly string[] | undefined;
@@ -815,7 +847,13 @@ import {
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
-import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
+import {
+  createRepoWorktree,
+  isGitWorkTree,
+  resolveRepositoryIdentity,
+  resolveRepositoryIdentitySync,
+  type RepositoryIdentity,
+} from './services/git-worktree.js';
 import { escapeXmlText } from './utils/xml.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
@@ -4816,6 +4854,8 @@ interface DaemonDescriptor {
   processStartIdentity: string;
   /** Full bots-config revision proven before this daemon admitted startup. */
   rosterRevision: string;
+  /** Exact compiled runtime generation executing in this daemon process. */
+  runtimeGeneration: string;
   startedAt: number;
   /** Public, random audience that changes on every daemon process start. */
   bootInstanceId: string;
@@ -7512,16 +7552,50 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
         taskControlMode,
       })
     : undefined;
+  const reservationId = dispatchPolicy.projectMode ? (dispatchOperationId ?? randomUUID()) : undefined;
   const projectContext = {
     dataDir: config.session.dataDir, chatId: ds.chatId, larkAppId: ds.larkAppId,
     coordinatorSessionId: ds.session.sessionId,
   };
   const registryPath = join(config.session.dataDir, 'orchestrate-dispatch.json');
+  let repositoryLeaseRef: RepositoryLeaseRef | undefined;
+  let repositoryLeaseIdentity: import('./services/git-worktree.js').RepositoryIdentity | undefined;
+  if (access?.mode === 'write') {
+    try {
+      const requirement = await resolveDispatchRepositoryLeaseRequirement(access);
+      if (!requirement) throw new Error('repository_lease_requirement_missing');
+      repositoryLeaseIdentity = requirement.identity;
+      repositoryLeaseRef = acquireRepositoryWriter(config.session.dataDir, {
+        identity: requirement.identity,
+        operationId: `${reservationId}:acquire-repository-writer`,
+        owner: {
+          chatId: ds.chatId,
+          dispatchRoot: reservationId!,
+          taskGuid: reservationId!,
+          controllerAppId: ds.larkAppId,
+          workerAppId: workerAppIds![0]!,
+          sessionId: ds.session.sessionId,
+          workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+          workingDir: requirement.workingDir,
+          declaredScopes: requirement.scopes,
+        },
+        now: new Date().toISOString(),
+      }).leaseRef;
+    } catch (error) {
+      return jsonRes(res, 409, {
+        ok: false, error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
   const prior = dispatchOperationId ? findDispatchOperation(registryPath, dispatchOperationId) : undefined;
   if (prior) {
     const priorProject = readProjectGroup(config.session.dataDir, ds.chatId);
     const priorWorkstream = priorProject?.workstreams
       .find(item => item.dispatchRoot === prior.dispatchRoot);
+    if (repositoryLeaseRef && priorWorkstream
+      && JSON.stringify(priorWorkstream.repositoryLeaseRef) !== JSON.stringify(repositoryLeaseRef)) {
+      return jsonRes(res, 409, { ok: false, error: 'project_repository_lease_ref_conflict' });
+    }
     if (priorWorkstream && priorWorkstream.status !== 'completed' && priorWorkstream.status !== 'failed') {
       if (taskControlMode === 'audit_only' && priorWorkstream.taskControl?.mappingStatus === 'pending') {
         const binding = priorWorkstream.taskControl;
@@ -7607,11 +7681,11 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     }
   }
 
-  const reservationId = dispatchPolicy.projectMode ? (dispatchOperationId ?? randomUUID()) : undefined;
   let taskControlReservation: import('./services/project-group-store.js').ProjectDispatchReservation | undefined;
   let reservationActive = false;
   const abortReservation = async (): Promise<void> => {
     if (!reservationId || !reservationActive) return;
+    if (repositoryLeaseRef) return;
     if (taskControlReservation?.taskControl) return;
     try {
       await projectCoordinator.run(projectContext, { action: 'abort_dispatch', reservationId, targetAppIds });
@@ -7669,6 +7743,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       }
       const reservedProject = await projectCoordinator.run(projectContext, {
         action: 'reserve_dispatch', reservationId, targetAppIds, access: access!, now: new Date(reservationNow).toISOString(),
+        ...(repositoryLeaseRef ? { repositoryLeaseRef } : {}),
         ...(taskControl ? { taskControl } : {}),
         ...(taskControl ? {
           maxActiveTaskControlMappings: dispatchPolicy.maxActiveMappings,
@@ -7681,6 +7756,26 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       taskControlReservation = reservedProject.dispatchReservations?.find(item => item.reservationId === reservationId);
       reservationActive = true;
     } catch (error) {
+      if (repositoryLeaseRef && repositoryLeaseIdentity) {
+        try {
+          abandonRepositoryWriter(config.session.dataDir, {
+            identity: repositoryLeaseIdentity,
+            operationId: `${reservationId}:abandon-before-dispatch`,
+            leaseId: repositoryLeaseRef.leaseId,
+            fencingToken: repositoryLeaseRef.fencingToken,
+            sessionId: ds.session.sessionId,
+            workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration ?? 0,
+            terminationEvidence: {
+              kind: 'abandoned_before_dispatch',
+              reservationId,
+              observedAt: new Date().toISOString(),
+            },
+            now: new Date().toISOString(),
+          });
+        } catch (abandonError) {
+          logger.warn(`[project:${ds.chatId}] repository lease abandon failed: ${abandonError instanceof Error ? abandonError.message : String(abandonError)}`);
+        }
+      }
       return jsonRes(res, 409, {
         ok: false, error: error instanceof Error ? error.message : String(error),
       });
@@ -7691,11 +7786,11 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     ? taskControlReservation.dispatchRoot
     : '';
   let seedCreated = !!dispatchRoot;
-  let taskControlSeedAttempted = false;
+  let seedIntentPersisted = false;
   let taskControlRoot: ReturnType<typeof projectGroupRootSnapshotFromLarkDetail>;
   try {
     if (!dispatchRoot) {
-      if (taskControlReservation?.taskControl && dispatchOperationId) {
+      if ((taskControlReservation?.taskControl || repositoryLeaseRef) && dispatchOperationId) {
         const assertExactSeedFence = (expectedFingerprint?: string): string => {
           const project = readProjectGroup(config.session.dataDir, ds.chatId);
           if (!project) throw new Error('project_not_found');
@@ -7707,28 +7802,36 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
           }
           return binding.fingerprint;
         };
-        const preparedSeed = withProjectTaskControlChatLockSync(
-          config.session.dataDir,
-          ds.chatId,
-          () => {
-            const fenceFingerprint = assertExactSeedFence();
-            const operation = beginTaskControlSeedOperationSync(registryPath, {
-              operationId: dispatchOperationId,
-              sourceAppId: ds.larkAppId,
-              targetChatId,
-              messageType: 'text',
-              payloadHash: createHash('sha256').update(seedText).digest('hex'),
-              attempt: taskControlProviderAttemptCoordinates(),
-            });
-            return { fenceFingerprint, operation };
-          },
-        );
+        const prepareSeed = () => {
+          const fenceFingerprint = taskControlReservation?.taskControl
+            ? assertExactSeedFence()
+            : undefined;
+          const operation = beginTaskControlSeedOperationSync(registryPath, {
+            operationId: dispatchOperationId,
+            sourceAppId: ds.larkAppId,
+            targetChatId,
+            messageType: 'text',
+            payloadHash: createHash('sha256').update(seedText).digest('hex'),
+            attempt: taskControlProviderAttemptCoordinates(),
+          });
+          return fenceFingerprint ? { fenceFingerprint, operation } : { operation };
+        };
+        const preparedSeed = taskControlReservation?.taskControl
+          ? withProjectTaskControlChatLockSync(
+            config.session.dataDir,
+            ds.chatId,
+            prepareSeed,
+          )
+          : prepareSeed();
         const seedOperation = preparedSeed.operation;
-        taskControlSeedAttempted = true;
+        seedIntentPersisted = true;
         if (seedOperation.state === 'ambiguous') {
           return jsonRes(res, 409, {
             ok: false, error: 'dispatch_seed_ambiguous', seedCreated: false,
-            stage: taskControlReservation.stage ?? 'reserved', retryableWithSameReservation: false,
+            ...(taskControlReservation?.taskControl
+              ? { stage: taskControlReservation.stage ?? 'reserved' }
+              : {}),
+            retryableWithSameReservation: false,
           });
         }
         if (seedOperation.state === 'delivered') {
@@ -7742,14 +7845,13 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
             ),
           );
           seedCreated = true;
-          withProjectTaskControlChatLockSync(
-            config.session.dataDir,
-            ds.chatId,
-            () => {
-              assertExactSeedFence(preparedSeed.fenceFingerprint);
-              completeTaskControlSeedOperationSync(registryPath, { operationId: dispatchOperationId, dispatchRoot });
-            },
-          );
+          const completeSeed = () => {
+            if (taskControlReservation?.taskControl) assertExactSeedFence(preparedSeed.fenceFingerprint);
+            completeTaskControlSeedOperationSync(registryPath, { operationId: dispatchOperationId, dispatchRoot });
+          };
+          if (taskControlReservation?.taskControl) {
+            withProjectTaskControlChatLockSync(config.session.dataDir, ds.chatId, completeSeed);
+          } else completeSeed();
         }
       } else {
         dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text', dispatchOperationId);
@@ -7761,7 +7863,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       if (!taskControlRoot) throw new Error('project_task_control_root_unreadable');
     }
   } catch (error) {
-    if (!taskControlSeedAttempted) await abortReservation();
+    if (!seedIntentPersisted) await abortReservation();
     return jsonRes(res, 502, {
       ok: false,
       error: 'dispatch_seed_send_failed',
@@ -7773,6 +7875,27 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
         retryableWithSameReservation: true,
       } : {}),
     });
+  }
+  if (repositoryLeaseRef && repositoryLeaseIdentity) {
+    try {
+      rebindRepositoryWriterDispatchRoot(config.session.dataDir, {
+        identity: repositoryLeaseIdentity,
+        operationId: `${reservationId}:bind-repository-dispatch-root`,
+        leaseId: repositoryLeaseRef.leaseId,
+        fencingToken: repositoryLeaseRef.fencingToken,
+        reservationId: reservationId!,
+        dispatchRoot,
+        now: new Date().toISOString(),
+      });
+    } catch (error) {
+      return jsonRes(res, 500, {
+        ok: false,
+        error: 'project_repository_lease_root_bind_failed',
+        detail: error instanceof Error ? error.message : String(error),
+        seedCreated: true,
+        dispatchRoot,
+      });
+    }
   }
   if (taskControlReservation?.taskControl && taskControlReservation.stage !== 'root_created') {
     try {
@@ -7821,6 +7944,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
           ...(access ? { access } : {}),
           ...(workerAppIds ? { workerAppIds } : {}),
           ...(reviewerAppIds ? { reviewerAppIds } : {}),
+          ...(repositoryLeaseRef ? { repositoryLeaseRef } : {}),
           ...(taskControlReservation?.taskControl ? {
             taskControl: {
               mode: 'audit_only',
@@ -7858,6 +7982,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       let committedProject = await projectCoordinator.run(projectContext, {
         action: 'commit_dispatch', reservationId, targetAppIds, dispatchRoot,
         title: title || '子任务', purpose, owners: stringArray(body?.owners), workerAppIds, reviewerAppIds,
+        ...(repositoryLeaseRef ? { repositoryLeaseRef } : {}),
       });
       reservationActive = false;
       projectSynced = true;
@@ -8210,6 +8335,14 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     requestId: `report:${decision.source.sessionId}:${Date.now()}`,
     receivedAt: new Date().toISOString(),
   };
+  const reportRequestId = 'report:' + createHash('sha256').update(JSON.stringify({
+    sourceSessionId: decision.source.sessionId,
+    sourceTurnId: decision.source.turnId,
+    dispatchRoot: decision.dispatchRoot,
+    reporterAppId: decision.reporterAppId,
+    content: decision.content,
+    projectUpdate: decision.projectUpdate,
+  })).digest('hex');
   const postProjectUpdate = async (
     target: { larkAppId: string; sessionId: string },
   ): Promise<{ projectSynced: boolean; projectSyncError?: string; deliveryRound?: number; projectRevision?: number }> => {
@@ -8220,6 +8353,107 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       // actual landing daemon instead of assuming the original one.
       : findOnlineDaemon(target.larkAppId);
     if (!projectDaemon) return { projectSynced: false, projectSyncError: 'orchestrator_daemon_offline' };
+    const registryEntry = registry[decision.dispatchRoot];
+    const dispatchEntry = registryEntry && typeof registryEntry === 'object' && !Array.isArray(registryEntry)
+      ? registryEntry as Record<string, unknown>
+      : undefined;
+    const projectChatId = typeof dispatchEntry?.orchChatId === 'string' ? dispatchEntry.orchChatId : '';
+    const beforeProject = projectChatId
+      ? readProjectGroup(config.session.dataDir, projectChatId)
+      : undefined;
+    const beforeWorkstream = beforeProject?.workstreams
+      .find(item => item.dispatchRoot === decision.dispatchRoot);
+    let repairLeaseRef: RepositoryLeaseRef | undefined;
+    let repairLeaseIdentity: import('./services/git-worktree.js').RepositoryIdentity | undefined;
+    let repairLeaseHandle: RepositoryLeaseRuntimeHandle | undefined;
+    const releaseRepairLease = (operationSuffix: string, observedAt: string): string | undefined => {
+      repairLeaseHandle?.stop();
+      repairLeaseHandle = undefined;
+      if (!repairLeaseRef || !repairLeaseIdentity) return undefined;
+      try {
+        releaseRepositoryWriter(config.session.dataDir, {
+          identity: repairLeaseIdentity,
+          operationId: `${reportRequestId}:${operationSuffix}`,
+          leaseId: repairLeaseRef.leaseId,
+          fencingToken: repairLeaseRef.fencingToken,
+          now: observedAt,
+        });
+        return undefined;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        try {
+          recordRepositoryLeaseReconcileRequired(config.session.dataDir, {
+            identity: repairLeaseIdentity,
+            operationId: `${reportRequestId}:${operationSuffix}:reconcile-required`,
+            leaseId: repairLeaseRef.leaseId,
+            fencingToken: repairLeaseRef.fencingToken,
+            reason,
+            now: observedAt,
+          });
+        } catch (recordError) {
+          return `repository_lease_reconcile_record_failed:${recordError instanceof Error ? recordError.message : String(recordError)}`;
+        }
+        return `repository_lease_reconcile_required:${reason}`;
+      }
+    };
+    const repairRequested = !decision.projectUpdate.reviewVerdict
+      && beforeWorkstream?.status === 'blocked'
+      && beforeWorkstream.review?.verdict === 'fail'
+      && decision.projectUpdate.status !== 'completed'
+      && decision.projectUpdate.status !== 'failed';
+    if (repairRequested) {
+      try {
+        if (beforeWorkstream?.access?.mode !== 'write') throw new Error('project_write_access_missing');
+        const requirement = await resolveDispatchRepositoryLeaseRequirement(beforeWorkstream.access);
+        if (!requirement || requirement.identity.repoKey !== beforeWorkstream.repositoryLeaseRef?.repoKey) {
+          throw new Error('project_repository_lease_identity_mismatch');
+        }
+        const workerGeneration = ds?.workerGeneration ?? ds?.session.workerGeneration ?? 0;
+        if (!Number.isSafeInteger(workerGeneration) || workerGeneration < 1) {
+          throw new Error('project_repository_lease_generation_unproven');
+        }
+        repairLeaseIdentity = requirement.identity;
+        repairLeaseRef = acquireRepositoryWriter(config.session.dataDir, {
+          identity: requirement.identity,
+          operationId: `${reportRequestId}:repair-acquire`,
+          owner: {
+            chatId: projectChatId,
+            dispatchRoot: decision.dispatchRoot,
+            taskGuid: beforeWorkstream.taskControl?.taskGuid ?? decision.dispatchRoot,
+            controllerAppId: decision.target.larkAppId,
+            workerAppId: decision.reporterAppId,
+            sessionId: decision.source.sessionId,
+            workerGeneration,
+            workingDir: requirement.workingDir,
+            declaredScopes: requirement.scopes,
+          },
+          now: beforeWorkstream.updatedAt,
+        }).leaseRef;
+        if (!bindActiveRepositoryLeaseGeneration) {
+          throw new Error('repository_lease_runtime_unavailable');
+        }
+        repairLeaseHandle = bindActiveRepositoryLeaseGeneration({
+          identity: requirement.identity,
+          leaseRef: repairLeaseRef,
+          dispatchRoot: decision.dispatchRoot,
+          workerAppId: decision.reporterAppId,
+          workingDir: requirement.workingDir,
+          sessionId: decision.source.sessionId,
+          workerGeneration,
+          replaceExisting: true,
+        });
+        if (!repairLeaseHandle) throw new Error('repository_lease_generation_attach_failed');
+      } catch (error) {
+        const compensationError = releaseRepairLease(
+          'repair-attach-failed',
+          beforeWorkstream?.updatedAt ?? triggerMeta.receivedAt,
+        );
+        return {
+          projectSynced: false,
+          projectSyncError: compensationError ?? (error instanceof Error ? error.message : String(error)),
+        };
+      }
+    }
     try {
       const projectResponse = await fetchDaemonIpc(
         projectDaemon.ipcPort,
@@ -8231,21 +8465,69 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
             action: 'report', dispatchRoot: decision.dispatchRoot, content: decision.content,
             reporterAppId: decision.reporterAppId,
             ...decision.projectUpdate,
+            ...(repairLeaseRef ? { repositoryLeaseRef: repairLeaseRef } : {}),
             ...(decision.phaseAReport ? { phaseAReport: decision.phaseAReport } : {}),
           }),
         },
       );
       const projectBody = await projectResponse.json().catch(() => ({})) as {
         ok?: boolean; error?: string;
-        project?: { revision?: number; workstreams?: Array<{ dispatchRoot?: string; delivery?: { round?: number } }> };
+        project?: { revision?: number; workstreams?: Array<{
+          dispatchRoot?: string;
+          status?: string;
+          updatedAt?: string;
+          repositoryLeaseRef?: RepositoryLeaseRef;
+          delivery?: { round?: number };
+        }> };
       };
       const projectSynced = projectResponse.ok && projectBody.ok === true;
       if (!projectSynced && !(!decision.projectRequired
         && projectResponse.status === 404 && projectBody.error === 'project_not_found')) {
+        if (repairLeaseRef) {
+          const compensationError = releaseRepairLease(
+            'repair-project-failed',
+            beforeWorkstream?.updatedAt ?? triggerMeta.receivedAt,
+          );
+          if (compensationError) {
+            return {
+              projectSynced: false,
+              projectSyncError: compensationError,
+            };
+          }
+        }
         return { projectSynced, projectSyncError: projectBody.error ?? `HTTP ${projectResponse.status}` };
       }
-      const deliveryRound = projectBody.project?.workstreams
-        ?.find(item => item.dispatchRoot === decision.dispatchRoot)?.delivery?.round;
+      const updatedWorkstream = projectBody.project?.workstreams
+        ?.find(item => item.dispatchRoot === decision.dispatchRoot);
+      const deliveryRound = updatedWorkstream?.delivery?.round;
+      const shouldRelease = !decision.projectUpdate.reviewVerdict
+        && (updatedWorkstream?.status === 'in_review' || updatedWorkstream?.status === 'failed');
+      if (projectSynced && shouldRelease && updatedWorkstream?.repositoryLeaseRef) {
+        try {
+          const leaseRef = updatedWorkstream.repositoryLeaseRef;
+          const identity = await resolveRepositoryIdentity(leaseRef.workingDir);
+          if (identity.repoKey !== leaseRef.repoKey) throw new Error('repository_lease_identity_mismatch');
+          const repository = readRepositoryControl(config.session.dataDir, identity);
+          if (repository.writerLease) {
+            if (repository.writerLease.leaseId !== leaseRef.leaseId
+              || repository.writerLease.fencingToken !== leaseRef.fencingToken) {
+              throw new Error('repository_lease_stale_token');
+            }
+            releaseRepositoryWriter(config.session.dataDir, {
+              identity,
+              operationId: `${reportRequestId}:${updatedWorkstream.status === 'failed' ? 'terminal' : 'review'}-release`,
+              leaseId: leaseRef.leaseId,
+              fencingToken: leaseRef.fencingToken,
+              now: updatedWorkstream.updatedAt ?? triggerMeta.receivedAt,
+            });
+          }
+        } catch (error) {
+          return {
+            projectSynced: false,
+            projectSyncError: `repository_lease_reconcile_required:${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+      }
       return {
         projectSynced,
         ...(Number.isSafeInteger(deliveryRound) && (deliveryRound as number) > 0
@@ -8254,20 +8536,18 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
           ? { projectRevision: projectBody.project!.revision } : {}),
       };
     } catch (error) {
+      const compensationError = repairLeaseRef
+        ? releaseRepairLease(
+            'repair-project-threw',
+            beforeWorkstream?.updatedAt ?? triggerMeta.receivedAt,
+          )
+        : undefined;
       return {
         projectSynced: false,
-        projectSyncError: error instanceof Error ? error.message : String(error),
+        projectSyncError: compensationError ?? (error instanceof Error ? error.message : String(error)),
       };
     }
   };
-  const reportRequestId = 'report:' + createHash('sha256').update(JSON.stringify({
-      sourceSessionId: decision.source.sessionId,
-      sourceTurnId: decision.source.turnId,
-      dispatchRoot: decision.dispatchRoot,
-      reporterAppId: decision.reporterAppId,
-      content: decision.content,
-      projectUpdate: decision.projectUpdate,
-    })).digest('hex');
   try {
     const delivered = await deliverReportSessionRelay({
       decision,
@@ -29056,6 +29336,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   }
                 },
               });
+              const auditRuntimeIdentity = runtimeBuildIdentity();
+              if (auditRuntimeIdentity.status === 'known') {
+                consumeRepositoryReleaseProbes(config.session.dataDir, auditRuntimeIdentity.id);
+              }
             } catch (error) {
               logger.warn(`[task-control] project audit failed: ${String(error)}`);
             } finally {
@@ -29364,6 +29648,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (!daemonProcessStartIdentity) {
     throw new Error('cannot bind daemon descriptor to a process-start identity');
   }
+  const daemonRuntimeIdentity = runtimeBuildIdentity();
+  if (daemonRuntimeIdentity.status !== 'known') {
+    throw new Error(`cannot publish daemon runtime identity: ${daemonRuntimeIdentity.reason}`);
+  }
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.displayName ?? cfg.larkAppId,
@@ -29373,6 +29661,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     pid: process.pid,
     processStartIdentity: daemonProcessStartIdentity,
     rosterRevision: startupRoster.revision,
+    runtimeGeneration: daemonRuntimeIdentity.id,
     startedAt: Date.now(),
     bootInstanceId: getDaemonBootId(),
     workflowIpcProtocol: 'v1',
@@ -29613,6 +29902,103 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.warn(`[task-control] project evidence capture failed: ${String(error)}`);
     }
     return true;
+  };
+  const repositoryLeaseRuntime = new RepositoryLeaseRuntime(config.session.dataDir, {
+    onError: error => logger.error(
+      `[repository-lease] runtime heartbeat failed: ${error instanceof Error ? error.message : String(error)}`,
+    ),
+  });
+  const repositoryLeaseHandles = new Map<string, RepositoryLeaseRuntimeHandle>();
+  const repositoryLeaseHandleKey = (sessionId: string, workerGeneration: number): string => (
+    `${sessionId}:${workerGeneration}`
+  );
+  bindActiveRepositoryLeaseGeneration = (
+    context: ActiveRepositoryLeaseGenerationBinding,
+  ): RepositoryLeaseRuntimeHandle | undefined => {
+    if (!context.dispatchRoot) return;
+    const expectedWorkingDir = realpathSync(context.workingDir);
+    let rawLeaseRef: unknown = context.leaseRef;
+    if (rawLeaseRef === undefined) {
+      const registryPath = join(config.session.dataDir, 'orchestrate-dispatch.json');
+      if (existsSync(registryPath)) {
+        const registry = JSON.parse(readFileSync(registryPath, 'utf8')) as Record<string, unknown>;
+        const rawEntry = registry[context.dispatchRoot];
+        if (rawEntry !== undefined) {
+          if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+            throw new Error('repository_lease_registry_invalid');
+          }
+          const entry = rawEntry as Record<string, unknown>;
+          if (entry.repositoryLeaseRef === undefined) return;
+          const workerAppIds = entry.workerAppIds;
+          rawLeaseRef = entry.repositoryLeaseRef;
+          if (!Array.isArray(workerAppIds) || !workerAppIds.every(value => typeof value === 'string')
+              || !workerAppIds.includes(context.workerAppId)) {
+            throw new Error('repository_lease_registry_invalid');
+          }
+        }
+      }
+    }
+    let identity = context.identity;
+    if (!identity) {
+      try {
+        identity = resolveRepositoryIdentitySync(expectedWorkingDir);
+      } catch (error) {
+        if (rawLeaseRef !== undefined) throw error;
+        return;
+      }
+    }
+    let leaseRef: RepositoryLeaseRef | undefined;
+    if (rawLeaseRef !== undefined) {
+      if (!rawLeaseRef || typeof rawLeaseRef !== 'object' || Array.isArray(rawLeaseRef)) {
+        throw new Error('repository_lease_registry_invalid');
+      }
+      const candidate = rawLeaseRef as Record<string, unknown>;
+      if (typeof candidate.repoKey !== 'string' || !/^[a-f0-9]{64}$/.test(candidate.repoKey)
+          || typeof candidate.leaseId !== 'string' || !candidate.leaseId
+          || !Number.isSafeInteger(candidate.fencingToken) || (candidate.fencingToken as number) < 1
+          || typeof candidate.workingDir !== 'string' || !isAbsolute(candidate.workingDir)) {
+        throw new Error('repository_lease_registry_invalid');
+      }
+      if (realpathSync(candidate.workingDir) !== expectedWorkingDir) {
+        throw new Error('repository_lease_binding_mismatch');
+      }
+      leaseRef = {
+        repoKey: candidate.repoKey,
+        leaseId: candidate.leaseId,
+        fencingToken: candidate.fencingToken as number,
+        workingDir: expectedWorkingDir,
+      };
+    }
+    if (leaseRef && identity.repoKey !== leaseRef.repoKey) throw new Error('repository_lease_identity_mismatch');
+    const key = repositoryLeaseHandleKey(context.sessionId, context.workerGeneration);
+    const existing = repositoryLeaseHandles.get(key);
+    if (existing) {
+      if (!context.replaceExisting) throw new Error('repository_lease_generation_already_attached');
+      existing.stop();
+    }
+    const attached = repositoryLeaseRuntime.attachActive({
+      identity,
+      ...(leaseRef ? { leaseRef } : {}),
+      dispatchRoot: context.dispatchRoot,
+      workerAppId: context.workerAppId,
+      workingDir: expectedWorkingDir,
+      sessionId: context.sessionId,
+      workerGeneration: context.workerGeneration,
+    });
+    if (!attached) return;
+    const handle: RepositoryLeaseRuntimeHandle = {
+      ready: attached.ready,
+      stop: () => {
+        if (repositoryLeaseHandles.get(key) === handle) repositoryLeaseHandles.delete(key);
+        attached.stop();
+      },
+      generationTerminated: evidence => {
+        if (repositoryLeaseHandles.get(key) === handle) repositoryLeaseHandles.delete(key);
+        attached.generationTerminated(evidence);
+      },
+    };
+    repositoryLeaseHandles.set(key, handle);
+    return handle;
   };
   const scheduleBindings = new ScheduleTurnBindingOwner();
   setScheduleTurnBindingOwner(scheduleBindings);
@@ -29873,6 +30259,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
+    onWorkerGenerationStarted(_ds, context) {
+      return bindActiveRepositoryLeaseGeneration?.(context)?.ready;
+    },
     onCliExit(ds, context) {
       ds.activeInteractiveTurn = undefined;
       // Same idempotent-async convergence as onWorkerExit: the MANAGED CLI can
@@ -29897,6 +30286,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     },
     onWorkerExit(ds, context) {
+      const repositoryLeaseKey = repositoryLeaseHandleKey(
+        context.sessionId,
+        context.workerGeneration,
+      );
+      const repositoryLeaseHandle = repositoryLeaseHandles.get(repositoryLeaseKey);
+      if (repositoryLeaseHandle) {
+        repositoryLeaseHandles.delete(repositoryLeaseKey);
+        try {
+          repositoryLeaseHandle.generationTerminated({
+            kind: 'process_exit',
+            code: context.code,
+            signal: context.signal,
+            observedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          logger.error(
+            `[repository-lease] generation termination evidence failed `
+            + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.
@@ -30649,6 +31060,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // normal fleet and core-only boots; the readiness setter is only a
         // barrier release and must not be the recovery trigger.
         await reconcileProjectStageAdvanceEventsAfterRestore();
+        consumeRepositoryReleaseProbes(config.session.dataDir, daemonRuntimeIdentity.id);
         markIpcReady();
         clearDeviceIsolationStartupIntent({
           intentId: startupIntent.intentId,

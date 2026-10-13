@@ -26,7 +26,8 @@ const evidenceCode = ts.transpileModule('const handler = ' + evidenceHandler.get
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
 
-type Failure = 'reserve' | 'seed' | 'seed_journal_complete' | 'registry' | 'commit' | 'refresh';
+type Failure = 'lease_conflict' | 'frozen' | 'reserve' | 'seed' | 'seed_ambiguous'
+  | 'seed_journal_complete' | 'registry' | 'commit' | 'refresh';
 
 function harness(failure?: Failure, projectMode = true) {
   const steps: string[] = [];
@@ -55,17 +56,23 @@ function harness(failure?: Failure, projectMode = true) {
   };
   const sendMessage = vi.fn(async () => {
     steps.push('seed');
-    if (failure === 'seed') throw new Error('seed_failed');
+    if (failure === 'seed' || failure === 'seed_ambiguous') throw new Error(`${failure}_failed`);
     return 'om_seed';
   });
+  let seedOperation: any;
   const beginTaskControlSeedOperationSync = vi.fn(() => {
     steps.push('seed_journal_begin');
-    return { state: 'pending', providerUuid: 'seed-provider-uuid' };
+    if (failure === 'seed_ambiguous') {
+      return { state: 'ambiguous', providerUuid: 'seed-provider-uuid' };
+    }
+    seedOperation ??= { state: 'pending', providerUuid: 'seed-provider-uuid' };
+    return seedOperation;
   });
   const completeTaskControlSeedOperationSync = vi.fn(() => {
     steps.push('seed_journal_complete');
     if (failure === 'seed_journal_complete') throw new Error('seed_journal_complete_failed');
-    return { state: 'delivered', dispatchRoot: 'om_seed' };
+    seedOperation = { state: 'delivered', providerUuid: 'seed-provider-uuid', dispatchRoot: 'om_seed' };
+    return seedOperation;
   });
   const providerAbortController = new AbortController();
   const runWithAbortDeadline = vi.fn(async (
@@ -77,6 +84,24 @@ function harness(failure?: Failure, projectMode = true) {
     steps.push('registry');
     if (failure === 'registry') throw new Error('registry_failed');
   });
+  const repositoryLeaseRef = {
+    repoKey: 'f'.repeat(64), leaseId: 'lease-route', fencingToken: 9, workingDir: '/repo',
+  };
+  const resolveDispatchRepositoryLeaseRequirement = vi.fn(async () => ({
+    identity: { repoKey: repositoryLeaseRef.repoKey, canonicalCommonDir: '/repo/.git' },
+    workingDir: repositoryLeaseRef.workingDir, scopes: ['/repo/src'],
+  }));
+  const acquireRepositoryWriter = vi.fn(() => {
+    steps.push('acquire_repository_lease');
+    if (failure === 'lease_conflict') throw new Error('repository_writer_conflict');
+    if (failure === 'frozen') throw new Error('repository_barrier_blocks_writer');
+    return { revision: 1, lease: {}, leaseRef: repositoryLeaseRef };
+  });
+  const rebindRepositoryWriterDispatchRoot = vi.fn(() => ({ revision: 2, lease: {} }));
+  const releaseRepositoryWriter = vi.fn(() => { steps.push('release_repository_lease'); });
+  const abandonRepositoryWriter = vi.fn((_dataDir: string, input: any) => {
+    steps.push(`abandon_repository_lease:${input.terminationEvidence?.kind ?? 'unknown'}`);
+  });
   const scope: any = {
     readJsonBody: async () => body, DISPATCH_REPORT_REGISTER_MAX_BYTES: 1_000_000,
     JsonBodyTooLargeError: class extends Error {},
@@ -86,6 +111,9 @@ function harness(failure?: Failure, projectMode = true) {
     readGroupCollaborationMode: () => ({ mode: projectMode ? 'project' : 'standard' }),
     evaluateProjectDispatchPolicy: () => ({ ok: true, projectMode }),
     normalizeDispatchWriteScopes: (scopes: string[]) => scopes,
+    resolveDispatchRepositoryLeaseRequirement, acquireRepositoryWriter,
+    rebindRepositoryWriterDispatchRoot,
+    releaseRepositoryWriter, abandonRepositoryWriter,
     partitionProjectDispatchRoles: (bots: Array<{ appId: string; role: string }>) => ({
       workerAppIds: bots.filter(bot => bot.role === 'worker').map(bot => bot.appId),
       reviewerAppIds: bots.filter(bot => bot.role === 'reviewer').map(bot => bot.appId),
@@ -122,7 +150,10 @@ function harness(failure?: Failure, projectMode = true) {
     body, steps, scope, projectCoordinator, sendMessage,
     beginTaskControlSeedOperationSync, completeTaskControlSeedOperationSync,
     providerAbortController, runWithAbortDeadline,
-    recordDispatchRegistryEntry, run: () => run({}, {}),
+    recordDispatchRegistryEntry, repositoryLeaseRef,
+    resolveDispatchRepositoryLeaseRequirement, acquireRepositoryWriter,
+    rebindRepositoryWriterDispatchRoot,
+    releaseRepositoryWriter, abandonRepositoryWriter, run: () => run({}, {}),
   };
 }
 
@@ -150,18 +181,65 @@ describe('dispatch registration project reservation', () => {
     expect(h.steps).toEqual([]);
   });
 
+  it.each([
+    ['lease_conflict', 'repository_writer_conflict'],
+    ['frozen', 'repository_barrier_blocks_writer'],
+  ] as const)('rejects %s before project reservation and seed delivery', async (failure, error) => {
+    const h = harness(failure);
+    expect(await h.run()).toMatchObject({ status: 409, value: { error } });
+    expect(h.steps).toEqual(['acquire_repository_lease']);
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(h.projectCoordinator.run).not.toHaveBeenCalled();
+  });
+
+  it('abandons the lease after reservation failure only because no seed intent exists', async () => {
+    const h = harness('reserve');
+    expect(await h.run()).toMatchObject({ status: 409, value: { error: 'project_write_scope_conflict' } });
+    expect(h.steps).toEqual([
+      'acquire_repository_lease', 'reserve_dispatch',
+      'abandon_repository_lease:abandoned_before_dispatch',
+    ]);
+    expect(h.abandonRepositoryWriter).toHaveBeenCalledWith(
+      '/data',
+      expect.objectContaining({
+        leaseId: h.repositoryLeaseRef.leaseId,
+        fencingToken: h.repositoryLeaseRef.fencingToken,
+        terminationEvidence: expect.objectContaining({ kind: 'abandoned_before_dispatch' }),
+      }),
+    );
+  });
+
+  it('keeps the lease and reservation when seed delivery is ambiguous', async () => {
+    const h = harness('seed_ambiguous');
+    expect(await h.run()).toMatchObject({
+      status: 409,
+      value: { error: 'dispatch_seed_ambiguous', retryableWithSameReservation: false },
+    });
+    expect(h.steps).toEqual([
+      'acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin',
+    ]);
+    expect(h.releaseRepositoryWriter).not.toHaveBeenCalled();
+    expect(h.abandonRepositoryWriter).not.toHaveBeenCalled();
+  });
+
   it('rejects a reservation conflict before sending the seed', async () => {
     const h = harness('reserve');
     expect(await h.run()).toMatchObject({ status: 409, value: { error: 'project_write_scope_conflict' } });
-    expect(h.steps).toEqual(['reserve_dispatch']);
+    expect(h.steps).toEqual([
+      'acquire_repository_lease', 'reserve_dispatch',
+      'abandon_repository_lease:abandoned_before_dispatch',
+    ]);
   });
 
-  it.each(['seed', 'registry'] as const)('aborts the reservation after %s failure', async failure => {
+  it.each(['seed', 'registry'] as const)('keeps the lease and reservation after %s uncertainty', async failure => {
     const h = harness(failure);
     expect((await h.run()).status).toBe(failure === 'seed' ? 502 : 500);
     expect(h.steps).toEqual(failure === 'seed'
-      ? ['reserve_dispatch', 'seed', 'abort_dispatch']
-      : ['reserve_dispatch', 'seed', 'registry', 'abort_dispatch']);
+      ? ['acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed']
+      : ['acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed',
+        'seed_journal_complete', 'registry']);
+    expect(h.releaseRepositoryWriter).not.toHaveBeenCalled();
+    expect(h.abandonRepositoryWriter).not.toHaveBeenCalled();
   });
 
   it('reports an explicit residual when commit fails after the seed and registry exist', async () => {
@@ -170,7 +248,10 @@ describe('dispatch registration project reservation', () => {
       status: 500,
       value: { ok: false, error: 'project_dispatch_commit_failed', seedCreated: true, dispatchRoot: 'om_seed' },
     });
-    expect(h.steps).toEqual(['reserve_dispatch', 'seed', 'registry', 'commit_dispatch']);
+    expect(h.steps).toEqual([
+      'acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed',
+      'seed_journal_complete', 'registry', 'commit_dispatch',
+    ]);
   });
 
   it('reuses the exact registry record when retrying a post-registry commit failure', async () => {
@@ -191,7 +272,7 @@ describe('dispatch registration project reservation', () => {
     expect(await h.run()).toMatchObject({
       status: 201, value: { ok: true, dispatchRoot: 'om_seed', projectSynced: true },
     });
-    expect(h.sendMessage).toHaveBeenCalledTimes(2);
+    expect(h.sendMessage).toHaveBeenCalledTimes(1);
     expect(h.recordDispatchRegistryEntry).toHaveBeenCalledTimes(1);
   });
 
@@ -200,7 +281,19 @@ describe('dispatch registration project reservation', () => {
     expect(await project.run()).toMatchObject({
       status: 201, value: { ok: true, dispatchRoot: 'om_seed', projectSynced: true, access: project.body.access },
     });
-    expect(project.steps).toEqual(['reserve_dispatch', 'seed', 'registry', 'commit_dispatch', 'refresh']);
+    expect(project.steps).toEqual([
+      'acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed',
+      'seed_journal_complete', 'registry', 'commit_dispatch', 'refresh',
+    ]);
+    expect(project.rebindRepositoryWriterDispatchRoot).toHaveBeenCalledWith(
+      '/data',
+      expect.objectContaining({
+        leaseId: project.repositoryLeaseRef.leaseId,
+        fencingToken: project.repositoryLeaseRef.fencingToken,
+        reservationId: 'operation-id',
+        dispatchRoot: 'om_seed',
+      }),
+    );
 
     const standard = harness(undefined, false);
     expect(await standard.run()).toMatchObject({
@@ -214,11 +307,13 @@ describe('dispatch registration project reservation', () => {
     h.scope.findDispatchOperation.mockReturnValue({
       dispatchRoot: 'om_prior', entry: { dispatchOperationId: 'operation-id', status: 'dispatched' },
     });
-    h.scope.readProjectGroup.mockReturnValue({ workstreams: [{ dispatchRoot: 'om_prior' }] });
+    h.scope.readProjectGroup.mockReturnValue({
+      workstreams: [{ dispatchRoot: 'om_prior', repositoryLeaseRef: h.repositoryLeaseRef }],
+    });
     expect(await h.run()).toMatchObject({
       status: 200, value: { ok: true, dispatchRoot: 'om_prior', projectSynced: true, replayed: true },
     });
-    expect(h.steps).toEqual([]);
+    expect(h.steps).toEqual(['acquire_repository_lease']);
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -227,7 +322,10 @@ describe('dispatch registration project reservation', () => {
     expect(await h.run()).toMatchObject({
       status: 201, value: { ok: true, dispatchRoot: 'om_seed', projectSynced: true },
     });
-    expect(h.steps).toEqual(['reserve_dispatch', 'seed', 'registry', 'commit_dispatch', 'refresh']);
+    expect(h.steps).toEqual([
+      'acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed',
+      'seed_journal_complete', 'registry', 'commit_dispatch', 'refresh',
+    ]);
     expect(h.scope.logger.warn).toHaveBeenCalledWith(expect.stringContaining('dispatch card refresh failed'));
   });
 
@@ -280,7 +378,10 @@ describe('dispatch registration project reservation', () => {
     expect(await h.run()).toEqual({
       status: 409, value: { ok: false, error: 'project_task_control_canary_capacity_reached' },
     });
-    expect(h.steps).toEqual(['reserve_dispatch']);
+    expect(h.steps).toEqual([
+      'acquire_repository_lease', 'reserve_dispatch',
+      'abandon_repository_lease:abandoned_before_dispatch',
+    ]);
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -326,7 +427,7 @@ describe('dispatch registration project reservation', () => {
       },
     });
     expect(h.steps).toEqual([
-      'reserve_dispatch', 'seed_journal_begin', 'seed', 'seed_journal_complete',
+      'acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed', 'seed_journal_complete',
     ]);
     expect(h.beginTaskControlSeedOperationSync).toHaveBeenCalledWith(
       '/data/orchestrate-dispatch.json',
@@ -388,7 +489,7 @@ describe('dispatch registration project reservation', () => {
       },
     });
     expect(h.steps).toEqual([
-      'reserve_dispatch', 'seed_journal_begin', 'seed', 'seed_journal_complete',
+      'acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed', 'seed_journal_complete',
     ]);
   });
 
@@ -574,7 +675,7 @@ describe('dispatch registration project reservation', () => {
       undefined, { timeoutMs: 5_000, signal: h.providerAbortController.signal },
     );
     expect(h.steps).toEqual([
-      'reserve_dispatch', 'seed_journal_begin', 'seed', 'seed_journal_complete',
+      'acquire_repository_lease', 'reserve_dispatch', 'seed_journal_begin', 'seed', 'seed_journal_complete',
       'bind_dispatch_root', 'registry', 'commit_dispatch', 'mark_task_control_mapping', 'refresh',
     ]);
     expect(registerMapping).toHaveBeenCalledOnce();
@@ -609,6 +710,7 @@ describe('dispatch registration project reservation', () => {
       workstreams: [{
         dispatchRoot: 'om_prior', status: 'pending', access: h.body.access,
         targetAppIds: ['cli_worker', 'cli_reviewer'], taskControl,
+        repositoryLeaseRef: h.repositoryLeaseRef,
       }],
       dispatchReservations: [],
     }));
@@ -648,7 +750,7 @@ describe('dispatch registration project reservation', () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
     expect(registerMapping).toHaveBeenCalledOnce();
     expect(dispatchRequested).toHaveBeenCalledOnce();
-    expect(h.steps).toEqual(['mark_task_control_mapping', 'refresh']);
+    expect(h.steps).toEqual(['acquire_repository_lease', 'mark_task_control_mapping', 'refresh']);
   });
 });
 

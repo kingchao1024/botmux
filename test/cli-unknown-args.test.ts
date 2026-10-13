@@ -251,3 +251,17 @@ describe('botmux autostart：帮助与额外参数不得产生副作用', () => 
     expect(r.homeUnchanged).toBe(true);
   });
 });
+
+describe('botmux repository：固定命令面拒绝未知参数', () => {
+  it.each([
+    ['status', '--workdir', '/tmp', '--json', '--force'],
+    ['freeze', 'finalize', '--barrier-id', 'barrier', '--expected-revision', '1', '--operation-id', 'op', '--force'],
+    ['transaction', 'inspect', '--transaction-id', 'tx-01234567', '--json', 'extra'],
+    ['release', '--barrier-id', 'barrier', '--expected-revision', '1', '--authorization-ref', 'om_auth', '--operation-id', 'op', '--force'],
+  ])('repository %s 遇到未知参数时 rc=2 且无副作用', (...args) => {
+    const r = runCli(['repository', ...args]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('unknown_argument');
+    expect(r.homeUnchanged).toBe(true);
+  });
+});
