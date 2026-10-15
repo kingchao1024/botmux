@@ -172,6 +172,7 @@ import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import {
   parseProjectCoordinatorAction,
   projectCompletionGateAuthorizationPrompt,
+  projectWorkstreamReviewerAuthorizationPrompt,
   type ProjectCompletionGateLifecycleAction,
 } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -3227,6 +3228,24 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
     }
     verifiedAction = { ...action, authorizedByOpenId };
   }
+  if (action.action === 'replace_workstream_reviewer') {
+    const authorizedByOpenId = verifiedCurrentProjectHumanActor(
+      ds,
+      action.authorizationRef,
+      projectWorkstreamReviewerAuthorizationPrompt(action),
+    );
+    if (!authorizedByOpenId) {
+      return jsonRes(res, 403, { ok: false, error: 'project_workstream_reviewer_authorization_required' });
+    }
+    if (groupMode?.mode !== 'project') {
+      return jsonRes(res, 409, { ok: false, error: 'project_mode_required' });
+    }
+    verifiedAction = {
+      ...action,
+      authorizedByOpenId,
+      allowedReviewerAppIds: [...(groupMode.workerAppIds ?? [])],
+    };
+  }
   try {
     const context = {
       dataDir: config.session.dataDir,
@@ -3247,6 +3266,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
         ok: true, project,
         ...(projectionWarning ? { projectionWarning } : {}),
         ...(stageAdvanceWarning ? { stageAdvanceWarning } : {}),
+      });
+    }
+    if (verifiedAction.action === 'replace_workstream_reviewer') {
+      const { project, projectionWarning } = await projectCoordinator.runReviewerReplacement(
+        context,
+        verifiedAction,
+      );
+      if (projectionWarning) {
+        logger.warn(`[project] reviewer replacement persisted but card projection failed: ${projectionWarning}`);
+      }
+      return jsonRes(res, 200, {
+        ok: true,
+        project,
+        ...(projectionWarning ? { projectionWarning } : {}),
       });
     }
     const project = await projectCoordinator.run(context, verifiedAction);

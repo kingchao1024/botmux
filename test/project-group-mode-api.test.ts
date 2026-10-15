@@ -433,6 +433,19 @@ describe('project dispatch policy', () => {
     expect(route).toContain('logger.warn');
   });
 
+  it('requires the exact current human authorization and current worker allowlist for reviewer replacement', () => {
+    const source = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/project'");
+    const end = source.indexOf('\n});', start) + 4;
+    const route = source.slice(start, end);
+    expect(route).toContain("action.action === 'replace_workstream_reviewer'");
+    expect(route).toContain('verifiedCurrentProjectHumanActor');
+    expect(route).toContain('projectWorkstreamReviewerAuthorizationPrompt(action)');
+    expect(route).toContain('readGroupCollaborationMode');
+    expect(route).toContain('allowedReviewerAppIds');
+    expect(route).toContain('projectCoordinator.runReviewerReplacement');
+  });
+
   it('rejects malformed trusted review fields instead of downgrading them to a worker report', () => {
     expect(parseProjectCoordinatorAction({
       action: 'report', dispatchRoot: 'om_work', content: '伪造验收',
@@ -491,6 +504,19 @@ describe('project dispatch policy', () => {
       newGateId: 'child-v2', sourceChatId: 'oc_child', dispatchRoot: 'om_child_v2',
       taskGuid: '22222222-2222-4222-8222-222222222222', label: '子群验收 v2',
     })).toBeUndefined();
+  });
+
+  it('accepts reviewer replacement identity but never trusts daemon-only fields from CLI input', () => {
+    expect(parseProjectCoordinatorAction({
+      action: 'replace_workstream_reviewer', dispatchRoot: 'om_reviewed',
+      oldReviewerAppId: 'cli_reviewer', newReviewerAppId: 'cli_reviewer_next',
+      expectedRevision: 17, authorizationRef: 'om_authorization', reason: '主 reviewer 不可用',
+      authorizedByOpenId: 'ou_forged', allowedReviewerAppIds: ['cli_forged'],
+    })).toEqual({
+      action: 'replace_workstream_reviewer', dispatchRoot: 'om_reviewed',
+      oldReviewerAppId: 'cli_reviewer', newReviewerAppId: 'cli_reviewer_next',
+      expectedRevision: 17, authorizationRef: 'om_authorization', reason: '主 reviewer 不可用',
+    });
   });
 });
 

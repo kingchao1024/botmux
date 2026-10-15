@@ -116,6 +116,56 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
       action: { action: 'add_completion_gate', gateId, sourceChatId, dispatchRoot, taskGuid, label },
     };
   }
+  if (subcommand === 'workstream') {
+    if (args[0] !== 'reviewer' || args[1] !== 'replace') {
+      return { ok: false, error: 'project workstream 只支持 reviewer replace' };
+    }
+    const replaceArgs = args.slice(2);
+    const allowed = new Set([
+      '--root', '--old-app', '--new-app', '--expected-revision',
+      '--authorization-ref', '--reason', '--session-id', '--json',
+    ]);
+    for (let i = 0; i < replaceArgs.length; i += 1) {
+      const token = replaceArgs[i]!;
+      if (!token.startsWith('-')) return { ok: false, error: `不支持位置参数: ${token}` };
+      const flag = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+      if (!allowed.has(flag)) return { ok: false, error: `未知选项: ${flag}` };
+      if (flag === '--json') {
+        if (token.includes('=')) return { ok: false, error: '--json 不接受值' };
+        continue;
+      }
+      const value = token.includes('=') ? token.slice(token.indexOf('=') + 1) : replaceArgs[++i];
+      if (value === undefined || !value.trim() || value.startsWith('--')) {
+        return { ok: false, error: `${flag} 需要一个值` };
+      }
+    }
+    const dispatchRoot = one(replaceArgs, '--root')?.trim();
+    const oldReviewerAppId = one(replaceArgs, '--old-app')?.trim();
+    const newReviewerAppId = one(replaceArgs, '--new-app')?.trim();
+    const expectedRevisionRaw = one(replaceArgs, '--expected-revision')?.trim();
+    const authorizationRef = one(replaceArgs, '--authorization-ref')?.trim();
+    const reason = one(replaceArgs, '--reason')?.trim();
+    if (!dispatchRoot || !oldReviewerAppId || !newReviewerAppId || !expectedRevisionRaw
+      || !authorizationRef || !reason) {
+      return {
+        ok: false,
+        error: 'project workstream reviewer replace 需要 --root、--old-app、--new-app、--expected-revision、--authorization-ref 和 --reason',
+      };
+    }
+    if (!/^[1-9]\d*$/.test(expectedRevisionRaw) || !Number.isSafeInteger(Number(expectedRevisionRaw))) {
+      return { ok: false, error: '--expected-revision 必须是正整数' };
+    }
+    return {
+      ok: true, help: false,
+      sessionId: one(replaceArgs, '--session-id'),
+      json: has(replaceArgs, '--json'),
+      action: {
+        action: 'replace_workstream_reviewer', dispatchRoot,
+        oldReviewerAppId, newReviewerAppId,
+        expectedRevision: Number(expectedRevisionRaw), authorizationRef, reason,
+      },
+    };
+  }
   const allowedByCommand: Record<string, Set<string>> = {
     init: new Set(['--title', '--goal', '--phase', '--focus', '--remaining', '--session-id', '--json']),
     status: new Set(['--session-id', '--json']),

@@ -11,6 +11,29 @@ import { describe, expect, it } from 'vitest';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 describe('botmux root help workflow surface', () => {
+  it('documents the auditable project workstream reviewer replacement command', () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-project-help-'));
+    try {
+      const env = { ...process.env, HOME: home };
+      const { command, prefixArgs } = tsRunnerPrefix();
+      const stdout = execFileSync(
+        command,
+        [
+          ...prefixArgs,
+          fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
+          'project', '--help',
+        ],
+        { cwd: process.cwd(), env, encoding: 'utf-8' },
+      );
+
+      expect(stdout).toContain('project workstream reviewer replace');
+      expect(stdout).toContain('--expected-revision <n>');
+      expect(stdout).toContain('当前有权限真人发送的精确 canonical action summary');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('advertises v3 Saved/ad-hoc commands and isolates v2 under the migration namespace', () => {
     const home = mkdtempSync(join(tmpdir(), 'botmux-root-help-'));
     try {

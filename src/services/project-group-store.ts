@@ -185,6 +185,18 @@ export interface ProjectWorkstreamReview {
   round: number;
 }
 
+export interface ProjectReviewerReplacement {
+  oldReviewerAppId: string;
+  newReviewerAppId: string;
+  authorizationRef: string;
+  authorizedByOpenId: string;
+  reason: string;
+  coordinatorSessionId: string;
+  replacedAt: string;
+  fromRevision: number;
+  toRevision: number;
+}
+
 export interface ProjectWorkstream {
   dispatchRoot: string;
   threadId?: string;
@@ -194,6 +206,7 @@ export interface ProjectWorkstream {
   targetAppIds?: string[];
   workerAppIds?: string[];
   reviewerAppIds?: string[];
+  reviewerReplacements?: ProjectReviewerReplacement[];
   access?: ProjectDispatchAccess;
   delivery?: ProjectWorkstreamDelivery;
   review?: ProjectWorkstreamReview;
@@ -697,6 +710,40 @@ function normalizedCompletionGates(value: unknown): ProjectCompletionGate[] {
   return gates;
 }
 
+function normalizedReviewerReplacements(value: unknown): ProjectReviewerReplacement[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 32) {
+    throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid reviewer replacements`);
+  }
+  return value.map(raw => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid reviewer replacement`);
+    }
+    const record = raw as ProjectReviewerReplacement;
+    if (!/^cli_[A-Za-z0-9_-]{1,128}$/.test(record.oldReviewerAppId?.trim())
+      || !/^cli_[A-Za-z0-9_-]{1,128}$/.test(record.newReviewerAppId?.trim())
+      || record.oldReviewerAppId.trim() === record.newReviewerAppId.trim()
+      || !/^om_[A-Za-z0-9_-]{1,128}$/.test(record.authorizationRef?.trim())
+      || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(record.authorizedByOpenId?.trim())
+      || !record.reason?.trim() || !record.coordinatorSessionId?.trim()
+      || !Number.isFinite(Date.parse(record.replacedAt))
+      || !Number.isSafeInteger(record.fromRevision) || record.fromRevision < 1
+      || !Number.isSafeInteger(record.toRevision) || record.toRevision !== record.fromRevision + 1) {
+      throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid reviewer replacement`);
+    }
+    return {
+      ...record,
+      oldReviewerAppId: record.oldReviewerAppId.trim(),
+      newReviewerAppId: record.newReviewerAppId.trim(),
+      authorizationRef: record.authorizationRef.trim(),
+      authorizedByOpenId: record.authorizedByOpenId.trim(),
+      reason: record.reason.trim(),
+      coordinatorSessionId: record.coordinatorSessionId.trim(),
+      replacedAt: new Date(record.replacedAt).toISOString(),
+    };
+  });
+}
+
 export function projectCompletionGateFingerprint(input: Pick<
   ProjectCompletionGate,
   'gateId' | 'sourceChatId' | 'dispatchRoot' | 'taskGuid'
@@ -759,6 +806,15 @@ function migrateProject(project: unknown): ProjectGroupState {
   if (stageAdvanceEvents.some(event => event.chatId !== raw.chatId)) {
     throw new Error(`${PROJECT_GROUP_STORE_FILE} has a stage advance chat mismatch`);
   }
+  const workstreams = Array.isArray(raw.workstreams)
+    ? (raw.workstreams as ProjectWorkstream[]).map(workstream => {
+        const reviewerReplacements = normalizedReviewerReplacements(workstream.reviewerReplacements);
+        return {
+          ...workstream,
+          ...(reviewerReplacements ? { reviewerReplacements } : {}),
+        };
+      })
+    : raw.workstreams;
   return {
     ...(raw as unknown as ProjectGroupState),
     schemaVersion: 3,
@@ -766,6 +822,7 @@ function migrateProject(project: unknown): ProjectGroupState {
     blockerRecords: records,
     completionGates: normalizedCompletionGates(raw.completionGates),
     stageAdvanceEvents,
+    workstreams: workstreams as ProjectWorkstream[],
   };
 }
 

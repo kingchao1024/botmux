@@ -161,6 +161,34 @@ mapping.registered
 
 TaskControl-managed worker 使用结构化 `botmux report --status failed` 时，report relay 必须先完成 project CAS，再生成签名 `failed_report` evidence，由 controller 写入 `task.failed`。project CAS 失败时只写 UNKNOWN，不制造终态；report 与 turn terminal 乱序或重放时只保留一个 `task.failed`。项目侧已有 delivery/review 继续保留作审计，不能用失败回报清除。新的 audit-only dispatch 只有在该 `task.failed` 可从 SQLite 投影回读后才会释放容量。
 
+## 非 TaskControl workstream 的 reviewer 换绑
+
+既有 write workstream 只有在 `status=in_review`、尚无 review 且已有 delivery 时，才允许原地替换 reviewer。带 `taskControl` 绑定的 workstream 本期一律拒绝；不得通过 reviewer 换绑绕开 mapping 或重新签发角色证据。
+
+先读取当前 project revision，再让有操作权限的真人在当前活动回合发送精确的 canonical 授权正文。JSON 字段顺序固定为 `action`、`dispatchRoot`、`oldReviewerAppId`、`newReviewerAppId`、`expectedRevision`、`reason`：
+
+```text
+授权执行 BotMux reviewer 变更：{"action":"replace_workstream_reviewer","dispatchRoot":"<om_root>","oldReviewerAppId":"cli_reviewer_old","newReviewerAppId":"cli_reviewer_new","expectedRevision":<revision>,"reason":"<原因>"}
+```
+
+把该消息的 `om_...` ID 作为 `--authorization-ref`，由当前 project coordinator 执行：
+
+```bash
+botmux project workstream reviewer replace \
+  --root <om_root> \
+  --old-app cli_reviewer_old \
+  --new-app cli_reviewer_new \
+  --expected-revision <revision> \
+  --authorization-ref <om_current_human_authorization> \
+  --reason <原因>
+```
+
+daemon 会精确回读授权正文和真人身份，并从当前群 worker allowlist 校验新 reviewer。transition 在 project store 锁内以 revision 和旧 reviewer 做 CAS；状态、授权或角色关系任一漂移都会 fail-closed。完全相同的重试返回当前状态，不增加 revision 或审计记录。
+
+成功 transition 只原位替换 `reviewerAppIds` 和 `targetAppIds` 中的旧 reviewer，数组中其它 reviewer 的顺序不变；worker、access、delivery round、候选证据和 report 内容均保持不变。每次成功都会追加有界 `reviewerReplacements` 审计记录。项目卡刷新失败时 durable transition 仍然成立，命令返回 `projectionWarning`；调用方必须回读 project revision，不得按旧卡片回滚 store。
+
+后续新建 workstream 可按流程预绑定一个主 reviewer 和一个备用 reviewer；本命令只替换指定数组成员，不自动选择主备、不修改存量 workstream，也不触发跨 workstream 调度。
+
 ## audit diff 的处理
 
 | code | 含义 | 处理 |

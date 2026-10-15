@@ -6092,11 +6092,15 @@ async function cmdProject(argv: string[]): Promise<void> {
                              --dispatch-root <om_xxx> --task-guid <uuid> --label <名称>
                              --authorization-ref <om_xxx> --reason <原因>
   botmux project gate status
+  botmux project workstream reviewer replace --root <om_xxx> --old-app <cli_xxx>
+                             --new-app <cli_xxx> --expected-revision <n>
+                             --authorization-ref <om_xxx> --reason <原因>
 
 说明:
   仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
   botmux dispatch 会自动登记子任务，botmux report 会把进展同步回同一张卡。
   gate retire/replace 的 --authorization-ref 必须指向当前有权限真人发送的精确 canonical action summary；
+  workstream reviewer replace 使用同一真人授权硬门，并在 project store 锁内做 revision CAS；
   只回复“授权”、复用旧消息或让 bot/定时任务代发都会被 daemon 拒绝。
   所有命令可加 --session-id <id>；--json 输出完整状态。`);
     return;
@@ -6131,11 +6135,19 @@ async function cmdProject(argv: string[]): Promise<void> {
     'project',
     parsed.action as unknown as Record<string, unknown>,
   );
-  const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; project?: Record<string, unknown> };
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    project?: Record<string, unknown>;
+    projectionWarning?: string;
+  };
   if (!response.ok || !body.ok || !body.project) {
     console.error(`project 操作失败: ${body.error ?? `HTTP ${response.status}`}`);
     process.exitCode = 1;
     return;
+  }
+  if (body.projectionWarning) {
+    console.error(`project 状态已持久化，但进度卡投影失败: ${body.projectionWarning}；请回读 project revision。`);
   }
   if (parsed.json || subcommand === 'status' || (subcommand === 'gate' && argv[1] === 'status')) {
     console.log(JSON.stringify(body.project, null, 2));
@@ -6148,6 +6160,7 @@ async function cmdProject(argv: string[]): Promise<void> {
       revision: project.revision,
       cardMessageId: project.card?.messageId,
       pinned: project.card?.pinned === true,
+      ...(body.projectionWarning ? { projectionWarning: body.projectionWarning } : {}),
     }));
   }
 }

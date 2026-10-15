@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   parseProjectCoordinatorAction,
+  projectWorkstreamReviewerAuthorizationPrompt,
   ProjectCoordinator,
   type ProjectCoordinatorTransport,
 } from '../src/services/project-coordinator.js';
@@ -89,6 +90,15 @@ function phaseABinding(label: string) {
 }
 
 describe('project group mode', () => {
+  it('builds one stable canonical reviewer replacement authorization prompt', () => {
+    expect(projectWorkstreamReviewerAuthorizationPrompt({
+      action: 'replace_workstream_reviewer',
+      dispatchRoot: ' om_reviewed ', oldReviewerAppId: ' cli_reviewer ',
+      newReviewerAppId: ' cli_reviewer_next ', expectedRevision: 17,
+      authorizationRef: 'om_authorization', reason: ' 主 reviewer 不可用 ',
+    })).toBe('授权执行 BotMux reviewer 变更：{"action":"replace_workstream_reviewer","dispatchRoot":"om_reviewed","oldReviewerAppId":"cli_reviewer","newReviewerAppId":"cli_reviewer_next","expectedRevision":17,"reason":"主 reviewer 不可用"}');
+  });
+
   it('preserves the exact Phase A report proof through project action parsing', () => {
     const phaseAReport = {
       operationId: 'f'.repeat(50), fenceFingerprint: `tccq1:${'a'.repeat(64)}`,
@@ -2038,6 +2048,235 @@ describe('project group mode', () => {
     });
   }
 
+  async function deliveredWriteWorkstream(f: ReturnType<typeof fixture>) {
+    await committedWriteWorkstream(f);
+    return f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_worker',
+      content: '冻结候选', status: 'completed',
+    });
+  }
+
+  function reviewerReplacement(expectedRevision: number, overrides: Record<string, unknown> = {}) {
+    return {
+      action: 'replace_workstream_reviewer' as const,
+      dispatchRoot: 'om_reviewed', oldReviewerAppId: 'cli_reviewer',
+      newReviewerAppId: 'cli_reviewer_next', expectedRevision,
+      authorizationRef: 'om_authorization', authorizedByOpenId: 'ou_authorizer',
+      allowedReviewerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_next', 'cli_reviewer_other'],
+      reason: '主 reviewer 不可用', now: '2026-10-13T10:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  it('atomically replaces only reviewer bindings and persists a bounded audit record', async () => {
+    const f = fixture();
+    await deliveredWriteWorkstream(f);
+    await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+      current!.workstreams[0]!.reviewerAppIds!.push('cli_reviewer_backup');
+      current!.workstreams[0]!.targetAppIds!.push('cli_reviewer_backup');
+      return current;
+    });
+    const delivered = readProjectGroup(f.dataDir, f.context.chatId)!;
+    const before = structuredClone(delivered.workstreams[0]!);
+
+    const result = await f.coordinator.runReviewerReplacement(
+      f.context,
+      reviewerReplacement(delivered.revision),
+    );
+    const item = result.project.workstreams[0]!;
+    expect(result).not.toHaveProperty('projectionWarning');
+    expect(result.project.revision).toBe(delivered.revision + 1);
+    expect(item).toEqual({
+      ...before,
+      targetAppIds: ['cli_reviewer_next', 'cli_worker', 'cli_reviewer_backup'],
+      reviewerAppIds: ['cli_reviewer_next', 'cli_reviewer_backup'],
+      reviewerReplacements: [{
+        oldReviewerAppId: 'cli_reviewer', newReviewerAppId: 'cli_reviewer_next',
+        authorizationRef: 'om_authorization', authorizedByOpenId: 'ou_authorizer',
+        reason: '主 reviewer 不可用', coordinatorSessionId: f.context.coordinatorSessionId,
+        replacedAt: '2026-10-13T10:00:00.000Z',
+        fromRevision: delivered.revision, toRevision: delivered.revision + 1,
+      }],
+      updatedAt: '2026-10-13T10:00:00.000Z',
+    });
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.workstreams[0]).toEqual(item);
+    expect(f.transport.updateCard).toHaveBeenCalled();
+
+    await expect(f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_reviewer',
+      content: '旧 reviewer 越权', reviewVerdict: 'pass', reviewRound: 1,
+    })).rejects.toThrow('project_reviewer_not_allowed');
+    await expect(f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_reviewer_next',
+      content: '新 reviewer 通过', reviewVerdict: 'pass', reviewRound: 1,
+    })).resolves.toMatchObject({
+      workstreams: [{ status: 'completed', review: { reviewerAppId: 'cli_reviewer_next' } }],
+    });
+  });
+
+  it('keeps an exact reviewer replacement retry idempotent', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    const action = reviewerReplacement(delivered.revision);
+    const first = await f.coordinator.runReviewerReplacement(f.context, action);
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeRetry = { revision: first.project.revision, inode: statSync(store).ino };
+    f.transport.updateCard.mockClear();
+
+    const retry = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(retry.project.revision).toBe(beforeRetry.revision);
+    expect(retry.project.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+    expect(statSync(store).ino).toBe(beforeRetry.inode);
+    expect(f.transport.updateCard).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['stale revision', 'project_revision_conflict'],
+    ['old reviewer mismatch', 'project_old_reviewer_mismatch'],
+    ['new reviewer is worker', 'project_review_roles_overlap'],
+    ['new reviewer is outside allowlist', 'project_reviewer_not_allowed'],
+    ['workstream is not in review', 'project_reviewer_replace_state_invalid'],
+    ['workstream already has review', 'project_reviewer_replace_state_invalid'],
+    ['workstream has no delivery', 'project_reviewer_replace_state_invalid'],
+    ['workstream has task control', 'project_reviewer_replace_task_control_unsupported'],
+    ['new reviewer already assigned', 'project_reviewer_already_assigned'],
+    ['invalid app id', 'project_reviewer_app_id_invalid'],
+  ])('rejects reviewer replacement when %s', async (scenario, expectedError) => {
+    const f = fixture();
+    const project = scenario === 'workstream has no delivery'
+      ? await committedWriteWorkstream(f)
+      : await deliveredWriteWorkstream(f);
+    const overrides: Record<string, unknown> = {};
+    if (scenario === 'stale revision') overrides.expectedRevision = project.revision - 1;
+    if (scenario === 'old reviewer mismatch') overrides.oldReviewerAppId = 'cli_other';
+    if (scenario === 'new reviewer is worker') overrides.newReviewerAppId = 'cli_worker';
+    if (scenario === 'new reviewer is outside allowlist') {
+      overrides.newReviewerAppId = 'cli_outside';
+      overrides.allowedReviewerAppIds = ['cli_worker', 'cli_reviewer'];
+    }
+    if (scenario === 'invalid app id') overrides.newReviewerAppId = 'reviewer-next';
+    if (scenario === 'workstream is not in review') {
+      await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+        current!.workstreams[0]!.status = 'blocked';
+        return current;
+      });
+    }
+    if (scenario === 'workstream already has review') {
+      await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+        current!.workstreams[0]!.review = {
+          reviewerAppId: 'cli_reviewer', verdict: 'fail', content: '已有结论',
+          reviewedAt: '2026-10-13T09:00:00.000Z', round: 1,
+        };
+        return current;
+      });
+    }
+    if (scenario === 'workstream has task control') await attachProjectTaskControl(f);
+    if (scenario === 'new reviewer already assigned') {
+      await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+        current!.workstreams[0]!.reviewerAppIds!.push('cli_reviewer_next');
+        current!.workstreams[0]!.targetAppIds!.push('cli_reviewer_next');
+        return current;
+      });
+    }
+    const before = readProjectGroup(f.dataDir, f.context.chatId)!;
+    await expect(f.coordinator.runReviewerReplacement(
+      f.context,
+      reviewerReplacement(before.revision, overrides),
+    )).rejects.toThrow(expectedError);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)).toEqual(before);
+  });
+
+  it('allows only one of two cross-process reviewer replacements to commit', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    const source = (action: Record<string, unknown>) => `
+      import { ProjectCoordinator } from './src/services/project-coordinator.js';
+      const coordinator = new ProjectCoordinator({
+        sendCard: async () => 'om_card', updateCard: async () => {}, pinMessage: async () => true,
+        unpinMessage: async () => true, resolveThreadId: async () => null,
+        isMessageWithdrawn: () => false, brand: () => 'feishu',
+      });
+      try {
+        await coordinator.runReviewerReplacement({
+          dataDir: ${JSON.stringify(f.dataDir)}, chatId: ${JSON.stringify(f.context.chatId)},
+          larkAppId: ${JSON.stringify(f.context.larkAppId)},
+          coordinatorSessionId: ${JSON.stringify(f.context.coordinatorSessionId)},
+        }, ${JSON.stringify(action)});
+        console.log(JSON.stringify({ ok: true }));
+      } catch (error) {
+        console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+      }
+    `;
+    const children = [
+      spawnTsEvalWithRepoImports(source(reviewerReplacement(delivered.revision)), {
+        cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
+      }),
+      spawnTsEvalWithRepoImports(source(reviewerReplacement(delivered.revision, {
+        newReviewerAppId: 'cli_reviewer_other', authorizationRef: 'om_authorization_other',
+      })), { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }),
+    ];
+    const results = await Promise.all(children.map(collectChild));
+    expect(results.every(result => result.code === 0), JSON.stringify(results)).toBe(true);
+    const outcomes = results.map(result => JSON.parse(result.stdout.trim()));
+    expect(outcomes.filter(result => result.ok)).toHaveLength(1);
+    expect(outcomes.filter(result => !result.ok)).toEqual([
+      expect.objectContaining({ error: 'project_revision_conflict' }),
+    ]);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+  });
+
+  it('returns a projection warning without rolling back reviewer replacement', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    f.transport.updateCard = vi.fn(async () => { throw new Error('projection unavailable'); });
+    const result = await f.coordinator.runReviewerReplacement(
+      f.context,
+      reviewerReplacement(delivered.revision),
+    );
+    expect(result).toMatchObject({
+      projectionWarning: 'projection unavailable',
+      project: { revision: delivered.revision + 1, workstreams: [{ reviewerAppIds: ['cli_reviewer_next'] }] },
+    });
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.workstreams[0]?.reviewerAppIds)
+      .toEqual(['cli_reviewer_next']);
+  });
+
+  it('bounds reviewer replacement audit history and validates it on reload', async () => {
+    const f = fixture();
+    let project = await deliveredWriteWorkstream(f);
+    let oldReviewerAppId = 'cli_reviewer';
+    for (let index = 0; index < 34; index += 1) {
+      const newReviewerAppId = `cli_reviewer_${index}`;
+      const result = await f.coordinator.runReviewerReplacement(f.context, {
+        ...reviewerReplacement(project.revision),
+        oldReviewerAppId,
+        newReviewerAppId,
+        authorizationRef: `om_authorization_${index}`,
+        allowedReviewerAppIds: ['cli_worker', newReviewerAppId],
+      });
+      project = result.project;
+      oldReviewerAppId = newReviewerAppId;
+    }
+    const records = readProjectGroup(f.dataDir, f.context.chatId)!
+      .workstreams[0]!.reviewerReplacements!;
+    expect(records).toHaveLength(32);
+    expect(records[0]).toMatchObject({
+      oldReviewerAppId: 'cli_reviewer_1', newReviewerAppId: 'cli_reviewer_2',
+      fromRevision: project.revision - 32,
+    });
+    expect(records.at(-1)).toMatchObject({
+      oldReviewerAppId: 'cli_reviewer_32', newReviewerAppId: 'cli_reviewer_33',
+      toRevision: project.revision,
+    });
+
+    const store = join(f.dataDir, 'project-groups.json');
+    const raw = JSON.parse(readFileSync(store, 'utf8'));
+    raw.projects[f.context.chatId].workstreams[0].reviewerReplacements[0].authorizedByOpenId = 'forged';
+    writeFileSync(store, JSON.stringify(raw));
+    expect(() => readProjectGroup(f.dataDir, f.context.chatId))
+      .toThrow('project-groups.json has invalid reviewer replacement');
+  });
+
   async function attachProjectTaskControl(f: ReturnType<typeof fixture>, dispatchRoot = 'om_reviewed') {
     const taskGuid = '33333333-3333-4333-8333-333333333333';
     await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
@@ -3116,6 +3355,38 @@ describe('project group mode', () => {
 });
 
 describe('project CLI parser', () => {
+  it('parses an auditable workstream reviewer replacement', () => {
+    expect(parseProjectArgs('workstream', [
+      'reviewer', 'replace', '--root', 'om_reviewed', '--old-app', 'cli_reviewer',
+      '--new-app', 'cli_reviewer_next', '--expected-revision', '17',
+      '--authorization-ref', 'om_authorization', '--reason', '主 reviewer 不可用',
+    ])).toEqual({
+      ok: true,
+      help: false,
+      sessionId: undefined,
+      json: false,
+      action: {
+        action: 'replace_workstream_reviewer',
+        dispatchRoot: 'om_reviewed',
+        oldReviewerAppId: 'cli_reviewer',
+        newReviewerAppId: 'cli_reviewer_next',
+        expectedRevision: 17,
+        authorizationRef: 'om_authorization',
+        reason: '主 reviewer 不可用',
+      },
+    });
+    expect(parseProjectArgs('workstream', [
+      'reviewer', 'replace', '--root', 'om_reviewed', '--old-app', 'cli_reviewer',
+      '--new-app', 'cli_reviewer_next', '--expected-revision', '17.5',
+      '--authorization-ref', 'om_authorization', '--reason', '主 reviewer 不可用',
+    ])).toEqual({ ok: false, error: '--expected-revision 必须是正整数' });
+    expect(parseProjectArgs('workstream', ['reviewer', 'replace', '--root', 'om_reviewed']))
+      .toEqual({
+        ok: false,
+        error: 'project workstream reviewer replace 需要 --root、--old-app、--new-app、--expected-revision、--authorization-ref 和 --reason',
+      });
+  });
+
   it('requires title+goal and validates percentage', () => {
     expect(parseProjectArgs('init', ['--title', 'A'])).toEqual({ ok: false, error: 'project init 需要 --title 和 --goal' });
     expect(parseProjectArgs('update', ['--progress', '101'])).toEqual({ ok: false, error: '--progress 必须是 0-100 的整数' });

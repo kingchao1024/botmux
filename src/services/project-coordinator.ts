@@ -137,6 +137,12 @@ export type ProjectCoordinatorAction =
       label: string; authorizationRef: string; authorizedByOpenId?: string; reason: string; now?: string;
     }
   | {
+      action: 'replace_workstream_reviewer'; dispatchRoot: string;
+      oldReviewerAppId: string; newReviewerAppId: string; expectedRevision: number;
+      authorizationRef: string; authorizedByOpenId?: string; reason: string;
+      allowedReviewerAppIds?: string[]; now?: string;
+    }
+  | {
       action: 'sync_completion_gate'; gateId: string; definitionFingerprint: string;
       status: ProjectCompletionGateStatus; reason: string; checkedAt: string;
       validUntil?: string;
@@ -311,6 +317,21 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
     return {
       action, gateId, expectedDefinitionFingerprint, newGateId,
       sourceChatId, dispatchRoot, taskGuid, label, authorizationRef, reason,
+    };
+  }
+  if (action === 'replace_workstream_reviewer') {
+    const dispatchRoot = stringField(body, 'dispatchRoot');
+    const oldReviewerAppId = stringField(body, 'oldReviewerAppId');
+    const newReviewerAppId = stringField(body, 'newReviewerAppId');
+    const expectedRevision = body.expectedRevision;
+    const authorizationRef = stringField(body, 'authorizationRef');
+    const reason = stringField(body, 'reason');
+    if (!dispatchRoot || !oldReviewerAppId || !newReviewerAppId
+      || !Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 1
+      || !authorizationRef || !reason) return undefined;
+    return {
+      action, dispatchRoot, oldReviewerAppId, newReviewerAppId,
+      expectedRevision: expectedRevision as number, authorizationRef, reason,
     };
   }
   if (action === 'dispatch') {
@@ -1149,6 +1170,7 @@ const COMPLETION_GATE_ROOT_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 const COMPLETION_GATE_TASK_GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const COMPLETION_GATE_AUTHORIZATION_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 const COMPLETION_GATE_AUTHORIZED_ACTOR_RE = /^ou_[A-Za-z0-9_-]{1,128}$/;
+const PROJECT_REVIEWER_APP_ID_RE = /^cli_[A-Za-z0-9_-]{1,128}$/;
 
 export type ProjectCompletionGateLifecycleAction = Extract<
   ProjectCoordinatorAction,
@@ -1177,6 +1199,27 @@ export function projectCompletionGateAuthorizationPrompt(
         reason: boundedText(action.reason, 160),
       };
   return `授权执行 BotMux completion gate 变更：${JSON.stringify(payload)}`;
+}
+
+export type ProjectWorkstreamReviewerReplacementAction = Extract<
+  ProjectCoordinatorAction,
+  { action: 'replace_workstream_reviewer' }
+>;
+
+/** Exact sentence the current authorized human must send before the daemon
+ * adds the actor and current project worker allowlist to this action. */
+export function projectWorkstreamReviewerAuthorizationPrompt(
+  action: ProjectWorkstreamReviewerReplacementAction,
+): string {
+  const payload = {
+    action: action.action,
+    dispatchRoot: action.dispatchRoot.trim(),
+    oldReviewerAppId: action.oldReviewerAppId.trim(),
+    newReviewerAppId: action.newReviewerAppId.trim(),
+    expectedRevision: action.expectedRevision,
+    reason: boundedText(action.reason, 160),
+  };
+  return `授权执行 BotMux reviewer 变更：${JSON.stringify(payload)}`;
 }
 
 function newCompletionGate(input: {
@@ -2095,6 +2138,9 @@ export class ProjectCoordinator {
     if (action.action === 'report' && action.phaseAReport) {
       return Promise.resolve().then(() => this.applyTaskControlPhaseAFailedReport(context, action));
     }
+    if (action.action === 'replace_workstream_reviewer') {
+      return this.runReviewerReplacement(context, action).then(result => result.project);
+    }
     if (action.action === 'reserve_dispatch'
       || action.action === 'commit_dispatch'
       || action.action === 'abort_dispatch'
@@ -2151,6 +2197,25 @@ export class ProjectCoordinator {
       return mapped?.sourceKind === 'project_group'
         ? withProjectTaskControlChatLock(context.dataDir, context.chatId, execute)
         : execute();
+    });
+  }
+
+  runReviewerReplacement(
+    context: ProjectCoordinatorContext,
+    action: ProjectWorkstreamReviewerReplacementAction,
+  ): Promise<{ project: ProjectGroupState; projectionWarning?: string }> {
+    return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      const beforeRevision = readProjectGroup(context.dataDir, context.chatId)?.revision;
+      const applied = await this.apply(context, action);
+      if (applied.revision === beforeRevision) return { project: applied };
+      try {
+        return { project: await this.publish(context, applied) };
+      } catch (error) {
+        return {
+          project: readProjectGroup(context.dataDir, context.chatId) ?? applied,
+          projectionWarning: error instanceof Error ? error.message : String(error),
+        };
+      }
     });
   }
 
@@ -2287,7 +2352,8 @@ export class ProjectCoordinator {
         ? new Date(action.checkedAt).toISOString()
         : (action.action === 'reserve_dispatch' || action.action === 'close'
         || action.action === 'add_completion_gate' || action.action === 'retire_completion_gate'
-        || action.action === 'replace_completion_gate') && action.now !== undefined
+        || action.action === 'replace_completion_gate'
+        || action.action === 'replace_workstream_reviewer') && action.now !== undefined
         ? new Date(action.now).toISOString()
         : nowIso();
       if (action.action === 'init') {
@@ -2531,6 +2597,88 @@ export class ProjectCoordinator {
           } : {}),
           createdAt: now, updatedAt: now,
         });
+      } else if (action.action === 'replace_workstream_reviewer') {
+        const dispatchRoot = action.dispatchRoot.trim();
+        const oldReviewerAppId = action.oldReviewerAppId.trim();
+        const newReviewerAppId = action.newReviewerAppId.trim();
+        const authorizationRef = action.authorizationRef.trim();
+        const authorizedByOpenId = action.authorizedByOpenId?.trim() ?? '';
+        const reason = boundedText(action.reason, 160);
+        if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot)) throw new Error('invalid_dispatch_root');
+        if (!PROJECT_REVIEWER_APP_ID_RE.test(oldReviewerAppId)
+          || !PROJECT_REVIEWER_APP_ID_RE.test(newReviewerAppId)) {
+          throw new Error('project_reviewer_app_id_invalid');
+        }
+        if (!Number.isSafeInteger(action.expectedRevision) || action.expectedRevision < 1) {
+          throw new Error('project_revision_invalid');
+        }
+        if (!COMPLETION_GATE_AUTHORIZATION_RE.test(authorizationRef)
+          || !COMPLETION_GATE_AUTHORIZED_ACTOR_RE.test(authorizedByOpenId)) {
+          throw new Error('project_workstream_reviewer_authorization_required');
+        }
+        if (!reason) throw new Error('project_reviewer_replace_reason_required');
+        const item = current.workstreams.find(candidate => candidate.dispatchRoot === dispatchRoot);
+        if (!item) throw new Error('workstream_not_found');
+        const exactRetry = item.reviewerReplacements?.find(record => (
+          record.oldReviewerAppId === oldReviewerAppId
+          && record.newReviewerAppId === newReviewerAppId
+          && record.authorizationRef === authorizationRef
+          && record.authorizedByOpenId === authorizedByOpenId
+          && record.reason === reason
+          && record.coordinatorSessionId === context.coordinatorSessionId
+          && record.fromRevision === action.expectedRevision
+          && item.reviewerAppIds?.includes(newReviewerAppId)
+          && !item.reviewerAppIds?.includes(oldReviewerAppId)
+          && item.targetAppIds?.includes(newReviewerAppId)
+          && !item.targetAppIds?.includes(oldReviewerAppId)
+        ));
+        if (exactRetry) {
+          current.coordinatorSessionId = previousCoordinatorSessionId;
+          current.revision = previousRevision;
+          current.updatedAt = previousUpdatedAt;
+          return current;
+        }
+        if (action.expectedRevision !== previousRevision) throw new Error('project_revision_conflict');
+        if (item.taskControl) throw new Error('project_reviewer_replace_task_control_unsupported');
+        if (item.access?.mode !== 'write' || item.status !== 'in_review' || item.review || !item.delivery) {
+          throw new Error('project_reviewer_replace_state_invalid');
+        }
+        const reviewerAppIds = item.reviewerAppIds ?? [];
+        const targetAppIds = item.targetAppIds ?? [];
+        if (reviewerAppIds.filter(appId => appId === oldReviewerAppId).length !== 1
+          || targetAppIds.filter(appId => appId === oldReviewerAppId).length !== 1) {
+          throw new Error('project_old_reviewer_mismatch');
+        }
+        if (item.workerAppIds?.includes(newReviewerAppId)) throw new Error('project_review_roles_overlap');
+        if (oldReviewerAppId === newReviewerAppId || reviewerAppIds.includes(newReviewerAppId)
+          || targetAppIds.includes(newReviewerAppId)) {
+          throw new Error('project_reviewer_already_assigned');
+        }
+        const allowedReviewerAppIds = new Set(
+          (action.allowedReviewerAppIds ?? []).map(appId => appId.trim()).filter(Boolean),
+        );
+        if (!allowedReviewerAppIds.has(newReviewerAppId)) throw new Error('project_reviewer_not_allowed');
+        item.reviewerAppIds = reviewerAppIds.map(
+          appId => appId === oldReviewerAppId ? newReviewerAppId : appId,
+        );
+        item.targetAppIds = targetAppIds.map(
+          appId => appId === oldReviewerAppId ? newReviewerAppId : appId,
+        );
+        item.reviewerReplacements = [
+          ...(item.reviewerReplacements ?? []).slice(-31),
+          {
+            oldReviewerAppId,
+            newReviewerAppId,
+            authorizationRef,
+            authorizedByOpenId,
+            reason,
+            coordinatorSessionId: context.coordinatorSessionId,
+            replacedAt: now,
+            fromRevision: previousRevision,
+            toRevision: current.revision,
+          },
+        ];
+        item.updatedAt = now;
       } else if (action.action === 'mark_task_control_mapping') {
         const item = current.workstreams.find(candidate => candidate.dispatchRoot === action.dispatchRoot);
         if (!item?.taskControl) throw new Error('project_task_control_binding_not_found');
