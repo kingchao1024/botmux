@@ -433,7 +433,7 @@ describe('project dispatch policy', () => {
     expect(route).toContain('logger.warn');
   });
 
-  it('requires the exact current human authorization and current worker allowlist for reviewer replacement', () => {
+  it('requires human authorization and validation of project mode but never injects a pre-lock allowlist for reviewer replacement', () => {
     const source = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
     const start = source.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/project'");
     const end = source.indexOf('\n});', start) + 4;
@@ -442,8 +442,34 @@ describe('project dispatch policy', () => {
     expect(route).toContain('verifiedCurrentProjectHumanActor');
     expect(route).toContain('projectWorkstreamReviewerAuthorizationPrompt(action)');
     expect(route).toContain('readGroupCollaborationMode');
-    expect(route).toContain('allowedReviewerAppIds');
+    // The coordinator derives the allowlist from the collaboration mode under
+    // the chat lock.  The Dashboard must NOT inject a pre-lock allowlist that
+    // can become stale before the coordinator acquires the lock.
+    expect(route).not.toContain('allowedReviewerAppIds');
     expect(route).toContain('projectCoordinator.runReviewerReplacement');
+  });
+
+  it('injects only the verified current human actor for workstream archive', () => {
+    expect(parseProjectCoordinatorAction({
+      action: 'archive_workstream', dispatchRoot: 'om_failed_archive', expectedRevision: 1219,
+      authorizationRef: 'om_archive_authorization', reason: '历史失败已由后续成功批次替代',
+      archivedByOpenId: 'ou_forged',
+    })).toEqual({
+      action: 'archive_workstream', dispatchRoot: 'om_failed_archive', expectedRevision: 1219,
+      authorizationRef: 'om_archive_authorization', reason: '历史失败已由后续成功批次替代',
+    });
+    const source = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/project'");
+    const end = source.indexOf('\n});', start) + 4;
+    const route = source.slice(start, end);
+    expect(route).toContain("action.action === 'archive_workstream'");
+    expect(route).toContain('verifiedCurrentProjectHumanActor');
+    expect(route).toContain('projectWorkstreamArchiveAuthorizationPrompt(action)');
+    expect(route).toContain('archivedByOpenId');
+    expect(route).toContain("verifiedAction.action === 'archive_workstream'");
+    expect(route).toContain('projectCoordinator.runWorkstreamArchive');
+    expect(route).toContain('archive persisted but card projection failed');
+    expect(route).toContain('...(projectionWarning ? { projectionWarning } : {})');
   });
 
   it('rejects malformed trusted review fields instead of downgrading them to a worker report', () => {

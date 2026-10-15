@@ -172,6 +172,7 @@ import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import {
   parseProjectCoordinatorAction,
   projectCompletionGateAuthorizationPrompt,
+  projectWorkstreamArchiveAuthorizationPrompt,
   projectWorkstreamReviewerAuthorizationPrompt,
   type ProjectCompletionGateLifecycleAction,
 } from '../services/project-coordinator.js';
@@ -3228,6 +3229,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
     }
     verifiedAction = { ...action, authorizedByOpenId };
   }
+  if (action.action === 'archive_workstream') {
+    const archivedByOpenId = verifiedCurrentProjectHumanActor(
+      ds,
+      action.authorizationRef,
+      projectWorkstreamArchiveAuthorizationPrompt(action),
+    );
+    if (!archivedByOpenId) {
+      return jsonRes(res, 403, { ok: false, error: 'project_workstream_archive_authorization_required' });
+    }
+    if (groupMode?.mode !== 'project') {
+      return jsonRes(res, 409, { ok: false, error: 'project_mode_required' });
+    }
+    verifiedAction = { ...action, archivedByOpenId };
+  }
   if (action.action === 'replace_workstream_reviewer') {
     const authorizedByOpenId = verifiedCurrentProjectHumanActor(
       ds,
@@ -3243,7 +3258,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
     verifiedAction = {
       ...action,
       authorizedByOpenId,
-      allowedReviewerAppIds: [...(groupMode.workerAppIds ?? [])],
     };
   }
   try {
@@ -3266,6 +3280,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
         ok: true, project,
         ...(projectionWarning ? { projectionWarning } : {}),
         ...(stageAdvanceWarning ? { stageAdvanceWarning } : {}),
+      });
+    }
+    if (verifiedAction.action === 'archive_workstream') {
+      const { project, projectionWarning } = await projectCoordinator.runWorkstreamArchive(
+        context,
+        verifiedAction,
+      );
+      if (projectionWarning) {
+        logger.warn(`[project] archive persisted but card projection failed: ${projectionWarning}`);
+      }
+      return jsonRes(res, 200, {
+        ok: true,
+        project,
+        ...(projectionWarning ? { projectionWarning } : {}),
       });
     }
     if (verifiedAction.action === 'replace_workstream_reviewer') {

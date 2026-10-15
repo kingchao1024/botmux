@@ -117,8 +117,50 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
     };
   }
   if (subcommand === 'workstream') {
+    if (args[0] === 'archive') {
+      const archiveArgs = args.slice(1);
+      const allowed = new Set([
+        '--root', '--expected-revision', '--authorization-ref', '--reason', '--session-id', '--json',
+      ]);
+      for (let i = 0; i < archiveArgs.length; i += 1) {
+        const token = archiveArgs[i]!;
+        if (!token.startsWith('-')) return { ok: false, error: `不支持位置参数: ${token}` };
+        const flag = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+        if (!allowed.has(flag)) return { ok: false, error: `未知选项: ${flag}` };
+        if (flag === '--json') {
+          if (token.includes('=')) return { ok: false, error: '--json 不接受值' };
+          continue;
+        }
+        const value = token.includes('=') ? token.slice(token.indexOf('=') + 1) : archiveArgs[++i];
+        if (value === undefined || !value.trim() || value.startsWith('--')) {
+          return { ok: false, error: `${flag} 需要一个值` };
+        }
+      }
+      const dispatchRoot = one(archiveArgs, '--root')?.trim();
+      const expectedRevisionRaw = one(archiveArgs, '--expected-revision')?.trim();
+      const authorizationRef = one(archiveArgs, '--authorization-ref')?.trim();
+      const reason = one(archiveArgs, '--reason')?.trim();
+      if (!dispatchRoot || !expectedRevisionRaw || !authorizationRef || !reason) {
+        return {
+          ok: false,
+          error: 'project workstream archive 需要 --root、--expected-revision、--authorization-ref 和 --reason',
+        };
+      }
+      if (!/^[1-9]\d*$/.test(expectedRevisionRaw) || !Number.isSafeInteger(Number(expectedRevisionRaw))) {
+        return { ok: false, error: '--expected-revision 必须是正整数' };
+      }
+      return {
+        ok: true, help: false,
+        sessionId: one(archiveArgs, '--session-id'),
+        json: has(archiveArgs, '--json'),
+        action: {
+          action: 'archive_workstream', dispatchRoot,
+          expectedRevision: Number(expectedRevisionRaw), authorizationRef, reason,
+        },
+      };
+    }
     if (args[0] !== 'reviewer' || args[1] !== 'replace') {
-      return { ok: false, error: 'project workstream 只支持 reviewer replace' };
+      return { ok: false, error: 'project workstream 只支持 archive 或 reviewer replace' };
     }
     const replaceArgs = args.slice(2);
     const allowed = new Set([

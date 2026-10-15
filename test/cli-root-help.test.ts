@@ -11,6 +11,30 @@ import { describe, expect, it } from 'vitest';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 describe('botmux root help workflow surface', () => {
+  it('documents the auditable failed-workstream archive command', () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-project-archive-help-'));
+    try {
+      const env = { ...process.env, HOME: home };
+      const { command, prefixArgs } = tsRunnerPrefix();
+      const stdout = execFileSync(
+        command,
+        [
+          ...prefixArgs,
+          fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
+          'project', '--help',
+        ],
+        { cwd: process.cwd(), env, encoding: 'utf-8' },
+      );
+
+      expect(stdout).toContain('project workstream archive --root <om_xxx>');
+      expect(stdout).toContain('--expected-revision <n>');
+      expect(stdout).toContain('--authorization-ref <om_xxx> --reason <原因>');
+      expect(stdout).toContain('历史 failed workstream');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('documents the auditable project workstream reviewer replacement command', () => {
     const home = mkdtempSync(join(tmpdir(), 'botmux-project-help-'));
     try {

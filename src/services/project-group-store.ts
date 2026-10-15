@@ -18,7 +18,7 @@ export const PROJECT_COMPLETION_GATE_VALIDITY_MS = 5 * 60_000;
 export const PROJECT_COMPLETION_GATE_REFRESH_WINDOW_MS = 60_000;
 
 export type ProjectGroupStatus = 'active' | 'paused' | 'completed';
-export type ProjectWorkstreamStatus = 'pending' | 'in_progress' | 'in_review' | 'blocked' | 'completed' | 'failed';
+export type ProjectWorkstreamStatus = 'pending' | 'in_progress' | 'in_review' | 'blocked' | 'completed' | 'failed' | 'cancelled';
 export type ProjectBlockerSource = 'manual' | 'task_control' | 'human_action';
 export type ProjectCompletionGateStatus = 'pending' | 'blocked' | 'satisfied';
 
@@ -197,7 +197,21 @@ export interface ProjectReviewerReplacement {
   toRevision: number;
 }
 
-export interface ProjectWorkstream {
+export interface ProjectReviewerReplacementReceipt {
+  operationFingerprint: string;
+  fromRevision: number;
+  toRevision: number;
+}
+
+export interface ProjectWorkstreamArchive {
+  archivedFromStatus: 'failed';
+  archivedAt: string;
+  archiveReason: string;
+  archiveAuthorizationRef: string;
+  archivedByOpenId: string;
+}
+
+export interface ProjectWorkstream extends Partial<ProjectWorkstreamArchive> {
   dispatchRoot: string;
   threadId?: string;
   title: string;
@@ -207,6 +221,7 @@ export interface ProjectWorkstream {
   workerAppIds?: string[];
   reviewerAppIds?: string[];
   reviewerReplacements?: ProjectReviewerReplacement[];
+  reviewerReplacementReceipts?: ProjectReviewerReplacementReceipt[];
   access?: ProjectDispatchAccess;
   delivery?: ProjectWorkstreamDelivery;
   review?: ProjectWorkstreamReview;
@@ -744,6 +759,70 @@ function normalizedReviewerReplacements(value: unknown): ProjectReviewerReplacem
   });
 }
 
+function normalizedReviewerReplacementReceipts(
+  value: unknown,
+): ProjectReviewerReplacementReceipt[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid reviewer replacement receipts`);
+  }
+  const seen = new Set<string>();
+  return value.map(raw => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid reviewer replacement receipt`);
+    }
+    const receipt = raw as ProjectReviewerReplacementReceipt;
+    if (!/^prr1:[a-f0-9]{64}$/.test(receipt.operationFingerprint)
+      || seen.has(receipt.operationFingerprint)
+      || !Number.isSafeInteger(receipt.fromRevision) || receipt.fromRevision < 1
+      || !Number.isSafeInteger(receipt.toRevision) || receipt.toRevision !== receipt.fromRevision + 1) {
+      throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid reviewer replacement receipt`);
+    }
+    seen.add(receipt.operationFingerprint);
+    return { ...receipt };
+  });
+}
+
+const PROJECT_WORKSTREAM_ARCHIVE_KEYS = new Set([
+  'archivedFromStatus', 'archivedAt', 'archiveReason',
+  'archiveAuthorizationRef', 'archivedByOpenId',
+]);
+
+function normalizedProjectWorkstreamArchive(
+  workstream: ProjectWorkstream,
+): ProjectWorkstreamArchive | undefined {
+  const keys = Object.keys(workstream);
+  if (keys.some(key => (key.startsWith('archive') || key.startsWith('archived'))
+    && !PROJECT_WORKSTREAM_ARCHIVE_KEYS.has(key))) {
+    throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid workstream archive metadata`);
+  }
+  const present = [...PROJECT_WORKSTREAM_ARCHIVE_KEYS].filter(key => Object.hasOwn(workstream, key));
+  if (present.length === 0) {
+    if (workstream.status === 'cancelled') {
+      throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid workstream archive metadata`);
+    }
+    return undefined;
+  }
+  const archive = workstream as ProjectWorkstream & ProjectWorkstreamArchive;
+  if (present.length !== PROJECT_WORKSTREAM_ARCHIVE_KEYS.size
+    || workstream.status !== 'cancelled'
+    || archive.archivedFromStatus !== 'failed'
+    || !Number.isFinite(Date.parse(archive.archivedAt))
+    || typeof archive.archiveReason !== 'string' || !archive.archiveReason.trim()
+    || Array.from(archive.archiveReason.trim()).length > 160
+    || !/^om_[A-Za-z0-9_-]{1,128}$/.test(archive.archiveAuthorizationRef?.trim())
+    || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(archive.archivedByOpenId?.trim())) {
+    throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid workstream archive metadata`);
+  }
+  return {
+    archivedFromStatus: 'failed',
+    archivedAt: new Date(archive.archivedAt).toISOString(),
+    archiveReason: archive.archiveReason.trim(),
+    archiveAuthorizationRef: archive.archiveAuthorizationRef.trim(),
+    archivedByOpenId: archive.archivedByOpenId.trim(),
+  };
+}
+
 export function projectCompletionGateFingerprint(input: Pick<
   ProjectCompletionGate,
   'gateId' | 'sourceChatId' | 'dispatchRoot' | 'taskGuid'
@@ -808,10 +887,20 @@ function migrateProject(project: unknown): ProjectGroupState {
   }
   const workstreams = Array.isArray(raw.workstreams)
     ? (raw.workstreams as ProjectWorkstream[]).map(workstream => {
+        if (!['pending', 'in_progress', 'in_review', 'blocked', 'completed', 'failed', 'cancelled']
+          .includes(workstream.status)) {
+          throw new Error(`${PROJECT_GROUP_STORE_FILE} has invalid workstream status`);
+        }
         const reviewerReplacements = normalizedReviewerReplacements(workstream.reviewerReplacements);
+        const reviewerReplacementReceipts = normalizedReviewerReplacementReceipts(
+          workstream.reviewerReplacementReceipts,
+        );
+        const archive = normalizedProjectWorkstreamArchive(workstream);
         return {
           ...workstream,
           ...(reviewerReplacements ? { reviewerReplacements } : {}),
+          ...(reviewerReplacementReceipts ? { reviewerReplacementReceipts } : {}),
+          ...(archive ?? {}),
         };
       })
     : raw.workstreams;
@@ -946,6 +1035,8 @@ export function projectRemainingSummary(project: ProjectGroupState): string {
   const openGates = activeProjectCompletionGates(project).filter(gate => projectCompletionGateOpen(gate)).length;
   if (openGates > 0) return `${openGates} 个父级完成门`;
   if (project.workstreams.length === 0) return project.status === 'completed' ? '无' : '待拆解';
-  const pending = project.workstreams.filter(item => item.status !== 'completed').length;
+  const pending = project.workstreams.filter(
+    item => item.status !== 'completed' && item.status !== 'cancelled',
+  ).length;
   return pending === 0 ? '无' : `${pending} 个子任务`;
 }

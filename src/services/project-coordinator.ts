@@ -143,6 +143,10 @@ export type ProjectCoordinatorAction =
       allowedReviewerAppIds?: string[]; now?: string;
     }
   | {
+      action: 'archive_workstream'; dispatchRoot: string; expectedRevision: number;
+      authorizationRef: string; archivedByOpenId?: string; reason: string; now?: string;
+    }
+  | {
       action: 'sync_completion_gate'; gateId: string; definitionFingerprint: string;
       status: ProjectCompletionGateStatus; reason: string; checkedAt: string;
       validUntil?: string;
@@ -332,6 +336,19 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
     return {
       action, dispatchRoot, oldReviewerAppId, newReviewerAppId,
       expectedRevision: expectedRevision as number, authorizationRef, reason,
+    };
+  }
+  if (action === 'archive_workstream') {
+    const dispatchRoot = stringField(body, 'dispatchRoot');
+    const expectedRevision = body.expectedRevision;
+    const authorizationRef = stringField(body, 'authorizationRef');
+    const reason = stringField(body, 'reason');
+    if (!dispatchRoot
+      || !Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 1
+      || !authorizationRef || !reason) return undefined;
+    return {
+      action, dispatchRoot, expectedRevision: expectedRevision as number,
+      authorizationRef, reason,
     };
   }
   if (action === 'dispatch') {
@@ -1156,12 +1173,35 @@ function assertProjectTaskControlCanaryFenceCommit(
 }
 
 function holdsWriteClaim(status: ProjectWorkstreamStatus): boolean {
-  return status !== 'completed' && status !== 'failed';
+  return status !== 'completed' && status !== 'failed' && status !== 'cancelled';
 }
 
 function boundedText(value: string | undefined, max: number, fallback = ''): string {
   const text = value?.trim() ?? '';
   return (text || fallback).slice(0, max);
+}
+
+function boundedArchiveReason(value: string | undefined): string {
+  return Array.from(value?.trim() ?? '').slice(0, 160).join('');
+}
+
+function reviewerReplacementFingerprint(
+  context: ProjectCoordinatorContext,
+  action: ProjectWorkstreamReviewerReplacementAction,
+  reason: string,
+): string {
+  const canonical = JSON.stringify({
+    chatId: context.chatId,
+    dispatchRoot: action.dispatchRoot.trim(),
+    oldReviewerAppId: action.oldReviewerAppId.trim(),
+    newReviewerAppId: action.newReviewerAppId.trim(),
+    authorizationRef: action.authorizationRef.trim(),
+    authorizedByOpenId: action.authorizedByOpenId?.trim() ?? '',
+    reason,
+    coordinatorSessionId: context.coordinatorSessionId,
+    expectedRevision: action.expectedRevision,
+  });
+  return `prr1:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
 const COMPLETION_GATE_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -1220,6 +1260,23 @@ export function projectWorkstreamReviewerAuthorizationPrompt(
     reason: boundedText(action.reason, 160),
   };
   return `授权执行 BotMux reviewer 变更：${JSON.stringify(payload)}`;
+}
+
+export type ProjectWorkstreamArchiveAction = Extract<
+  ProjectCoordinatorAction,
+  { action: 'archive_workstream' }
+>;
+
+export function projectWorkstreamArchiveAuthorizationPrompt(
+  action: ProjectWorkstreamArchiveAction,
+): string {
+  const dispatchRoot = action.dispatchRoot.trim();
+  const reason = boundedArchiveReason(action.reason);
+  return '授权归档 BotMux 历史 failed workstream：' + JSON.stringify({
+    dispatchRoot,
+    expectedRevision: action.expectedRevision,
+    reason,
+  });
 }
 
 function newCompletionGate(input: {
@@ -2141,6 +2198,9 @@ export class ProjectCoordinator {
     if (action.action === 'replace_workstream_reviewer') {
       return this.runReviewerReplacement(context, action).then(result => result.project);
     }
+    if (action.action === 'archive_workstream') {
+      return this.runWorkstreamArchive(context, action).then(result => result.project);
+    }
     if (action.action === 'reserve_dispatch'
       || action.action === 'commit_dispatch'
       || action.action === 'abort_dispatch'
@@ -2167,6 +2227,25 @@ export class ProjectCoordinator {
         return changed;
       }
       return this.publish(context, changed);
+    });
+  }
+
+  runWorkstreamArchive(
+    context: ProjectCoordinatorContext,
+    action: ProjectWorkstreamArchiveAction,
+  ): Promise<{ project: ProjectGroupState; projectionWarning?: string }> {
+    return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      const applied = await this.apply(context, action);
+      try {
+        // Archive's business mutation already advanced the revision; the card
+        // projection is always a refresh and must never additionally bump it.
+        return { project: await this.publish(context, applied, false, false) };
+      } catch (error) {
+        return {
+          project: readProjectGroup(context.dataDir, context.chatId) ?? applied,
+          projectionWarning: error instanceof Error ? error.message : String(error),
+        };
+      }
     });
   }
 
@@ -2205,11 +2284,50 @@ export class ProjectCoordinator {
     action: ProjectWorkstreamReviewerReplacementAction,
   ): Promise<{ project: ProjectGroupState; projectionWarning?: string }> {
     return queued(`${context.dataDir}:${context.chatId}`, async () => {
-      const beforeRevision = readProjectGroup(context.dataDir, context.chatId)?.revision;
-      const applied = await this.apply(context, action);
-      if (applied.revision === beforeRevision) return { project: applied };
+      const { applied, beforeRevision } = await withProjectTaskControlChatLock(context.dataDir, context.chatId, async () => {
+        const groupMode = readGroupCollaborationMode(context.dataDir, context.chatId);
+        if (groupMode?.mode !== 'project') {
+          throw new Error('project_mode_required');
+        }
+        // Validate the reviewer app-id format before any store reads,
+        // keeping the existing validation order from apply().
+        if (!PROJECT_REVIEWER_APP_ID_RE.test(action.newReviewerAppId.trim())) {
+          throw new Error('project_reviewer_app_id_invalid');
+        }
+        // Read the project to check for an exact durable receipt replay before
+        // enforcing the allowlist.  Exact replays must remain idempotent even
+        // after the collaboration-mode policy is updated to exclude the reviewer.
+        const project = readProjectGroup(context.dataDir, context.chatId);
+        const reason = boundedText(action.reason, 160);
+        const operationFingerprint = reviewerReplacementFingerprint(context, action, reason);
+        const hasExactReceipt = project?.workstreams.some(item =>
+          item.dispatchRoot === action.dispatchRoot.trim()
+          && (item.reviewerReplacementReceipts ?? []).some(
+            receipt => receipt.operationFingerprint === operationFingerprint,
+          ),
+        );
+        if (!hasExactReceipt) {
+          const workerAppIds = new Set(
+            (groupMode.workerAppIds ?? []).map(id => id.trim()).filter(Boolean),
+          );
+          if (!workerAppIds.has(action.newReviewerAppId.trim())) {
+            throw new Error('project_reviewer_not_allowed');
+          }
+        }
+        const beforeRevision = project?.revision;
+        const applied = await this.apply(context, action);
+        return { applied, beforeRevision };
+      });
       try {
-        return { project: await this.publish(context, applied) };
+        // publish must run outside the chat lock: it calls
+        // retireOnboardingCard → writeProjectOnboardingCard →
+        // withLockedGroupConfig → withProjectTaskControlChatLockSync,
+        // which would re-enter the same non-reentrant lock.
+        // An exact replay (revision unchanged) re-projects only the card without
+        // resolving threadIds or recording a projection revision; a new mutation
+        // keeps full publish behavior (resolve + record projection revision).
+        const replay = applied.revision === beforeRevision;
+        return { project: await this.publish(context, applied, !replay, !replay) };
       } catch (error) {
         return {
           project: readProjectGroup(context.dataDir, context.chatId) ?? applied,
@@ -2353,7 +2471,8 @@ export class ProjectCoordinator {
         : (action.action === 'reserve_dispatch' || action.action === 'close'
         || action.action === 'add_completion_gate' || action.action === 'retire_completion_gate'
         || action.action === 'replace_completion_gate'
-        || action.action === 'replace_workstream_reviewer') && action.now !== undefined
+        || action.action === 'replace_workstream_reviewer'
+        || action.action === 'archive_workstream') && action.now !== undefined
         ? new Date(action.now).toISOString()
         : nowIso();
       if (action.action === 'init') {
@@ -2617,8 +2736,18 @@ export class ProjectCoordinator {
           throw new Error('project_workstream_reviewer_authorization_required');
         }
         if (!reason) throw new Error('project_reviewer_replace_reason_required');
+        const operationFingerprint = reviewerReplacementFingerprint(context, action, reason);
         const item = current.workstreams.find(candidate => candidate.dispatchRoot === dispatchRoot);
         if (!item) throw new Error('workstream_not_found');
+        const hasExactReceipt = item.reviewerReplacementReceipts?.some(
+          receipt => receipt.operationFingerprint === operationFingerprint,
+        );
+        if (hasExactReceipt) {
+          current.coordinatorSessionId = previousCoordinatorSessionId;
+          current.revision = previousRevision;
+          current.updatedAt = previousUpdatedAt;
+          return current;
+        }
         const exactRetry = item.reviewerReplacements?.find(record => (
           record.oldReviewerAppId === oldReviewerAppId
           && record.newReviewerAppId === newReviewerAppId
@@ -2654,10 +2783,6 @@ export class ProjectCoordinator {
           || targetAppIds.includes(newReviewerAppId)) {
           throw new Error('project_reviewer_already_assigned');
         }
-        const allowedReviewerAppIds = new Set(
-          (action.allowedReviewerAppIds ?? []).map(appId => appId.trim()).filter(Boolean),
-        );
-        if (!allowedReviewerAppIds.has(newReviewerAppId)) throw new Error('project_reviewer_not_allowed');
         item.reviewerAppIds = reviewerAppIds.map(
           appId => appId === oldReviewerAppId ? newReviewerAppId : appId,
         );
@@ -2678,6 +2803,51 @@ export class ProjectCoordinator {
             toRevision: current.revision,
           },
         ];
+        item.reviewerReplacementReceipts = [
+          ...(item.reviewerReplacementReceipts ?? []),
+          {
+            operationFingerprint,
+            fromRevision: previousRevision,
+            toRevision: current.revision,
+          },
+        ];
+        item.updatedAt = now;
+      } else if (action.action === 'archive_workstream') {
+        const dispatchRoot = action.dispatchRoot.trim();
+        const authorizationRef = action.authorizationRef.trim();
+        const archivedByOpenId = action.archivedByOpenId?.trim() ?? '';
+        const reason = boundedArchiveReason(action.reason);
+        if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot)) throw new Error('invalid_dispatch_root');
+        if (!Number.isSafeInteger(action.expectedRevision) || action.expectedRevision < 1) {
+          throw new Error('project_revision_invalid');
+        }
+        if (!COMPLETION_GATE_AUTHORIZATION_RE.test(authorizationRef)
+          || !COMPLETION_GATE_AUTHORIZED_ACTOR_RE.test(archivedByOpenId)) {
+          throw new Error('project_workstream_archive_authorization_required');
+        }
+        if (!reason) throw new Error('project_workstream_archive_reason_required');
+        const item = current.workstreams.find(candidate => candidate.dispatchRoot === dispatchRoot);
+        if (!item) throw new Error('workstream_not_found');
+        const exactRetry = item.status === 'cancelled'
+          && item.archivedFromStatus === 'failed'
+          && item.archiveAuthorizationRef === authorizationRef
+          && item.archivedByOpenId === archivedByOpenId
+          && item.archiveReason === reason
+          && previousRevision > action.expectedRevision;
+        if (exactRetry) {
+          current.coordinatorSessionId = previousCoordinatorSessionId;
+          current.revision = previousRevision;
+          current.updatedAt = previousUpdatedAt;
+          return current;
+        }
+        if (action.expectedRevision !== previousRevision) throw new Error('project_revision_conflict');
+        if (item.status !== 'failed') throw new Error('project_workstream_archive_state_invalid');
+        item.status = 'cancelled';
+        item.archivedFromStatus = 'failed';
+        item.archivedAt = now;
+        item.archiveReason = reason;
+        item.archiveAuthorizationRef = authorizationRef;
+        item.archivedByOpenId = archivedByOpenId;
         item.updatedAt = now;
       } else if (action.action === 'mark_task_control_mapping') {
         const item = current.workstreams.find(candidate => candidate.dispatchRoot === action.dispatchRoot);
@@ -2976,6 +3146,7 @@ export class ProjectCoordinator {
         }
         const item = current.workstreams.find(candidate => candidate.dispatchRoot === action.dispatchRoot);
         if (!item) throw new Error('workstream_not_found');
+        if (item.status === 'cancelled') throw new Error('project_workstream_cancelled');
         const beforeStage = structuredClone(item);
         if (item.access?.mode === 'write') {
           const reporterAppId = action.reporterAppId?.trim();
@@ -3106,21 +3277,25 @@ export class ProjectCoordinator {
     return next;
   }
 
-  private async publish(context: ProjectCoordinatorContext, initial: ProjectGroupState): Promise<ProjectGroupState> {
+  private async publish(context: ProjectCoordinatorContext, initial: ProjectGroupState,
+    resolveThreadIds = true, recordProjectionRevision = true,
+  ): Promise<ProjectGroupState> {
     let project = initial;
-    const resolutions = await Promise.all(project.workstreams
-      .filter(item => !item.threadId)
-      .map(async item => ({ dispatchRoot: item.dispatchRoot, threadId: await this.transport.resolveThreadId(project.larkAppId, item.dispatchRoot) })));
-    const found = resolutions.filter((item): item is { dispatchRoot: string; threadId: string } => !!item.threadId);
-    if (found.length > 0) {
-      const byRoot = new Map(found.map(item => [item.dispatchRoot, item.threadId]));
-      project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
-        if (!current) throw new Error('project_not_found');
-        for (const item of current.workstreams) item.threadId ??= byRoot.get(item.dispatchRoot);
-        current.revision += 1;
-        current.updatedAt = nowIso();
-        return current;
-      }))!;
+    if (resolveThreadIds) {
+      const resolutions = await Promise.all(project.workstreams
+        .filter(item => !item.threadId)
+        .map(async item => ({ dispatchRoot: item.dispatchRoot, threadId: await this.transport.resolveThreadId(project.larkAppId, item.dispatchRoot) })));
+      const found = resolutions.filter((item): item is { dispatchRoot: string; threadId: string } => !!item.threadId);
+      if (found.length > 0) {
+        const byRoot = new Map(found.map(item => [item.dispatchRoot, item.threadId]));
+        project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+          if (!current) throw new Error('project_not_found');
+          for (const item of current.workstreams) item.threadId ??= byRoot.get(item.dispatchRoot);
+          current.revision += 1;
+          current.updatedAt = nowIso();
+          return current;
+        }))!;
+      }
     }
     const mode = readGroupCollaborationMode(context.dataDir, context.chatId);
     const cardConfig = mode?.progressCard;
@@ -3150,8 +3325,13 @@ export class ProjectCoordinator {
     const pinned = await this.transport.pinMessage(project.larkAppId, messageId);
     project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
       if (!current) throw new Error('project_not_found');
-      current.revision += 1;
-      current.updatedAt = nowIso();
+      if (recordProjectionRevision) {
+        current.revision += 1;
+        current.updatedAt = nowIso();
+      }
+      // When recordProjectionRevision is false the card projection is an idempotent
+      // refresh: persist the fresh card metadata against the existing durable state
+      // without bumping the business revision or advancing the project updatedAt.
       current.card = { messageId, pinned, updatedAt: current.updatedAt };
       return current;
     }))!;

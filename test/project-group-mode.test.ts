@@ -1,4 +1,4 @@
-import { buildProjectGroupStartedNoticeCard } from '../src/im/lark/project-group-card.js';
+import { buildProjectGroupCard, buildProjectGroupStartedNoticeCard } from '../src/im/lark/project-group-card.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -10,6 +10,7 @@ import {
   ProjectCoordinator,
   type ProjectCoordinatorTransport,
 } from '../src/services/project-coordinator.js';
+import * as projectCoordinatorModule from '../src/services/project-coordinator.js';
 import {
   activateTaskControlTurnAdmissionSync,
   claimTaskControlTurnAdmissionPendingSync,
@@ -18,6 +19,7 @@ import {
   mutateProjectGroup,
   projectCompletionGateFingerprint,
   projectOverallProgress,
+  projectRemainingSummary,
   projectTaskControlCanaryFenceFingerprint,
   readProjectGroup,
   refreshProjectBlockerProjection,
@@ -29,6 +31,7 @@ import {
 } from '../src/services/group-collaboration-mode-store.js';
 import { parseProjectArgs } from '../src/cli/project-args.js';
 import { planProjectGroupTaskControlReconciliation } from '../src/services/task-control-plane-project-group-audit.js';
+import { evaluateProjectCompletionGate } from '../src/services/project-group-completion-gate.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const roots: string[] = [];
@@ -97,6 +100,49 @@ describe('project group mode', () => {
       newReviewerAppId: ' cli_reviewer_next ', expectedRevision: 17,
       authorizationRef: 'om_authorization', reason: ' 主 reviewer 不可用 ',
     })).toBe('授权执行 BotMux reviewer 变更：{"action":"replace_workstream_reviewer","dispatchRoot":"om_reviewed","oldReviewerAppId":"cli_reviewer","newReviewerAppId":"cli_reviewer_next","expectedRevision":17,"reason":"主 reviewer 不可用"}');
+  });
+
+  it('parses workstream archive input while stripping caller-supplied trusted fields', () => {
+    expect(parseProjectCoordinatorAction({
+      action: 'archive_workstream',
+      dispatchRoot: 'om_failed_archive',
+      expectedRevision: 1219,
+      authorizationRef: 'om_archive_authorization',
+      reason: '历史失败已由后续成功批次替代',
+      archivedByOpenId: 'ou_forged',
+      now: '1900-01-01T00:00:00.000Z',
+    })).toEqual({
+      action: 'archive_workstream',
+      dispatchRoot: 'om_failed_archive',
+      expectedRevision: 1219,
+      authorizationRef: 'om_archive_authorization',
+      reason: '历史失败已由后续成功批次替代',
+    });
+  });
+
+  it('builds the exact canonical failed-workstream archive authorization prompt', () => {
+    const prompt = (projectCoordinatorModule as Record<string, unknown>)
+      .projectWorkstreamArchiveAuthorizationPrompt;
+    expect(typeof prompt).toBe('function');
+    expect((prompt as (action: Record<string, unknown>) => string)({
+      action: 'archive_workstream',
+      dispatchRoot: ' om_failed_archive ',
+      expectedRevision: 1219,
+      authorizationRef: 'om_archive_authorization',
+      reason: ' 历史失败已由后续成功批次替代 ',
+    })).toBe('授权归档 BotMux 历史 failed workstream：{"dispatchRoot":"om_failed_archive","expectedRevision":1219,"reason":"历史失败已由后续成功批次替代"}');
+  });
+
+  it('keeps 160 Unicode code points in the canonical archive reason', () => {
+    const reason = '😀'.repeat(160);
+    const prefix = '授权归档 BotMux 历史 failed workstream：';
+    const prompt = projectCoordinatorModule.projectWorkstreamArchiveAuthorizationPrompt({
+      action: 'archive_workstream', dispatchRoot: 'om_failed_archive', expectedRevision: 1219,
+      authorizationRef: 'om_archive_authorization', reason,
+    });
+    const payload = JSON.parse(prompt.slice(prefix.length));
+    expect(payload.reason).toBe(reason);
+    expect(Array.from(payload.reason)).toHaveLength(160);
   });
 
   it('preserves the exact Phase A report proof through project action parsing', () => {
@@ -2036,6 +2082,10 @@ describe('project group mode', () => {
   });
 
   async function committedWriteWorkstream(f: ReturnType<typeof fixture>) {
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_next', 'cli_reviewer_other'],
+    });
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '交付可验收结果' });
     await f.coordinator.run(f.context, {
       action: 'reserve_dispatch', reservationId: 'write-review',
@@ -2055,6 +2105,429 @@ describe('project group mode', () => {
       content: '冻结候选', status: 'completed',
     });
   }
+
+  async function failedWriteWorkstream(f: ReturnType<typeof fixture>) {
+    await committedWriteWorkstream(f);
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'status-dashboard', sections: ['goal'],
+        milestonesExpanded: false,
+      },
+    });
+    await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+      const item = current!.workstreams[0]!;
+      item.status = 'failed';
+      item.progress = 99;
+      item.remaining = '保留失败现场';
+      item.lastReport = '历史交付失败';
+      item.blocker = '验收未通过';
+      item.delivery = {
+        reportedByAppId: 'cli_worker', content: '历史候选',
+        reportedAt: '2026-10-14T09:00:00.000Z', round: 1,
+      };
+      item.review = {
+        reviewerAppId: 'cli_reviewer', verdict: 'fail', content: '验收未通过',
+        reviewedAt: '2026-10-14T09:30:00.000Z', round: 1,
+      };
+      return current;
+    });
+    return readProjectGroup(f.dataDir, f.context.chatId)!;
+  }
+
+  function archiveWorkstream(expectedRevision: number, overrides: Record<string, unknown> = {}) {
+    return {
+      action: 'archive_workstream' as const,
+      dispatchRoot: 'om_reviewed', expectedRevision,
+      authorizationRef: 'om_archive', archivedByOpenId: 'ou_authorizer',
+      reason: '历史失败已由后续成功批次替代',
+      now: '2026-10-15T10:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  it('archives one failed workstream without rewriting its failure evidence', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const before = structuredClone(failed.workstreams[0]!);
+
+    const archived = await f.coordinator.run(
+      f.context,
+      archiveWorkstream(failed.revision) as any,
+    );
+
+    expect(archived.workstreams[0]).toEqual({
+      ...before,
+      status: 'cancelled',
+      archivedFromStatus: 'failed',
+      archivedAt: '2026-10-15T10:00:00.000Z',
+      archiveReason: '历史失败已由后续成功批次替代',
+      archiveAuthorizationRef: 'om_archive',
+      archivedByOpenId: 'ou_authorizer',
+      updatedAt: '2026-10-15T10:00:00.000Z',
+    });
+    expect(projectRemainingSummary(archived)).toBe('无');
+  });
+
+  it.each([
+    [160, '😀'.repeat(160)],
+    [161, '😀'.repeat(160)],
+  ])('persists an archive reason at the %i-code-point boundary', async (inputLength, expectedReason) => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const inputReason = '😀'.repeat(inputLength);
+    const action = archiveWorkstream(failed.revision, { reason: inputReason });
+    const prefix = '授权归档 BotMux 历史 failed workstream：';
+    const promptReason = JSON.parse(
+      projectCoordinatorModule.projectWorkstreamArchiveAuthorizationPrompt(action).slice(prefix.length),
+    ).reason;
+
+    const archived = await f.coordinator.runWorkstreamArchive(f.context, action);
+
+    expect(promptReason).toBe(expectedReason);
+    expect(archived.project.workstreams[0]?.archiveReason).toBe(expectedReason);
+    expect(Array.from(archived.project.workstreams[0]!.archiveReason!)).toHaveLength(160);
+  });
+
+  it('does not replay an archive when code-point-truncated reasons differ', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const firstReason = `${'😀'.repeat(159)}A-tail`;
+    const differentReason = `${'😀'.repeat(159)}B-tail`;
+    const firstAction = archiveWorkstream(failed.revision, { reason: firstReason });
+    const first = await f.coordinator.runWorkstreamArchive(f.context, firstAction);
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeReplay = { revision: first.project.revision, inode: statSync(store).ino };
+
+    await expect(f.coordinator.runWorkstreamArchive(
+      f.context,
+      archiveWorkstream(failed.revision, { reason: differentReason }),
+    )).rejects.toThrow('project_revision_conflict');
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.revision).toBe(beforeReplay.revision);
+    expect(statSync(store).ino).toBe(beforeReplay.inode);
+  });
+
+  it('rejects a stale workstream archive revision without mutation', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const before = structuredClone(failed);
+
+    await expect(f.coordinator.run(
+      f.context,
+      archiveWorkstream(failed.revision - 1) as any,
+    )).rejects.toThrow('project_revision_conflict');
+    expect(readProjectGroup(f.dataDir, f.context.chatId)).toEqual(before);
+  });
+
+  it('rejects archiving a completed workstream', async () => {
+    const f = fixture();
+    await deliveredWriteWorkstream(f);
+    const completed = await f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_reviewer',
+      content: '验收通过', reviewVerdict: 'pass', reviewRound: 1,
+    });
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'status-dashboard', sections: ['goal'],
+        milestonesExpanded: false,
+      },
+    });
+
+    await expect(f.coordinator.run(
+      f.context,
+      archiveWorkstream(completed.revision) as any,
+    )).rejects.toThrow('project_workstream_archive_state_invalid');
+  });
+
+  it('keeps only the exact workstream archive replay idempotent', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const action = archiveWorkstream(failed.revision);
+    const first = await f.coordinator.run(f.context, action as any);
+    expect(first.revision).toBe(failed.revision + 1);
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeReplay = { revision: first.revision, inode: statSync(store).ino };
+    expect(readProjectGroup(f.dataDir, f.context.chatId)).toMatchObject({
+      revision: action.expectedRevision + 1,
+      workstreams: [{
+        status: 'cancelled', archivedFromStatus: 'failed',
+        archiveAuthorizationRef: action.authorizationRef,
+        archivedByOpenId: action.archivedByOpenId,
+        archiveReason: action.reason,
+      }],
+    });
+
+    const replay = await f.coordinator.run(f.context, action as any);
+    expect(replay.revision).toBe(beforeReplay.revision);
+    expect(statSync(store).ino).toBe(beforeReplay.inode);
+
+    for (const drift of [
+      { reason: '不同理由' },
+      { authorizationRef: 'om_archive_other' },
+      { archivedByOpenId: 'ou_other' },
+    ]) {
+      await expect(f.coordinator.run(
+        f.context,
+        archiveWorkstream(failed.revision, drift) as any,
+      )).rejects.toThrow();
+    }
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.revision).toBe(beforeReplay.revision);
+  });
+
+  it('replays archive without durably resolving a missing thread id', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const action = archiveWorkstream(failed.revision);
+    f.transport.resolveThreadId = vi.fn(async () => 'omt_probe');
+    f.transport.updateCard.mockClear();
+
+    const first = await f.coordinator.run(f.context, action as any);
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeReplay = { revision: first.revision, inode: statSync(store).ino };
+    const replay = await f.coordinator.run(f.context, action as any);
+
+    expect(replay.revision).toBe(beforeReplay.revision);
+    expect(statSync(store).ino).toBe(beforeReplay.inode);
+    expect(replay.workstreams[0]).toMatchObject({
+      status: 'cancelled', archivedFromStatus: 'failed',
+      archiveAuthorizationRef: 'om_archive', archivedByOpenId: 'ou_authorizer',
+    });
+    expect(replay.workstreams[0]?.threadId).toBeUndefined();
+    expect((readFileSync(store, 'utf8').match(/"archivedAt"/g) ?? [])).toHaveLength(1);
+    expect(f.transport.resolveThreadId).not.toHaveBeenCalled();
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays archive after a withdrawn card is replaced', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const action = archiveWorkstream(failed.revision);
+    const previousCardId = failed.card?.messageId;
+    f.transport.sendCard.mockClear();
+    f.transport.pinMessage.mockClear();
+    f.transport.updateCard = vi.fn()
+      .mockRejectedValueOnce(new Error('withdrawn'))
+      .mockResolvedValueOnce(undefined);
+
+    const first = await f.coordinator.runWorkstreamArchive(f.context, action);
+    expect(first).not.toHaveProperty('projectionWarning');
+    expect(first.project.revision).toBe(failed.revision + 1);
+    expect(first.project.card?.messageId).not.toBe(previousCardId);
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeReplay = {
+      revision: first.project.revision,
+      workstreams: structuredClone(first.project.workstreams),
+      inode: statSync(store).ino,
+    };
+
+    const replay = await f.coordinator.runWorkstreamArchive(f.context, action);
+
+    expect(replay).not.toHaveProperty('projectionWarning');
+    expect(replay.project.revision).toBe(beforeReplay.revision);
+    expect(replay.project.workstreams).toEqual(beforeReplay.workstreams);
+    expect(statSync(store).ino).toBe(beforeReplay.inode);
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(1);
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays archive after creating a card for a valid cardless legacy project', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+      delete current!.card;
+      return current;
+    });
+    const cardless = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(cardless.card).toBeUndefined();
+    const action = archiveWorkstream(cardless.revision);
+    f.transport.sendCard.mockClear();
+    f.transport.pinMessage.mockClear();
+    f.transport.updateCard.mockClear();
+
+    const first = await f.coordinator.runWorkstreamArchive(f.context, action);
+    expect(first).not.toHaveProperty('projectionWarning');
+    expect(first.project.revision).toBe(cardless.revision + 1);
+    expect(first.project.card?.messageId).toBeTruthy();
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeReplay = {
+      revision: first.project.revision,
+      workstreams: structuredClone(first.project.workstreams),
+      inode: statSync(store).ino,
+    };
+
+    const replay = await f.coordinator.runWorkstreamArchive(f.context, action);
+
+    expect(replay).not.toHaveProperty('projectionWarning');
+    expect(replay.project.revision).toBe(beforeReplay.revision);
+    expect(replay.project.workstreams).toEqual(beforeReplay.workstreams);
+    expect(statSync(store).ino).toBe(beforeReplay.inode);
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(f.transport.pinMessage).toHaveBeenCalledTimes(1);
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays archive after the card is later withdrawn and then removed, keeping business revision at +1', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const action = archiveWorkstream(failed.revision);
+    const first = await f.coordinator.runWorkstreamArchive(f.context, action);
+    expect(first).not.toHaveProperty('projectionWarning');
+    expect(first.project.revision).toBe(failed.revision + 1);
+    const businessRevision = first.project.revision;
+    const business = structuredClone(first.project.workstreams);
+
+    f.transport.updateCard.mockRejectedValueOnce(new Error('withdrawn'));
+    f.transport.sendCard.mockClear();
+    const withdrawnReplay = await f.coordinator.runWorkstreamArchive(f.context, action);
+    expect(withdrawnReplay.project.revision).toBe(businessRevision);
+    expect(withdrawnReplay.project.workstreams).toEqual(business);
+    expect(withdrawnReplay).not.toHaveProperty('projectionWarning');
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+
+    await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+      delete current!.card;
+      return current;
+    });
+    const cardlessBefore = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(cardlessBefore.revision).toBe(businessRevision);
+    f.transport.sendCard.mockClear();
+    const cardlessReplay = await f.coordinator.runWorkstreamArchive(f.context, action);
+    expect(cardlessReplay.project.revision).toBe(businessRevision);
+    expect(cardlessReplay.project.card?.messageId).toBeTruthy();
+    expect(cardlessReplay.project.workstreams).toEqual(business);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.revision).toBe(businessRevision);
+  });
+
+  it('retries archive projection after durable cancelled state succeeds', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const action = archiveWorkstream(failed.revision);
+    f.transport.resolveThreadId = vi.fn(async () => 'omt_probe');
+    f.transport.updateCard = vi.fn()
+      .mockRejectedValueOnce(new Error('projection unavailable'))
+      .mockResolvedValueOnce(undefined);
+
+    const first = await f.coordinator.runWorkstreamArchive(f.context, action);
+    expect(first).toMatchObject({
+      projectionWarning: 'projection unavailable',
+      project: { workstreams: [{ status: 'cancelled', archivedFromStatus: 'failed' }] },
+    });
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeRetry = readProjectGroup(f.dataDir, f.context.chatId)!;
+    const beforeRetryInode = statSync(store).ino;
+
+    const retry = await f.coordinator.runWorkstreamArchive(f.context, action);
+
+    expect(retry).not.toHaveProperty('projectionWarning');
+    expect(retry.project.revision).toBe(beforeRetry.revision);
+    expect(retry.project.workstreams).toEqual(beforeRetry.workstreams);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.workstreams).toEqual(beforeRetry.workstreams);
+    expect(statSync(store).ino).not.toBe(beforeRetryInode);
+    expect(retry.project.card?.updatedAt).toBe(retry.project.updatedAt);
+    expect(f.transport.resolveThreadId).not.toHaveBeenCalled();
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['missing field', (item: Record<string, unknown>) => { delete item.archiveReason; }],
+    ['tampered actor', (item: Record<string, unknown>) => { item.archivedByOpenId = 'forged'; }],
+    ['tampered source status', (item: Record<string, unknown>) => { item.archivedFromStatus = 'completed'; }],
+    ['extra archive field', (item: Record<string, unknown>) => { item.archiveUnexpected = 'forged'; }],
+    ['metadata on wrong lifecycle state', (item: Record<string, unknown>) => { item.status = 'failed'; }],
+  ])('rejects %s in workstream archive metadata on reload', async (_scenario, tamper) => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    await f.coordinator.run(f.context, archiveWorkstream(failed.revision) as any);
+    const store = join(f.dataDir, 'project-groups.json');
+    const raw = JSON.parse(readFileSync(store, 'utf8'));
+    tamper(raw.projects[f.context.chatId].workstreams[0]);
+    writeFileSync(store, JSON.stringify(raw));
+
+    expect(() => readProjectGroup(f.dataDir, f.context.chatId))
+      .toThrow('project-groups.json has invalid workstream archive metadata');
+  });
+
+  it('continues to load legacy workstreams without archive metadata', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.workstreams[0]).toEqual(
+      failed.workstreams[0],
+    );
+  });
+
+  it('excludes a cancelled workstream from remaining write claims', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    await f.coordinator.run(f.context, archiveWorkstream(failed.revision) as any);
+
+    await expect(f.coordinator.run(f.context, {
+      action: 'reserve_dispatch', reservationId: 'after-archive',
+      targetAppIds: ['cli_worker'], access: { mode: 'write', scopes: [f.dataDir] },
+    })).resolves.toMatchObject({
+      dispatchReservations: [expect.objectContaining({ reservationId: 'after-archive' })],
+    });
+  });
+
+  it('does not satisfy a completion gate from a cancelled source workstream', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const archived = await f.coordinator.run(f.context, archiveWorkstream(failed.revision) as any);
+    const taskGuid = '44444444-4444-4444-8444-444444444444';
+    archived.workstreams[0]!.taskControl = { taskGuid } as any;
+    const gate = {
+      gateId: 'archived-source', sourceChatId: archived.chatId,
+      dispatchRoot: archived.workstreams[0]!.dispatchRoot, taskGuid,
+      label: '已归档来源', definitionFingerprint: 'pcg1:archive',
+      status: 'pending' as const, reason: 'waiting',
+      createdAt: '2026-10-15T10:00:00.000Z', updatedAt: '2026-10-15T10:00:00.000Z',
+    };
+
+    expect(evaluateProjectCompletionGate({
+      parentLarkAppId: archived.larkAppId,
+      gate,
+      sourceProject: archived,
+      reader: {} as any,
+      checkedAt: '2026-10-15T10:01:00.000Z',
+      staleExecutionMs: 60_000,
+    })).toMatchObject({ status: 'pending', reason: 'source_workstream_incomplete' });
+  });
+
+  it('keeps a cancelled workstream terminal when a late report arrives', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const archived = await f.coordinator.run(f.context, archiveWorkstream(failed.revision) as any);
+
+    await expect(f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_worker',
+      content: '迟到报告', status: 'in_progress', progress: 50,
+    })).rejects.toThrow('project_workstream_cancelled');
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.revision).toBe(archived.revision);
+  });
+
+  it('renders cancelled archive metadata without changing failed styling', async () => {
+    const f = fixture();
+    const failed = await failedWriteWorkstream(f);
+    const failedCard = JSON.stringify(buildProjectGroupCard(failed));
+    expect(failedCard).toContain("<text_tag color='red'>失败</text_tag>");
+
+    const archived = await f.coordinator.run(f.context, archiveWorkstream(failed.revision) as any);
+    const built = buildProjectGroupCard(archived) as any;
+    const card = JSON.stringify(built);
+    const archiveRow = built.body.elements.find((element: { tag?: string }) => element.tag === 'table').rows[0].wf;
+    expect(card).toContain("<text_tag color='neutral'>已归档</text_tag>");
+    expect(card).toContain('归档记录 · 1');
+    expect(card).not.toContain('完成记录 · 1');
+    expect(archiveRow).toContain('原状态 · 失败');
+    expect(archiveRow).toContain('归档原因 · 历史失败已由后续成功批次替代');
+    expect(archiveRow).toContain('授权消息 · om\\_archive');
+    expect(archiveRow).toContain('归档人 · ou\\_authorizer');
+    expect(archiveRow).toContain('归档时间 · 2026\\-10\\-15T10:00:00\\.000Z');
+    expect(archiveRow).toContain('Review · 验收未通过');
+  });
 
   function reviewerReplacement(expectedRevision: number, overrides: Record<string, unknown> = {}) {
     return {
@@ -2097,6 +2570,11 @@ describe('project group mode', () => {
         replacedAt: '2026-10-13T10:00:00.000Z',
         fromRevision: delivered.revision, toRevision: delivered.revision + 1,
       }],
+      reviewerReplacementReceipts: [{
+        operationFingerprint: expect.stringMatching(/^prr1:[a-f0-9]{64}$/),
+        fromRevision: delivered.revision,
+        toRevision: delivered.revision + 1,
+      }],
       updatedAt: '2026-10-13T10:00:00.000Z',
     });
     expect(readProjectGroup(f.dataDir, f.context.chatId)?.workstreams[0]).toEqual(item);
@@ -2126,8 +2604,125 @@ describe('project group mode', () => {
     const retry = await f.coordinator.runReviewerReplacement(f.context, action);
     expect(retry.project.revision).toBe(beforeRetry.revision);
     expect(retry.project.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+    expect(retry.project.workstreams[0]?.reviewerReplacementReceipts).toHaveLength(1);
     expect(statSync(store).ino).toBe(beforeRetry.inode);
-    expect(f.transport.updateCard).not.toHaveBeenCalled();
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries projection after durable reviewer replacement success', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    const action = reviewerReplacement(delivered.revision);
+    f.transport.updateCard = vi.fn()
+      .mockRejectedValueOnce(new Error('projection unavailable'))
+      .mockResolvedValueOnce(undefined);
+    const first = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(first.projectionWarning).toBe('projection unavailable');
+    const durableRevision = first.project.revision;
+    const retry = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(retry.project.revision).toBe(durableRevision);
+    expect(retry).not.toHaveProperty('projectionWarning');
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not bump revision or enrich threadId on exact replay projection', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    const action = reviewerReplacement(delivered.revision);
+    f.transport.resolveThreadId = vi.fn()
+      .mockResolvedValueOnce(null)         // first publish: unresolved at that moment
+      .mockResolvedValueOnce('omt_topic'); // exact replay: now resolvable
+    f.transport.updateCard = vi.fn()
+      .mockRejectedValueOnce(new Error('projection unavailable'))
+      .mockResolvedValueOnce(undefined);
+    const first = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(first.projectionWarning).toBe('projection unavailable');
+    const durableRevision = first.project.revision;
+    const retry = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(retry.project.revision).toBe(durableRevision);
+    expect(retry).not.toHaveProperty('projectionWarning');
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(2);
+    // Replay projection must refresh the card without durably resolving threadIds.
+    const durable = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(durable.workstreams[0]?.threadId).toBeUndefined();
+    expect(durable.revision).toBe(durableRevision);
+    expect(f.transport.resolveThreadId).toHaveBeenCalledTimes(1);
+  });
+
+  async function reviewerChangedAfterKey(f: ReturnType<typeof fixture>) {
+    await deliveredWriteWorkstream(f);
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_next', 'cli_reviewer_final'],
+    });
+    let project = readProjectGroup(f.dataDir, f.context.chatId)!;
+    const firstAction = reviewerReplacement(project.revision);
+    project = (await f.coordinator.runReviewerReplacement(f.context, firstAction)).project;
+    project = (await f.coordinator.runReviewerReplacement(f.context, reviewerReplacement(project.revision, {
+      oldReviewerAppId: 'cli_reviewer_next', newReviewerAppId: 'cli_reviewer_final',
+      authorizationRef: 'om_authorization_final', reason: '再次变更当前 reviewer',
+    }))).project;
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_final'],
+    });
+    return { project, firstAction };
+  }
+
+  it('keeps an old reviewer operation business-noop when replay rebuilds a withdrawn card', async () => {
+    const f = fixture();
+    const { project, firstAction } = await reviewerChangedAfterKey(f);
+    const beforeReplay = structuredClone(project);
+    f.transport.updateCard = vi.fn(async () => { throw new Error('withdrawn'); });
+    f.transport.sendCard.mockClear();
+    f.transport.pinMessage.mockClear();
+
+    const replay = await f.coordinator.runReviewerReplacement(f.context, firstAction);
+
+    expect(replay.project.revision).toBe(beforeReplay.revision);
+    expect(replay.project.workstreams[0]!.reviewerAppIds).toEqual(['cli_reviewer_final']);
+    expect(replay.project.workstreams[0]!.reviewerReplacements)
+      .toEqual(beforeReplay.workstreams[0]!.reviewerReplacements);
+    expect(replay.project.workstreams[0]!.reviewerReplacementReceipts)
+      .toEqual(beforeReplay.workstreams[0]!.reviewerReplacementReceipts);
+    // A withdrawn card is rebuilt: a fresh card is sent, but business state is untouched.
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(replay.project.card?.messageId).toBeTruthy();
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.revision).toBe(beforeReplay.revision);
+  });
+
+  it('keeps an old reviewer operation business-noop when replay creates a card for a cardless project', async () => {
+    const f = fixture();
+    const { project, firstAction } = await reviewerChangedAfterKey(f);
+    await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+      delete current!.card;
+      return current;
+    });
+    const cardlessBefore = readProjectGroup(f.dataDir, f.context.chatId)!;
+    f.transport.sendCard.mockClear();
+    f.transport.pinMessage.mockClear();
+
+    const replay = await f.coordinator.runReviewerReplacement(f.context, firstAction);
+
+    expect(replay.project.revision).toBe(cardlessBefore.revision);
+    expect(replay.project.card?.messageId).toBeTruthy();
+    expect(replay.project.workstreams[0]!.reviewerAppIds).toEqual(['cli_reviewer_final']);
+    expect(replay.project.workstreams[0]!.reviewerReplacements)
+      .toEqual(cardlessBefore.workstreams[0]!.reviewerReplacements);
+    expect(replay.project.workstreams[0]!.reviewerReplacementReceipts)
+      .toEqual(cardlessBefore.workstreams[0]!.reviewerReplacementReceipts);
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.revision).toBe(cardlessBefore.revision);
+  });
+
+  it('normal reviewer replacement still creates a card and bumps business revision', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    f.transport.sendCard.mockClear();
+    const result = await f.coordinator.runReviewerReplacement(f.context, reviewerReplacement(delivered.revision));
+    expect(result.project.revision).toBe(delivered.revision + 1);
+    expect(result).not.toHaveProperty('projectionWarning');
+    expect(result.project.card?.messageId).toBeTruthy();
   });
 
   it.each([
@@ -2244,6 +2839,13 @@ describe('project group mode', () => {
   it('bounds reviewer replacement audit history and validates it on reload', async () => {
     const f = fixture();
     let project = await deliveredWriteWorkstream(f);
+    // Populate the collaboration mode with the cycling reviewer ids so the
+    // coordinator derives the allowlist from current policy, not from
+    // action.allowedReviewerAppIds.
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', ...Array.from({ length: 34 }, (_, i) => `cli_reviewer_${i}`)],
+    });
     let oldReviewerAppId = 'cli_reviewer';
     for (let index = 0; index < 34; index += 1) {
       const newReviewerAppId = `cli_reviewer_${index}`;
@@ -2259,7 +2861,10 @@ describe('project group mode', () => {
     }
     const records = readProjectGroup(f.dataDir, f.context.chatId)!
       .workstreams[0]!.reviewerReplacements!;
+    const receipts = readProjectGroup(f.dataDir, f.context.chatId)!
+      .workstreams[0]!.reviewerReplacementReceipts!;
     expect(records).toHaveLength(32);
+    expect(receipts).toHaveLength(34);
     expect(records[0]).toMatchObject({
       oldReviewerAppId: 'cli_reviewer_1', newReviewerAppId: 'cli_reviewer_2',
       fromRevision: project.revision - 32,
@@ -2275,6 +2880,104 @@ describe('project group mode', () => {
     writeFileSync(store, JSON.stringify(raw));
     expect(() => readProjectGroup(f.dataDir, f.context.chatId))
       .toThrow('project-groups.json has invalid reviewer replacement');
+  });
+
+  it('keeps an evicted reviewer replacement operation idempotent', async () => {
+    const f = fixture();
+    let project = await deliveredWriteWorkstream(f);
+    // Populate the collaboration mode with the cycling reviewer ids so the
+    // coordinator derives the allowlist from current policy.
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer_next', ...Array.from({ length: 33 }, (_, i) => `cli_after_${i}`)],
+    });
+    const firstAction = reviewerReplacement(project.revision);
+    project = (await f.coordinator.runReviewerReplacement(f.context, firstAction)).project;
+    let oldReviewerAppId = 'cli_reviewer_next';
+    for (let index = 0; index < 33; index += 1) {
+      const newReviewerAppId = `cli_after_${index}`;
+      project = (await f.coordinator.runReviewerReplacement(f.context, {
+        ...reviewerReplacement(project.revision),
+        oldReviewerAppId,
+        newReviewerAppId,
+        authorizationRef: `om_after_${index}`,
+        allowedReviewerAppIds: ['cli_worker', newReviewerAppId],
+      })).project;
+      oldReviewerAppId = newReviewerAppId;
+    }
+    expect(project.workstreams[0]!.reviewerReplacements).toHaveLength(32);
+    expect(project.workstreams[0]!.reviewerReplacements)
+      .not.toContainEqual(expect.objectContaining({ authorizationRef: 'om_authorization' }));
+    expect(project.workstreams[0]!.reviewerReplacementReceipts).toHaveLength(34);
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeReplay = structuredClone(project);
+    const beforeReplayInode = statSync(store).ino;
+
+    const replay = await f.coordinator.runReviewerReplacement(f.context, firstAction);
+
+    expect(replay.project.revision).toBe(beforeReplay.revision);
+    expect(statSync(store).ino).toBe(beforeReplayInode);
+    expect(replay.project.workstreams[0]!.reviewerAppIds).toEqual([oldReviewerAppId]);
+    expect(replay.project.workstreams[0]!.reviewerReplacements)
+      .toEqual(beforeReplay.workstreams[0]!.reviewerReplacements);
+    expect(replay.project.workstreams[0]!.reviewerReplacementReceipts)
+      .toEqual(beforeReplay.workstreams[0]!.reviewerReplacementReceipts);
+  });
+
+  type StoredReviewerReplacementReceipt = {
+    operationFingerprint: string;
+    fromRevision: number;
+    toRevision: number;
+  };
+  const reviewerReplacementReceiptTamperCases: Array<[
+    string,
+    (receipts: StoredReviewerReplacementReceipt[]) => void,
+  ]> = [
+    ['malformed fingerprint', receipts => {
+      receipts[0].operationFingerprint = 'prr1:forged';
+    }],
+    ['duplicate fingerprint', receipts => {
+      receipts.push(structuredClone(receipts[0]));
+    }],
+    ['non-positive revision', receipts => {
+      receipts[0].fromRevision = 0;
+    }],
+    ['unsafe revision', receipts => {
+      receipts[0].fromRevision = Number.MAX_SAFE_INTEGER + 1;
+      receipts[0].toRevision = Number.MAX_SAFE_INTEGER + 2;
+    }],
+    ['non-consecutive revision', receipts => {
+      receipts[0].toRevision += 1;
+    }],
+  ];
+
+  it.each(reviewerReplacementReceiptTamperCases)(
+    'rejects tampered reviewer replacement receipts on reload: %s', async (_scenario, tamper) => {
+      const f = fixture();
+      const delivered = await deliveredWriteWorkstream(f);
+      await f.coordinator.runReviewerReplacement(f.context, reviewerReplacement(delivered.revision));
+      const store = join(f.dataDir, 'project-groups.json');
+      const raw = JSON.parse(readFileSync(store, 'utf8'));
+      tamper(raw.projects[f.context.chatId].workstreams[0].reviewerReplacementReceipts);
+      writeFileSync(store, JSON.stringify(raw));
+
+      expect(() => readProjectGroup(f.dataDir, f.context.chatId))
+        .toThrow('project-groups.json has invalid reviewer replacement receipt');
+    },
+  );
+
+  it('loads legacy reviewer replacement audit without durable receipts', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    await f.coordinator.runReviewerReplacement(f.context, reviewerReplacement(delivered.revision));
+    const store = join(f.dataDir, 'project-groups.json');
+    const raw = JSON.parse(readFileSync(store, 'utf8'));
+    delete raw.projects[f.context.chatId].workstreams[0].reviewerReplacementReceipts;
+    writeFileSync(store, JSON.stringify(raw));
+
+    const loaded = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(loaded.workstreams[0]!.reviewerReplacements).toHaveLength(1);
+    expect(loaded.workstreams[0]!.reviewerReplacementReceipts).toBeUndefined();
   });
 
   async function attachProjectTaskControl(f: ReturnType<typeof fixture>, dispatchRoot = 'om_reviewed') {
@@ -2365,6 +3068,290 @@ describe('project group mode', () => {
       action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_reviewer', content: '改判失败',
       reviewVerdict: 'fail', reviewRound: 1,
     })).rejects.toThrow('project_review_conflict');
+  });
+
+  it('rejects reviewer replacement when the current collaboration-mode policy excludes the reviewer (RED: stale allowlist currently trusted)', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    // Set up collaboration mode deliberately excluding the new reviewer
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer'],
+    });
+    // Simulate a Dashboard that read stale policy and injected the old allowlist
+    const action = reviewerReplacement(delivered.revision, {
+      allowedReviewerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_next'],
+    });
+    // RED: current code trusts action.allowedReviewerAppIds and succeeds.
+    // After fix: the coordinator reads current collaboration mode under the
+    // chat lock, derives workerAppIds, and rejects the replacement because
+    // cli_reviewer_next is no longer in the group.
+    await expect(f.coordinator.runReviewerReplacement(f.context, action))
+      .rejects.toThrow('project_reviewer_not_allowed');
+  });
+
+  it('preserves exact receipt replay idempotency after a subsequent collaboration-mode policy revokes the reviewer', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    // Set up collaboration mode with cli_reviewer_next allowed
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_next'],
+    });
+    // First replacement succeeds (reviewer is allowed)
+    const action = reviewerReplacement(delivered.revision);
+    const first = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(first.project.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+
+    // Now revoke the reviewer from the collaboration mode
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer'],
+    });
+
+    // Exact replay must remain idempotent — produces no new revision or mutation
+    // even though the current collaboration-mode policy excludes the reviewer.
+    const replay = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(replay.project.revision).toBe(first.project.revision);
+    expect(replay.project.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+    expect(replay.project.workstreams[0]?.reviewerReplacementReceipts).toHaveLength(1);
+  });
+
+  it('prevents cross-process stale-policy reviewer commit with deterministic revoke-first lock barrier', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+    // Set up collaboration mode with the new reviewer initially allowed
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_next'],
+    });
+
+    const holdReadyFile = join(f.dataDir, '.revoke-barrier-ready');
+    const holdReleaseFile = join(f.dataDir, '.revoke-barrier-release');
+
+    // Child 1: holds the inner lock (group-collaboration-modes.json.lock),
+    // signals readiness, then waits for release.
+    const holderSource = `
+      import { withGroupCollaborationModeLockSync } from './src/services/group-collaboration-mode-store.js';
+      import { writeFileSync, existsSync } from 'node:fs';
+      try {
+        withGroupCollaborationModeLockSync(${JSON.stringify(f.dataDir)}, ${JSON.stringify(f.context.chatId)}, () => {
+          writeFileSync(${JSON.stringify(holdReadyFile)}, 'ready');
+          const deadline = Date.now() + 4500;
+          while (!existsSync(${JSON.stringify(holdReleaseFile)})) {
+            if (Date.now() > deadline) throw new Error('holder deadline exceeded waiting for release');
+          }
+        });
+        console.log(JSON.stringify({ ok: true }));
+      } catch (error) {
+        console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+      }
+    `;
+
+    // Child 2: writes the group collaboration mode to revoke cli_reviewer_next
+    // from the worker set.  It will acquire the outer chat lock first, then
+    // block on the inner group-mode lock held by the holder child.
+    const revokeSource = `
+      import { writeGroupCollaborationMode } from './src/services/group-collaboration-mode-store.js';
+      try {
+        await writeGroupCollaborationMode(${JSON.stringify(f.dataDir)}, {
+          chatId: ${JSON.stringify(f.context.chatId)}, mode: 'project',
+          coordinatorAppId: ${JSON.stringify(f.context.larkAppId)},
+          workerAppIds: ['cli_worker', 'cli_reviewer'],
+        });
+        console.log(JSON.stringify({ ok: true }));
+      } catch (error) {
+        console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+      }
+    `;
+
+    // Child 3: runs the reviewer replacement.  It will block on the outer
+    // chat lock, which is held by the revoke child while it waits for the
+    // inner group-mode lock.
+    const replacementSource = (action: Record<string, unknown>) => `
+      import { ProjectCoordinator } from './src/services/project-coordinator.js';
+      const coordinator = new ProjectCoordinator({
+        sendCard: async () => 'om_card', updateCard: async () => {}, pinMessage: async () => true,
+        unpinMessage: async () => true, resolveThreadId: async () => null,
+        isMessageWithdrawn: () => false, brand: () => 'feishu',
+      });
+      try {
+        await coordinator.runReviewerReplacement({
+          dataDir: ${JSON.stringify(f.dataDir)}, chatId: ${JSON.stringify(f.context.chatId)},
+          larkAppId: ${JSON.stringify(f.context.larkAppId)},
+          coordinatorSessionId: ${JSON.stringify(f.context.coordinatorSessionId)},
+        }, ${JSON.stringify(action)});
+        console.log(JSON.stringify({ ok: true }));
+      } catch (error) {
+        console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+      }
+    `;
+
+    // Compute the outer lock file path — the exact file that
+    // withProjectTaskControlChatLockSync acquires.
+    const chatLockFile = join(
+      f.dataDir,
+      `.task-control-chat-${createHash('sha256').update(f.context.chatId).digest('hex').slice(0, 24)}.lock`,
+    );
+
+    // 1. Start the holder child (acquires inner lock, signals ready)
+    // Immediately create the completion promise per child so the finally
+    // block can drain every started process without double-listening.
+    const completionPromises: ReturnType<typeof collectChild>[] = [];
+    let holderChild: ReturnType<typeof spawnTsEvalWithRepoImports> | undefined;
+    let revokeChild: ReturnType<typeof spawnTsEvalWithRepoImports> | undefined;
+    let replacementChild: ReturnType<typeof spawnTsEvalWithRepoImports> | undefined;
+    try {
+      holderChild = spawnTsEvalWithRepoImports(holderSource, {
+        cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      completionPromises.push(collectChild(holderChild));
+
+      // 2. Wait for the holder to signal "ready" (barrier)
+      const readyStart = Date.now();
+      while (!existsSync(holdReadyFile)) {
+        if (Date.now() - readyStart > 5_000) throw new Error('barrier timeout: holder did not signal ready');
+      }
+
+      // 3. Start the revoke child — it acquires the outer lock, then blocks
+      //    on the inner group-mode lock held by the holder.
+      revokeChild = spawnTsEvalWithRepoImports(revokeSource, {
+        cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      completionPromises.push(collectChild(revokeChild));
+
+      // 4. Poll for the outer lock file: the revoke process must have
+      //    acquired it before entering the inner-lock wait.  If the lock
+      //    file exists, its holder is the revoke child.
+      const outerLockStart = Date.now();
+      while (!existsSync(chatLockFile)) {
+        if (Date.now() - outerLockStart > 5_000) throw new Error('barrier timeout: revoke did not acquire outer lock');
+      }
+
+      // 5. Start the replacement child — it will block on the outer lock.
+      replacementChild = spawnTsEvalWithRepoImports(
+        replacementSource(reviewerReplacement(delivered.revision)),
+        { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      completionPromises.push(collectChild(replacementChild));
+
+      // 6. Release the inner lock → the revoke commits → releases the outer
+      //    lock → the replacement observes the updated collaboration mode.
+      writeFileSync(holdReleaseFile, 'release');
+
+      // 7. Collect all children — reuse the saved completion promises to
+      //    avoid attaching duplicate listeners.
+      const [holderOut, revokeOut, replacementOut] = await Promise.all(completionPromises);
+      expect(holderOut.code).toBe(0);
+      expect(revokeOut.code).toBe(0);
+      expect(replacementOut.code).toBe(0);
+
+      const revokeResult = JSON.parse(revokeOut.stdout.trim());
+      const replacementResult = JSON.parse(replacementOut.stdout.trim());
+      expect(revokeResult.ok).toBe(true);
+
+      // After the deterministic revoke-first barrier, the replacement MUST
+      // observe the updated collaboration mode and reject the stale allowlist.
+      expect(replacementResult.ok).toBe(false);
+      expect(replacementResult.error).toBe('project_reviewer_not_allowed');
+
+      // Verify no stale-policy commit: revision unchanged, reviewer binding
+      // and target set exactly the same as before the rejected replacement.
+      const state = readProjectGroup(f.dataDir, f.context.chatId)!;
+      expect(state.revision).toBe(delivered.revision);
+      expect(state.workstreams[0]?.reviewerAppIds).toEqual(['cli_reviewer']);
+      expect(state.workstreams[0]?.targetAppIds).toEqual(['cli_reviewer', 'cli_worker']);
+      expect(state.workstreams[0]?.reviewerReplacements?.length ?? 0).toBe(0);
+    } finally {
+      // Unblock the holder so it can exit cleanly under its own deadline.
+      try { writeFileSync(holdReleaseFile, 'release'); } catch { /* best-effort */ }
+      for (const child of [holderChild, revokeChild, replacementChild]) {
+        if (child && child.exitCode === null && child.signalCode === null) {
+          try { child.kill('SIGTERM'); } catch { /* best-effort */ }
+        }
+      }
+      // Drain every started child so no zombie processes outlive the test.
+      await Promise.allSettled(completionPromises);
+    }
+  });
+
+  it('grandfathers an existing reviewer binding when the collaboration-mode policy is later revoked (replacement-first order)', async () => {
+    // Replacement-first semantics: when a reviewer replacement commits before
+    // the collaboration-mode policy revokes the reviewer, the existing binding
+    // is grandfathered.  A subsequent policy revoke succeeds (it does not
+    // roll back committed bindings), only affecting future replacements.  An
+    // exact receipt replay of the original replacement remains idempotent.
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+
+    // 1. Replacement first — succeeds (reviewer is still in the policy)
+    const action = reviewerReplacement(delivered.revision);
+    const first = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(first.project.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+    expect(first.project.workstreams[0]?.reviewerAppIds).toContain('cli_reviewer_next');
+
+    // 2. Revoke the reviewer from the collaboration-mode policy — succeeds
+    //    (does not roll back the committed binding)
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker', 'cli_reviewer'],
+    });
+
+    // 3. Existing reviewer binding is grandfathered — still present
+    const stateAfter = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(stateAfter.workstreams[0]?.reviewerAppIds).toContain('cli_reviewer_next');
+    expect(stateAfter.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+
+    // 4. Policy now excludes the reviewer
+    const mode = readGroupCollaborationMode(f.dataDir, f.context.chatId)!;
+    expect(mode.workerAppIds).not.toContain('cli_reviewer_next');
+
+    // 5. Exact receipt replay of the original replacement remains
+    //    idempotent (no new revision)
+    const replay = await f.coordinator.runReviewerReplacement(f.context, action);
+    expect(replay.project.revision).toBe(first.project.revision);
+    expect(replay.project.workstreams[0]?.reviewerReplacements).toHaveLength(1);
+  });
+
+  it('retires the stale onboarding card without re-entering the chat lock during reviewer replacement', async () => {
+    const f = fixture();
+    const delivered = await deliveredWriteWorkstream(f);
+
+    // Inject a stale onboardingCard to verify that publish (now outside the
+    // chat lock) can retire it without re-entering the same non-reentrant
+    // .task-control-chat-<hash>.lock.
+    const registryPath = join(f.dataDir, 'group-collaboration-modes.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.configs[f.context.chatId].onboardingCard = {
+      messageId: 'om_guide_stale',
+      pinned: true,
+      larkAppId: f.context.larkAppId,
+      createdAt: '2026-10-13T10:00:00.000Z',
+      updatedAt: '2026-10-13T10:00:00.000Z',
+    };
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard?.messageId)
+      .toBe('om_guide_stale');
+
+    const start = Date.now();
+    const result = await f.coordinator.runReviewerReplacement(
+      f.context,
+      reviewerReplacement(delivered.revision),
+    );
+    const elapsed = Date.now() - start;
+
+    // GREEN: publish runs outside the chat lock, so the onboarding card
+    // retirement completes without re-entering the lock.
+    expect(result.projectionWarning).toBeUndefined();
+    expect(elapsed).toBeLessThan(2000);
+
+    // Durable commit and projection must both succeed.
+    expect(result.project.revision).toBe(delivered.revision + 1);
+    expect(result.project.workstreams[0]?.reviewerAppIds).toEqual(['cli_reviewer_next']);
+
+    // The stale onboardingCard must be cleared by the successful publish.
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
   });
 
   it.each([
@@ -3355,6 +4342,25 @@ describe('project group mode', () => {
 });
 
 describe('project CLI parser', () => {
+  it('parses an auditable failed-workstream archive command', () => {
+    expect(parseProjectArgs('workstream', [
+      'archive', '--root', 'om_failed_archive', '--expected-revision', '1219',
+      '--authorization-ref', 'om_archive_authorization',
+      '--reason', '历史失败已由后续成功批次替代',
+    ])).toEqual({
+      ok: true, help: false, sessionId: undefined, json: false,
+      action: {
+        action: 'archive_workstream', dispatchRoot: 'om_failed_archive', expectedRevision: 1219,
+        authorizationRef: 'om_archive_authorization', reason: '历史失败已由后续成功批次替代',
+      },
+    });
+    expect(parseProjectArgs('workstream', ['archive', '--root', 'om_failed_archive']))
+      .toEqual({
+        ok: false,
+        error: 'project workstream archive 需要 --root、--expected-revision、--authorization-ref 和 --reason',
+      });
+  });
+
   it('parses an auditable workstream reviewer replacement', () => {
     expect(parseProjectArgs('workstream', [
       'reviewer', 'replace', '--root', 'om_reviewed', '--old-app', 'cli_reviewer',

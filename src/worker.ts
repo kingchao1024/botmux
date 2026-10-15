@@ -2485,6 +2485,15 @@ let isPromptReady = false;
 let promptReadyEdges = 0;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
+let flushPendingAfterCurrent = false;
+
+function requestPendingFlush(): void {
+  if (isFlushing) {
+    flushPendingAfterCurrent = true;
+    return;
+  }
+  queueMicrotask(() => { void flushPending(); });
+}
 /** An init prompt exists but spawn/RPC policy has not yet established whether
  * it is argv-baked, RPC-owned, or queued. Concurrent follow-ups may enter the
  * queue during async init, but must not flush ahead of this first turn. */
@@ -13664,11 +13673,14 @@ async function flushPending(): Promise<void> {
   const codexBridgeActive = codexBridgeFallbackActive();
   const runtimeSupportsTypeAhead =
     cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady();
+  const nextIsTrustedRpcSteer = pendingMessages[0]?.codexAppSteerable === true
+    && pendingMessages[0]?.trustedCaller?.senderType === 'bot'
+    && !pendingMessages[0]?.taskContinuation;
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
     runtimeSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
-    directRpcTurnBlocksTypeAhead(),
+    directRpcTurnBlocksTypeAhead() && !nextIsTrustedRpcSteer,
   ) && !activeTurnBlocks(pendingMessages[0] ?? {});
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
@@ -13819,10 +13831,12 @@ async function flushPending(): Promise<void> {
       });
       return;
     }
+    let trustedRpcSteerReleasedFollower = false;
     while (pendingMessages.length > 0 && backend && cliAdapter) {
-      if (activeTurnBlocks(pendingMessages[0]!)) break;
+      if (activeTurnBlocks(pendingMessages[0]!) && !trustedRpcSteerReleasedFollower) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
+      trustedRpcSteerReleasedFollower = false;
       // Apply the credential snapshot that arrived WITH this turn, immediately
       // before the turn is written. Doing it at IPC-receive time collapsed two
       // queued credential turns (A/B/C ran as A/C/C).
@@ -14095,14 +14109,15 @@ async function flushPending(): Promise<void> {
             await writeRpcEngine.steerTurn(msg, expectedTurnId);
             result = { submitted: true };
             log(`Steered exact Codex RPC native turn ${expectedTurnId.slice(0, 12)} from control ${item.turnId ?? '-'}`);
-            if (writeRpcEngine.activeNativeTurnId !== expectedTurnId) {
-              queueMicrotask(() => {
-                if (writeContinuationIsCurrent()) void flushPending();
-              });
+            const trustedRpcSteerTargetReachedTerminal = writeRpcEngine.activeNativeTurnId !== expectedTurnId;
+            if (trustedRpcSteerTargetReachedTerminal && writeContinuationIsCurrent()) {
+              trustedRpcSteerReleasedFollower = true;
+              requestPendingFlush();
             }
             // The currently active native turn retains the sole lifecycle
             // ownership and will release the queue at its terminal. Do not
             // create a second bridge owner for a control-only message.
+            if (trustedRpcSteerTargetReachedTerminal) continue;
             break;
           }
           if (item.taskContinuation
@@ -14240,34 +14255,32 @@ async function flushPending(): Promise<void> {
             // this exact owner is active, re-drive only that control queue head
             // after the current flush releases its mutex. Ordinary input remains
             // queued until the native terminal calls the normal release path.
-            queueMicrotask(() => {
-              if (!writeContinuationIsCurrent()) return;
+            if (writeContinuationIsCurrent()) {
               const next = pendingMessages[0];
               const nextIsTrustedRpcSteer = next?.codexAppSteerable === true
                 && next.trustedCaller?.senderType === 'bot'
                 && !next.taskContinuation;
-              if (!nextIsTrustedRpcSteer) return;
-              if (writeRpcEngine.activeNativeTurnId) {
-                void flushPending();
-                return;
+              if (nextIsTrustedRpcSteer && writeRpcEngine.activeNativeTurnId) {
+                requestPendingFlush();
+              } else if (nextIsTrustedRpcSteer && terminalArrivedBeforeAck) {
+                // This continuation just received the exact turn/start ACK. With
+                // no live owner now, the engine has already replayed this root's
+                // native terminal; the queued steer has a proven-dead target, not
+                // an unbound target. Fail this control exactly once and let its
+                // ordinary successor continue — never convert it to turn/start.
+                const rejectedSteer = pendingMessages.shift();
+                if (rejectedSteer) {
+                  emitTurnTerminal(
+                    rejectedSteer.turnId ?? 'codex-rpc-steer-target-inactive',
+                    'failed',
+                    'steer_target_no_longer_active',
+                    rejectedSteer.dispatchAttempt,
+                  );
+                  log(`Rejected trusted Codex RPC steer after its native target reached terminal: turn=${rejectedSteer.turnId ?? '-'}`);
+                  requestPendingFlush();
+                }
               }
-              if (!terminalArrivedBeforeAck) return;
-              // This continuation just received the exact turn/start ACK. With
-              // no live owner now, the engine has already replayed this root's
-              // native terminal; the queued steer has a proven-dead target, not
-              // an unbound target. Fail this control exactly once and let its
-              // ordinary successor continue — never convert it to turn/start.
-              const rejectedSteer = pendingMessages.shift();
-              if (!rejectedSteer) return;
-              emitTurnTerminal(
-                rejectedSteer.turnId ?? 'codex-rpc-steer-target-inactive',
-                'failed',
-                'steer_target_no_longer_active',
-                rejectedSteer.dispatchAttempt,
-              );
-              log(`Rejected trusted Codex RPC steer after its native target reached terminal: turn=${rejectedSteer.turnId ?? '-'}`);
-              void flushPending();
-            });
+            }
           }
         } else if (item.codexAppInput && writeAdapter.writeStructuredInput) {
           submissionBackend = writeBackend;
@@ -14706,7 +14719,12 @@ async function flushPending(): Promise<void> {
       // turn/start; its queued successor waits for the native terminal and a new
       // idle edge. Durable receiver attempts likewise stay on separate edges.
       if (rpcLifecycleFailClosedOwners.size > 0) break;
-      if (directRpcTurnBlocksTypeAhead()) break;
+      const nextIsTrustedRpcSteerQueued = pendingMessages[0]?.codexAppSteerable === true
+        && pendingMessages[0]?.trustedCaller?.senderType === 'bot'
+        && !pendingMessages[0]?.taskContinuation;
+      if (!nextIsTrustedRpcSteerQueued) {
+        if (directRpcTurnBlocksTypeAhead()) break;
+      }
       if (item.taskContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
       // A type-ahead adapter may accept several queued submits in one flush.
@@ -14724,6 +14742,9 @@ async function flushPending(): Promise<void> {
     }
   } finally {
     isFlushing = false;
+    const kick = flushPendingAfterCurrent;
+    flushPendingAfterCurrent = false;
+    if (kick) queueMicrotask(() => { void flushPending(); });
     // A prompt can arrive after turn N completes but before turn N+1's chunked
     // control line finishes. We reject it while N+1 has a liveness slot. If that
     // write then fails, the prompt is still the runner's real ready boundary;
@@ -14831,11 +14852,14 @@ function sendToPty(
     return true;
   }
   if (!cliAdapter) return false;
+  const nextIsTrustedRpcSteer = next.codexAppSteerable === true
+    && next.trustedCaller?.senderType === 'bot'
+    && !next.taskContinuation;
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
     cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
     durableTurnInFlight,
     next,
-    directRpcTurnBlocksTypeAhead(),
+    directRpcTurnBlocksTypeAhead() && !nextIsTrustedRpcSteer,
   ) && !activeTurnBlocks(next);
   const shouldMergeQueued = opts.dispatchAttempt === undefined && !durableTurnInFlight
     && !isFlushing && !shouldWriteNow({
@@ -22824,7 +22848,7 @@ function emitTurnTerminal(
     // The terminal may be emitted from inside an active flush continuation
     // (for example a synchronous hard-submit failure). Wake after that
     // continuation releases the mutex so queued work cannot remain stranded.
-    queueMicrotask(() => { void flushPending(); });
+    requestPendingFlush();
   }
 }
 
