@@ -266,6 +266,29 @@ describe('schedule precondition protected store', () => {
     });
   });
 
+  it('fails closed when the owner union identity differs from the active canonical input', () => {
+    const staged = stageSchedulePrecondition(APP_ID, TASK_ID, 'echo 1\n', options());
+    const configured = task(staged.preconditionRef, {
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    });
+    activateSchedulePrecondition(configured, APP_ID, options());
+
+    expect(resolveSchedulePrecondition(configured, APP_ID, options())).toEqual({
+      kind: 'configured',
+      enabled: true,
+      source: { kind: 'inline', script: 'echo 1\n' },
+    });
+    expectCode(
+      () => resolveSchedulePrecondition(
+        { ...configured, ownerUnionId: 'on_other' },
+        APP_ID,
+        options(),
+      ),
+      'canonical_input_mismatch',
+    );
+  });
+
   it('binds to the concrete task instance independently of canonical input', () => {
     const configured = stageAndActivate();
     const replacement = { ...configured, createdAt: '2026-08-29T01:02:03.000Z' };

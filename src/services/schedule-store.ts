@@ -663,6 +663,7 @@ export function canonicalScheduleInput(t: {
    *  scheduled-turn-provenance). Part of canonical input: the same workflow
    *  attempt run as a different creator is a different schedule. */
   ownerOpenId?: string;
+  ownerUnionId?: string;
 }): unknown {
   const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
@@ -711,6 +712,7 @@ export function canonicalScheduleInput(t: {
     // slot is dropped by computeInputHash and their canonical JSON is
     // byte-for-byte unchanged.
     ownerOpenId: t.ownerOpenId?.trim() || undefined,
+    ownerUnionId: t.ownerUnionId?.trim() || undefined,
   };
 }
 
