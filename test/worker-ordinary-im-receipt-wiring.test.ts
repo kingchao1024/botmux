@@ -97,7 +97,7 @@ describe('native input consumption receipt wiring', () => {
   });
 
   it('Codex RPC: only after the acknowledged turn/start passed the generation fence', () => {
-    const start = workerSource.indexOf('rpcNativeTurnId = (await writeRpcEngine.sendTurn(msg, rpcTurnIdentity!)).nativeTurnId;');
+    const start = workerSource.indexOf('rpcNativeTurnId = (await writeRpcEngine.sendTurn(');
     const fence = workerSource.indexOf('if (!writeContinuationIsCurrent()) {', start);
     const receipt = workerSource.indexOf("acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start'", start);
     const bridgeMark = workerSource.indexOf('bridgeTurnId = rpcTurnIdentity.turnId;', start);
@@ -127,5 +127,43 @@ describe('native input consumption receipt wiring', () => {
     const commitStart = workerSource.indexOf('function acknowledgeTurnInputCommitted(');
     const commitEnd = workerSource.indexOf('function acknowledgeTurnInputReceived(', commitStart);
     expect(workerSource.slice(commitStart, commitEnd)).not.toContain('acknowledgeNativeInputConsumed');
+  });
+
+  it('settles TraeX context only from RPC accepted or ambiguous outcomes', () => {
+    const rpcSend = workerSource.indexOf('writeRpcEngine.sendTurn(');
+    const catchStart = workerSource.indexOf('} catch (err: any) {', rpcSend);
+    const accepted = workerSource.slice(rpcSend, catchStart);
+    const ambiguousEnd = workerSource.indexOf('codexAppPromptReplay.cancelSubmission(', catchStart);
+    const failed = workerSource.slice(catchStart, ambiguousEnd);
+
+    expect(rpcSend).toBeGreaterThanOrEqual(0);
+    expect(accepted).toMatch(/publishTraexNativeContextReceipt\([\s\S]*?rpcContext,[\s\S]*?rpcTurnIdentity\.turnId,[\s\S]*?'accepted'/);
+    expect(failed).toContain("deliveryError?.deliveryDisposition === 'ambiguous'");
+    expect(failed).toMatch(/publishTraexNativeContextReceipt\([\s\S]*?rpcContext,[\s\S]*?rpcTurnIdentity\.turnId,[\s\S]*?'unknown'/);
+    expect(failed.indexOf("'unknown'")).toBeLessThan(failed.indexOf('installRpcLifecycleFailClosedOwner'));
+  });
+
+  it('blocks an unknown same-thread context receipt before calling turn/start again', () => {
+    const prepare = workerSource.indexOf('rpcContext = item.traexNativeContext');
+    const sendTurn = workerSource.indexOf('writeRpcEngine.sendTurn(', prepare);
+    const guarded = workerSource.slice(prepare, sendTurn);
+
+    expect(prepare).toBeGreaterThanOrEqual(0);
+    expect(sendTurn).toBeGreaterThan(prepare);
+    expect(guarded).toContain("rpcContext.blockedReason === 'context_receipt_unknown'");
+    expect(guarded).toContain('pendingMessages.unshift(item);');
+    expect(guarded).toContain('break;');
+  });
+
+  it('revalidates the prepared context metadata against the latest receipt', () => {
+    const prepare = workerSource.indexOf('rpcContext = item.traexNativeContext');
+    const sendTurn = workerSource.indexOf('writeRpcEngine.sendTurn(', prepare);
+    const guarded = workerSource.slice(prepare, sendTurn);
+
+    expect(guarded).toMatch(
+      /restorePreparedTraexNativeContext\(\s*msg,\s*item\.traexNativeContext,\s*nativeThreadId,\s*lastInitConfig\.traexNativeContextReceipt,\s*\)/,
+    );
+    expect(guarded.indexOf('restorePreparedTraexNativeContext'))
+      .toBeLessThan(guarded.indexOf(': prepareTraexNativeContext'));
   });
 });

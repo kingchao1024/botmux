@@ -28,7 +28,9 @@ import {
   builtinSkillEntries,
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
+  type BuiltinSkillEntry,
 } from '../skills/injection-mode.js';
+import { compactSkillTriggerSummary } from './skills/prompt.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
@@ -100,6 +102,7 @@ import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { writePromptContext } from '../services/prompt-context-store.js';
+import { prepareTraexNativeContext } from './traex-native-context.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
@@ -991,7 +994,7 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
 function renderRoleContextBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   if (!larkAppId || !chatId) return '';
 
@@ -1004,7 +1007,10 @@ function renderRoleContextBlock(
   if (opts?.followUp && injectMode === 'once') return '';
 
   const ctx = roleSource === 'team' ? 'team' : 'group';
-  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
+  const renderedRoleContent = opts?.escapeTagLikeContent
+    ? escapeXmlTagLikeTokens(roleContent)
+    : roleContent;
+  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${renderedRoleContent}\n</role>`;
 }
 
 export function renderProjectGroupModeBlock(
@@ -1038,7 +1044,7 @@ export function renderProjectGroupModeBlock(
 function renderApplicationRoleBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   return [
     renderRoleContextBlock(larkAppId, chatId, opts),
@@ -1287,12 +1293,75 @@ type NewTopicOpts = {
   solo?: boolean;
   /** solo 裸文本时用于剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** Force the compact first-turn envelope for a TraeX RPC session. */
+  traexRpcContextEnabled?: boolean;
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
+
+function buildCompactTraexRoutingHints(
+  locale: Locale | undefined,
+  noTransport: boolean,
+  replyDelivery: ReplyDelivery,
+): string[] {
+  const full = buildBotmuxShellHints(locale, noTransport, replyDelivery);
+  if (noTransport || replyDelivery === 'transcript') return full;
+
+  const verboseKeys = [
+    'ai.shell.intro',
+    'ai.shell.commands_are_shell',
+    'ai.shell.how_to_send',
+    'ai.shell.multiline_heredoc',
+    'ai.shell.heredoc_example',
+    'ai.shell.helpers',
+    'ai.shell.when_to_send',
+    'ai.shell.mention_gate',
+  ];
+  const replaced = new Set(verboseKeys.map(key => escapeXmlTagLikeTokens(t(key, undefined, locale))));
+  const preservedConditionalHints = full.filter(line => !replaced.has(line));
+  const en = (locale ?? getDefaultLocale()) === 'en';
+  const compact = en
+    ? [
+        'Lark session: terminal output is invisible; reply with the shell command `botmux send`.',
+        'For multiline text use quoted heredoc/stdin or UTF-8 `--content-file`; never pass literal \\n or JSON-escaped text. Attach with `--images`, `--files`, or `--videos` plus `--video-covers`.',
+        "Example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
+        'Helpers: `botmux history`; `botmux quoted <message_id>` only when the prompt says a message was quoted; `botmux bots list`.',
+        'Every `botmux send` must choose exactly one: `--mention <open_id:name>`, `--mention-back`, or `--no-mention`; collaboration with another bot requires `--mention`.',
+        'Respond to addressed messages at least once via `botmux send`; only unrelated messages use final `BOTMUX_NOTHING_TO_SEND`.',
+      ]
+    : [
+        '飞书会话中终端输出用户不可见；回复用 shell 命令 `botmux send`。',
+        '多行正文用 quoted heredoc/stdin 或 UTF-8 `--content-file`，不得传字面量 `\\n` 或 JSON 转义文本；附件用 `--images`/`--files`/`--videos` 及 `--video-covers`。',
+        "示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
+        '辅助：`botmux history`；仅在 prompt 提示引用时用 `botmux quoted <message_id>`；查群内 bot 用 `botmux bots list`。',
+        '每次 `botmux send` 必须三选一：`--mention <open_id:名字>` / `--mention-back` / `--no-mention`；与其他 bot 协作必须 `--mention`。',
+        '发给你的消息至少用 `botmux send` 回应一次；只有完全无关的消息才在 final 输出 `BOTMUX_NOTHING_TO_SEND`。',
+      ];
+  return [...compact.map(escapeXmlTagLikeTokens), ...preservedConditionalHints];
+}
+
+function buildCompactTraexBuiltinSkillCatalog(
+  entries: BuiltinSkillEntry[],
+  locale: Locale | undefined,
+): string {
+  if (entries.length === 0) return '';
+  const instruction = (locale ?? getDefaultLocale()) === 'en'
+    ? 'Trigger index; run `botmux skill show <name>` before using a matching skill.'
+    : '技能触发索引；匹配后先运行 `botmux skill show <name>` 读取完整说明。';
+  const skills = entries.map((entry) => {
+    const trigger = compactSkillTriggerSummary(entry.description);
+    return `  <skill name="${xmlEscape(entry.name)}"${trigger ? ` trigger="${xmlEscape(trigger)}"` : ''} />`;
+  });
+  return [
+    '<botmux_builtin_skills>',
+    `  <instruction>${escapeXmlTagLikeTokens(instruction)}</instruction>`,
+    ...skills,
+    '</botmux_builtin_skills>',
+  ].join('\n');
+}
 
 /** opening 的 hook 模式（#794 后续）：whiteboard/sender/mentions 搬进 hook envelope，
  *  PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。与 follow-up 同一套
@@ -1332,10 +1401,26 @@ function buildNewTopicBlocks(
   // transcript + solo，首轮同样去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
-  const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  let compactTraexRpcContext = false;
+  if (cliId === 'traex') {
+    compactTraexRpcContext = opts?.traexRpcContextEnabled === true;
+    if (!compactTraexRpcContext) {
+      try {
+        compactTraexRpcContext = getBot(opts?.larkAppId ?? '').config.codexRpcInput === true
+          || config.codexRpcInputDefault;
+      } catch {
+        compactTraexRpcContext = config.codexRpcInputDefault;
+      }
+    }
+  }
+  const bare = replyDelivery === 'transcript'
+    && opts?.solo === true
+    && !compactTraexRpcContext;
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery);
+    : compactTraexRpcContext
+      ? buildCompactTraexRoutingHints(locale, noTransport, replyDelivery)
+      : buildBotmuxShellHints(locale, noTransport, replyDelivery);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1355,7 +1440,9 @@ function buildNewTopicBlocks(
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
       // the catalog as a compact trigger for complex delivery and safety rules.
       const entries = builtinSkillEntries({ asksViaHook: adapter.asksViaHook, whiteboardEnabled: whiteboardEnabled(), excludeRoutingCovered: true });
-      skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
+      skillBlock = compactTraexRpcContext
+        ? buildCompactTraexBuiltinSkillCatalog(entries, locale)
+        : buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
       skillBlock = builtinSkillHelpPointer(locale);
     }
@@ -1383,7 +1470,9 @@ function buildNewTopicBlocks(
     ].join('\n');
   }
 
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    escapeTagLikeContent: compactTraexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -1535,6 +1624,7 @@ export function buildNewTopicCliInput(
     /** 见 NewTopicOpts 同名字段。 */
     solo?: boolean;
     selfMention?: { name?: string | null; openId?: string | null };
+    traexRpcContextEnabled?: boolean;
     /** opening 轮的权威 turnId（= 发给 worker 的 turnId，最终成为
      *  managedTurnOrigin.turnId）。hook 模式下用于 sidecar 绑定；缺失回退 inline。 */
     turnId?: string;
@@ -1677,6 +1767,11 @@ type FollowUpOpts = {
   solo?: boolean;
   /** solo 裸文本时剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** TraeX RPC binds stable role context to the native thread, not a worker PID. */
+  traexRpcContext?: {
+    nativeThreadId: string;
+    receipt?: Session['traexNativeContextReceipt'];
+  };
 };
 
 function buildFollowUpBlocks(
@@ -1694,8 +1789,11 @@ function buildFollowUpBlocks(
   // reminder_no_transport）。bare = transcript + solo → 信封去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection) === 'transcript';
-  const bare = transcript && opts?.solo === true;
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
+  const bare = transcript && opts?.solo === true && !opts?.traexRpcContext;
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    followUp: !opts?.traexRpcContext,
+    escapeTagLikeContent: !!opts?.traexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -1948,6 +2046,19 @@ export function buildFollowUpCliInput(
     // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
+  if (opts?.cliId === 'traex' && !opts.isAdoptMode && opts.traexRpcContext) {
+    const prepared = prepareTraexNativeContext(
+      legacyContent,
+      opts.traexRpcContext.nativeThreadId,
+      opts.traexRpcContext.receipt,
+    );
+    const { content: preparedContent, contextVersion: _contextVersion, ...traexNativeContext } = prepared;
+    return {
+      content: preparedContent,
+      ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+      traexNativeContext,
+    };
+  }
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
     return { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
   }
@@ -2191,6 +2302,17 @@ export function buildReforkCliInput(
     codexAppMessageContext: opts?.codexAppMessageContext,
     solo: ds.soloSession,
     selfMention: opts?.selfMention,
+    ...(opts?.cliId === 'traex'
+      && ds.session.cliSessionId
+      ? {
+          traexRpcContext: {
+            nativeThreadId: ds.session.cliSessionId,
+            ...(ds.session.traexNativeContextReceipt
+              ? { receipt: ds.session.traexNativeContextReceipt }
+              : {}),
+          },
+        }
+      : {}),
   });
 }
 

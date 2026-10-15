@@ -161,6 +161,23 @@ export interface CodexRpcEngineFailure {
   errorCode: 'rpc_engine_dead' | 'rpc_native_turn_ownership_conflict';
 }
 
+export type CodexRpcDeliveryDisposition = 'not_sent' | 'ambiguous';
+
+export class CodexRpcDeliveryError extends Error {
+  constructor(
+    message: string,
+    readonly code:
+      | 'rpc_turn_start_active'
+      | 'rpc_turn_start_not_sent'
+      | 'rpc_turn_start_ambiguous',
+    readonly deliveryDisposition: CodexRpcDeliveryDisposition,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'CodexRpcDeliveryError';
+  }
+}
+
 /** Server→client requests are auto-answered so codex never blocks on a human;
  *  botmux already runs codex with approvals bypassed. Mirrors codex-app-runner. */
 function autoApproval(method: string): unknown {
@@ -443,11 +460,19 @@ export class CodexRpcEngine {
     identity: CodexRpcTurnIdentity,
     opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
   ): Promise<{ nativeTurnId: string }> {
-    if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
+    if (!this.threadId) {
+      throw new CodexRpcDeliveryError(
+        'sendTurn before startThread/resumeThread',
+        'rpc_turn_start_not_sent',
+        'not_sent',
+      );
+    }
     const activeNativeTurnId = this.activeNativeTurnId;
     if (activeNativeTurnId) {
-      throw new Error(
+      throw new CodexRpcDeliveryError(
         `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
+        'rpc_turn_start_active',
+        'not_sent',
       );
     }
     const params: Json = {
@@ -458,9 +483,33 @@ export class CodexRpcEngine {
       sandboxPolicy: { type: 'dangerFullAccess' },
     };
     params.clientUserMessageId = identity.turnId;
-    await this.request('turn/start', params, opts, undefined, identity);
+    let dispatched = false;
+    try {
+      await this.request(
+        'turn/start',
+        params,
+        opts,
+        () => { dispatched = true; },
+        identity,
+      );
+    } catch (err) {
+      if (err instanceof CodexRpcDeliveryError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new CodexRpcDeliveryError(
+        message,
+        dispatched ? 'rpc_turn_start_ambiguous' : 'rpc_turn_start_not_sent',
+        dispatched ? 'ambiguous' : 'not_sent',
+        err,
+      );
+    }
     const nativeTurnId = this.takeNativeTurnId(identity);
-    if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
+    if (!nativeTurnId) {
+      throw new CodexRpcDeliveryError(
+        'turn/start ack did not bind a native turn id',
+        'rpc_turn_start_ambiguous',
+        'ambiguous',
+      );
+    }
     return { nativeTurnId };
   }
 

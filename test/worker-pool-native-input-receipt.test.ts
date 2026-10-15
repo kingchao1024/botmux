@@ -116,6 +116,7 @@ import { join } from 'node:path';
 import { initWorkerPool, sendWorkerInput, forkWorker, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
+import * as sessionStore from '../src/services/session-store.js';
 import {
   writePreparedGroupContext, confirmGroupContextNativeInput,
   readGroupContextDeliveryReceipt, getDeliveredGroupContextSeqs, bindGroupContextDelivery, type PreparedGroupContext,
@@ -195,6 +196,32 @@ describe('native_input_consumed fencing', () => {
     await flush();
     expect(onNativeInputConsumed).toHaveBeenCalledTimes(1);
     expect(worker.killed).toBe(false);
+  });
+
+  it('persists an accepted TraeX native-thread context receipt only from the live generation', async () => {
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.cliId = 'traex';
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const receipt = {
+      nativeThreadId: 'native-known',
+      roleDigest: 'a'.repeat(64),
+      skillCatalogDigest: 'b'.repeat(64),
+      turnId: 'om_context',
+      status: 'accepted',
+    };
+
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt });
+    await flush();
+
+    expect((ds.session as any).traexNativeContextReceipt).toEqual(receipt);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+
+    const unknown = { ...receipt, turnId: 'om_ambiguous', status: 'unknown' };
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt: unknown });
+    await flush();
+    expect((ds.session as any).traexNativeContextReceipt).toEqual(unknown);
   });
 });
 

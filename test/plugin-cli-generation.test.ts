@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { prepareCliPluginGeneration } from '../src/core/plugins/cli-generation.js';
@@ -13,6 +14,11 @@ import {
 import { pluginMcpPrivatePath } from '../src/core/plugins/paths.js';
 import { readSessionPluginManifest } from '../src/core/plugins/session-manifest.js';
 import { readSessionSkillManifest } from '../src/core/skills/manifest-store.js';
+import {
+  appendTraexSkillCatalog,
+  prepareTraexNativeContext,
+  settleTraexNativeContextReceipt,
+} from '../src/core/traex-native-context.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -151,5 +157,115 @@ describe('CLI plugin generation', () => {
     expect(sessionMcpRuntimeHostOnlyPaths(refreshedMcpRuntime, dataDir)).toEqual([
       sessionMcpRuntimeManifestPath('same-session', dataDir),
     ]);
+  });
+
+  it('builds a digest-addressed compact skill index for TraeX RPC', () => {
+    const source = join(home, 'compact-source');
+    write(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-compact',
+      version: '0.1.0',
+      keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: 'compact' },
+    }));
+    write(join(source, 'dist', 'skills', 'review', 'SKILL.md'), [
+      '---',
+      'name: review',
+      'description: Use when reviewing a change. Detailed workflow stays in the skill file.',
+      '---',
+      '# Review',
+    ].join('\n'));
+    write(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+      transport: 'stdio',
+      command: ['./mcp/server.mjs'],
+    }));
+    write(join(source, 'dist', 'mcp', 'server.mjs'), 'process.exit(0);\n');
+    installLocalPlugin(source);
+
+    const result = prepareCliPluginGeneration({
+      sessionId: 'traex-compact',
+      bot: { larkAppId: 'app-1', plugins: ['compact'] },
+      global: { plugins: [] },
+      dataDir,
+      cliId: 'traex',
+      adapter: { id: 'traex' } as CliAdapter,
+      workingDir: '/repo',
+      prompt: 'first turn',
+      replacesPriorGeneration: false,
+      compactCatalog: true,
+      deferCatalogToContextManager: true,
+      now: () => '2026-10-14T00:00:00.000Z',
+    } as any);
+
+    expect(result.prompt).toBe('first turn');
+    expect(result.deferredSkillCatalog).toBe(result.skillCatalog);
+    expect(result.skillCatalog).toContain('trigger="Use when reviewing a change."');
+    expect(result.skillCatalog).not.toContain('Detailed workflow stays in the skill file');
+    expect(result.skillCatalogDigest).toMatch(/^[a-f0-9]{64}$/);
+
+    const resumed = prepareCliPluginGeneration({
+      sessionId: 'traex-compact',
+      bot: { larkAppId: 'app-1', plugins: ['compact'] },
+      global: { plugins: [] },
+      dataDir,
+      cliId: 'traex',
+      adapter: { id: 'traex' } as CliAdapter,
+      workingDir: '/repo',
+      prompt: 'after same-thread restart',
+      replacesPriorGeneration: true,
+      compactCatalog: true,
+      deferCatalogToContextManager: true,
+      now: () => '2026-10-14T01:00:00.000Z',
+    } as any);
+    expect(resumed.prompt).toBe('after same-thread restart');
+    expect(resumed.deferredSkillCatalog).toContain('<botmux_skills_refresh>');
+    expect(resumed.skillCatalogDigest).toBe(result.skillCatalogDigest);
+
+    const roleBlock = `<role context="group">${'安全边界。'.repeat(1_050)}</role>`;
+    const firstContext = appendTraexSkillCatalog(
+      prepareTraexNativeContext(`${roleBlock}\n\n<user_message>first</user_message>`, 'native-thread-1'),
+      result.skillCatalog!,
+      undefined,
+      result.skillCatalogDigest,
+    );
+    expect(firstContext.fixedContextBytes).toBeLessThanOrEqual(24 * 1024);
+    expect(firstContext.content).toContain('安全边界。');
+    expect(firstContext.content).toContain('name="review"');
+    expect(firstContext.content).toContain('botmux skill show <name>');
+
+    const receipt = settleTraexNativeContextReceipt(firstContext, 'om_first', 'accepted')!;
+    const resumedContext = appendTraexSkillCatalog(
+      prepareTraexNativeContext(
+        `${roleBlock}\n\n<botmux_reminder>continue</botmux_reminder>\n\n<user_message>next</user_message>`,
+        'native-thread-1',
+        receipt,
+      ),
+      resumed.deferredSkillCatalog!,
+      receipt,
+      resumed.skillCatalogDigest,
+    );
+    expect(resumedContext.content).not.toContain('<role');
+    expect(resumedContext.content).not.toContain('<botmux_skills');
+    expect(resumedContext.fixedContextBytes).toBeLessThanOrEqual(4 * 1024);
+
+    const changedCatalog = result.skillCatalog!.replace(
+      'Use when reviewing a change.',
+      'Use when auditing a release.',
+    );
+    const changedDigest = createHash('sha256').update(changedCatalog, 'utf8').digest('hex');
+    const changedContext = appendTraexSkillCatalog(
+      prepareTraexNativeContext('<user_message>changed</user_message>', 'native-thread-1', receipt),
+      changedCatalog,
+      receipt,
+      changedDigest,
+    );
+    expect(changedContext.content).toContain('Use when auditing a release.');
+    const changedReceipt = settleTraexNativeContextReceipt(changedContext, 'om_changed', 'accepted')!;
+    const afterChange = appendTraexSkillCatalog(
+      prepareTraexNativeContext('<user_message>steady</user_message>', 'native-thread-1', changedReceipt),
+      changedCatalog,
+      changedReceipt,
+      changedDigest,
+    );
+    expect(afterChange.content).not.toContain('<botmux_skills');
   });
 });

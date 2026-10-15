@@ -454,6 +454,8 @@ export interface Session {
   sessionId: string;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
   runnerBuildId?: string;
+  /** Last role/skill context version settled for one TraeX native thread. */
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
   chatId: string;
   chatType?: 'group' | 'p2p';
   /** Thread-scope: an actual root message id under which all replies thread.
@@ -1731,6 +1733,7 @@ export interface CodexAppGenerationCommit {
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
   content: string;
+  traexNativeContext?: Omit<import('./core/traex-native-context.js').PreparedTraexNativeContext, 'content' | 'contextVersion'>;
   codexAppInput?: CodexAppTurnInput;
   nativeSessionTitle?: string;
   nativeSessionTitlePrompt?: string;
@@ -1890,8 +1893,12 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
         cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
         terminalCardEpoch?: string;
+        traexNativeContext?: CliTurnPayload['traexNativeContext'];
+        traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
       }
-    : Message
+    : Message extends { type: 'message' }
+      ? Message & { traexNativeContext?: CliTurnPayload['traexNativeContext'] }
+      : Message
   : never;
 
 /** One node of the native CoT (thinking process) message, in transcript
@@ -1985,6 +1992,7 @@ export type WorkerToDaemon =
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
   | { type: 'native_input_consumed'; turnId: string; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'traex_native_context_receipt'; receipt: import('./core/traex-native-context.js').TraexNativeContextReceipt }
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }

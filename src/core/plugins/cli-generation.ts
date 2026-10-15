@@ -1,4 +1,5 @@
 import type { CliAdapter, CliId } from '../../adapters/cli/types.js';
+import { createHash } from 'node:crypto';
 import type { BotConfig } from '../../bot-registry.js';
 import type { GlobalConfig } from '../../global-config.js';
 import { prepareSkillDelivery } from '../skills/delivery.js';
@@ -16,6 +17,7 @@ export interface CliPluginGenerationResult {
   /** Catalog bytes appended to prompt (or deferred when prompt is empty).
    * Structured transports use this copy as hidden application context. */
   skillCatalog?: string;
+  skillCatalogDigest?: string;
   skillPluginDir?: string;
   skillReadonlyRoots?: string[];
   deferredSkillCatalog?: string;
@@ -23,13 +25,12 @@ export interface CliPluginGenerationResult {
   fatal?: boolean;
 }
 
-function renderReplacementCatalog(manifest: SessionSkillManifest | null): string {
-  const catalog = renderSkillCatalogBlock(manifest)
-    || '<botmux_skills mode="priority"></botmux_skills>';
+function renderReplacementCatalog(catalog: string): string {
+  const replacement = catalog || '<botmux_skills mode="priority"></botmux_skills>';
   return [
     '<botmux_skills_refresh>',
     '  <instruction>This catalog replaces every earlier botmux_skills catalog in this conversation. Skills not listed here are no longer available.</instruction>',
-    catalog,
+    replacement,
     '</botmux_skills_refresh>',
   ].join('\n');
 }
@@ -46,6 +47,8 @@ export function prepareCliPluginGeneration(opts: {
   prompt: string;
   replacesPriorGeneration: boolean;
   promptInjection?: 'default' | 'none';
+  compactCatalog?: boolean;
+  deferCatalogToContextManager?: boolean;
   now?: () => string;
 }): CliPluginGenerationResult {
   const pluginManifest = refreshSessionPluginManifest({
@@ -83,20 +86,33 @@ export function prepareCliPluginGeneration(opts: {
     preparedSkills.manifest,
     preparedSkills.manifest?.delivery ?? 'auto',
   );
+  const baseCatalog = renderSkillCatalogBlock(
+    preparedSkills.manifest,
+    { compact: opts.compactCatalog === true },
+  );
   const catalog = opts.replacesPriorGeneration
-    ? renderReplacementCatalog(preparedSkills.manifest)
-    : renderSkillCatalogBlock(preparedSkills.manifest);
-  const prompt = opts.replacesPriorGeneration && opts.prompt.trim().length > 0
-    ? `${opts.prompt}\n\n${catalog}`
-    : preparedSkills.prompt;
+    ? renderReplacementCatalog(baseCatalog)
+    : baseCatalog;
+  let prompt = preparedSkills.prompt;
+  if (opts.deferCatalogToContextManager) prompt = opts.prompt;
+  else if (opts.replacesPriorGeneration && opts.prompt.trim().length > 0) {
+    prompt = `${opts.prompt}\n\n${catalog}`;
+  }
+  let deferredSkillCatalog: string | undefined;
+  if (catalog && (opts.deferCatalogToContextManager || prompt.trim().length === 0)) {
+    deferredSkillCatalog = catalog;
+  }
 
   return {
     pluginManifest,
     prompt,
     skillCatalog: catalog || undefined,
+    skillCatalogDigest: catalog
+      ? createHash('sha256').update(baseCatalog, 'utf8').digest('hex')
+      : undefined,
     skillPluginDir: delivery.pluginDir,
     skillReadonlyRoots: delivery.readonlyRoots.length > 0 ? delivery.readonlyRoots : undefined,
-    deferredSkillCatalog: prompt.trim().length === 0 && catalog ? catalog : undefined,
+    deferredSkillCatalog,
     diagnostics: [
       ...pluginSkills.diagnostics.map(value => `plugin_skill:${value}`),
       ...delivery.diagnostics.map(value => `skill_delivery:${value}`),

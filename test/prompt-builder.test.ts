@@ -1104,6 +1104,45 @@ describe('replyDelivery=transcript envelope', () => {
     expect(out).not.toContain('- @Bot');
   });
 
+  it('TraeX transcript + solo still budgets and deduplicates its fixed role', async () => {
+    mockBotConfig.replyDelivery = 'transcript';
+    const { writeRoleFile } = await import('../src/core/role-resolver.js');
+    const role = `SOLO_FIXED_ROLE\n${'r'.repeat(6 * 1024)}`;
+    writeRoleFile('app_test', 'oc_traex_solo', role);
+    const first = buildFollowUpCliInput('bare payload', 'sid-traex-solo', {
+      ...base,
+      chatId: 'oc_traex_solo',
+      cliId: 'traex',
+      solo: true,
+      selfMention,
+      traexRpcContext: { nativeThreadId: 'native-traex-solo' },
+    });
+    expect(first.content).toContain('<user_message>\nbare payload\n</user_message>');
+    expect(first.content).toContain('SOLO_FIXED_ROLE');
+    expect(first.traexNativeContext).toMatchObject({ includedRole: true });
+    expect(first.traexNativeContext!.fixedContextBytes)
+      .toBeGreaterThanOrEqual(Buffer.byteLength(role, 'utf8'));
+
+    const receipt = {
+      nativeThreadId: 'native-traex-solo',
+      roleDigest: first.traexNativeContext!.roleDigest,
+      skillCatalogDigest: first.traexNativeContext!.skillCatalogDigest,
+      turnId: 'om_traex_solo_first',
+      status: 'accepted' as const,
+    };
+    const steady = buildFollowUpCliInput('next bare payload', 'sid-traex-solo', {
+      ...base,
+      chatId: 'oc_traex_solo',
+      cliId: 'traex',
+      solo: true,
+      selfMention,
+      traexRpcContext: { nativeThreadId: 'native-traex-solo', receipt },
+    });
+    expect(steady.content).not.toContain('SOLO_FIXED_ROLE');
+    expect(steady.content).toContain('<user_message>\nnext bare payload\n</user_message>');
+    expect(steady.traexNativeContext!.fixedContextBytes).toBeLessThanOrEqual(4 * 1024);
+  });
+
   it('transcript + solo：cursor 的 <sender_note> 随 sender 一起消失', () => {
     mockBotConfig.replyDelivery = 'transcript';
     // cursor 没有转写采集 → effectiveReplyDelivery 回落 send，信封与 send 逐字相同。

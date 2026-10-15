@@ -524,9 +524,14 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
 
   it('refuses an ordinary second turn while an exact native turn is still active', async () => {
     let deadCount = 0;
+    const requestFile = join(tmpdir(), `fake-overlap-${Math.round(performance.now())}.jsonl`);
     const engine = makeEngine({
       sessionId: 'ordinary-overlap',
-      env: { ...process.env, FAKE_NO_TURN_TERMINAL: '1' },
+      env: {
+        ...process.env,
+        FAKE_NO_TURN_TERMINAL: '1',
+        FAKE_TURN_CONFIG_FILE: requestFile,
+      },
       onDead: () => { deadCount += 1; },
     });
     await engine.start();
@@ -534,10 +539,19 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await expect(engine.sendTurn('first', owner('ordinary-first', 1)))
       .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
 
-    await expect(engine.sendTurn('second', owner('ordinary-second', 2)))
-      .rejects.toThrow('active native turn turn-fake-1');
+    const error = await engine.sendTurn('second', owner('ordinary-second', 2))
+      .catch(caught => caught);
+    expect(error).toMatchObject({
+      name: 'CodexRpcDeliveryError',
+      code: 'rpc_turn_start_active',
+      deliveryDisposition: 'not_sent',
+    });
+    expect(error.message).toContain('active native turn turn-fake-1');
+    const requests = readFileSync(requestFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(requests).toHaveLength(1);
     expect(deadCount).toBe(0);
     engine.stop();
+    rmSync(requestFile, { force: true });
   }, 20_000);
 
   it('steers only the exact active native turn without opening another turn', async () => {
@@ -604,7 +618,14 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     });
     await engine.start();
     await engine.startThread();
-    await expect(engine.sendTurn('never answered', owner('turn-hang', 1))).rejects.toThrow(/timed out/);
+    const error = await engine.sendTurn('never answered', owner('turn-hang', 1))
+      .catch(caught => caught);
+    expect(error).toMatchObject({
+      name: 'CodexRpcDeliveryError',
+      code: 'rpc_turn_start_ambiguous',
+      deliveryDisposition: 'ambiguous',
+    });
+    expect(error.message).toMatch(/timed out/);
     expect(deadCount).toBe(1); // failAll → onDead exactly once
     engine.stop();
   }, 20_000);

@@ -636,7 +636,7 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
-import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
+import { shouldQueueAfterActiveTurn, trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
@@ -11165,6 +11165,9 @@ export function sendWorkerInput(
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
+          ...(normalized.traexNativeContext
+            ? { traexNativeContext: normalized.traexNativeContext }
+            : {}),
           // R4-B1: freeze the admission-time steer authorization into the queued
           // tail's frozen payload so promote/repark/restore COPY it verbatim
           // (admission computed once; never re-inferred downstream).
@@ -11237,6 +11240,9 @@ export function sendWorkerInput(
     // an unconditional field would be pure noise on every message.
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(normalized.traexNativeContext
+      ? { traexNativeContext: normalized.traexNativeContext }
+      : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
@@ -11248,7 +11254,12 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined && isSerialGroupInput(ds, opts.trustedCaller)
+    ...(shouldQueueAfterActiveTurn(ds, {
+      turnId: effectiveTurnId,
+      dispatchAttempt: opts.dispatchAttempt,
+      codexAppSteerable: opts.codexAppSteerable,
+      caller: opts.trustedCaller,
+    })
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
@@ -12121,6 +12132,9 @@ export function forkWorker(
           content: prompt,
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
+            : {}),
+          ...(promptPayload.traexNativeContext
+            ? { traexNativeContext: promptPayload.traexNativeContext }
             : {}),
           // R5-B1-2: preserve the frozen steer authorization on the double-fork
           // staged tail entry (only `=== true`).
@@ -13003,6 +13017,12 @@ export function forkWorker(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
+    ...(promptPayload.traexNativeContext
+      ? { traexNativeContext: promptPayload.traexNativeContext }
+      : {}),
+    ...(ds.session.traexNativeContextReceipt
+      ? { traexNativeContextReceipt: ds.session.traexNativeContextReceipt }
+      : {}),
     ...(queuedActivationToken ? { queuedActivationToken } : {}),
     resume,
     // One-shot native fork intent (see Session.pendingForkSession). Only the
@@ -13777,6 +13797,28 @@ function setupWorkerHandlers(
         } catch (err) {
           logger.warn(`[${t}] native input receipt handler failed: ${err instanceof Error ? err.message : String(err)}`);
         }
+        break;
+      }
+      case 'traex_native_context_receipt': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored traex_native_context_receipt from stale worker generation`);
+          break;
+        }
+        const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId
+          ?? ds.session.cliId
+          ?? getBot(ds.larkAppId).config.cliId;
+        if (effectiveCliId !== 'traex'
+          || (ds.session.cliSessionId
+            && ds.session.cliSessionId !== msg.receipt.nativeThreadId)) {
+          logger.warn(`[${t}] Ignored traex_native_context_receipt with mismatched session identity`);
+          break;
+        }
+        ds.session.traexNativeContextReceipt = structuredClone(msg.receipt);
+        sessionStore.updateSession(ds.session);
         break;
       }
       case 'turn_input_committed': {
