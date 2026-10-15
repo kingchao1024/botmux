@@ -659,3 +659,102 @@ if (process.argv.includes('app-server')) {
     rmSync(root, { recursive: true, force: true });
   }
 }, 20_000);
+
+it('blocks a prepared TraeX resume when its native thread does not match', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-worker-traex-thread-mismatch-'));
+  const fakeTraex = join(root, 'fake-traex');
+  const requestLog = join(root, 'requests.jsonl');
+  const logs: string[] = [];
+  const messages: WorkerToDaemon[] = [];
+  let child: ChildProcess | undefined;
+
+  writeFileSync(fakeTraex, `#!/usr/bin/env node
+const { spawn } = require('node:child_process');
+const fixture = ${JSON.stringify(resolve('test/fixtures/fake-codex-rpc-server.mjs'))};
+if (process.argv.includes('app-server')) {
+  const child = spawn(process.execPath, [fixture, ...process.argv.slice(2)], { stdio: 'inherit' });
+  child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+} else {
+  setTimeout(() => process.stdout.write('› Ask TraeX to do anything\\n'), 200);
+  setInterval(() => {}, 1_000);
+}
+`);
+  chmodSync(fakeTraex, 0o755);
+
+  const role = '<role context="group">AUTH_VERSION_A</role>';
+  const first = prepareTraexNativeContext(
+    `${role}\n\n<user_message>old</user_message>`,
+    'foreign-native-thread',
+  );
+  const accepted = settleTraexNativeContextReceipt(first, 'om_old', 'accepted')!;
+  const queued = prepareTraexNativeContext(
+    `${role}\n\n<user_message>resumed-user</user_message>`,
+    'foreign-native-thread',
+    accepted,
+  );
+  const { content, contextVersion: _contextVersion, ...metadata } = queued;
+
+  try {
+    child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        NODE_ENV: 'test',
+        SESSION_DATA_DIR: root,
+        BOTMUX_SESSION_ID: 'sid-traex-thread-mismatch',
+        LARK_APP_ID: 'app_traex_thread_mismatch',
+        LARK_APP_SECRET: 'secret',
+        FAKE_TURN_CONFIG_FILE: requestLog,
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.on('message', message => messages.push(message as WorkerToDaemon));
+    child.send({
+      type: 'init',
+      sessionId: 'sid-traex-thread-mismatch',
+      chatId: 'oc_traex_thread_mismatch',
+      rootMessageId: 'om_traex_thread_mismatch_root',
+      workingDir: resolve('.'),
+      cliId: 'traex',
+      cliRuntime: {
+        id: 'fixture-traex', displayName: 'Fixture TraeX', executable: fakeTraex,
+        source: 'configured', update: { provider: 'self' },
+      },
+      cliPathOverride: fakeTraex,
+      backendType: 'tmux',
+      codexRpcInput: true,
+      promptInjection: 'none',
+      larkAppId: 'app_traex_thread_mismatch',
+      larkAppSecret: 'secret',
+      resume: true,
+      cliSessionId: 'thread-resumed',
+      prompt: content,
+      turnId: 'om_resume',
+      traexNativeContext: metadata,
+      traexNativeContextReceipt: accepted,
+    } satisfies DaemonToWorker);
+
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline
+      && !messages.some(message => message.type === 'error' || message.type === 'user_notify')
+      && !logs.join('').includes('falling back to paste mode')) {
+      if (child.exitCode !== null) break;
+      await new Promise(resolveWait => setTimeout(resolveWait, 20));
+    }
+    await new Promise(resolveWait => setTimeout(resolveWait, 250));
+
+    expect(requests(requestLog)).toHaveLength(0);
+    expect(logs.join('')).not.toContain('falling back to paste mode');
+    expect(logs.join('')).not.toContain('Writing to PTY');
+    const fatal = messages.find(
+      (message): message is Extract<WorkerToDaemon, { type: 'error' }> => message.type === 'error',
+    );
+    expect(fatal?.message).toContain('TraeX native context thread mismatch');
+  } finally {
+    if (child) await stop(child);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);

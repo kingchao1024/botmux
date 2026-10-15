@@ -1593,7 +1593,8 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       throw err;
     }
     if (err instanceof TraexContextBudgetError
-      || err instanceof TraexContextReceiptUnknownError) {
+      || err instanceof TraexContextReceiptUnknownError
+      || err instanceof TraexContextThreadMismatchError) {
       clearRpcEnginePidMarker();
       try { engine?.stop(); } catch { /* best effort */ }
       stopCodexRpcEngine();
