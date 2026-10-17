@@ -17,10 +17,12 @@ import {
 } from '../src/core/dispatch-registry.js';
 import {
   mutateProjectGroup,
+  projectBlockerRecordFingerprint,
   projectCompletionGateFingerprint,
   projectOverallProgress,
   projectRemainingSummary,
   projectTaskControlCanaryFenceFingerprint,
+  projectTaskControlCanaryAbandonedRecord,
   readProjectGroup,
   refreshProjectBlockerProjection,
 } from '../src/services/project-group-store.js';
@@ -34,10 +36,34 @@ import { planProjectGroupTaskControlReconciliation } from '../src/services/task-
 import { evaluateProjectCompletionGate } from '../src/services/project-group-completion-gate.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
+// Deterministic concurrent-replay race injection:
+// When set to a number, the next readProjectGroup call returns a shallow clone
+// with the given revision instead of the real one, then clears itself.
+// Simulates a cross-process page-cache read that saw the project before a
+// concurrent writer committed.
+let injectStaleRevision: number | undefined;
+
+vi.mock('../src/services/project-group-store.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/services/project-group-store.js')>('../src/services/project-group-store.js');
+  return {
+    ...actual,
+    readProjectGroup: (dataDir: string, chatId: string) => {
+      const real = actual.readProjectGroup(dataDir, chatId);
+      if (injectStaleRevision !== undefined && real) {
+        const staleRev = injectStaleRevision;
+        injectStaleRevision = undefined;
+        return { ...real, revision: staleRev };
+      }
+      return real;
+    },
+  };
+});
+
 const roots: string[] = [];
 
 afterEach(() => {
   vi.useRealTimers();
+  injectStaleRevision = undefined;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -92,7 +118,89 @@ function phaseABinding(label: string) {
   };
 }
 
+async function installAbandonedBlocker(
+  f: ReturnType<typeof fixture>,
+  openedAt = '2026-10-17T11:59:00.000Z',
+) {
+  await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '退休历史 abandoned blocker' });
+  mkdirSync(join(f.dataDir, 'canary-scope'));
+  const fence = {
+    dispatchOperationId: 'd'.repeat(50),
+    taskGuid: '11111111-1111-4111-8111-111111111111',
+    coordinatorSessionId: f.context.coordinatorSessionId,
+    originTurnId: 'om_original_turn',
+    authorizationRef: 'om_original_authorization',
+    authorizedByOpenId: 'ou_original_authorizer',
+    planSha256: 'a'.repeat(64),
+    controllerAppId: f.context.larkAppId,
+    workerAppId: 'cli_worker',
+    reviewerAppId: 'cli_reviewer',
+    acceptorAppId: 'cli_acceptor',
+    targetChatId: f.context.chatId,
+    targetAppIds: ['cli_worker', 'cli_reviewer'],
+    writeScopes: [join(f.dataDir, 'canary-scope')],
+    title: '历史 canary',
+    purpose: '验证 abandoned blocker 专用退休路径',
+    owners: ['Worker', 'Reviewer'],
+    botOpenIds: ['ou_worker', 'ou_reviewer'],
+    acceptanceRequested: true,
+    seedText: '历史 canary seed',
+    taskControlMode: 'audit_only' as const,
+    kickoff: {
+      templateVersion: 'TaskControlKickoff.v1' as const,
+      rootPlaceholder: '{{dispatchRoot}}' as const,
+      brief: '验证 abandoned blocker 专用退休路径',
+      briefSha256: createHash('sha256')
+        .update('验证 abandoned blocker 专用退休路径').digest('hex'),
+      bots: [
+        { appId: 'cli_worker', openId: 'ou_worker', displayName: 'Worker', role: 'worker' as const },
+        { appId: 'cli_reviewer', openId: 'ou_reviewer', displayName: 'Reviewer', role: 'reviewer' as const },
+      ],
+    },
+    phaseA: phaseABinding('abandoned retirement'),
+  };
+  const record = projectTaskControlCanaryAbandonedRecord(fence, {
+    authorizationRef: 'om_abandon',
+    authorizedByOpenId: 'ou_authorized',
+    abandonedAt: '2026-10-10T03:16:50.755Z',
+    phaseBDispatchRoot: null,
+  }, openedAt);
+  const project = await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+    current!.blockerRecords.push(record);
+    refreshProjectBlockerProjection(current!);
+    return current;
+  });
+  return { record, recordFingerprint: projectBlockerRecordFingerprint(record), project: project! };
+}
+
 describe('project group mode', () => {
+  it('strips trusted abandoned-retirement fields and builds one canonical prompt', () => {
+    const action = parseProjectCoordinatorAction({
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: `pcbr1:${'a'.repeat(64)}`,
+      authorizationRef: 'om_authorization',
+      reason: ' 历史 canary 已由成功批次替代 ',
+      authorizedByOpenId: 'ou_forged',
+      now: '1900-01-01T00:00:00.000Z',
+    });
+    expect(action).toEqual({
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: `pcbr1:${'a'.repeat(64)}`,
+      authorizationRef: 'om_authorization',
+      reason: ' 历史 canary 已由成功批次替代 ',
+    });
+    const prompt = (projectCoordinatorModule as Record<string, unknown>)
+      .projectTaskControlCanaryAbandonedRetirementAuthorizationPrompt;
+    expect(typeof prompt).toBe('function');
+    expect((prompt as (value: Record<string, unknown>) => string)(action! as any)).toBe(
+      '授权退休 BotMux abandoned blocker：' + JSON.stringify({
+        action: 'retire_task_control_canary_abandoned',
+        expectedRecordFingerprint: `pcbr1:${'a'.repeat(64)}`,
+        reason: '历史 canary 已由成功批次替代',
+      }),
+    );
+  });
+
   it('builds one stable canonical reviewer replacement authorization prompt', () => {
     expect(projectWorkstreamReviewerAuthorizationPrompt({
       action: 'replace_workstream_reviewer',
@@ -228,6 +336,438 @@ describe('project group mode', () => {
     await expect(f.coordinator.run(f.context, { action: 'close' }))
       .rejects.toThrow('project_derived_blockers_open');
   });
+
+  it('retires one exact abandoned blocker retirement and keeps its audit across close and resume', async () => {
+    const f = fixture();
+    const { record, recordFingerprint, project: before } = await installAbandonedBlocker(f);
+    await expect(f.coordinator.run(f.context, { action: 'close' }))
+      .rejects.toThrow('project_derived_blockers_open');
+
+    const retired = await f.coordinator.runTaskControlCanaryAbandonedRetirement(f.context, {
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+    });
+    expect(retired.projectionWarning).toBeUndefined();
+    expect(retired.project.revision).toBe(before.revision + 1);
+    expect(retired.project.blockerRecords).not.toContainEqual(
+      expect.objectContaining({ code: 'task_control_canary_abandoned' }),
+    );
+    expect(retired.project.blockerRetirements).toEqual([{
+      schemaVersion: 'ProjectBlockerRetirement.v1',
+      record,
+      recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      retiredAt: '2026-10-17T12:00:00.000Z',
+      retiredBySessionId: f.context.coordinatorSessionId,
+    }]);
+
+    const closed = await f.coordinator.run(f.context, {
+      action: 'close', now: '2026-10-17T12:01:00.000Z',
+    });
+    expect(closed.status).toBe('completed');
+    expect(closed.blockerRetirements).toEqual(retired.project.blockerRetirements);
+    const resumed = await f.coordinator.run(f.context, { action: 'resume' });
+    expect(resumed.status).toBe('active');
+    expect(resumed.blockerRecords).toEqual([]);
+    expect(resumed.blockerRetirements).toEqual(retired.project.blockerRetirements);
+  });
+
+  it('returns retirement status fingerprints without rewriting the store', async () => {
+    const f = fixture();
+    const { recordFingerprint } = await installAbandonedBlocker(f);
+    const store = join(f.dataDir, 'project-groups.json');
+    const before = readFileSync(store, 'utf8');
+    const inode = statSync(store).ino;
+
+    const first = await f.coordinator.run(f.context, { action: 'status' });
+    const second = await f.coordinator.run(f.context, { action: 'status' });
+    expect((first.blockerRecords[0] as any).recordFingerprint).toBe(recordFingerprint);
+    expect((second.blockerRecords[0] as any).recordFingerprint).toBe(recordFingerprint);
+    expect(readFileSync(store, 'utf8')).toBe(before);
+    expect(statSync(store).ino).toBe(inode);
+  });
+
+  it.each([
+    ['malformed fingerprint', { expectedRecordFingerprint: 'pcbr1:bad' }, false,
+      'project_task_control_canary_abandoned_retirement_fingerprint_invalid'],
+    ['stale fingerprint', { expectedRecordFingerprint: `pcbr1:${'0'.repeat(64)}` }, false,
+      'project_task_control_canary_abandoned_retirement_target_changed'],
+    ['missing target', {}, true,
+      'project_task_control_canary_abandoned_retirement_not_found'],
+    ['missing actor', { authorizedByOpenId: undefined }, false,
+      'project_task_control_canary_abandoned_retirement_authorization_required'],
+    ['invalid actor', { authorizedByOpenId: 'not-an-open-id' }, false,
+      'project_task_control_canary_abandoned_retirement_authorization_required'],
+    ['empty reason', { reason: '   ' }, false,
+      'project_task_control_canary_abandoned_retirement_reason_required'],
+  ])('keeps abandoned retirement validation zero-write: %s', async (
+    _label, overrides, removeTarget, expectedError,
+  ) => {
+    const f = fixture();
+    const { recordFingerprint } = await installAbandonedBlocker(f);
+    if (removeTarget) {
+      await mutateProjectGroup(f.dataDir, f.context.chatId, current => {
+        current!.blockerRecords = [];
+        return current;
+      });
+    }
+    const store = join(f.dataDir, 'project-groups.json');
+    const before = readFileSync(store, 'utf8');
+    const inode = statSync(store).ino;
+    await expect(f.coordinator.runTaskControlCanaryAbandonedRetirement(f.context, {
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+      ...overrides,
+    } as any)).rejects.toThrow(expectedError);
+    expect(readFileSync(store, 'utf8')).toBe(before);
+    expect(statSync(store).ino).toBe(inode);
+  });
+
+  it('keeps exact retirement replay idempotent and rejects metadata conflicts', async () => {
+    const f = fixture();
+    const { recordFingerprint } = await installAbandonedBlocker(f);
+    const action = {
+      action: 'retire_task_control_canary_abandoned' as const,
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+    };
+    const first = await f.coordinator.runTaskControlCanaryAbandonedRetirement(f.context, action);
+    const store = join(f.dataDir, 'project-groups.json');
+    const before = readFileSync(store, 'utf8');
+    const inode = statSync(store).ino;
+    const replay = await f.coordinator.runTaskControlCanaryAbandonedRetirement(
+      { ...f.context, coordinatorSessionId: 'session-new' },
+      { ...action, now: '2026-10-17T12:01:00.000Z' },
+    );
+    expect(replay.project).toMatchObject({
+      revision: first.project.revision,
+      updatedAt: first.project.updatedAt,
+      coordinatorSessionId: f.context.coordinatorSessionId,
+    });
+    expect(replay.project.blockerRetirements).toEqual(first.project.blockerRetirements);
+    expect(readFileSync(store, 'utf8')).toBe(before);
+    expect(statSync(store).ino).toBe(inode);
+
+    for (const override of [
+      { authorizationRef: 'om_other' },
+      { authorizedByOpenId: 'ou_other' },
+      { reason: '不同原因' },
+    ]) {
+      await expect(f.coordinator.runTaskControlCanaryAbandonedRetirement(
+        f.context, { ...action, ...override },
+      )).rejects.toThrow('project_task_control_canary_abandoned_retirement_conflict');
+      expect(readFileSync(store, 'utf8')).toBe(before);
+      expect(statSync(store).ino).toBe(inode);
+    }
+  });
+
+  it.each([
+    ['summary', (record: any) => { record.summary = '{}'; }],
+    ['source', (record: any) => { record.source = 'manual'; }],
+  ])('rejects a tampered retirement target without writing: %s', async (_field, tamper) => {
+    const f = fixture();
+    const { recordFingerprint } = await installAbandonedBlocker(f);
+    const store = join(f.dataDir, 'project-groups.json');
+    const registry = JSON.parse(readFileSync(store, 'utf8'));
+    tamper(registry.projects[f.context.chatId].blockerRecords[0]);
+    if (_field === 'summary') {
+      registry.projects[f.context.chatId].blockers[0] =
+        registry.projects[f.context.chatId].blockerRecords[0].summary;
+    }
+    writeFileSync(store, JSON.stringify(registry, null, 2));
+    const before = readFileSync(store, 'utf8');
+    const inode = statSync(store).ino;
+    await expect(f.coordinator.runTaskControlCanaryAbandonedRetirement(f.context, {
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+    })).rejects.toThrow('project_task_control_canary_abandonment_conflict');
+    expect(readFileSync(store, 'utf8')).toBe(before);
+    expect(statSync(store).ino).toBe(inode);
+  });
+
+  it('retries abandoned retirement projection without repeating the business mutation', async () => {
+    const f = fixture();
+    const { recordFingerprint } = await installAbandonedBlocker(f);
+    vi.mocked(f.transport.updateCard)
+      .mockRejectedValueOnce(new Error('projection unavailable'));
+    const action = {
+      action: 'retire_task_control_canary_abandoned' as const,
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+    };
+    const first = await f.coordinator.runTaskControlCanaryAbandonedRetirement(f.context, action);
+    expect(first).toMatchObject({
+      projectionWarning: 'projection unavailable',
+      project: { blockerRetirements: [{ recordFingerprint }] },
+    });
+    const before = readProjectGroup(f.dataDir, f.context.chatId)!;
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeBytes = readFileSync(store, 'utf8');
+    const beforeInode = statSync(store).ino;
+    const replay = await f.coordinator.runTaskControlCanaryAbandonedRetirement(
+      f.context, { ...action, now: '2026-10-17T12:01:00.000Z' },
+    );
+    expect(replay.projectionWarning).toBeUndefined();
+    expect(replay.project.revision).toBe(first.project.revision);
+    expect(replay.project.updatedAt).toBe(first.project.updatedAt);
+    expect(replay.project.blockerRetirements).toEqual(first.project.blockerRetirements);
+    expect(f.transport.updateCard).toHaveBeenCalledTimes(2);
+    const after = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(after.revision).toBe(before.revision);
+    expect(after.updatedAt).toBe(before.updatedAt);
+    expect(after.coordinatorSessionId).toBe(before.coordinatorSessionId);
+    expect(after.blockerRetirements).toEqual(before.blockerRetirements);
+    expect(readFileSync(store, 'utf8')).toBe(beforeBytes);
+    expect(statSync(store).ino).toBe(beforeInode);
+  });
+
+  it('converges concurrent abandoned retirement to one durable history entry', async () => {
+    const f = fixture();
+    const { recordFingerprint, project: before } = await installAbandonedBlocker(f);
+    const action = {
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+    };
+    const source = `
+      import { ProjectCoordinator } from './src/services/project-coordinator.js';
+      const coordinator = new ProjectCoordinator({
+        sendCard: async () => 'om_card', updateCard: async () => {}, pinMessage: async () => true,
+        unpinMessage: async () => true, resolveThreadId: async () => null,
+        isMessageWithdrawn: () => false, isMessageUpdateExpired: () => false, brand: () => 'feishu',
+      });
+      await coordinator.run({
+        dataDir: ${JSON.stringify(f.dataDir)}, chatId: ${JSON.stringify(f.context.chatId)},
+        larkAppId: ${JSON.stringify(f.context.larkAppId)}, coordinatorSessionId: 'session-racer',
+      }, ${JSON.stringify(action)});
+    `;
+    const results = await Promise.all([source, source].map(value => collectChild(
+      spawnTsEvalWithRepoImports(value, { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }),
+    )));
+    expect(results.map(result => result.code)).toEqual([0, 0]);
+    const final = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(final.revision).toBe(before.revision + 1);
+    expect(final.blockerRetirements).toHaveLength(1);
+    expect(final.blockerRecords).not.toContainEqual(
+      expect.objectContaining({ code: 'task_control_canary_abandoned' }),
+    );
+  }, 10_000);
+
+  it('does not persist card metadata on replay after a stale outer revision read (concurrent race regression)', async () => {
+    const f = fixture();
+    const { recordFingerprint } = await installAbandonedBlocker(f);
+    // First retirement: projection fails, leaving the store at revision +1.
+    vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error('projection unavailable'));
+    const action = {
+      action: 'retire_task_control_canary_abandoned' as const,
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+    };
+    const first = await f.coordinator.runTaskControlCanaryAbandonedRetirement(
+      f.context, action,
+    );
+    expect(first.projectionWarning).toBe('projection unavailable');
+
+    // Capture the store state before the replay.
+    const before = readProjectGroup(f.dataDir, f.context.chatId)!;
+    const store = join(f.dataDir, 'project-groups.json');
+    const beforeBytes = readFileSync(store, 'utf8');
+    const beforeInode = statSync(store).ino;
+
+    // Simulate a concurrent reader that saw the project before the writer
+    // committed.  In a real cross-process race the first readProjectGroup
+    // inside runTaskControlCanaryAbandonedRetirement can return a revision
+    // that is already outdated by the time apply acquires the store lock.
+    injectStaleRevision = before.revision - 1;
+
+    const replay = await f.coordinator.runTaskControlCanaryAbandonedRetirement(
+      f.context, { ...action, now: '2026-10-17T12:01:00.000Z' },
+    );
+
+    // Even with a stale outer read, the replay must not change store bytes.
+    expect(replay.projectionWarning).toBeUndefined();
+    expect(readFileSync(store, 'utf8')).toBe(beforeBytes);
+    expect(statSync(store).ino).toBe(beforeInode);
+    // Card metadata must stay untouched.
+    expect(replay.project.card?.updatedAt).toBe(before.card?.updatedAt);
+    // Business state must be identical.
+    expect(replay.project.revision).toBe(before.revision);
+    expect(replay.project.updatedAt).toBe(before.updatedAt);
+    expect(replay.project.blockerRetirements).toEqual(before.blockerRetirements);
+  });
+
+  it('concurrent abandoned retirement replay across processes preserves store bytes and inode', async () => {
+    const f = fixture();
+    const { recordFingerprint, project: before } = await installAbandonedBlocker(f);
+    // Barrier directory pre-created so child-process sync loops never hit
+    // ENOENT while stat'ing.
+    const barrierDir = join(f.dataDir, 'barriers');
+    mkdirSync(barrierDir, { recursive: true });
+    const barrierAReady = join(barrierDir, 'a_ready');
+    const barrierBPreread = join(barrierDir, 'b_preread');
+    const barrierADone = join(barrierDir, 'a_done');
+
+    const action = {
+      action: 'retire_task_control_canary_abandoned' as const,
+      expectedRecordFingerprint: recordFingerprint,
+      authorizationRef: 'om_retire',
+      authorizedByOpenId: 'ou_authorizer',
+      reason: '历史 canary 已由成功批次替代',
+      now: '2026-10-17T12:00:00.000Z',
+    };
+    // Process A: signals ready, then blocks until B has entered its
+    // wrapped apply() and written b_preread.  Once the barrier fires,
+    // A performs the first retirement with a failing projection (store
+    // is committed, card stays unchanged) and saves a bytes+inode
+    // snapshot of the store for the final idempotence check.
+    const sourceA = `
+      import { ProjectCoordinator } from './src/services/project-coordinator.js';
+      import { readFileSync, statSync, writeFileSync, existsSync } from 'node:fs';
+      import { join } from 'node:path';
+      const barrierAReady = ${JSON.stringify(barrierAReady)};
+      const barrierBPreread = ${JSON.stringify(barrierBPreread)};
+      const barrierADone = ${JSON.stringify(barrierADone)};
+      writeFileSync(barrierAReady, '');
+      const start = Date.now();
+      while (!existsSync(barrierBPreread)) {
+        if (Date.now() - start > 10_000) throw new Error('timeout waiting for b_preread');
+      }
+      const coordinator = new ProjectCoordinator({
+        sendCard: async () => 'om_card',
+        updateCard: async () => { throw new Error('projection unavailable'); },
+        pinMessage: async () => true,
+        unpinMessage: async () => true,
+        resolveThreadId: async () => null,
+        isMessageWithdrawn: () => false,
+        isMessageUpdateExpired: () => false,
+        brand: () => 'feishu',
+      });
+      await coordinator.runTaskControlCanaryAbandonedRetirement({
+        dataDir: ${JSON.stringify(f.dataDir)}, chatId: ${JSON.stringify(f.context.chatId)},
+        larkAppId: ${JSON.stringify(f.context.larkAppId)}, coordinatorSessionId: 'session-a',
+      }, ${JSON.stringify(action)});
+      const storePath = join(${JSON.stringify(f.dataDir)}, 'project-groups.json');
+      const bytes = readFileSync(storePath).toString('base64');
+      const ino = statSync(storePath).ino;
+      writeFileSync(barrierADone, '');
+      console.log(JSON.stringify({ bytes, ino }));
+    `;
+    // Process B: wraps the coordinator's apply() ON THE INSTANCE (not
+    // on the ESM namespace — Bun seals those) so that when
+    // runTaskControlCanaryAbandonedRetirement calls apply() the wrapper
+    // fires the barrier, then delegates to the original apply.  While
+    // B is paused at the barrier, A commits.  When B resumes, apply's
+    // in-lock replayDetection must identify the exact replay.
+    const sourceB = `
+      import { ProjectCoordinator } from './src/services/project-coordinator.js';
+      import { readFileSync, statSync, writeFileSync, existsSync } from 'node:fs';
+      import { join } from 'node:path';
+      const barrierAReady = ${JSON.stringify(barrierAReady)};
+      const barrierBPreread = ${JSON.stringify(barrierBPreread)};
+      const barrierADone = ${JSON.stringify(barrierADone)};
+
+      const start = Date.now();
+      while (!existsSync(barrierAReady)) {
+        if (Date.now() - start > 10_000) throw new Error('timeout waiting for a_ready');
+      }
+
+      const coordinator = new ProjectCoordinator({
+        sendCard: async () => 'om_card',
+        updateCard: async () => {},
+        pinMessage: async () => true,
+        unpinMessage: async () => true,
+        resolveThreadId: async () => null,
+        isMessageWithdrawn: () => false,
+        isMessageUpdateExpired: () => false,
+        brand: () => 'feishu',
+      });
+
+      // Monkey-patch the instance's apply method to inject a barrier
+      // between entering runTaskControlCanaryAbandonedRetirement and
+      // acquiring the store lock — reproducing the exact race window.
+      const originalApply = coordinator.apply.bind(coordinator);
+      coordinator.apply = async (...args) => {
+        writeFileSync(barrierBPreread, '');
+        const waitStart = Date.now();
+        while (!existsSync(barrierADone)) {
+          if (Date.now() - waitStart > 10_000) throw new Error('timeout waiting for a_done');
+        }
+        return originalApply(...args);
+      };
+
+      const result = await coordinator.runTaskControlCanaryAbandonedRetirement({
+        dataDir: ${JSON.stringify(f.dataDir)}, chatId: ${JSON.stringify(f.context.chatId)},
+        larkAppId: ${JSON.stringify(f.context.larkAppId)}, coordinatorSessionId: 'session-b',
+      }, ${JSON.stringify(action)});
+
+      const storePath = join(${JSON.stringify(f.dataDir)}, 'project-groups.json');
+      const bytes = readFileSync(storePath).toString('base64');
+      const ino = statSync(storePath).ino;
+      console.log(JSON.stringify({
+        bytes,
+        ino,
+        revision: result.project.revision,
+        projectionWarning: result.projectionWarning,
+      }));
+    `;
+    const children = [sourceA, sourceB].map(value =>
+      spawnTsEvalWithRepoImports(value, { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }),
+    );
+    const results = await Promise.all(children.map(collectChild));
+    expect(results.map(r => r.code)).toEqual([0, 0]);
+
+    // Parse A's post-commit snapshot and B's post-replay snapshot.
+    const aOutput = results[0].stdout.trim().split('\n').pop()!;
+    const aSnapshot = JSON.parse(aOutput);
+    const bOutput = results[1].stdout.trim().split('\n').pop()!;
+    const bSnapshot = JSON.parse(bOutput);
+
+    // A committed first; B's replay must not have mutated the store.
+    // If a stale outer revision read caused a false first-submission
+    // classification, publish would persist card.updatedAt and change
+    // both bytes and inode.
+    expect(bSnapshot.bytes).toBe(aSnapshot.bytes);
+    expect(bSnapshot.ino).toBe(aSnapshot.ino);
+
+    // Replay must be detected — no projection warning for B (its
+    // transport does not throw), and the store is at A's revision.
+    expect(bSnapshot.projectionWarning).toBeUndefined();
+
+    // Store-level invariants: one retirement, correct revision, no
+    // canary record left behind.
+    const final = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(final.revision).toBe(before.revision + 1);
+    expect(final.blockerRetirements).toHaveLength(1);
+    expect(final.blockerRecords).not.toContainEqual(
+      expect.objectContaining({ code: 'task_control_canary_abandoned' }),
+    );
+  }, 15_000);
 
   it('keeps an unresolved parent completion gate and blocks 100 percent or close', async () => {
     const f = fixture();
@@ -4342,6 +4882,49 @@ describe('project group mode', () => {
 });
 
 describe('project CLI parser', () => {
+  it('documents the abandoned blocker retirement in project help', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    expect(source).toContain('botmux project blocker retire-abandoned --expected-fingerprint <pcbr1:...>');
+    expect(source).toContain('只接受 canonical abandoned tombstone');
+    expect(source).toContain('退休会保留完整 tombstone 与行政审计，不会放宽 project close 规则');
+  });
+
+  it('parses only the abandoned blocker retirement command', () => {
+    expect(parseProjectArgs('blocker', [
+      'retire-abandoned',
+      '--expected-fingerprint', `pcbr1:${'a'.repeat(64)}`,
+      '--authorization-ref', 'om_authorization',
+      '--reason', '历史 canary 已由成功批次替代',
+      '--json',
+    ])).toEqual({
+      ok: true, help: false, sessionId: undefined, json: true,
+      action: {
+        action: 'retire_task_control_canary_abandoned',
+        expectedRecordFingerprint: `pcbr1:${'a'.repeat(64)}`,
+        authorizationRef: 'om_authorization',
+        reason: '历史 canary 已由成功批次替代',
+      },
+    });
+    expect(parseProjectArgs('blocker', ['retire-abandoned', '--authorized-by-open-id', 'ou_forged']))
+      .toEqual({ ok: false, error: '未知选项: --authorized-by-open-id' });
+    expect(parseProjectArgs('blocker', ['remove', '--expected-fingerprint', `pcbr1:${'a'.repeat(64)}`]))
+      .toEqual({ ok: false, error: 'project blocker 只支持 retire-abandoned' });
+    expect(parseProjectArgs('blocker', ['retire-abandoned', 'positional']))
+      .toEqual({ ok: false, error: '不支持位置参数: positional' });
+    expect(parseProjectArgs('blocker', ['retire-abandoned', '--expected-fingerprint', 'pcbr1:bad']))
+      .toEqual({
+        ok: false,
+        error: 'project blocker retire-abandoned 需要 --expected-fingerprint、--authorization-ref 和 --reason',
+      });
+    expect(parseProjectArgs('blocker', [
+      'retire-abandoned', '--expected-fingerprint', 'pcbr1:bad',
+      '--authorization-ref', 'om_authorization', '--reason', '原因',
+    ])).toEqual({
+      ok: false,
+      error: '--expected-fingerprint 必须是 pcbr1: 加 64 位小写十六进制',
+    });
+  });
+
   it('parses an auditable failed-workstream archive command', () => {
     expect(parseProjectArgs('workstream', [
       'archive', '--root', 'om_failed_archive', '--expected-revision', '1219',

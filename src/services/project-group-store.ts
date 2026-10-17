@@ -66,6 +66,17 @@ export interface ProjectBlockerRecord {
   code?: string;
 }
 
+export interface ProjectBlockerRetirement {
+  schemaVersion: 'ProjectBlockerRetirement.v1';
+  record: ProjectBlockerRecord;
+  recordFingerprint: string;
+  authorizationRef: string;
+  authorizedByOpenId: string;
+  reason: string;
+  retiredAt: string;
+  retiredBySessionId: string;
+}
+
 export const TASK_CONTROL_CANARY_QUARANTINE_CODE = 'task_control_canary_quarantine';
 export const TASK_CONTROL_CANARY_ABANDONED_CODE = 'task_control_canary_abandoned';
 
@@ -278,6 +289,7 @@ export interface ProjectGroupState {
   remaining?: string;
   blockers: string[];
   blockerRecords: ProjectBlockerRecord[];
+  blockerRetirements?: ProjectBlockerRetirement[];
   workstreams: ProjectWorkstream[];
   /** Bounded durable outbox for trusted coordinator wake-ups. */
   stageAdvanceEvents?: ProjectStageAdvanceEvent[];
@@ -567,6 +579,7 @@ export function projectTaskControlCanaryAbandonmentFromRecord(
     }, record.openedAt);
     if ((parsed.schemaVersion !== 'TaskControlCanaryAbandoned.v1'
       && parsed.schemaVersion !== 'TaskControlCanaryAbandoned.v2')
+      || record.source !== expected.source
       || record.code !== TASK_CONTROL_CANARY_ABANDONED_CODE
       || record.blockerId !== expected.blockerId || record.eventId !== expected.eventId
       || record.taskGuid !== expected.taskGuid || record.summary !== expected.summary) {
@@ -610,6 +623,68 @@ function normalizedBlockerRecords(records: readonly ProjectBlockerRecord[]): Pro
     }
     return { ...record, blockerId: record.blockerId.trim(), summary: record.summary.trim() };
   }).sort(blockerOrder);
+}
+
+export function projectBlockerRecordFingerprint(record: ProjectBlockerRecord): string {
+  const normalized = normalizedBlockerRecords([record])[0]!;
+  if (normalized.code === TASK_CONTROL_CANARY_ABANDONED_CODE) {
+    projectTaskControlCanaryAbandonmentFromRecord(normalized);
+  }
+  const canonical = {
+    blockerId: normalized.blockerId,
+    source: normalized.source,
+    summary: normalized.summary,
+    openedAt: normalized.openedAt,
+    ...(normalized.taskGuid ? { taskGuid: normalized.taskGuid } : {}),
+    ...(normalized.eventId ? { eventId: normalized.eventId } : {}),
+    ...(normalized.code ? { code: normalized.code } : {}),
+  };
+  return `pcbr1:${createHash('sha256').update(JSON.stringify(canonical)).digest('hex')}`;
+}
+
+function normalizedProjectBlockerRetirements(value: unknown): ProjectBlockerRetirement[] {
+  const invalid = 'project_task_control_canary_abandoned_retirement_history_invalid';
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(invalid);
+  const seen = new Set<string>();
+  return value.map(raw => {
+    try {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(invalid);
+      const retirement = raw as ProjectBlockerRetirement;
+      const reason = typeof retirement.reason === 'string'
+        ? Array.from(retirement.reason.trim()).slice(0, 160).join('')
+        : '';
+      projectTaskControlCanaryAbandonmentFromRecord(retirement.record);
+      const recordFingerprint = projectBlockerRecordFingerprint(retirement.record);
+      const valid = retirement.schemaVersion === 'ProjectBlockerRetirement.v1'
+        && /^pcbr1:[a-f0-9]{64}$/.test(retirement.recordFingerprint)
+        && retirement.recordFingerprint === recordFingerprint
+        && typeof retirement.authorizationRef === 'string'
+        && /^om_[A-Za-z0-9_-]{1,128}$/.test(retirement.authorizationRef)
+        && typeof retirement.authorizedByOpenId === 'string'
+        && /^ou_[A-Za-z0-9_-]{1,128}$/.test(retirement.authorizedByOpenId)
+        && typeof retirement.retiredBySessionId === 'string'
+        && /^[A-Za-z0-9_-]{1,160}$/.test(retirement.retiredBySessionId)
+        && Number.isFinite(Date.parse(retirement.retiredAt))
+        && new Date(retirement.retiredAt).toISOString() === retirement.retiredAt
+        && reason.length > 0
+        && reason === retirement.reason;
+      if (!valid || seen.has(retirement.recordFingerprint)) throw new Error(invalid);
+      seen.add(retirement.recordFingerprint);
+      return {
+        schemaVersion: 'ProjectBlockerRetirement.v1',
+        record: structuredClone(retirement.record),
+        recordFingerprint,
+        authorizationRef: retirement.authorizationRef,
+        authorizedByOpenId: retirement.authorizedByOpenId,
+        reason,
+        retiredAt: retirement.retiredAt,
+        retiredBySessionId: retirement.retiredBySessionId,
+      };
+    } catch {
+      throw new Error(invalid);
+    }
+  });
 }
 
 function blockerSummaries(records: readonly ProjectBlockerRecord[]): string[] {
@@ -904,11 +979,15 @@ function migrateProject(project: unknown): ProjectGroupState {
         };
       })
     : raw.workstreams;
+  const blockerRetirements = normalizedProjectBlockerRetirements(raw.blockerRetirements);
+  const projectFields = { ...raw };
+  delete projectFields.blockerRetirements;
   return {
-    ...(raw as unknown as ProjectGroupState),
+    ...(projectFields as unknown as ProjectGroupState),
     schemaVersion: 3,
     blockers: projected,
     blockerRecords: records,
+    ...(blockerRetirements.length > 0 ? { blockerRetirements } : {}),
     completionGates: normalizedCompletionGates(raw.completionGates),
     stageAdvanceEvents,
     workstreams: workstreams as ProjectWorkstream[],

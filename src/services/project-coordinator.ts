@@ -47,6 +47,7 @@ import {
   canonicalProjectTaskControlCanaryFence,
   mutateProjectGroup,
   mutateProjectGroupSync,
+  projectBlockerRecordFingerprint,
   projectBlockerId,
   projectCompletionGatesOpen,
   readProjectGroup,
@@ -145,6 +146,14 @@ export type ProjectCoordinatorAction =
   | {
       action: 'archive_workstream'; dispatchRoot: string; expectedRevision: number;
       authorizationRef: string; archivedByOpenId?: string; reason: string; now?: string;
+    }
+  | {
+      action: 'retire_task_control_canary_abandoned';
+      expectedRecordFingerprint: string;
+      authorizationRef: string;
+      authorizedByOpenId?: string;
+      reason: string;
+      now?: string;
     }
   | {
       action: 'sync_completion_gate'; gateId: string; definitionFingerprint: string;
@@ -350,6 +359,13 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
       action, dispatchRoot, expectedRevision: expectedRevision as number,
       authorizationRef, reason,
     };
+  }
+  if (action === 'retire_task_control_canary_abandoned') {
+    const expectedRecordFingerprint = stringField(body, 'expectedRecordFingerprint');
+    const authorizationRef = stringField(body, 'authorizationRef');
+    const reason = stringField(body, 'reason');
+    if (!expectedRecordFingerprint || !authorizationRef || !reason) return undefined;
+    return { action, expectedRecordFingerprint, authorizationRef, reason };
   }
   if (action === 'dispatch') {
     const dispatchRoot = stringField(body, 'dispatchRoot');
@@ -1279,6 +1295,30 @@ export function projectWorkstreamArchiveAuthorizationPrompt(
   });
 }
 
+export type ProjectTaskControlCanaryAbandonedRetirementAction = Extract<
+  ProjectCoordinatorAction,
+  { action: 'retire_task_control_canary_abandoned' }
+>;
+
+export function projectTaskControlCanaryAbandonedRetirementAuthorizationPrompt(
+  action: ProjectTaskControlCanaryAbandonedRetirementAction,
+): string {
+  return '授权退休 BotMux abandoned blocker：' + JSON.stringify({
+    action: action.action,
+    expectedRecordFingerprint: action.expectedRecordFingerprint.trim(),
+    reason: boundedArchiveReason(action.reason),
+  });
+}
+
+function projectStatusView(project: ProjectGroupState): ProjectGroupState {
+  const view = structuredClone(project);
+  view.blockerRecords = view.blockerRecords.map(record => ({
+    ...record,
+    recordFingerprint: projectBlockerRecordFingerprint(record),
+  })) as ProjectGroupState['blockerRecords'];
+  return view;
+}
+
 function newCompletionGate(input: {
   gateId: string;
   sourceChatId: string;
@@ -2201,6 +2241,10 @@ export class ProjectCoordinator {
     if (action.action === 'archive_workstream') {
       return this.runWorkstreamArchive(context, action).then(result => result.project);
     }
+    if (action.action === 'retire_task_control_canary_abandoned') {
+      return this.runTaskControlCanaryAbandonedRetirement(context, action)
+        .then(result => result.project);
+    }
     if (action.action === 'reserve_dispatch'
       || action.action === 'commit_dispatch'
       || action.action === 'abort_dispatch'
@@ -2213,7 +2257,7 @@ export class ProjectCoordinator {
       if (action.action === 'status') {
         const current = readProjectGroup(context.dataDir, context.chatId);
         if (!current) throw new Error('project_not_found');
-        return current;
+        return projectStatusView(current);
       }
       if (action.action === 'refresh') {
         const current = readProjectGroup(context.dataDir, context.chatId);
@@ -2240,6 +2284,29 @@ export class ProjectCoordinator {
         // Archive's business mutation already advanced the revision; the card
         // projection is always a refresh and must never additionally bump it.
         return { project: await this.publish(context, applied, false, false) };
+      } catch (error) {
+        return {
+          project: readProjectGroup(context.dataDir, context.chatId) ?? applied,
+          projectionWarning: error instanceof Error ? error.message : String(error),
+        };
+      }
+    });
+  }
+
+  runTaskControlCanaryAbandonedRetirement(
+    context: ProjectCoordinatorContext,
+    action: ProjectTaskControlCanaryAbandonedRetirementAction,
+  ): Promise<{ project: ProjectGroupState; projectionWarning?: string }> {
+    return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      // Detect exact replay inside the store lock so that a concurrent
+      // writer cannot race a stale outer revision read before apply
+      // acquires the lock.  The replay flag controls whether publish
+      // persists card metadata (first submit) or only re-projects the
+      // card without changing store bytes (replay).
+      const replayFlag = { wasReplay: false };
+      const applied = await this.apply(context, action, replayFlag);
+      try {
+        return { project: await this.publish(context, applied, false, false, !replayFlag.wasReplay) };
       } catch (error) {
         return {
           project: readProjectGroup(context.dataDir, context.chatId) ?? applied,
@@ -2461,6 +2528,7 @@ export class ProjectCoordinator {
         | 'claim_task_control_turn_admission'
         | 'begin_task_control_phase_a_instruction' | 'complete_task_control_phase_a_instruction';
     }>,
+    replayDetection?: { wasReplay: boolean },
   ): Promise<ProjectGroupState> {
     const reservedAccess = action.action === 'reserve_dispatch' && action.access.mode === 'write'
       ? { mode: 'write' as const, scopes: normalizeDispatchWriteScopes(action.access.scopes) }
@@ -2472,7 +2540,8 @@ export class ProjectCoordinator {
         || action.action === 'add_completion_gate' || action.action === 'retire_completion_gate'
         || action.action === 'replace_completion_gate'
         || action.action === 'replace_workstream_reviewer'
-        || action.action === 'archive_workstream') && action.now !== undefined
+        || action.action === 'archive_workstream'
+        || action.action === 'retire_task_control_canary_abandoned') && action.now !== undefined
         ? new Date(action.now).toISOString()
         : nowIso();
       if (action.action === 'init') {
@@ -3066,6 +3135,59 @@ export class ProjectCoordinator {
           return current;
         }
         if (gate.status !== 'satisfied' && current.manualProgress === 100) current.manualProgress = 99;
+      } else if (action.action === 'retire_task_control_canary_abandoned') {
+        if (current.status !== 'active') throw new Error('project_not_active');
+        const expected = action.expectedRecordFingerprint.trim();
+        const authorizationRef = action.authorizationRef.trim();
+        const actor = action.authorizedByOpenId?.trim() ?? '';
+        const reason = boundedArchiveReason(action.reason);
+        if (!/^pcbr1:[a-f0-9]{64}$/.test(expected)) {
+          throw new Error('project_task_control_canary_abandoned_retirement_fingerprint_invalid');
+        }
+        if (!COMPLETION_GATE_AUTHORIZATION_RE.test(authorizationRef)
+          || !COMPLETION_GATE_AUTHORIZED_ACTOR_RE.test(actor)) {
+          throw new Error('project_task_control_canary_abandoned_retirement_authorization_required');
+        }
+        if (!reason) throw new Error('project_task_control_canary_abandoned_retirement_reason_required');
+
+        const history = current.blockerRetirements ?? [];
+        const replay = history.find(item => item.recordFingerprint === expected);
+        if (replay) {
+          if (replay.authorizationRef !== authorizationRef
+            || replay.authorizedByOpenId !== actor || replay.reason !== reason) {
+            throw new Error('project_task_control_canary_abandoned_retirement_conflict');
+          }
+          current.coordinatorSessionId = previousCoordinatorSessionId;
+          current.revision = previousRevision;
+          current.updatedAt = previousUpdatedAt;
+          if (replayDetection) replayDetection.wasReplay = true;
+          return current;
+        }
+
+        const abandoned = current.blockerRecords.filter(
+          item => item.code === TASK_CONTROL_CANARY_ABANDONED_CODE,
+        );
+        const target = abandoned.find(item => projectBlockerRecordFingerprint(item) === expected);
+        if (!target) {
+          throw new Error(abandoned.length > 0
+            ? 'project_task_control_canary_abandoned_retirement_target_changed'
+            : 'project_task_control_canary_abandoned_retirement_not_found');
+        }
+        projectTaskControlCanaryAbandonmentFromRecord(target);
+        current.blockerRetirements = [...history, {
+          schemaVersion: 'ProjectBlockerRetirement.v1',
+          record: structuredClone(target),
+          recordFingerprint: expected,
+          authorizationRef,
+          authorizedByOpenId: actor,
+          reason,
+          retiredAt: now,
+          retiredBySessionId: context.coordinatorSessionId,
+        }];
+        current.blockerRecords = current.blockerRecords.filter(
+          item => projectBlockerRecordFingerprint(item) !== expected,
+        );
+        refreshProjectBlockerProjection(current);
       } else if (action.action === 'close') {
         current.dispatchReservations = current.dispatchReservations.filter(item => Date.parse(item.expiresAt) > nowMs);
         if (current.dispatchReservations.length > 0) throw new Error('project_dispatch_reservations_active');
@@ -3279,6 +3401,7 @@ export class ProjectCoordinator {
 
   private async publish(context: ProjectCoordinatorContext, initial: ProjectGroupState,
     resolveThreadIds = true, recordProjectionRevision = true,
+    persistExistingCardRefresh = true,
   ): Promise<ProjectGroupState> {
     let project = initial;
     if (resolveThreadIds) {
@@ -3303,12 +3426,14 @@ export class ProjectCoordinator {
     if (project.card?.messageId) {
       try {
         await this.transport.updateCard(project.larkAppId, project.card.messageId, cardJson);
-        project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
-          if (!current) throw new Error('project_not_found');
-          if (!current.card || current.card.messageId !== project.card?.messageId) return current;
-          current.card.updatedAt = current.updatedAt;
-          return current;
-        }))!;
+        if (persistExistingCardRefresh) {
+          project = (await mutateProjectGroup(context.dataDir, context.chatId, current => {
+            if (!current) throw new Error('project_not_found');
+            if (!current.card || current.card.messageId !== project.card?.messageId) return current;
+            current.card.updatedAt = current.updatedAt;
+            return current;
+          }))!;
+        }
         // If a previous first-publish attempt persisted and pinned the active
         // card but failed to retire the guide, retry that cleanup on refresh.
         await this.retireOnboardingCard(context);

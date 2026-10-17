@@ -6091,6 +6091,8 @@ async function cmdProject(argv: string[]): Promise<void> {
                              --new-id <新-gate-id> --source-chat-id <oc_xxx>
                              --dispatch-root <om_xxx> --task-guid <uuid> --label <名称>
                              --authorization-ref <om_xxx> --reason <原因>
+  botmux project blocker retire-abandoned --expected-fingerprint <pcbr1:...>
+                             --authorization-ref <om_xxx> --reason <原因>
   botmux project gate status
   botmux project workstream archive --root <om_xxx> --expected-revision <n>
                              --authorization-ref <om_xxx> --reason <原因>
@@ -6102,6 +6104,8 @@ async function cmdProject(argv: string[]): Promise<void> {
   仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
   botmux dispatch 会自动登记子任务，botmux report 会把进展同步回同一张卡。
   gate retire/replace 的 --authorization-ref 必须指向当前有权限真人发送的精确 canonical action summary；
+  blocker retire-abandoned 只接受 canonical abandoned tombstone；授权消息必须来自当前有权限真人；
+  退休会保留完整 tombstone 与行政审计，不会放宽 project close 规则；
   workstream archive 只归档历史 failed workstream，保留原失败证据并执行 revision CAS；
   workstream reviewer replace 使用同一真人授权硬门，并在 project store 锁内做 revision CAS；
   只回复“授权”、复用旧消息或让 bot/定时任务代发都会被 daemon 拒绝。

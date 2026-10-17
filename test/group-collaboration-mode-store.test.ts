@@ -229,6 +229,35 @@ async function abandonFence(f: ReturnType<typeof fixture>) {
   } as any);
 }
 
+function blockerRecordFingerprint(record: Record<string, unknown>): string {
+  const canonical = {
+    blockerId: record.blockerId,
+    source: record.source,
+    summary: record.summary,
+    openedAt: record.openedAt,
+    ...(record.taskGuid ? { taskGuid: record.taskGuid } : {}),
+    ...(record.eventId ? { eventId: record.eventId } : {}),
+    ...(record.code ? { code: record.code } : {}),
+  };
+  return `pcbr1:${createHash('sha256').update(JSON.stringify(canonical)).digest('hex')}`;
+}
+
+function abandonedRetirementFixture(
+  record: Record<string, unknown>,
+  context: ReturnType<typeof fixture>['context'],
+) {
+  return {
+    schemaVersion: 'ProjectBlockerRetirement.v1',
+    record,
+    recordFingerprint: blockerRecordFingerprint(record),
+    authorizationRef: 'om_retire',
+    authorizedByOpenId: 'ou_authorizer',
+    reason: '历史 canary 已由成功批次替代',
+    retiredAt: '2026-10-17T12:00:00.000Z',
+    retiredBySessionId: context.coordinatorSessionId,
+  };
+}
+
 function ensureTaskControlDaemonIpcSecret(f: ReturnType<typeof fixture>): string {
   writeFileSync(join(dirname(f.dataDir), '.dashboard-secret'), TEST_TASK_CONTROL_DAEMON_IPC_SECRET, { mode: 0o600 });
   return TEST_TASK_CONTROL_DAEMON_IPC_SECRET;
@@ -1925,6 +1954,97 @@ describe('field-only TaskControl collaboration config CAS', () => {
     const replayed = await f.coordinator.run(f.context, action);
     expect(replayed).toEqual(abandoned);
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.taskControlPlane).toBeUndefined();
+  });
+
+  it('reloads one exact abandoned blocker retirement history', async () => {
+    const f = fixture();
+    await installFence(f);
+    const abandoned = await abandonFence(f);
+    const tombstone = abandoned.blockerRecords.find(
+      record => record.code === 'task_control_canary_abandoned',
+    )!;
+    const retirement = abandonedRetirementFixture(tombstone, f.context);
+    const registryPath = join(f.dataDir, 'project-groups.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.projects[f.context.chatId].blockerRetirements = [retirement];
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    const reloaded = readProjectGroup(f.dataDir, f.context.chatId)! as typeof abandoned & {
+      blockerRetirements?: unknown[];
+    };
+    expect(reloaded.blockerRetirements).toEqual([retirement]);
+  });
+
+  it('omits an empty abandoned blocker retirement history on reload', async () => {
+    const f = fixture();
+    await installFence(f);
+    const registryPath = join(f.dataDir, 'project-groups.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.projects[f.context.chatId].blockerRetirements = [];
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    expect(readProjectGroup(f.dataDir, f.context.chatId))
+      .not.toHaveProperty('blockerRetirements');
+  });
+
+  it.each([
+    ['record.openedAt', (retirement: any) => { retirement.record.openedAt = '2026-10-17T12:00:01.000Z'; }],
+    ['record.summary', (retirement: any) => { retirement.record.summary = '{}'; }],
+    ['record.source', (retirement: any) => { retirement.record.source = 'manual'; }],
+    ['recordFingerprint', (retirement: any) => { retirement.recordFingerprint = `pcbr1:${'0'.repeat(64)}`; }],
+  ])('fails closed on tampered abandoned-retirement history: %s', async (_field, tamper) => {
+    const f = fixture();
+    await installFence(f);
+    const abandoned = await abandonFence(f);
+    const tombstone = abandoned.blockerRecords.find(
+      record => record.code === 'task_control_canary_abandoned',
+    )!;
+    const retirement = abandonedRetirementFixture(structuredClone(tombstone), f.context);
+    tamper(retirement);
+    const registryPath = join(f.dataDir, 'project-groups.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.projects[f.context.chatId].blockerRetirements = [retirement];
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    expect(() => readProjectGroup(f.dataDir, f.context.chatId))
+      .toThrow('project_task_control_canary_abandoned_retirement_history_invalid');
+  });
+
+  it.each([
+    ['schema', (project: any) => { project.blockerRetirements[0].schemaVersion = 'ProjectBlockerRetirement.v2'; }],
+    ['authorization', (project: any) => { project.blockerRetirements[0].authorizationRef = 'not-a-message'; }],
+    ['authorization array', (project: any) => {
+      project.blockerRetirements[0].authorizationRef = [project.blockerRetirements[0].authorizationRef];
+    }],
+    ['actor', (project: any) => { project.blockerRetirements[0].authorizedByOpenId = 'not-an-open-id'; }],
+    ['actor array', (project: any) => {
+      project.blockerRetirements[0].authorizedByOpenId = [project.blockerRetirements[0].authorizedByOpenId];
+    }],
+    ['reason', (project: any) => { project.blockerRetirements[0].reason = ' padded '; }],
+    ['retiredAt', (project: any) => { project.blockerRetirements[0].retiredAt = 'not-a-date'; }],
+    ['session', (project: any) => { project.blockerRetirements[0].retiredBySessionId = 'bad session'; }],
+    ['session array', (project: any) => {
+      project.blockerRetirements[0].retiredBySessionId = [project.blockerRetirements[0].retiredBySessionId];
+    }],
+    ['duplicate', (project: any) => { project.blockerRetirements.push(structuredClone(project.blockerRetirements[0])); }],
+    ['non-array', (project: any) => { project.blockerRetirements = {}; }],
+  ])('fails closed on malformed abandoned-retirement metadata: %s', async (_field, tamper) => {
+    const f = fixture();
+    await installFence(f);
+    const abandoned = await abandonFence(f);
+    const tombstone = abandoned.blockerRecords.find(
+      record => record.code === 'task_control_canary_abandoned',
+    )!;
+    const registryPath = join(f.dataDir, 'project-groups.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.projects[f.context.chatId].blockerRetirements = [
+      abandonedRetirementFixture(tombstone, f.context),
+    ];
+    tamper(registry.projects[f.context.chatId]);
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    expect(() => readProjectGroup(f.dataDir, f.context.chatId))
+      .toThrow('project_task_control_canary_abandoned_retirement_history_invalid');
   });
 
   it('atomically disables an enabled canary and replaces its fence with the abandonment tombstone', async () => {

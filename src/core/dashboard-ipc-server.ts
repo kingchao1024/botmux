@@ -172,6 +172,7 @@ import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import {
   parseProjectCoordinatorAction,
   projectCompletionGateAuthorizationPrompt,
+  projectTaskControlCanaryAbandonedRetirementAuthorizationPrompt,
   projectWorkstreamArchiveAuthorizationPrompt,
   projectWorkstreamReviewerAuthorizationPrompt,
   type ProjectCompletionGateLifecycleAction,
@@ -3229,6 +3230,23 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
     }
     verifiedAction = { ...action, authorizedByOpenId };
   }
+  if (action.action === 'retire_task_control_canary_abandoned') {
+    const authorizedByOpenId = verifiedCurrentProjectHumanActor(
+      ds,
+      action.authorizationRef,
+      projectTaskControlCanaryAbandonedRetirementAuthorizationPrompt(action),
+    );
+    if (!authorizedByOpenId) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: 'project_task_control_canary_abandoned_retirement_authorization_required',
+      });
+    }
+    if (groupMode?.mode !== 'project') {
+      return jsonRes(res, 409, { ok: false, error: 'project_mode_required' });
+    }
+    verifiedAction = { ...action, authorizedByOpenId };
+  }
   if (action.action === 'archive_workstream') {
     const archivedByOpenId = verifiedCurrentProjectHumanActor(
       ds,
@@ -3282,6 +3300,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
         ...(stageAdvanceWarning ? { stageAdvanceWarning } : {}),
       });
     }
+    if (verifiedAction.action === 'retire_task_control_canary_abandoned') {
+      const { project, projectionWarning } =
+        await projectCoordinator.runTaskControlCanaryAbandonedRetirement(context, verifiedAction);
+      if (projectionWarning) {
+        logger.warn(`[project] abandoned blocker retirement persisted but card projection failed: ${projectionWarning}`);
+      }
+      return jsonRes(res, 200, {
+        ok: true,
+        project,
+        ...(projectionWarning ? { projectionWarning } : {}),
+      });
+    }
     if (verifiedAction.action === 'archive_workstream') {
       const { project, projectionWarning } = await projectCoordinator.runWorkstreamArchive(
         context,
@@ -3318,7 +3348,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
       : detail === 'project_already_exists' || detail === 'project_coordinator_mismatch' ? 409
         : detail.startsWith('invalid_') || detail === 'title_and_goal_required' || detail === 'workstream_not_found'
           || detail === 'project_workstream_title_required' || detail === 'project_workstream_title_too_long' ? 400
-          : detail === 'project_completion_gate_authorization_required' ? 403
+          : detail === 'project_completion_gate_authorization_required'
+            || detail === 'project_task_control_canary_abandoned_retirement_authorization_required' ? 403
             : 502;
     return jsonRes(res, status, { ok: false, error: detail });
   }

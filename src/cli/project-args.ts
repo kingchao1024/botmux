@@ -116,6 +116,52 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
       action: { action: 'add_completion_gate', gateId, sourceChatId, dispatchRoot, taskGuid, label },
     };
   }
+  if (subcommand === 'blocker') {
+    if (args[0] !== 'retire-abandoned') {
+      return { ok: false, error: 'project blocker 只支持 retire-abandoned' };
+    }
+    const retirementArgs = args.slice(1);
+    const allowed = new Set([
+      '--expected-fingerprint', '--authorization-ref', '--reason', '--session-id', '--json',
+    ]);
+    for (let i = 0; i < retirementArgs.length; i += 1) {
+      const token = retirementArgs[i]!;
+      if (!token.startsWith('-')) return { ok: false, error: `不支持位置参数: ${token}` };
+      const flag = token.includes('=') ? token.slice(0, token.indexOf('=')) : token;
+      if (!allowed.has(flag)) return { ok: false, error: `未知选项: ${flag}` };
+      if (flag === '--json') {
+        if (token.includes('=')) return { ok: false, error: '--json 不接受值' };
+        continue;
+      }
+      const value = token.includes('=')
+        ? token.slice(token.indexOf('=') + 1)
+        : retirementArgs[++i];
+      if (value === undefined || !value.trim() || value.startsWith('--')) {
+        return { ok: false, error: `${flag} 需要一个值` };
+      }
+    }
+    const expectedRecordFingerprint = one(retirementArgs, '--expected-fingerprint')?.trim();
+    const authorizationRef = one(retirementArgs, '--authorization-ref')?.trim();
+    const reason = one(retirementArgs, '--reason')?.trim();
+    if (!expectedRecordFingerprint || !authorizationRef || !reason) {
+      return {
+        ok: false,
+        error: 'project blocker retire-abandoned 需要 --expected-fingerprint、--authorization-ref 和 --reason',
+      };
+    }
+    if (!/^pcbr1:[a-f0-9]{64}$/.test(expectedRecordFingerprint)) {
+      return { ok: false, error: '--expected-fingerprint 必须是 pcbr1: 加 64 位小写十六进制' };
+    }
+    return {
+      ok: true, help: false,
+      sessionId: one(retirementArgs, '--session-id'),
+      json: has(retirementArgs, '--json'),
+      action: {
+        action: 'retire_task_control_canary_abandoned',
+        expectedRecordFingerprint, authorizationRef, reason,
+      },
+    };
+  }
   if (subcommand === 'workstream') {
     if (args[0] === 'archive') {
       const archiveArgs = args.slice(1);

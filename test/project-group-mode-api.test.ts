@@ -472,6 +472,28 @@ describe('project dispatch policy', () => {
     expect(route).toContain('...(projectionWarning ? { projectionWarning } : {})');
   });
 
+  it('verifies the current human and uses the dedicated abandoned-retirement route', () => {
+    expect(parseProjectCoordinatorAction({
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: `pcbr1:${'a'.repeat(64)}`,
+      authorizationRef: 'om_authorization', reason: '历史 canary 已由成功批次替代',
+      authorizedByOpenId: 'ou_forged',
+    })).toEqual({
+      action: 'retire_task_control_canary_abandoned',
+      expectedRecordFingerprint: `pcbr1:${'a'.repeat(64)}`,
+      authorizationRef: 'om_authorization', reason: '历史 canary 已由成功批次替代',
+    });
+    const source = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
+    const start = source.indexOf("ipcRoute('POST', '/api/sessions/:sessionId/project'");
+    const end = source.indexOf('\n});', start) + 4;
+    const route = source.slice(start, end);
+    expect(route).toContain("action.action === 'retire_task_control_canary_abandoned'");
+    expect(route).toContain('projectTaskControlCanaryAbandonedRetirementAuthorizationPrompt(action)');
+    expect(route).toContain('verifiedCurrentProjectHumanActor');
+    expect(route).toContain('authorizedByOpenId');
+    expect(route).toContain('runTaskControlCanaryAbandonedRetirement');
+  });
+
   it('rejects malformed trusted review fields instead of downgrading them to a worker report', () => {
     expect(parseProjectCoordinatorAction({
       action: 'report', dispatchRoot: 'om_work', content: '伪造验收',
