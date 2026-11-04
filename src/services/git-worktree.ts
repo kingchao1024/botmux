@@ -7,10 +7,10 @@
  * Async (execFile) on purpose: a `git fetch` can take many seconds and this
  * runs inside the daemon's event loop.
  */
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { existsSync, lstatSync, mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
@@ -26,6 +26,23 @@ export interface WorktreeCreation {
   /** Ref the branch was created from (e.g. `origin/master`); equals `branch`
    *  when an existing local branch was checked out instead. */
   baseRef: string;
+}
+
+export interface RepositoryIdentity {
+  canonicalCommonDir: string;
+  repoKey: string;
+}
+
+function repositoryIdentityFromCommonDir(commonDir: string): RepositoryIdentity {
+  let canonicalCommonDir: string;
+  try { canonicalCommonDir = realpathSync(commonDir); }
+  catch { throw new Error('repository_identity_common_dir_unavailable'); }
+  return {
+    canonicalCommonDir,
+    repoKey: createHash('sha256')
+      .update(`botmux-repository-v1\0${canonicalCommonDir}`)
+      .digest('hex'),
+  };
 }
 
 export interface CreateRepoWorktreeOptions {
@@ -96,6 +113,52 @@ async function resolveBaseRef(repo: string): Promise<string> {
  *  spamming a creating→failed message pair on every new session. */
 export async function isGitWorkTree(dir: string): Promise<boolean> {
   return (await tryGit(['rev-parse', '--is-inside-work-tree'], resolve(dir), 5_000)) === 'true';
+}
+
+/** Resolve every linked worktree and path alias for one Git repository to a
+ * stable host-local identity. There is intentionally no path-lock fallback:
+ * callers that need write authority must fail closed when Git cannot prove
+ * the common directory. */
+export async function resolveRepositoryIdentity(dir: string): Promise<RepositoryIdentity> {
+  const workingDir = realpathSync(resolve(dir));
+  if (!await isGitWorkTree(workingDir)) throw new Error('repository_identity_not_git');
+  let commonDir: string;
+  try {
+    commonDir = await git(
+      ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+      workingDir,
+      5_000,
+    );
+  } catch {
+    throw new Error('repository_identity_common_dir_unavailable');
+  }
+  return repositoryIdentityFromCommonDir(commonDir);
+}
+
+/** Synchronous identity resolution for the worker spawn fence. The child must
+ * not receive its first IPC message before its repository lease is bound. */
+export function resolveRepositoryIdentitySync(dir: string): RepositoryIdentity {
+  const workingDir = realpathSync(resolve(dir));
+  try {
+    const inside = execFileSync(
+      'git', ['rev-parse', '--is-inside-work-tree'],
+      { cwd: workingDir, timeout: 5_000, encoding: 'utf-8' },
+    ).trim();
+    if (inside !== 'true') throw new Error('repository_identity_not_git');
+  } catch (error) {
+    if (error instanceof Error && error.message === 'repository_identity_not_git') throw error;
+    throw new Error('repository_identity_not_git');
+  }
+  try {
+    const commonDir = execFileSync(
+      'git', ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+      { cwd: workingDir, timeout: 5_000, encoding: 'utf-8' },
+    ).trim();
+    return repositoryIdentityFromCommonDir(commonDir);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'repository_identity_common_dir_unavailable') throw error;
+    throw new Error('repository_identity_common_dir_unavailable');
+  }
 }
 
 /** Branch names may contain `/` etc. — flatten to a filesystem-safe suffix. */

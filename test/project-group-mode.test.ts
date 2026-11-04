@@ -2626,16 +2626,22 @@ describe('project group mode', () => {
       chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
       workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_reviewer_next', 'cli_reviewer_other'],
     });
+    const repositoryLeaseRef = {
+      repoKey: 'c'.repeat(64), leaseId: 'lease-review-1', fencingToken: 21,
+      workingDir: f.dataDir,
+    };
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '交付可验收结果' });
     await f.coordinator.run(f.context, {
       action: 'reserve_dispatch', reservationId: 'write-review',
       targetAppIds: ['cli_worker', 'cli_reviewer'], access: { mode: 'write', scopes: [f.dataDir] },
-    });
+      repositoryLeaseRef,
+    } as any);
     return f.coordinator.run(f.context, {
       action: 'commit_dispatch', reservationId: 'write-review',
       targetAppIds: ['cli_worker', 'cli_reviewer'], workerAppIds: ['cli_worker'], reviewerAppIds: ['cli_reviewer'],
       dispatchRoot: 'om_reviewed', title: '写入任务', purpose: '完成并验收', owners: ['Worker', 'Reviewer'],
-    });
+      repositoryLeaseRef,
+    } as any);
   }
 
   async function deliveredWriteWorkstream(f: ReturnType<typeof fixture>) {
@@ -3946,6 +3952,40 @@ describe('project group mode', () => {
     })).rejects.toThrow('project_review_round_mismatch');
   });
 
+  it('requires a newly fenced repositoryLeaseRef before failed review repair resumes', async () => {
+    const f = fixture();
+    const committed = await committedWriteWorkstream(f);
+    const oldLease = committed.workstreams[0]!.repositoryLeaseRef!;
+    await f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_worker',
+      content: '第一版', status: 'completed',
+    });
+    await f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_reviewer',
+      content: '需要返修', reviewVerdict: 'fail', reviewRound: 1,
+    });
+
+    await expect(f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_worker',
+      content: '开始返修', status: 'in_progress',
+    })).rejects.toThrow('project_repository_lease_reacquire_required');
+    await expect(f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_worker',
+      content: '偷用旧 token', status: 'in_progress', repositoryLeaseRef: oldLease,
+    } as any)).rejects.toThrow('project_repository_lease_reacquire_required');
+
+    const newLease = { ...oldLease, leaseId: 'lease-review-2', fencingToken: oldLease.fencingToken + 1 };
+    const repaired = await f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: 'om_reviewed', reporterAppId: 'cli_worker',
+      content: '开始返修', status: 'in_progress', repositoryLeaseRef: newLease,
+    } as any);
+    expect(repaired.workstreams[0]).toMatchObject({
+      status: 'in_progress', repositoryLeaseRef: newLease,
+    });
+    expect(repaired.workstreams[0]).not.toHaveProperty('delivery');
+    expect(repaired.workstreams[0]).not.toHaveProperty('review');
+  });
+
   it('preserves delivery and reviewer failure when a TaskControl worker reports terminal failure', async () => {
     const f = fixture();
     await committedWriteWorkstream(f);
@@ -4218,6 +4258,76 @@ describe('project group mode', () => {
       .rejects.toThrow('project_dispatch_reservation_id_required');
   });
 
+  it('persists an immutable repositoryLeaseRef on write reservations and workstreams', async () => {
+    const f = fixture();
+    const repositoryLeaseRef = {
+      repoKey: 'a'.repeat(64),
+      leaseId: 'lease-project-write',
+      fencingToken: 7,
+      workingDir: join(f.dataDir, 'repo'),
+    };
+    mkdirSync(repositoryLeaseRef.workingDir);
+    await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '交付可验收结果' });
+
+    const reserved = await f.coordinator.run(f.context, {
+      action: 'reserve_dispatch', reservationId: 'lease-bound',
+      targetAppIds: ['cli_worker', 'cli_reviewer'],
+      access: { mode: 'write', scopes: [repositoryLeaseRef.workingDir] },
+      repositoryLeaseRef,
+    } as any);
+    expect(reserved.dispatchReservations).toEqual([
+      expect.objectContaining({ reservationId: 'lease-bound', repositoryLeaseRef }),
+    ]);
+
+    const committed = await f.coordinator.run(f.context, {
+      action: 'commit_dispatch', reservationId: 'lease-bound',
+      targetAppIds: ['cli_worker', 'cli_reviewer'],
+      workerAppIds: ['cli_worker'], reviewerAppIds: ['cli_reviewer'],
+      dispatchRoot: 'om_lease_bound', title: '仓库租约绑定',
+      repositoryLeaseRef,
+    } as any);
+    expect(committed.workstreams).toEqual([
+      expect.objectContaining({ dispatchRoot: 'om_lease_bound', repositoryLeaseRef }),
+    ]);
+  });
+
+  it('rejects repositoryLeaseRef drift during reservation retry and commit', async () => {
+    const leaseA = {
+      repoKey: 'b'.repeat(64),
+      leaseId: 'lease-a',
+      fencingToken: 11,
+      workingDir: '/tmp/repository-lease-a',
+    };
+    const leaseB = { ...leaseA, leaseId: 'lease-b', fencingToken: 12 };
+
+    const retry = fixture();
+    await retry.coordinator.run(retry.context, { action: 'init', title: '项目', goal: '交付可验收结果' });
+    await retry.coordinator.run(retry.context, {
+      action: 'reserve_dispatch', reservationId: 'retry-drift',
+      targetAppIds: ['cli_worker', 'cli_reviewer'],
+      access: { mode: 'write', scopes: [retry.dataDir] }, repositoryLeaseRef: leaseA,
+    } as any);
+    await expect(retry.coordinator.run(retry.context, {
+      action: 'reserve_dispatch', reservationId: 'retry-drift',
+      targetAppIds: ['cli_worker', 'cli_reviewer'],
+      access: { mode: 'write', scopes: [retry.dataDir] }, repositoryLeaseRef: leaseB,
+    } as any)).rejects.toThrow('project_repository_lease_ref_conflict');
+
+    const commit = fixture();
+    await commit.coordinator.run(commit.context, { action: 'init', title: '项目', goal: '交付可验收结果' });
+    await commit.coordinator.run(commit.context, {
+      action: 'reserve_dispatch', reservationId: 'commit-drift',
+      targetAppIds: ['cli_worker', 'cli_reviewer'],
+      access: { mode: 'write', scopes: [commit.dataDir] }, repositoryLeaseRef: leaseA,
+    } as any);
+    await expect(commit.coordinator.run(commit.context, {
+      action: 'commit_dispatch', reservationId: 'commit-drift',
+      targetAppIds: ['cli_worker', 'cli_reviewer'],
+      workerAppIds: ['cli_worker'], reviewerAppIds: ['cli_reviewer'],
+      dispatchRoot: 'om_commit_drift', title: '租约漂移拒绝', repositoryLeaseRef: leaseB,
+    } as any)).rejects.toThrow('project_repository_lease_ref_conflict');
+  });
+
   it('fails closed for invalid commit and abort reservation identities', async () => {
     const f = fixture();
     await f.coordinator.run(f.context, { action: 'init', title: '项目', goal: '交付可验收结果' });
@@ -4378,10 +4488,12 @@ describe('project group mode', () => {
       },
     }));
 
-    expect(readProjectGroup(f.dataDir, f.context.chatId)).toMatchObject({
+    const legacy = readProjectGroup(f.dataDir, f.context.chatId)!;
+    expect(legacy).toMatchObject({
       schemaVersion: 3, title: '旧项目',
       workstreams: [{ dispatchRoot: 'om_legacy' }],
     });
+    expect(legacy.workstreams[0]).not.toHaveProperty('repositoryLeaseRef');
     await f.coordinator.run(f.context, { action: 'update', focus: '迁移后继续' });
     expect(JSON.parse(readFileSync(join(f.dataDir, 'project-groups.json'), 'utf8'))).toMatchObject({
       schemaVersion: 3, projects: { [f.context.chatId]: { schemaVersion: 3 } },

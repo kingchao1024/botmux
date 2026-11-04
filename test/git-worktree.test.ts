@@ -8,11 +8,18 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createRepoWorktree, removeRepoWorktree, slugFromWorktreeText, worktreeRootFor, worktreeSafetyStatus } from '../src/services/git-worktree.js';
+import {
+  createRepoWorktree,
+  removeRepoWorktree,
+  resolveRepositoryIdentity,
+  slugFromWorktreeText,
+  worktreeRootFor,
+  worktreeSafetyStatus,
+} from '../src/services/git-worktree.js';
 import { localWorktreeSlugFromContext } from '../src/services/worktree-slug-ai.js';
 
 let tempRoot: string;
@@ -47,6 +54,35 @@ function makeClone(upstream: string, name: string): string {
 beforeEach(() => {
   // git worktree canonicalizes macOS /var temp paths to /private/var.
   tempRoot = realpathSync(mkdtempSync(join(tmpdir(), 'git-worktree-test-')));
+});
+
+describe('resolveRepositoryIdentity', () => {
+  it('resolves the same repository identity from the main checkout and a linked worktree', async () => {
+    const repo = makeUpstream('identity-main');
+    const linked = join(tempRoot, 'identity-linked');
+    git(repo, 'worktree', 'add', '-b', 'identity-linked', linked);
+
+    await expect(resolveRepositoryIdentity(repo)).resolves.toEqual(
+      await resolveRepositoryIdentity(linked),
+    );
+  });
+
+  it('canonicalizes symlink aliases before deriving repoKey', async () => {
+    const repo = makeUpstream('identity-symlink-main');
+    const alias = join(tempRoot, 'identity-alias');
+    symlinkSync(repo, alias, 'dir');
+
+    await expect(resolveRepositoryIdentity(alias)).resolves.toEqual(
+      await resolveRepositoryIdentity(repo),
+    );
+  });
+
+  it('rejects a non-git directory without returning a path fallback', async () => {
+    const ordinary = join(tempRoot, 'ordinary');
+    mkdirSync(ordinary);
+
+    await expect(resolveRepositoryIdentity(ordinary)).rejects.toThrow('repository_identity_not_git');
+  });
 });
 
 afterEach(() => {

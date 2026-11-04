@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { loadDashboardSecret } from '../dashboard/auth.js';
 import {
   dispatchReportBindingSecretPath,
@@ -164,6 +164,7 @@ export type ProjectCoordinatorAction =
   | {
       action: 'reserve_dispatch'; reservationId: string; targetAppIds: string[];
       access: ProjectDispatchAccess; now?: string; ttlMs?: number;
+      repositoryLeaseRef?: ProjectDispatchReservation['repositoryLeaseRef'];
       taskControl?: NonNullable<ProjectDispatchReservation['taskControl']>;
       maxActiveTaskControlMappings?: number;
       getTaskControlMappingDecision?: (input: { dispatchRoot: string; taskGuid: string }) => {
@@ -203,6 +204,7 @@ export type ProjectCoordinatorAction =
   | {
       action: 'commit_dispatch'; reservationId: string; targetAppIds: string[]; dispatchRoot: string;
       title: string; purpose?: string; owners?: string[]; workerAppIds?: string[]; reviewerAppIds?: string[];
+      repositoryLeaseRef?: ProjectDispatchReservation['repositoryLeaseRef'];
     }
   | {
       action: 'bind_dispatch_root'; reservationId: string; targetAppIds: string[];
@@ -222,6 +224,7 @@ export type ProjectCoordinatorAction =
       action: 'report'; dispatchRoot: string; content: string; status?: ProjectWorkstreamStatus;
       progress?: number; remaining?: string; milestone?: string; reporterAppId?: string;
       reviewVerdict?: 'pass' | 'fail'; reviewRound?: number;
+      repositoryLeaseRef?: ProjectDispatchReservation['repositoryLeaseRef'];
       phaseAReport?: {
         operationId: string; fenceFingerprint: string; sourceSessionId: string;
         sourceTurnId: string; workerGeneration: number; reportRequestId: string;
@@ -269,6 +272,26 @@ function phaseAReportProof(value: unknown): NonNullable<Extract<
   return {
     operationId, fenceFingerprint, sourceSessionId, sourceTurnId,
     workerGeneration: workerGeneration as number, reportRequestId,
+  };
+}
+
+function parsedRepositoryLeaseRef(
+  value: unknown,
+): ProjectDispatchReservation['repositoryLeaseRef'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const ref = value as Record<string, unknown>;
+  if (JSON.stringify(Object.keys(ref).sort()) !== JSON.stringify([
+    'fencingToken', 'leaseId', 'repoKey', 'workingDir',
+  ])
+    || typeof ref.repoKey !== 'string' || !/^[a-f0-9]{64}$/.test(ref.repoKey)
+    || typeof ref.leaseId !== 'string' || ref.leaseId.length < 1 || ref.leaseId.length > 128
+    || !Number.isSafeInteger(ref.fencingToken) || (ref.fencingToken as number) < 1
+    || typeof ref.workingDir !== 'string' || !isAbsolute(ref.workingDir)) return undefined;
+  return {
+    repoKey: ref.repoKey,
+    leaseId: ref.leaseId,
+    fencingToken: ref.fencingToken as number,
+    workingDir: ref.workingDir,
   };
 }
 
@@ -396,6 +419,11 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
     const hasPhaseAReport = Object.hasOwn(body, 'phaseAReport');
     const phaseAReport = hasPhaseAReport ? phaseAReportProof(body.phaseAReport) : undefined;
     if (hasPhaseAReport && !phaseAReport) return undefined;
+    const hasRepositoryLeaseRef = Object.hasOwn(body, 'repositoryLeaseRef');
+    const repositoryLeaseRef = hasRepositoryLeaseRef
+      ? parsedRepositoryLeaseRef(body.repositoryLeaseRef)
+      : undefined;
+    if (hasRepositoryLeaseRef && !repositoryLeaseRef) return undefined;
     return {
       action, dispatchRoot, content, status, progress,
       remaining: stringField(body, 'remaining'), milestone: stringField(body, 'milestone'),
@@ -404,6 +432,7 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
       reviewRound: Number.isSafeInteger(body.reviewRound) && (body.reviewRound as number) > 0
         ? body.reviewRound as number : undefined,
       ...(phaseAReport ? { phaseAReport } : {}),
+      ...(repositoryLeaseRef ? { repositoryLeaseRef } : {}),
     };
   }
   if (action === 'fail_dispatch') {
@@ -451,6 +480,17 @@ function targetIdentity(targetAppIds: readonly string[]): string[] {
 
 function sameTargets(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameRepositoryLeaseRef(
+  left: ProjectDispatchReservation['repositoryLeaseRef'],
+  right: ProjectDispatchReservation['repositoryLeaseRef'],
+): boolean {
+  if (!left || !right) return left === right;
+  return left.repoKey === right.repoKey
+    && left.leaseId === right.leaseId
+    && left.fencingToken === right.fencingToken
+    && left.workingDir === right.workingDir;
 }
 
 function sameAccess(left: ProjectDispatchAccess, right: ProjectDispatchAccess): boolean {
@@ -2620,6 +2660,9 @@ export class ProjectCoordinator {
             } : undefined)) {
             throw new Error('project_dispatch_reservation_conflict');
           }
+          if (!sameRepositoryLeaseRef(existing.repositoryLeaseRef, action.repositoryLeaseRef)) {
+            throw new Error('project_repository_lease_ref_conflict');
+          }
           current.coordinatorSessionId = previousCoordinatorSessionId;
           current.revision = previousRevision;
           current.updatedAt = previousUpdatedAt;
@@ -2662,6 +2705,9 @@ export class ProjectCoordinator {
         current.dispatchReservations.push({
           reservationId, targetAppIds, access: structuredClone(reservedAccess!), createdAt: now,
           expiresAt: new Date(nowMs + ttlMs).toISOString(),
+          ...(action.repositoryLeaseRef
+            ? { repositoryLeaseRef: structuredClone(action.repositoryLeaseRef) }
+            : {}),
           ...(action.taskControl ? {
             stage: 'reserved' as const,
             taskControl: { ...structuredClone(action.taskControl), coordinatorSessionId: context.coordinatorSessionId },
@@ -2727,6 +2773,9 @@ export class ProjectCoordinator {
         if (!sameTargets(reservation.targetAppIds, targetAppIds)) {
           throw new Error('project_dispatch_reservation_identity_mismatch');
         }
+        if (!sameRepositoryLeaseRef(reservation.repositoryLeaseRef, action.repositoryLeaseRef)) {
+          throw new Error('project_repository_lease_ref_conflict');
+        }
         current.dispatchReservations.splice(reservationIndex, 1);
         const root = action.dispatchRoot.trim();
         if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(root)) throw new Error('invalid_dispatch_root');
@@ -2757,6 +2806,9 @@ export class ProjectCoordinator {
           dispatchRoot: root, title, purpose: boundedText(action.purpose, 300, '等待补充任务说明'),
           owners: (action.owners ?? []).map(owner => boundedText(owner, 80)).filter(Boolean).slice(0, 16),
           targetAppIds, access: reservation.access, status: 'pending', progress: 0,
+          ...(reservation.repositoryLeaseRef
+            ? { repositoryLeaseRef: structuredClone(reservation.repositoryLeaseRef) }
+            : {}),
           ...(workerAppIds.length > 0 ? { workerAppIds } : {}),
           ...(reviewerAppIds.length > 0 ? { reviewerAppIds } : {}),
           ...(reservation.taskControl ? {
@@ -3281,6 +3333,26 @@ export class ProjectCoordinator {
             throw new Error('project_worker_not_allowed');
           }
           const content = boundedText(action.content, 1000);
+          const resumesFailedReview = !action.reviewVerdict
+            && item.status === 'blocked'
+            && item.review?.verdict === 'fail'
+            && action.status !== 'completed'
+            && action.status !== 'failed';
+          if (resumesFailedReview) {
+            const previousLease = item.repositoryLeaseRef;
+            const nextLease = action.repositoryLeaseRef;
+            if (!previousLease || !nextLease
+              || nextLease.repoKey !== previousLease.repoKey
+              || nextLease.workingDir !== previousLease.workingDir
+              || nextLease.leaseId === previousLease.leaseId
+              || nextLease.fencingToken <= previousLease.fencingToken) {
+              throw new Error('project_repository_lease_reacquire_required');
+            }
+            item.repositoryLeaseRef = structuredClone(nextLease);
+          } else if (action.repositoryLeaseRef
+            && !sameRepositoryLeaseRef(item.repositoryLeaseRef, action.repositoryLeaseRef)) {
+            throw new Error('project_repository_lease_ref_conflict');
+          }
           if (item.taskControl?.sourceKind === 'project_group'
             && (item.status === 'completed' || item.status === 'failed')) {
             const repeatedFailure = !action.reviewVerdict && action.status === 'failed'

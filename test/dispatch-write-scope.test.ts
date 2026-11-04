@@ -1,11 +1,13 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
 
 import {
   normalizeDispatchWriteScopes,
   projectDispatchAccessConflicts,
+  resolveDispatchRepositoryLeaseRequirement,
 } from '../src/core/dispatch-write-scope.js';
 
 const roots: string[] = [];
@@ -29,6 +31,44 @@ describe('dispatch write scopes', () => {
     const f = fixture();
 
     expect(normalizeDispatchWriteScopes([f.api, f.src, `${f.src}/`, f.src])).toEqual([f.src]);
+  });
+
+  it('maps every write scope to one repoKey and rejects a multi-repository batch', async () => {
+    const f = fixture();
+    const first = join(f.root, 'first-repo');
+    const second = join(f.root, 'second-repo');
+    mkdirSync(first);
+    mkdirSync(second);
+    for (const repo of [first, second]) {
+      execFileSync('git', ['init', '-b', 'master'], { cwd: repo });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t',
+          GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t',
+        },
+      });
+    }
+    const firstChild = join(first, 'src');
+    mkdirSync(firstChild);
+
+    const one = await resolveDispatchRepositoryLeaseRequirement({
+      mode: 'write',
+      scopes: [first, firstChild],
+    });
+    expect(one?.workingDir).toBe(realpathSync(first));
+    expect(one?.scopes).toEqual([realpathSync(first)]);
+    expect(one?.identity.repoKey).toMatch(/^[a-f0-9]{64}$/);
+
+    await expect(resolveDispatchRepositoryLeaseRequirement({
+      mode: 'write',
+      scopes: [first, second],
+    })).rejects.toThrow('write_scope_spans_multiple_repositories');
+  });
+
+  it('keeps read-only access free of repository lease requirements', async () => {
+    await expect(resolveDispatchRepositoryLeaseRequirement({ mode: 'read_only' })).resolves.toBeNull();
   });
 
   it('rejects relative, missing and non-directory scopes', () => {

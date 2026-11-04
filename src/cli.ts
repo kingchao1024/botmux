@@ -18171,6 +18171,23 @@ switch (command) {
     process.exitCode = await runObserveCommand(process.argv.slice(3));
     break;
   }
+  case 'repository': {
+    try {
+      const { runRepositoryReleaseCommand } = await import('./core/repository-release-command.js');
+      runRepositoryReleaseCommand(process.argv.slice(3), {
+        dataDir: resolveDataDir(),
+        env: process.env,
+      }, {
+        stdout: message => process.stdout.write(`${message}\n`),
+        stderr: message => process.stderr.write(`${message}\n`),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(message);
+      process.exitCode = message.startsWith('repository_command_invalid:') ? 2 : 1;
+    }
+    break;
+  }
   case 'send': {
     try { await cmdSend(process.argv.slice(3)); }
     catch (error) {
