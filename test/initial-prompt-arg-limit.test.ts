@@ -5,7 +5,6 @@ import { describe, expect, it } from 'vitest';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createRiffAdapter } from '../src/adapters/cli/riff.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
@@ -24,13 +23,12 @@ import { PI_INITIAL_PROMPT_COMMAND } from '../src/adapters/cli/pi-initial-prompt
 process.env.BOTMUX_TIME_SCALE ??= '0.01';
 
 describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
-  it('arms only for Grok-class argv + SessionStart + reliable terminal', () => {
+  it('arms for Grok-class argv + reliable terminal (even without injectsReadyHook)', () => {
     const grok = createGrokAdapter('/bin/grok');
     expect(shouldArmSpawnArgvInitialPromptBusy({
       passesInitialPromptViaArgs: grok.passesInitialPromptViaArgs === true,
       preparedInitialPrompt: 'review this MR',
       queuedInitialPrompt: undefined,
-      injectsReadyHook: grok.injectsReadyHook === true,
       reliableTurnTerminal: grok.reliableTurnTerminal === true,
     })).toBe(true);
   });
@@ -44,13 +42,12 @@ describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
       passesInitialPromptViaArgs: riff.passesInitialPromptViaArgs === true,
       preparedInitialPrompt: 'hello from feishu',
       queuedInitialPrompt: undefined,
-      injectsReadyHook: riff.injectsReadyHook === true,
       reliableTurnTerminal: riff.reliableTurnTerminal === true,
     })).toBe(false);
   });
 
-  it('does not arm for quiescence-only argv adapters (Pi / Gemini) but still tracks argv seed', () => {
-    for (const adapter of [createPiAdapter('/bin/pi'), createGeminiAdapter('/bin/gemini')]) {
+  it('does not arm for quiescence-only argv adapters (Pi / MTR) but still tracks argv seed', () => {
+    for (const adapter of [createPiAdapter('/bin/pi'), createMtrAdapter('/bin/mtr')]) {
       expect(adapter.passesInitialPromptViaArgs).toBe(true);
       expect(adapter.injectsReadyHook).toBeFalsy();
       const base = {
@@ -63,7 +60,6 @@ describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
       // Must NOT hold busy across first ready (first ready IS turn end).
       expect(shouldArmSpawnArgvInitialPromptBusy({
         ...base,
-        injectsReadyHook: adapter.injectsReadyHook === true,
         reliableTurnTerminal: adapter.reliableTurnTerminal === true,
       })).toBe(false);
     }
@@ -74,7 +70,6 @@ describe('shouldArmSpawnArgvInitialPromptBusy (PR #633 CR)', () => {
       passesInitialPromptViaArgs: true,
       preparedInitialPrompt: 'argv-form',
       queuedInitialPrompt: 'queued command',
-      injectsReadyHook: true,
       reliableTurnTerminal: true,
     })).toBe(false);
   });
@@ -443,7 +438,6 @@ describe('argv-baked providers share the tmux command-too-long guard', () => {
   // maxInitialPromptArgBytes stays unset (see the Pi cases above).
   const cases: Array<[string, CliAdapter, number]> = [
     ['cursor', createCursorAdapter('/usr/bin/cursor-agent'), 8192],
-    ['gemini', createGeminiAdapter('/usr/bin/gemini'), 8192],
     ['mtr', createMtrAdapter('/usr/bin/mtr'), 8192],
     ['grok', createGrokAdapter('/usr/bin/grok'), 4096],
   ];

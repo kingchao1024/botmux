@@ -5,7 +5,6 @@ import { join } from 'node:path';
 
 import { withSecureHostParentSync, type SecureHostParentHandle } from '../platform/secure-host-file.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { logger } from '../utils/logger.js';
 import { ASK_MAX_TIMEOUT_MS } from './ask-limits.js';
 import {
   askAnswerDigest,
@@ -16,7 +15,48 @@ import {
   type AskPersistenceIntegrityV1,
   type SignedAskReceiptV1,
 } from './ask-receipt.js';
+/**
+ * ask-persist-store — file-backed pending `botmux ask` state (injectable).
+ *
+ * Why this exists: the ask broker's pending registry is an in-memory Map, so a
+ * daemon restart between "card posted" and "user clicked" loses the ask. The
+ * user's later click then hits `stale` ("此 ask 已失效"), and the CLI hook that
+ * was blocking on `/api/asks` has meanwhile dropped its connection and fallen
+ * back to passthrough → the CLI renders its native picker with no way to deliver
+ * the answer. (See the AskUserQuestion picker-desync investigation.)
+ *
+ * This module owns the durable projection of each pending ask under
+ * `<storeDir>/<askKey>.json`. The broker persists on create, updates on card /
+ * selection / terminal-answer change, and removes once the answer is CLAIMED by
+ * the reconnecting hook. On boot the broker re-hydrates them as "dormant" asks
+ * (card still live in Feishu, no waiter yet).
+ *
+ * DEPENDENCY INJECTION (codex P1-4): the store is created with an explicit
+ * directory rather than reading `config.session.dataDir` at call time. Tests
+ * inject a temp dir and delete only their own sentinel-guarded directory; the
+ * broker never bulk-cleans a shared/global dataDir (a test helper doing that
+ * could delete a LIVE pending ask). Production wires the real dir once at
+ * daemon bootstrap.
+ *
+ * Design mirrors `workflows/v3/gate-wait-store.ts` (also "survive restart"):
+ * atomic writes, fsync durability, a `list()` restore scan.
+ *
+ * IDENTITY (codex影响面纠正): `askKey` is supplied by the caller and is derived
+ * from a per-invocation `requestId` (generated once by the hook, reused across
+ * retries) + an `originKind` (hook-ask vs explicit `botmux ask buttons`). This
+ * is a true invocation identity — unlike a questions hash it distinguishes two
+ * concurrent same-question asks and two same-question invocations 24h apart, and
+ * prevents an explicit ask from re-claiming a hook ask's card.
+ */
+
+import { logger } from '../utils/logger.js';
+import {
+  humanDecisionDispatchUuidForKey,
+  humanDecisionKeyFor,
+} from './human-decision-store.js';
 import type { AskQuestion, AskResult, CreateAskInput } from './ask-types.js';
+import { hasAskForm, parseAskFormValues } from './ask-form.js';
+import { ASK_CUSTOM_MAX_LENGTH, ASK_CUSTOM_TOTAL_LENGTH } from './ask-custom-input.js';
 
 export const ASK_STORE_SENTINEL = '.botmux-ask-store';
 export const HANDOFF_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -43,7 +83,10 @@ interface PersistedAskFields {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
+  customAnswers?: ReadonlyArray<string | null>;
+  customRevision?: number;
   createdAt: number;
   deadlineAt: number;
   /** Original absolute S1 activation window; both are absent for non-S1 asks. */
@@ -222,18 +265,32 @@ export function askKeyFor(
   originKind: string,
   requestId: string,
 ): string {
-  return [larkAppId, sessionId, originKind, requestId]
-    .map((segment) => `${String(segment).length}:${String(segment)}`)
-    .join('|');
+  return humanDecisionKeyFor(larkAppId, sessionId, originKind, requestId);
 }
 
 export function dispatchUuidForKey(askKey: string): string {
   return `ask-${createHash('sha256').update(`uuid|${askKey}`).digest('hex').slice(0, 40)}`;
 }
 
+/** Feishu IM `uuid` dedupe token (≤50 chars) for one ask's card, derived from
+ *  the FULL scoped ask key — NOT the bare requestId (codex P1-1) — plus the ask
+ *  instance's askId. The askId is persisted, so every re-send of THIS ask (a
+ *  bounded transient retry, or a re-send after restore) gets the same uuid and
+ *  Feishu returns the original message_id. A different session reusing the same
+ *  requestId gets a DIFFERENT uuid and so cannot alias the first session's card.
+ *  A NEW ask instance under the same key (e.g. a hook that re-registers after
+ *  its earlier ask was invalidated) also gets a different uuid: its buttons carry
+ *  a new askId + nonce, so being deduped onto the old card would leave the user
+ *  a card that can't be answered. `ask-` + 40 hex = 44 chars, under the cap. */
+export function dispatchUuidForAsk(askKey: string, askId: string): string {
+  return humanDecisionDispatchUuidForKey(`${askKey}|${askId}`, 'ask');
+}
+
 export interface AskPersistStore {
   readonly dir: string;
-  put(ask: PersistedAskWrite): void;
+  /** Create-or-update a record. Best-effort durable (atomic rename + fsync). */
+  put(ask: PersistedAskWrite, options?: { strict?: boolean }): void;
+  /** Remove a record by key. Idempotent (missing file is not an error). */
   remove(askKey: string): void;
   list(now?: number): PersistedAsk[];
   commitSigned(ask: SignedAskWrite, expectedRevision: number): number;
@@ -362,7 +419,9 @@ export function createAskPersistStore(
           && (typeof ask.cardMessageId !== 'string' || !ask.cardMessageId))
         || !safeTimestamp(ask.createdAt) || !safeTimestamp(ask.deadlineAt)
         || ask.deadlineAt <= ask.createdAt
-        || ask.deadlineAt - ask.createdAt > ASK_MAX_TIMEOUT_MS
+        || (ask.timeoutStartedAt !== undefined && !safeTimestamp(ask.timeoutStartedAt))
+        || ask.deadlineAt - (ask.timeoutStartsAfterDelivery && ask.timeoutStartedAt !== undefined
+          ? ask.timeoutStartedAt : ask.createdAt) > ASK_MAX_TIMEOUT_MS
         || !Array.isArray(ask.questions) || !Array.isArray(ask.selections)
         || ask.questions.length !== ask.selections.length
         || !ask.questions.every((question) => question && typeof question.prompt === 'string'
@@ -445,11 +504,33 @@ export function createAskPersistStore(
 
   function validateTerminalResult(ask: PersistedAskFields, result: AskResult): void {
     if (answered(result)) {
+      const custom = result.customAnswers;
+      if (custom !== undefined && (!Array.isArray(custom) || custom.length !== ask.questions.length
+          || !custom.every((text, index) => text === null || (typeof text === 'string'
+            && text.trim().length > 0 && text.length <= ASK_CUSTOM_MAX_LENGTH
+            && ask.questions[index]?.allowCustom !== false))
+          || custom.reduce((sum, text) => sum + (text?.length ?? 0), 0) > ASK_CUSTOM_TOTAL_LENGTH)) {
+        throw new Error(`ask-persist: invalid custom terminal result for ${ask.askKey}`);
+      }
+      if (hasAskForm(ask.questions)) {
+        const values = Object.fromEntries(ask.questions.map((q, index) => [
+          `q${index}`, q.input ? result.inputs?.[index] : result.answers?.[index],
+        ]));
+        const parsed = parseAskFormValues(ask.questions, values);
+        if (!parsed || result.comment !== null || custom !== undefined
+            || !canonicalEqual(parsed.answers, result.answers)
+            || !canonicalEqual(parsed.inputs, result.inputs)
+            || typeof result.by !== 'string' || !result.by || result.timedOut !== false) {
+          throw new Error(`ask-persist: invalid form terminal result for ${ask.askKey}`);
+        }
+        return;
+      }
       if (!Array.isArray(result.answers) || result.answers.length !== ask.questions.length
           || !result.answers.every((keys, index) => Array.isArray(keys)
             && new Set(keys).size === keys.length
             && keys.every((key) => ask.questions[index]?.options.some((option) => option.key === key))
-            && (ask.questions[index]?.multiSelect === true || keys.length === (result.comment === null ? 1 : 0)))
+            && (custom?.[index] ? keys.length === 0
+              : ask.questions[index]?.multiSelect === true || keys.length === (result.comment === null ? 1 : 0)))
           || (result.comment !== null && result.answers.some((keys) => keys.length > 0))
           || typeof result.by !== 'string' || !result.by
           || (result.comment !== null && typeof result.comment !== 'string')
@@ -815,13 +896,24 @@ export function createAskPersistStore(
       askKey: ask.askKey, requestId: ask.requestId, originKind: ask.originKind, askId: ask.askId,
       nonce: ask.nonce, larkAppId: ask.larkAppId, chatId: ask.chatId,
       rootMessageId: ask.rootMessageId, sessionId: ask.sessionId, chatType: ask.chatType ?? null,
-      questions: ask.questions, createdAt: ask.createdAt, deadlineAt: ask.deadlineAt,
+      questions: ask.questions, createdAt: ask.createdAt,
       notBeforeMs: ask.notBeforeMs ?? null, expiresAtMs: ask.expiresAtMs ?? null,
+      answererOpenId: ask.answererOpenId ?? null, deliveryTarget: ask.deliveryTarget ?? null,
+      replyCardTarget: ask.replyCardTarget ?? null, timeoutMs: ask.timeoutMs ?? ask.deadlineAt - ask.createdAt,
+      timeoutStartsAfterDelivery: ask.timeoutStartsAfterDelivery ?? false,
     };
   }
 
   function assertImmutableIdentity(current: SignedAskStateV1, next: SignedAskWrite): void {
+    const startsDeliveryClock = current.timeoutStartsAfterDelivery === true
+      && current.timeoutStartedAt === undefined
+      && safeTimestamp(next.timeoutStartedAt)
+      && current.originKind !== 's1-controller'
+      && typeof next.timeoutMs === 'number'
+      && next.deadlineAt === next.timeoutStartedAt + next.timeoutMs;
     if (!canonicalEqual(immutableAskIdentity(current), immutableAskIdentity(next))
+        || (!startsDeliveryClock && (current.deadlineAt !== next.deadlineAt
+          || current.timeoutStartedAt !== next.timeoutStartedAt))
         || (current.cardMessageId !== undefined && current.cardMessageId !== next.cardMessageId)
         || (!current.receiptEligible && next.receiptEligible)) {
       throw new Error(`ask-persist: immutable ask identity mismatch for ${next.askKey}`);
@@ -831,8 +923,10 @@ export function createAskPersistStore(
   function assertTerminalBaseMatches(current: SignedAskStateV1, next: SignedAskWrite): void {
     const projection = (ask: PersistedAskFields) => ({
       ...immutableAskIdentity(ask),
+      deadlineAt: ask.deadlineAt, timeoutStartedAt: ask.timeoutStartedAt ?? null,
       cardMessageId: ask.cardMessageId ?? null, selections: ask.selections,
       selectionActorIdentity: ask.selectionActorIdentity ?? null,
+      customAnswers: ask.customAnswers ?? ask.questions.map(() => null), customRevision: ask.customRevision ?? 0,
       receiptEligible: 'receiptEligible' in ask ? ask.receiptEligible : null,
     });
     if (!canonicalEqual(projection(current), projection(next))) {
@@ -1152,11 +1246,13 @@ export function createAskPersistStore(
       if (!ask || ask.v !== 2 || !ask.askKey || !ask.requestId || !Array.isArray(ask.questions)) continue;
       if (ask.answeredResult !== undefined) {
         const stashedAt = typeof ask.answeredAt === 'number' ? ask.answeredAt : ask.createdAt;
-        if (now - stashedAt > HANDOFF_RETENTION_MS) {
+        if (ask.originKind !== 'host_explicit' && now - stashedAt > HANDOFF_RETENTION_MS) {
           try { unlinkSync(path); } catch { /* best effort */ }
           continue;
         }
       } else if (
+        ask.originKind !== 'host_explicit'
+        &&
         !(ask.timeoutStartsAfterDelivery === true && !ask.cardMessageId)
         && typeof ask.deadlineAt === 'number'
         && ask.deadlineAt <= now
@@ -1171,7 +1267,7 @@ export function createAskPersistStore(
 
   return {
     dir,
-    put(ask): void {
+    put(ask, options): void {
       if (ask.v === 3) throw new Error('ask-persist: signed writes require commitSigned');
       try {
         ensureDir();
@@ -1179,6 +1275,7 @@ export function createAskPersistStore(
         delete (normalized as { receiptEligible?: boolean }).receiptEligible;
         atomicWriteFileSync(statePath(ask.askKey), JSON.stringify(normalized), { mode: 0o600, durable: true });
       } catch (error) {
+        if (options?.strict || (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered')) throw error;
         logger.warn?.(`ask-persist: failed to persist ${ask.askKey}: ${error instanceof Error ? error.message : String(error)}`);
       }
     },

@@ -113,7 +113,7 @@ export function normalizeRepositoryReleaseSnapshot(
       || typeof snapshot.remoteRef !== 'string' || !/^refs\/remotes\/[A-Za-z0-9._/-]+$/.test(snapshot.remoteRef)
       || !/^[a-f0-9]{40}$/.test(String(snapshot.remoteCommitSha))
       || snapshot.worktreeClean !== true
-      || snapshot.bunVersion !== '1.4.2'
+      || snapshot.bunVersion !== '1.4.3'
       || !/^[a-f0-9]{64}$/.test(String(snapshot.buildToolchainHash))
       || !/^[a-f0-9]{64}$/.test(String(snapshot.artifactTreeHash))
       || !/^[a-f0-9]{64}$/.test(String(snapshot.rollbackTreeHash))

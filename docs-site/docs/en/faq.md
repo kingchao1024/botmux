@@ -38,7 +38,7 @@ botmux has two permission layers (the full layer model is in [Permissions & Acce
 
 ### C. Terminal has output but nothing sent to Lark
 
-**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Gemini / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Antigravity / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
 
 > ⚠️ **Exception: `codex-app` (Codex App app-server protocol)** — its final assistant message is **auto-forwarded** back to Lark by botmux, so **don't call `botmux send` for normal replies** (that would double-send); use it only for mid-turn pushes / attachments / cross-bot @mentions.
 
@@ -84,6 +84,19 @@ See [Multi-bot Collaboration](/en/multi-bot) for details.
 ## Does restarting the daemon lose context?
 
 With **tmux** installed, no — tmux is the default backend, the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. ⚠️ Without tmux it does **not** silently downgrade to pty; it hard-gates and posts a card asking you to install tmux. Only an explicit `BACKEND_TYPE=pty` (or per-bot `backendType:"pty"`) uses pty, and pty sessions **do not survive daemon restarts** — a restart reloads everything.
+
+## What happens to work in progress when the CLI is restarted mid-way?
+
+When the CLI process exits unexpectedly (a crash, the tmux server going away, …), botmux relaunches it in the same worker with its previous context and reads the transcript the old process left behind to see whether work was cut off:
+
+- **the previous turn had not finished** (say, a review half-way through);
+- **background tasks were terminated with the old process** (Claude Code `run_in_background` commands, Monitors, background agents).
+
+If so, the resumed CLI first receives a short note (it was restarted, which background tasks were interrupted, check them and continue), and the thread gets one notice. A cold resume after a suspend or a daemon restart is checked the same way (without a record of when the old process ended, a background task stopped by hand in the terminal on an idle session may also be reported as interrupted), with the note placed in front of the next message the CLI receives (a CLI that takes its first message as a launch argument, such as Pi, only gets the thread notice). Only the transcript is read, never the screen; this covers Claude Code and CLIs with structured transcripts such as Pi and Codex (for those, only the turn). Nothing is posted when nothing was interrupted.
+
+Messages received before a restart but not yet handed to the CLI are not dropped either: a first message passed to the CLI as a launch argument that the CLI exited before starting is typed in again after the restart, and messages still queued when the daemon restarts are delivered by the session's next worker (if that restart also brings a new message and the CLI takes its first message as a launch argument, the new one runs first). Ones more than 24 hours old are reported in the thread as not delivered instead, and so are ones caught by another restart part-way through being re-delivered, whose delivery cannot be confirmed. Conversely, a message the CLI had already received and started on (its own record shows the turn began) is not typed in again after a restart — that used to make the CLI redo the same work — but picked up through the note above; it is only re-sent when the restart has to open a fresh session without the old context.
+
+Also, a session whose main turn has ended while background tasks keep running (the card shows "⏳ Main turn ended · background tasks running (N)") is not suspended by the live-session cap or the idle timeout: suspending would kill those tasks, and a cold resume cannot bring them back.
 
 ## Does a session keep running if I don't close it? Is there automatic reclamation?
 
@@ -181,6 +194,10 @@ curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh 
 ### Why can't I npm-upgrade from a release older than v3.18.0?
 
 Starting with v3.18.0 the npm package changed form, from "Node + `dist/` sources" to a **platform binary subpackage**, and `node-pty` left `dependencies`. Old builds shipped a `botmux upgrade` that simply delegated to npm; when npm installs across that boundary it prunes `node-pty` from the old tree, while the old daemon's first restart step is still `node …/dist/cli.js restart` — and that file still statically imports `node-pty`. The driver dies on `ERR_MODULE_NOT_FOUND` and the whole daemon fleet never comes back, even though output may already have said "restarting to apply". The curl route drops in the new binary and points the launcher at it without touching the old directory or depending on what npm prunes, which makes it the one reliable way across this boundary. On current (≥3.18) binary installs `botmux upgrade` is equivalent to re-running curl; when you don't remember your install form, curl always works.
+
+## A bot with `cliId: "gemini"` no longer starts?
+
+Gemini CLI has been retired and the `gemini` adapter removed. That bot refuses to start with a hint to switch to Antigravity; other bots keep running. Install `agy` and sign in with a Google account (or set `modelProvider: "gemini"` in `~/.gemini/antigravity-cli/settings.json` and provide `GEMINI_API_KEY`), then change `cliId` to `"antigravity"` (in `bots.json` or with `botmux setup`) and run `botmux restart`. The old `cliPathOverride` / `wrapperCli` (e.g. `ttadk gemini`), Gemini `model` names and `GEMINI_CLI_HOME` do not carry over. See [Gemini CLI has been removed](/en/adapters#gemini-cli-has-been-removed).
 
 ## CoCo loses messages while busy?
 

@@ -10,7 +10,7 @@ source_of_truth: package.json、bun.lock、.github/workflows/、scripts/ 与 tes
 
 ## 工具链事实
 
-- `package.json` 将包管理器固定为 Bun `1.4.2`，`.github/workflows/` 使用相同编译版本。
+- `package.json` 将包管理器固定为 Bun `1.4.3`，`.github/workflows/` 使用相同编译版本。
 - `trustedDependencies` 刻意只含 `electron`、`node-pty`；未经单独评审不得删除、扩展或替换。
 - canonical 安装命令是 `bun install --frozen-lockfile`。绝不在 worktree 执行 `bun install`：共享或软链 `node_modules` 可能被删除，或被另一 checkout 静默覆盖版本。
 - 分支改动 `package.json` 或 lockfile 时，只能在 worktree 外解决依赖，例如 canonical checkout 或 CI；不能用 worktree install 规避。

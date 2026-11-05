@@ -1,3 +1,5 @@
+import { CHAT_MODE_SCENARIOS, type ChatModeScenario } from './chat-mode-scenarios.js';
+
 type Hook = () => void | Promise<void>;
 type TestBody = () => void | Promise<void>;
 
@@ -13,17 +15,24 @@ interface RegisteredSuite {
   tests: RegisteredTest[];
 }
 
-export const FEISHU_SCENARIOS = [
+const BASE_SCENARIOS = [
   'bot-aiden-basic',
   'bot-claude-basic',
   'bot-coco-basic',
   'bot-codex-basic',
   'bot-codex-prompt',
   'bot-opencode-basic',
+  'bot-pi-basic',
+  'bot-ohmypi-basic',
+  'bot-kimi-basic',
+  'bot-antigravity-basic',
+  'bot-grok-basic',
   'bot-reply-smoke',
   'bot-collaboration',
   'card-lifecycle',
   'consecutive-messages',
+  'conversation-follow-up',
+  'thread-status-close',
   'group-without-mention',
   'group-single-mention',
   'group-topic-reply',
@@ -31,7 +40,11 @@ export const FEISHU_SCENARIOS = [
   'private-topic-reply',
   'scheduled-task-thread',
   'web-terminal',
+  'sandbox-file-isolation',
+  'traex-ambient-continuity',
 ] as const;
+
+export const FEISHU_SCENARIOS = [...BASE_SCENARIOS, ...CHAT_MODE_SCENARIOS] as const;
 
 export type FeishuScenario = (typeof FEISHU_SCENARIOS)[number];
 
@@ -41,7 +54,7 @@ interface ScenarioTarget {
   test: string;
 }
 
-const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
+const BASE_TARGETS: Record<(typeof BASE_SCENARIOS)[number], ScenarioTarget> = {
   'bot-aiden-basic': {
     module: 'feishu-bot-aiden.e2e.ts',
     suite: 'Aiden basic flow',
@@ -72,6 +85,31 @@ const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
     suite: 'OpenCode basic flow',
     test: 'sends hello, receives streaming card and actual reply from OpenCode',
   },
+  'bot-pi-basic': {
+    module: 'feishu-bot-pi.e2e.ts',
+    suite: 'Pi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Pi',
+  },
+  'bot-ohmypi-basic': {
+    module: 'feishu-bot-ohmypi.e2e.ts',
+    suite: 'OhMyPi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from OhMyPi',
+  },
+  'bot-kimi-basic': {
+    module: 'feishu-bot-kimi.e2e.ts',
+    suite: 'Kimi basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Kimi',
+  },
+  'bot-antigravity-basic': {
+    module: 'feishu-bot-antigravity.e2e.ts',
+    suite: 'Antigravity basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Antigravity',
+  },
+  'bot-grok-basic': {
+    module: 'feishu-bot-grok.e2e.ts',
+    suite: 'Grok basic flow',
+    test: 'sends hello, receives streaming card and actual reply from Grok',
+  },
   'bot-reply-smoke': {
     module: 'feishu-bot-reply.e2e.ts',
     suite: 'feishu bot reply (smoke test)',
@@ -91,6 +129,16 @@ const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
     module: 'feishu-consecutive-messages.e2e.ts',
     suite: 'consecutive messages',
     test: 'should process 3 rapidly sent messages in sequence',
+  },
+  'conversation-follow-up': {
+    module: 'feishu-conversation.e2e.ts',
+    suite: 'feishu topic conversation',
+    test: 'a follow-up reply in the same topic reaches the same session and its history',
+  },
+  'thread-status-close': {
+    module: 'feishu-conversation.e2e.ts',
+    suite: 'feishu topic commands',
+    test: '/status reports the live session and /close ends it',
   },
   'group-without-mention': {
     module: 'feishu-group-mention.e2e.ts',
@@ -127,6 +175,30 @@ const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
     suite: 'feishu web terminal',
     test: 'web terminal opens from the current streaming card',
   },
+  'sandbox-file-isolation': {
+    module: 'feishu-sandbox.e2e.ts',
+    suite: 'sandbox file isolation',
+    test: 'hides the home directory and the harness secrets and keeps writes inside the working directory',
+  },
+  'traex-ambient-continuity': {
+    module: 'feishu-traex-ambient.e2e.ts',
+    suite: 'TraeX ambient mode continuity',
+    test: 'answers every un-@ message across consecutive turns without wedging',
+  },
+};
+
+// feishu-chat-modes.e2e.ts registers one suite and one case per scenario,
+// both named after it.
+const CHAT_MODE_TARGETS = Object.fromEntries(
+  CHAT_MODE_SCENARIOS.map((scenario) => [
+    scenario,
+    { module: 'feishu-chat-modes.e2e.ts', suite: scenario, test: scenario },
+  ]),
+) as Record<ChatModeScenario, ScenarioTarget>;
+
+const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
+  ...BASE_TARGETS,
+  ...CHAT_MODE_TARGETS,
 };
 
 let collectingSuites: RegisteredSuite[] | undefined;

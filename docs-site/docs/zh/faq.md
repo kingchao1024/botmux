@@ -38,7 +38,7 @@ botmux 权限分两层（完整分层见 [权限与授权](/permissions)，速�
 
 ### C. 终端有输出但没发飞书
 
-**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Gemini / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
+**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Antigravity / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
 
 > ⚠️ **例外：`codex-app`（Codex App app-server 协议）**——它的最终 assistant message 由 botmux **自动转发**回飞书，**常规回复不要调 `botmux send`**（否则会重复发送），仅在中途主动推送 / 发附件 / 跨 bot @ 时才用。
 
@@ -84,6 +84,19 @@ botmux 权限分两层（完整分层见 [权限与授权](/permissions)，速�
 ## daemon 重启会丢上下文吗？
 
 装了 **tmux** 就不会——tmux 是默认后端，CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。⚠️ 没装 tmux **不会自动降级 pty**，而是硬拦截弹卡让你装 tmux；只有显式 `BACKEND_TYPE=pty`（或 per-bot `backendType:"pty"`）才用 pty，且 pty 会话**不跨 daemon 重启存活**、重启会重载。
+
+## CLI 中途被重启，进行中的工作会怎样？
+
+CLI 进程意外退出（崩溃、tmux server 掉线等）后，botmux 会在同一 worker 内用原上下文重新拉起它，并读旧进程留下的 transcript，看有没有被打断的工作：
+
+- **上一轮还没做完**（例如复审跑到一半）；
+- **后台任务随旧进程一起被终止**（Claude Code 的 `run_in_background` 命令、Monitor、后台子代理）。
+
+有的话，恢复后的 CLI 会先收到一条简短说明（重启过、哪些后台任务中断了、请核对后继续），话题里也会出现一次提示。挂起或 daemon 重启后冷启动时同样检查（这时没有旧进程结束时刻的记录，空闲会话里在终端手动停掉的后台任务也可能被当成中断报出），说明放在下一条消息前面一起交给 CLI（Pi 这类把首条消息放进启动参数的 CLI 无法前置，只发话题提示）。判断只看 transcript，不读屏幕；目前覆盖 Claude Code 和 Pi、Codex 等结构化 transcript 的 CLI（后者只判断回合）。没有被打断的工作就什么都不发。
+
+重启前收到、还没送进 CLI 的消息也不会悄悄丢掉：首条消息作为启动参数交给 CLI、CLI 还没开始处理就退出的，重启后会重新输入一次；daemon 重启时还排在队列里的消息，由同一会话的下一个 worker 补投（若这次重启恰好又带了一条新消息、且 CLI 以启动参数接收首条消息，新消息先执行）。超过 24 小时的不再补投，改为在话题里说明没送达；补投途中又遇到重启、无法确认是否送达的，同样在话题里说明。反过来，已经送进 CLI、CLI 自己的记录也显示开始处理的消息，重启后不会再输入一遍（以前会让 CLI 把同一件事重做一轮），而是用上面的说明提醒它接着做；只有重启后只能开新会话、旧上下文不在了的情况，才会重新输入。
+
+另外，主回合已结束、但还有后台任务在跑的会话（卡片显示「⏳ 主回合已结束 · 后台子任务运行中（N）」）不会被活跃会话上限或空闲超时自动挂起：挂起会杀掉这些任务，冷启动也没法让它们回来。
 
 ## 会话不关会一直跑吗？有自动回收吗？
 
@@ -181,6 +194,10 @@ curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh 
 ### 为什么 v3.18.0 之前的老版本不能用 npm 升级？
 
 v3.18.0 起 npm 包从「Node + `dist/` 源码」改成**平台二进制子包**，`node-pty` 移出了依赖。老版本自带的 `botmux upgrade` 当时就是交回 npm；npm 跨这个边界安装时会把旧目录里的 `node-pty` 清掉，而旧 daemon 重启的第一步仍是 `node …/dist/cli.js restart`——该文件仍静态 import `node-pty`，于是 `ERR_MODULE_NOT_FOUND`、重启驱动死掉、整个 daemon 舰队起不回来（输出里却可能已经提示「正在重启以应用更新」）。curl 直接落新二进制并让启动器指向它，不经过旧目录、也不看 npm 怎么剪依赖，是跨这个边界唯一稳妥的方式。≥3.18 的二进制安装上 `botmux upgrade` 与重跑 curl 等价；不确定自己是什么安装形态时，统一用 curl 即可。
+
+## 原来 `cliId: "gemini"` 的 bot 起不来？
+
+Gemini CLI 已下线，`gemini` 适配器已移除。这个 bot 会拒绝启动并提示改用 Antigravity，其它 bot 照常运行。装好 `agy` 并用 Google 账号登录（或在 `~/.gemini/antigravity-cli/settings.json` 设 `modelProvider: "gemini"` 并提供 `GEMINI_API_KEY`），再把 `cliId` 改成 `"antigravity"`（改 `bots.json` 或用 `botmux setup`），然后 `botmux restart`。原来的 `cliPathOverride` / `wrapperCli`（如 `ttadk gemini`）、Gemini `model` 名、`GEMINI_CLI_HOME` 不会沿用。详见 [Gemini CLI 已下线](/adapters#gemini-cli-已下线)。
 
 ## CoCo 忙时发消息丢失？
 

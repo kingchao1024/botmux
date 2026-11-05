@@ -78,7 +78,7 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 | `requestId` | | Your request id; recorded in the trigger audit log |
 | `receivedAt` | | When the upstream received the event |
 
-> ⚠️ **`source.type` is not validated at all** — any string passes. Only two values change behavior: `headless` (the local-CLI headless branch, which renders a different prompt block) and `vc_meeting` (compact event-JSON rendering). For ordinary external callers, **always send `"webhook"`**; do not expect other values to do anything.
+> ⚠️ **`source.type` is enum-validated**: only the six values in the table above are accepted (`webhook` / `ui` / `workflow` / `schedule` / `vc_meeting` / `headless`); any other string, including a typo, is rejected at the edge with 400 `bad_request`. Only two values change behavior: `headless` (the local-CLI headless branch, which renders a different prompt block) and `vc_meeting` (compact event-JSON rendering). Ordinary external callers should **always send `"webhook"`**.
 
 ### 3.2 `target`
 
@@ -102,6 +102,8 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 | `rawText` | | Raw text |
 
 **`envelope.trusted` must be `false`** by design: it declares "the envelope below is untrusted external data", which is what makes the daemon wrap the whole envelope in `<botmux_external_event trusted="false">` and explicitly tell the model not to execute instructions smuggled inside it. **Put what you actually want done in the top-level `instruction`** — it is rendered as `<botmux_task trusted="true">` above the event data.
+
+> Exception: when a webhook connector turns on "[Treat event content as trusted instructions](/en/webhook#treat-event-content-as-trusted-instructions-optional-off-by-default)", the Dashboard adds top-level `payloadTrusted: true` to the forwarded request (`envelope.trusted` stays `false`) and the daemon renders the event data as a trusted task. The field is only accepted with `source.type: "webhook"` and `target.kind: "turn"`; any other combination is a 400. Direct `/api/trigger` callers don't need it — put the work in `instruction`.
 
 ### 3.4 `presentation` (optional; controls how it looks in Feishu)
 
@@ -136,7 +138,7 @@ Details for `model` / `reasoningEffort`:
 - `model` is that CLI's model id. `reasoningEffort` is validated against the CLI/model capability; when unconfigured or unknown only the common safe tiers are allowed, and an explicitly unsupported value is a 400.
 - **New sessions only**: a follow-up turn folded into a live worker does not rewrite them.
 - `model` **lives in memory only, never on disk**: after a daemon restart the session starts on the bot's configured model. `reasoningEffort` is still persisted with the session.
-- Both fields are ignored when the target bot is not codex / codex-app / traex / grok (they never change the model of Claude / Gemini / CoCo and friends).
+- Both fields are ignored when the target bot is not codex / codex-app / traex / grok (they never change the model of Claude / Antigravity / CoCo and friends).
 
 **⚠️ Three trap fields (present in the type, but not what you think)**
 
@@ -709,7 +711,7 @@ Robustness notes (all straight from the measured contract):
 
 - **`chat_not_allowed` maps to 500 on this endpoint** (§11.3), inconsistent with the webhook connector's 403.
 
-- **`source.type` is not validated** (§3.1); `envelope.format`, `options.dedupKey` and `options.status` have no readers (§3.5).
+- **`envelope.format`, `options.dedupKey` and `options.status` have no readers** (§3.5). `source.type` is no longer in this category: it is enum-validated and an unknown value gets 400 (§3.1).
 
 ---
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { builtinSkillContent } from '../src/skills/injection-mode.js';
 
 import {
   buildWorkflowGrillPrompt,
@@ -36,10 +37,19 @@ describe('v3 /workflow grill entry', () => {
     expect(parseWorkflowGrillTrigger('/template run old')).toBeNull();
   });
 
-  it('builds the skill-directed prompt', () => {
+  it('builds a prompt whose on-demand skill command really resolves the workflow skill', () => {
     const prompt = buildWorkflowGrillPrompt('调研三家竞品');
-    expect(prompt).toContain('botmux-workflow');
     expect(prompt).toContain('调研三家竞品');
+    // The workflow skill is no longer resident in the session, so the rewritten
+    // `/workflow` prompt is the only thing that can lead the agent to it.
+    const shown = [...prompt.matchAll(/botmux skill show ([a-z0-9-]+)/g)].map((m) => m[1]!);
+    expect(shown).toEqual(['botmux-workflow']);
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      expect(builtinSkillContent(shown[0]!)).toContain('name: botmux-workflow');
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
   });
 
   it('births one exact chat-bound run for a retried Lark message', () => {

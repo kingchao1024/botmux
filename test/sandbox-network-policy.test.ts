@@ -1,24 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { parseSandboxNetworkPolicy, networkZone, networkPolicyAllows, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, type NetworkMode } from '../src/core/sandbox-network-policy.js';
+import { parseSandboxNetworkPolicy, networkZone, compileNetworkNft, addressMatches, networkPolicySupportError, networkProxyError, networkPolicyWarnings, hostDnsServers, proxyEnvKeys } from '../src/core/sandbox-network-policy.js';
 import { networkSocketFilter } from '../src/core/sandbox-network-launch.js';
 import { workflowSandboxInitFields } from '../src/workflows/shared/sandbox-policy.js';
 
 const base = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
-const modes: NetworkMode[] = ['allow', 'block', 'allowlist', 'denylist'];
 describe('network policy', () => {
-  for (const publicMode of modes) for (const privateMode of modes) {
-    it(`${publicMode}/${privateMode} are independent`, () => {
-      const p = parseSandboxNetworkPolicy({ version: 1,
-        public: { mode: publicMode, ...(['allowlist', 'denylist'].includes(publicMode) ? { rules: [{ cidr: '8.8.8.8', protocol: 'tcp', ports: [443] }] } : {}) },
-        private: { mode: privateMode, ...(['allowlist', 'denylist'].includes(privateMode) ? { rules: [{ cidr: '10.1.2.3', protocol: 'tcp', ports: [443] }] } : {}) },
-      });
-      for (const [ip, mode] of [['8.8.8.8', publicMode], ['10.1.2.3', privateMode]] as const) {
-        expect(networkPolicyAllows(p, ip, 'tcp', 443)).toBe(mode === 'allow' || mode === 'allowlist');
-        expect(networkPolicyAllows(p, ip, 'udp', 443)).toBe(mode === 'allow' || mode === 'denylist');
-        expect(networkPolicyAllows(p, ip, 'tcp', 444)).toBe(mode === 'allow' || mode === 'denylist');
-      }
-    });
-  }
   it.each(['10.0.0.1','127.0.0.1','169.254.0.1','100.64.0.1','192.168.1.1','198.18.0.1','224.0.0.1','0.0.0.0','255.255.255.255','::1','::','fe80::1','fc00::1','ff02::1','2001:db8::1','2002::1','64:ff9b::a00:1','::ffff:127.0.0.1','3fff::1'])('special/private %s', ip => expect(networkZone(ip)).toBe('private'));
   it.each(['8.8.8.8','1.1.1.1','2606:4700:4700::1111','::ffff:8.8.8.8'])('public %s', ip => expect(networkZone(ip)).toBe('public'));
   it('normalizes CIDR and IPv4 mappings', () => {
@@ -33,10 +19,6 @@ describe('network policy', () => {
     { ...base, private: { mode: 'denylist', rules: [{ cidr: '::/0', protocol: 'icmp' }] } },
     { ...base, dnsServers: ['10.0.2.3'] }, { ...base, dnsServers: ['::1'] },
   ])('rejects invalid or unsupported policies %#', raw => expect(() => parseSandboxNetworkPolicy(raw)).toThrow());
-  it('empty lists have explicit inverse semantics', () => {
-    expect(networkPolicyAllows(parseSandboxNetworkPolicy({ ...base, public: { mode: 'allowlist', rules: [] } }), '8.8.8.8', 'tcp', 443)).toBe(false);
-    expect(networkPolicyAllows(parseSandboxNetworkPolicy({ ...base, public: { mode: 'denylist', rules: [] } }), '8.8.8.8', 'tcp', 443)).toBe(true);
-  });
   it('freezes workflow policy with no shared mutable lists', () => {
     const policy = parseSandboxNetworkPolicy({ ...base, private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8' }] } });
     const init = workflowSandboxInitFields({ sandbox: true, sandboxNetworkPolicy: policy });
@@ -117,4 +99,48 @@ describe('network policy', () => {
     expect(snapshot.sandboxNetworkPolicy?.proxyMode).toBe('trusted-egress');
   });
   it('unknown socket syscall ABI fails closed', () => expect(() => networkSocketFilter('ia32')).toThrow());
+  it('names the launch the policy cannot run on', () => {
+    // The worker reports the session's real backend, which can differ from what the save-time check saw.
+    for (const backendType of ['tmux', 'zellij', 'riff']) {
+      expect(networkPolicySupportError({ platform: 'linux', backendType, sandbox: true, policy: base })).toContain(backendType);
+    }
+    expect(networkPolicySupportError({ platform: 'linux', backendType: 'tmux', sandbox: true, policy: base, adopt: true })).toContain('adopt');
+    expect(networkPolicySupportError({ platform: 'linux', backendType: 'pty', sandbox: 'scratch', policy: base })).toContain('scratch');
+    expect(networkPolicySupportError({ platform: 'darwin', backendType: 'pty', sandbox: true, policy: base })).toContain('darwin');
+  });
+  it('names the proxy variables it refuses, never their values', () => {
+    const message = networkProxyError(parseSandboxNetworkPolicy(base), { HTTPS_PROXY: 'http://user:secret@proxy.example:8080', all_proxy: 'socks5://x', NO_PROXY: '*' })!;
+    expect(message).toContain('HTTPS_PROXY');
+    expect(message).toContain('all_proxy');
+    expect(message).not.toContain('secret');
+    expect(message).not.toContain('NO_PROXY');
+    expect(proxyEnvKeys({ HTTP_PROXY: 'x', https_proxy: '', NO_PROXY: '*' })).toEqual(['HTTP_PROXY']);
+  });
+  it.each([
+    [{ public: { mode: 'allow' }, private: { mode: 'allow' } }, {}, ['dns_servers_missing']],
+    [{ public: { mode: 'allow' }, private: { mode: 'block' } }, {}, ['dns_servers_missing']],
+    [{ public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] }, {}, []],
+    [{ public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] }, { https_proxy: 'http://p:1' }, ['proxy_requires_trusted_egress']],
+    [{ public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'], proxyMode: 'trusted-egress' }, { https_proxy: 'http://p:1' }, []],
+    [{ public: { mode: 'allow' }, private: { mode: 'allow' } }, { HTTP_PROXY: 'http://p:1' }, ['dns_servers_missing']],
+  ])('warns about policies that cannot work as configured %#', (zones, env, expected) => {
+    // Any policy replaces resolv.conf with dnsServers alone, allow/allow included.
+    expect(networkPolicyWarnings(parseSandboxNetworkPolicy({ version: 1, ...zones }), env)).toEqual(expected);
+  });
+  it('suggests host nameservers the sandbox can actually reach', () => {
+    const files = (map: Record<string, string>) => (path: string) => { if (path in map) return map[path]!; throw new Error('ENOENT'); };
+    expect(hostDnsServers(files({ '/etc/resolv.conf': 'domain x\nnameserver 10.199.34.255\n  nameserver 2001:4860:4860::8888\n#nameserver 9.9.9.9\nnameserver 10.199.34.255\n' })))
+      .toEqual(['10.199.34.255', '2001:4860:4860::8888']);
+    // systemd-resolved stub: loopback is the sandbox's own, so use the upstream list.
+    expect(hostDnsServers(files({
+      '/etc/resolv.conf': 'nameserver 127.0.0.53\noptions edns0\n',
+      '/run/systemd/resolve/resolv.conf': 'nameserver 192.168.1.1\nnameserver fe80::1%eth0\n',
+    }))).toEqual(['192.168.1.1']);
+    expect(hostDnsServers(files({ '/etc/resolv.conf': 'nameserver 127.0.0.53\n' }))).toEqual([]);
+    expect(hostDnsServers(files({}))).toEqual([]);
+    // Every suggestion is accepted by the policy parser.
+    const many = Array.from({ length: 12 }, (_, i) => `nameserver 10.0.0.${i + 1}`).join('\n');
+    const suggested = hostDnsServers(files({ '/etc/resolv.conf': many }));
+    expect(parseSandboxNetworkPolicy({ ...base, dnsServers: suggested }).dnsServers).toEqual(suggested);
+  });
 });

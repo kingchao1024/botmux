@@ -42,7 +42,7 @@ function releaseSnapshot(): Record<string, unknown> {
     remoteRef: 'refs/remotes/origin/main',
     remoteCommitSha: '1'.repeat(40),
     worktreeClean: true,
-    bunVersion: '1.4.2',
+    bunVersion: '1.4.3',
     buildToolchainHash: '9'.repeat(64),
     artifactPath: '/srv/next',
     artifactTreeHash: '3'.repeat(64),

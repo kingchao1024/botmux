@@ -52,6 +52,11 @@ export interface OnlineDaemonInfo {
   receiptAuthorityActivationEpoch?: string;
   /** Exact graceful-shutdown protocol armed by this daemon generation. */
   supervisorShutdownProtocol?: string;
+  /** Internal target-authoritative dispatch launch protocol. */
+  dispatchLaunchIpcProtocol?: 'v1';
+  /** Applies a workflow run's Gate-2 working dir to its node sessions
+   *  (design 2026-11-03 §15.4). Absent = an older daemon that ignores it. */
+  workflowNodeWorkingDir?: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
   sessionStoreProtocol?: string;
   /** Running binary version. Copy only; never compared by size. */
@@ -75,6 +80,8 @@ export interface DaemonDescriptorPublication {
 }
 
 export interface DaemonDiscoveryOptions {
+  /** Refuse an unreadable registry instead of treating it as an empty fleet. */
+  strict?: boolean;
   registryDir?: string;
   now?: number;
   processStart?: (pid: number) => string | undefined;
@@ -384,6 +391,10 @@ function parseDescriptor(
     ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
       ? { workflowIpcProtocol: d.workflowIpcProtocol }
       : {}),
+    ...(d.dispatchLaunchIpcProtocol === 'v1'
+      ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
+      : {}),
+    ...(d.workflowNodeWorkingDir === 'v1' ? { workflowNodeWorkingDir: d.workflowNodeWorkingDir } : {}),
     // 上游新增能力字段（8271df51 会话库协议收口）：透传给 dashboard 的版本/
     // 协议展示与升级可见性，fork 的 generation 发现架构不能把它们吃掉。
     ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
@@ -428,14 +439,16 @@ function candidateFreshness(left: DaemonCandidate, right: DaemonCandidate): numb
 
 function readDaemonCandidates(options: DaemonDiscoveryOptions): DaemonCandidate[] {
   const directory = options.registryDir ?? registryDir();
-  if (!existsSync(directory)) return [];
   const now = options.now ?? Date.now();
   const readStart = options.processStart ?? readSupervisorProcessStartIdentity;
   const exists = options.processExists ?? processExists;
   const processOpaque = options.processVisibility === 'opaque';
   const cleanupStale = processOpaque ? false : options.cleanupStale ?? true;
   let names: string[];
-  try { names = readdirSync(directory).sort(); } catch { return []; }
+  try { names = readdirSync(directory).sort(); } catch (error) {
+    if (options.strict && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return [];
+  }
   const candidates: DaemonCandidate[] = [];
 
   for (const fileName of names) {
@@ -558,8 +571,9 @@ function normalizeDiscoveryOptions(
 /** List every live process generation; same-App predecessors are preserved. */
 export function listOnlineDaemons(
   options: DaemonDiscoveryOptions | string = {},
+  opts: { strict?: boolean } = {},
 ): OnlineDaemonInfo[] {
-  return readDaemonCandidates(normalizeDiscoveryOptions(options))
+  return readDaemonCandidates({ ...normalizeDiscoveryOptions(options), ...opts })
     .map(candidate => candidate.daemon);
 }
 

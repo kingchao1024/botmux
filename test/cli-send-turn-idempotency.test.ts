@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,11 +11,14 @@ import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const repo = fileURLToPath(new URL('..', import.meta.url));
 
-function createFixture(topicUnavailablePolicy?: 'stop', session: Record<string, unknown> = {}) {
+function createFixture(
+  topicUnavailablePolicy?: 'stop',
+  session: Record<string, unknown> = {},
+  turnId = 'om_turn_idempotency',
+) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-turn-idempotency-'));
   const dataDir = join(root, 'data');
   const sessionId = 'sid_turn_idempotency';
-  const turnId = 'om_turn_idempotency';
   mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
   writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId, turnId }));
   writeFileSync(join(root, 'bots.json'), JSON.stringify([{
@@ -41,7 +45,8 @@ function createFixture(topicUnavailablePolicy?: 'stop', session: Record<string, 
       cwd: repo,
       env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir,
         BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: sessionId, BOTMUX_TURN_ID: turnId,
-        BOTMUX_LARK_APP_ID: 'cli_test', ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}) },
+        BOTMUX_LARK_APP_ID: 'cli_test', BOTMUX_TEST_ALLOW_IMAGE_UPLOAD: '1',
+        ...(topicUnavailablePolicy ? { BOTMUX_TEST_TOPIC_STATE: topicState } : {}) },
       encoding: 'utf8', timeout: 30_000,
     });
     const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='));
@@ -214,6 +219,82 @@ describe('botmux send per-turn final idempotency', () => {
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
 
+  it('replays an image-only final after the relay restages identical bytes', () => {
+    const f = createFixture();
+    const firstImage = join(f.root, 'relay-attempt-1.png');
+    const retryImage = join(f.root, 'relay-attempt-2.png');
+    writeFileSync(firstImage, 'same-image-bytes');
+    writeFileSync(retryImage, 'same-image-bytes');
+    try {
+      const first = f.run('final', '', ['--images', firstImage]);
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+
+      const retry = f.run('final', '', ['--images', retryImage]);
+      expect(retry.result.status, String(retry.result.stderr)).toBe(0);
+      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+        messageId: 'om_separate_message', replayed: true,
+      });
+      expect(retry.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('refuses an image-only final retried with different bytes instead of replaying success', () => {
+    const f = createFixture();
+    const firstImage = join(f.root, 'relay-attempt-1.png');
+    const otherImage = join(f.root, 'relay-attempt-2.png');
+    writeFileSync(firstImage, 'first-image-bytes');
+    writeFileSync(otherImage, 'other-image-bytes');
+    try {
+      expect(f.run('final', '', ['--images', firstImage]).result.status).toBe(0);
+
+      // Byte identity is what makes a restaged retry replayable; it must not
+      // degrade into "any image replays", which would silently drop a genuinely
+      // different picture a second final attempt was trying to deliver.
+      const changed = f.run('final', '', ['--images', otherImage]);
+      expect(changed.result.status).toBe(2);
+      expect(String(changed.result.stderr)).toContain('本次请求的目标、提及或附件与已投递请求不同');
+      expect(changed.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('rejects a FIFO passed as --images on a durable final instead of hanging on the second read', () => {
+    const f = createFixture();
+    const fifo = join(f.root, 'pipe.png');
+    try { execFileSync('mkfifo', [fifo], { stdio: 'ignore' }); }
+    catch { rmSync(f.root, { recursive: true, force: true }); return; } // mkfifo unavailable — skip
+    // One-shot writer blocks until the reader opens the FIFO — the same shape
+    // as shell process substitution <(...). It is killed if send never opens it.
+    const writer = spawn('sh', ['-c', `printf png-bytes > '${fifo}'`], { stdio: 'ignore' });
+    try {
+      const start = Date.now();
+      const r = f.run('final', '', ['--images', fifo]);
+      const ms = Date.now() - start;
+      expect(r.result.status, String(r.result.stderr)).toBe(1);
+      expect(String(r.result.stderr)).toContain('不是普通文件');
+      expect(r.requests).toHaveLength(0);
+      // Without the regular-file gate send blocks in uploadImage's second read
+      // of the one-shot FIFO and only dies on the spawn timeout (30s).
+      expect(ms).toBeLessThan(10_000);
+    } finally {
+      writer.kill('SIGKILL');
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it('reports a directory passed as --images with the regular-file error instead of an uncaught stack', () => {
+    const f = createFixture();
+    const dir = join(f.root, 'adir.png');
+    mkdirSync(dir);
+    try {
+      const r = f.run('final', '', ['--images', dir]);
+      expect(r.result.status, String(r.result.stderr)).toBe(1);
+      expect(String(r.result.stderr)).toContain('不是普通文件');
+      expect(String(r.result.stderr)).not.toContain('triggerUncaughtException');
+      expect(r.requests).toHaveLength(0);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
   it('refuses the same final body with a new attachment instead of silently dropping it', () => {
     const f = createFixture();
     const attachment = join(f.root, 'supplement.md');
@@ -278,6 +359,69 @@ describe('botmux send per-turn final idempotency', () => {
       expect(markerAfter.turnId).toBe('om_turn_2');
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 30_000);
+
+  it('keeps a scheduled turn current when first-final cleanup cannot reach its daemon', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const f = createFixture(undefined, { scope: 'chat' }, scheduledTurn);
+    try {
+      const markerPath = join(f.dataDir, '.botmux-cli-pids', String(process.pid));
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: f.sessionId,
+        turnId: scheduledTurn,
+        queuedTurns: [{ turnId: 'om_turn_2' }],
+      }));
+
+      const first = f.run('final', 'scheduled answer', ['--schedule-remove-self']);
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+      expect(String(first.result.stderr)).toContain('当前 turn 已保留');
+      const receipt = String(first.result.stdout).split('\n')
+        .findLast(line => line.startsWith('{'));
+      expect(JSON.parse(receipt!)).toMatchObject({
+        scheduleSelfCleanup: {
+          requested: true,
+          taskId: 'a1b2c3d4',
+          removed: false,
+        },
+      });
+      const markerAfter = JSON.parse(readFileSync(markerPath, 'utf8'));
+      expect(markerAfter.turnId).toBe(scheduledTurn);
+      expect(markerAfter.queuedTurns).toEqual([{ turnId: 'om_turn_2' }]);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
+
+  it('keeps a scheduled turn current when replayed final cleanup cannot reach its daemon', () => {
+    const scheduledTurn = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const f = createFixture(undefined, { scope: 'chat' }, scheduledTurn);
+    try {
+      const first = f.run('final', 'scheduled answer');
+      expect(first.result.status, String(first.result.stderr)).toBe(0);
+      expect(first.requests).toHaveLength(1);
+
+      const markerPath = join(f.dataDir, '.botmux-cli-pids', String(process.pid));
+      writeFileSync(markerPath, JSON.stringify({
+        sessionId: f.sessionId,
+        turnId: scheduledTurn,
+        queuedTurns: [{ turnId: 'om_turn_2' }],
+      }));
+
+      const retry = f.run('final', 'scheduled answer', ['--schedule-remove-self']);
+      expect(retry.result.status, String(retry.result.stderr)).toBe(0);
+      expect(retry.requests).toHaveLength(0);
+      expect(String(retry.result.stderr)).toContain('当前 turn 已保留');
+      expect(JSON.parse(String(retry.result.stdout).trim())).toMatchObject({
+        replayed: true,
+        scheduleSelfCleanup: {
+          requested: true,
+          taskId: 'a1b2c3d4',
+          removed: false,
+        },
+      });
+      const markerAfter = JSON.parse(readFileSync(markerPath, 'utf8'));
+      expect(markerAfter.turnId).toBe(scheduledTurn);
+      expect(markerAfter.queuedTurns).toEqual([{ turnId: 'om_turn_2' }]);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }, 40_000);
 
   it('promotes auxiliary to final and quotes queued turn when active turn has delivered final and successor has not', () => {
     const f = createFixture(undefined, {

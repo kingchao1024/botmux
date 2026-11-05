@@ -13,6 +13,8 @@
 
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { openSync, closeSync, mkdirSync } from 'node:fs';
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
+import { resolveBotmuxDataDir } from './data-dir.js';
 import { join } from 'node:path';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { rotateLogIfNeeded, logSizeExceedsThreshold, type LogRotationOptions, DEFAULT_LOG_ROTATION } from './log-rotation.js';
@@ -577,6 +579,16 @@ export class FleetSupervisor {
       this.startupAdmissionTimers.delete(spec.name);
     }
     const entry = spec.entry ?? 'daemon';
+    if (!spec.external && entry === 'daemon' && feedbackMaintenanceActive(resolveBotmuxDataDir({ env: this.opts.daemonEnv }))) {
+      this.log(`feedback maintenance: deferred ${spec.name}`);
+      const timer = setTimeout(() => {
+        this.restartTimers.delete(spec.name);
+        this.spawnBot(spec, isRestart);
+      }, 1000);
+      timer.unref();
+      this.restartTimers.set(spec.name, timer);
+      return;
+    }
     // An external member (a plugin service) runs an arbitrary command instead of
     // one of our entry modules. Everything BELOW this point — logs, state,
     // restart budget, graceful stop — is shared verbatim; only the command and
@@ -1057,7 +1069,7 @@ export class FleetSupervisor {
    *  residual risk. This is visibility-only. */
   private checkActiveLogSizes(rotation: LogRotationOptions): void {
     if (!this.opts.logDir) return;
-    for (const [name, logBase] of this.childLogBases) {
+    for (const logBase of this.childLogBases.values()) {
       for (const suffix of ['-out.log', '-err.log']) {
         const path = join(this.opts.logDir, `${logBase}${suffix}`);
         if (logSizeExceedsThreshold(path, rotation)) {

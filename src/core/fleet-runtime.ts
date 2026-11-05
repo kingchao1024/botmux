@@ -24,6 +24,7 @@ import { resolveDaemonEnv } from '../cli/daemon-lifecycle-env.js';
 import { scrubDetachedRestartEnvRefresh } from './restart-env-refresh.js';
 import type { RestartEnvFallback } from './restart-env-refresh.js';
 import { stripDashboardH5Env } from '../utils/child-env.js';
+import { scrubSessionTempEnv } from './session-temp.js';
 import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
 import { resolveBotsConfigFile } from './config-dir.js';
 import { readDeviceIsolationRosterSnapshot } from '../services/device-isolation-roster.js';
@@ -37,6 +38,7 @@ import {
   validateFleetLaunchPlan,
   type FleetLaunchPlan,
 } from './fleet-launch-plan.js';
+import { findRetiredCliBots } from '../adapters/cli/retired-cli.js';
 import {
   inspectFleetProcess,
   signalAttestedFleetProcess,
@@ -168,6 +170,7 @@ export function resolveFleetDaemonEnv(
   };
   scrubDetachedRestartEnvRefresh(env);
   stripDashboardH5Env(env);
+  scrubSessionTempEnv(env);
   //
   // MIGRATION-CRITICAL: pin SESSION_DATA_DIR for every supervised child. The old
   // pm2 ecosystem injected `SESSION_DATA_DIR: DATA_DIR` into both the bot daemons
@@ -215,6 +218,9 @@ export function resolveFleetDaemonEnv(
  * resolveFleetMembers(), so operators retain a recovery surface. */
 export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotSpec[] {
   const cyclicAppIds = new Set(findQuotaFallbackCycles(list as any[]).flat());
+  // Rows on a removed CLI (gemini) are not started either: their daemon would
+  // only exit on the same notice in a restart loop (see retired-cli.ts).
+  const retiredIndexes = new Set(findRetiredCliBots(list).map(bot => bot.index));
   return list.map((b, index) => {
     const bot = (b ?? {}) as { name?: unknown; larkAppId?: unknown };
     return {
@@ -222,7 +228,7 @@ export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotS
       appId: typeof bot.larkAppId === 'string' ? bot.larkAppId : '',
       botIndex: index,
     };
-  }).filter(spec => !cyclicAppIds.has(spec.appId));
+  }).filter(spec => !cyclicAppIds.has(spec.appId) && !retiredIndexes.has(spec.botIndex));
 }
 
 export function resolveFleetBots(planValue?: FleetLaunchPlan): FleetBotSpec[] {

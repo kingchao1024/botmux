@@ -15,12 +15,37 @@
 | `botmux delete <id>` (别名 `del`/`rm`) | 关闭指定会话，支持 ID 前缀匹配 |
 | `botmux delete all` | 关闭所有活跃会话 |
 | `botmux delete stopped` | 清理进程已退出的僵尸会话 |
+| `botmux maintenance suspend-idle --dry-run\|--yes` | 按最后活动时间预览或批量休眠长期空闲会话（默认 7 天） |
 | `botmux dashboard [current\|rotate]` | 获取当前 Dashboard 登录 URL，尚无 token 时创建第一个；`rotate` 才显式替换已有 token |
 
 daemon 在线时，`botmux delete` 会先请求会话所属 daemon 执行与 `/close`
 一致的生命周期收口：移除内存中的活跃会话、持久化关闭状态，并回收
 worker、后端与订阅。仅当所属 daemon 确认不在线时才使用本地收口；在线
 daemon 拒绝或 IPC 连接失败时命令返回失败，不会继续本地强杀。
+
+当 `BOTMUX_COORDINATION_MODE=primary` 时，PostgreSQL 中的 durable Session 才是 canonical truth。此模式下 `delete`、`resume`、非 dry-run 的 `suspend`、`maintenance suspend-idle`，以及交互式 `list` 中的删除/唤醒都会明确拒绝；`list` 仍可只读展示，但会跳过本地自动清理。关闭或恢复请在原话题使用会话卡片，确保操作经过带 fencing 的 durable session-control 通道。
+
+### 多副本下的 Web 终端与「显示/隐藏输出」
+
+primary 模式下，worker 只跑在持有会话的那个副本（owner）上，而飞书回调和浏览器请求可能落到任意副本：
+
+- **「显示/隐藏输出」按钮**：点击进入同一条 durable session-control 通道，由 owner 副本执行并更新原卡片。只有能操作该会话的人点击才会生效；点旧卡片或无权限时会提示改用最新卡片。
+- **Web 终端跨副本转发**：Dashboard 把本副本上有活 worker 的会话发布到共享存储（45 秒过期、定期续写）。请求落到非 owner 副本时，按这条记录转发到 owner 的 Dashboard，只转发一跳；地址必须是 IP 字面量，Cookie、Authorization 与所有 `x-botmux-*` 头都不会跨副本。
+  - `BOTMUX_TERMINAL_ROUTE_HOST`：本副本对其它副本可达的 IP（如 Pod IP），不设置则不发布。
+  - `BOTMUX_TERMINAL_ROUTE_PORT`：其它副本访问本 Dashboard 用的端口（如 NodePort），未设置时用 `BOTMUX_DASHBOARD_PORT`；与实际监听端口不一致时启动日志会告警。
+- **能力边界**：只有自带凭据的**飞书卡片链接**（`?viewToken=` / `?token=`，由 owner 的 worker 校验）可以跨副本使用。Dashboard 工作台内嵌终端（靠登录 Cookie）、触屏动态换链，以及需要写权限的接管，都依赖本副本签发的凭据，跨副本会被 owner 拒绝（403）——这些操作需要落在 owner 副本上（负载均衡按会话粘滞，或直接访问 owner）。
+- 单副本部署（未开启 primary）不发布路由、不转发，以上行为都与之前一致。
+
+## 空闲会话维护
+
+```bash
+botmux maintenance suspend-idle --older-than 7d --dry-run
+botmux maintenance suspend-idle --older-than 7d --yes
+```
+
+`--dry-run` 只读取在线 daemon 的权威运行态，不会修改会话或进程；输出包含会话、Bot、标题、最后活动时间、worker PID、持久后端目标与预计回收的进程类型。执行必须显式传 `--yes`，并通过 daemon 内部的同一 `suspendWorker` 路径完成：先精确销毁持久后端并 post-probe 确认 missing，才把逻辑会话持久化为 active + dormant；下一条消息从 transcript 冷恢复。销毁结果为 `exists` 或 `unknown` 时 fail closed，不会谎报休眠成功。
+
+候选会 fail closed：只选择 worker 已就绪、屏幕明确 idle、后端可恢复且最后活动时间已知的会话；adopt、锁定、待选仓库、排队输入、未结算 dispatch、需要用户处理和正在转移的会话都会跳过。`--bot <appId>` 可限定单个 Bot，`--json` 输出机器可读结果。Dashboard 的 per-bot「空闲自动休眠」配置仍负责周期策略；本命令提供人工预览和批量执行入口。
 
 ## 开机自启
 

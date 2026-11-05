@@ -13,6 +13,7 @@ import type {
   PluginServiceState,
 } from '../types.js';
 import { readPluginCardActionToken } from './auth.js';
+import type { PluginHostPrivileges } from '../commands/protocol.js';
 import {
   buildPluginCardActionRequest,
   parsePluginCardActionResponse,
@@ -37,6 +38,8 @@ export interface PluginCardActionGatewayOptions {
     larkAppId: string,
     askReceiptProvenance?: AskAnswerProvenanceToken,
   ) => unknown | Promise<unknown>;
+  /** Host-computed operator authority forwarded to the plugin. Omitted = field not sent. */
+  resolvePrivileges?: (larkAppId: string, data: CardActionData) => PluginHostPrivileges | Promise<PluginHostPrivileges>;
   readRegistry?: () => PluginRegistryFile;
   readServiceState?: (pluginId: string) => PluginServiceState | undefined;
   readToken?: (pluginId: string) => string;
@@ -145,7 +148,7 @@ export const resolvePluginCardActionRoute = (
   };
 };
 
-const readResponseBodyLimited = async (response: Response, maxBytes: number): Promise<string> => {
+export const readResponseBodyLimited = async (response: Response, maxBytes: number): Promise<string> => {
   const contentLength = Number(response.headers.get('content-length'));
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     await response.body?.cancel().catch(() => {});
@@ -172,7 +175,7 @@ const readResponseBodyLimited = async (response: Response, maxBytes: number): Pr
   return Buffer.concat(chunks.map(chunk => Buffer.from(chunk)), total).toString('utf8');
 };
 
-const assertServicePort = (state: PluginServiceState | undefined, pluginId: string): number => {
+export const assertServicePort = (state: PluginServiceState | undefined, pluginId: string): number => {
   if (state?.pluginId !== pluginId || state.status !== 'online') {
     throw new Error('plugin_card_action_service_offline');
   }
@@ -185,6 +188,7 @@ const assertServicePort = (state: PluginServiceState | undefined, pluginId: stri
 interface ResolvedPluginCardActionGatewayOptions {
   resolvePluginIds: PluginCardActionGatewayOptions['resolvePluginIds'];
   fallback: PluginCardActionGatewayOptions['fallback'];
+  resolvePrivileges: PluginCardActionGatewayOptions['resolvePrivileges'];
   readRegistry: NonNullable<PluginCardActionGatewayOptions['readRegistry']>;
   readServiceState: NonNullable<PluginCardActionGatewayOptions['readServiceState']>;
   readToken: NonNullable<PluginCardActionGatewayOptions['readToken']>;
@@ -201,6 +205,7 @@ const resolveGatewayOptions = (
 ): ResolvedPluginCardActionGatewayOptions => ({
   resolvePluginIds: options.resolvePluginIds,
   fallback: options.fallback,
+  resolvePrivileges: options.resolvePrivileges,
   readRegistry: options.readRegistry ?? readPluginRegistry,
   readServiceState: options.readServiceState ?? readPluginServiceState,
   readToken: options.readToken ?? readPluginCardActionToken,
@@ -211,6 +216,23 @@ const resolveGatewayOptions = (
   responseMaxBytes: boundedLimit(options.responseMaxBytes, PLUGIN_CARD_ACTION_RESPONSE_MAX_BYTES),
   now: options.now ?? Date.now,
 });
+
+const NO_PRIVILEGES: PluginHostPrivileges = Object.freeze({ canOperate: false, canTalk: false });
+
+/** A broken privilege resolver must degrade to "no authority", never to "skip the field". */
+const resolveCardActionPrivileges = async (
+  options: ResolvedPluginCardActionGatewayOptions,
+  larkAppId: string,
+  data: CardActionData,
+): Promise<PluginHostPrivileges | undefined> => {
+  if (!options.resolvePrivileges) return undefined;
+  try {
+    const resolved = await options.resolvePrivileges(larkAppId, data);
+    return { canOperate: resolved.canOperate === true, canTalk: resolved.canTalk === true };
+  } catch {
+    return NO_PRIVILEGES;
+  }
+};
 
 const forwardPluginCardAction = async (
   options: ResolvedPluginCardActionGatewayOptions,
@@ -223,7 +245,8 @@ const forwardPluginCardAction = async (
 ): Promise<PluginCardActionAck | undefined> => {
   const port = assertServicePort(options.readServiceState(record.id), record.id);
   const token = options.readToken(record.id);
-  const payload = JSON.stringify(buildPluginCardActionRequest(data, larkAppId, actionName));
+  const privileges = await resolveCardActionPrivileges(options, larkAppId, data);
+  const payload = JSON.stringify(buildPluginCardActionRequest(data, larkAppId, actionName, privileges));
   const bodyBytes = Buffer.byteLength(payload);
   if (bodyBytes > options.requestMaxBytes) throw new Error('plugin_card_action_request_too_large');
 

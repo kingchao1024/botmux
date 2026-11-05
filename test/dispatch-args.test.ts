@@ -15,7 +15,10 @@ describe('parseDispatchArgs', () => {
       '--brief-file=/tmp/brief.md',
       '--chat-id', 'oc_chat',
       '--repo=/repo',
+      '--model=gpt-6-astra',
+      '--reasoning-effort', 'high',
       '--into', 'om_root',
+      '--result-delivery=publish-and-relay',
       '--session-id=sid',
       '--standby',
       '--steer',
@@ -33,7 +36,10 @@ describe('parseDispatchArgs', () => {
         briefFile: '/tmp/brief.md',
         chatId: 'oc_chat',
         repo: '/repo',
+        model: 'gpt-6-astra',
+        reasoningEffort: 'high',
         into: 'om_root',
+        resultDelivery: 'publish-and-relay',
         sessionId: 'sid',
         standby: true,
         steer: true,
@@ -47,6 +53,11 @@ describe('parseDispatchArgs', () => {
   it('keeps --brief text verbatim', () => {
     const result = parseDispatchArgs(['--title', 't', '--bot-app', 'cli_a', '--brief', '  keep me  ']);
     expect(result).toMatchObject({ ok: true, value: { brief: '  keep me  ' } });
+  });
+
+  it('parses an explicit result delivery mode for downstream validation', () => {
+    expect(parseDispatchArgs(['--result-delivery', 'publish']))
+      .toMatchObject({ ok: true, value: { resultDelivery: 'publish' } });
   });
 
   it('preserves explicit empty values for downstream legacy validation and fallback', () => {
@@ -64,8 +75,6 @@ describe('parseDispatchArgs', () => {
   });
 
   it.each([
-    ['--model', ['--model', 'gpt-5']],
-    ['--reasoning-effort', ['--reasoning-effort', 'high']],
     ['--mdoel', ['--mdoel', 'gpt-5']],
     ['--unknown=value', ['--unknown=value']],
   ])(
@@ -92,11 +101,22 @@ describe('parseDispatchArgs', () => {
     },
   );
 
+  it.each(['--model', '--reasoning-effort'])(
+    'rejects missing launch-spec value for %s',
+    (option) => expect(parseDispatchArgs([option]))
+      .toMatchObject({ ok: false, errorCode: 'OPTION_VALUE_REQUIRED' }),
+  );
+
   it('preserves first-wins singleton and idempotent boolean behavior', () => {
     expect(parseDispatchArgs(['--title', 'a', '--title', 'b']))
       .toMatchObject({ ok: true, value: { title: 'a' } });
     expect(parseDispatchArgs(['--standby', '--standby', '--steer', '--steer']))
       .toMatchObject({ ok: true, value: { standby: true, steer: true } });
+  });
+
+  it.each(['--model', '--reasoning-effort'])('rejects duplicate launch option %s', option => {
+    expect(parseDispatchArgs([option, 'one', option, 'two']))
+      .toMatchObject({ ok: false, errorCode: 'DUPLICATE_OPTION', option });
   });
 
   it('preserves repeatable bot flags', () => {
@@ -147,10 +167,10 @@ describe('parseDispatchArgs', () => {
     expect(parseDispatchArgs(['--unknown', '-h'])).toMatchObject({ ok: true, value: { help: true } });
   });
 
-  it('rejects unknown options at the CLI boundary before transport setup', () => {
+  it('rejects a misspelled launch option at the CLI boundary before transport setup', () => {
     const result = spawnSyncTsScript(
       resolve('src/cli.ts'),
-      ['dispatch', '--title', 'task', '--model', 'gpt-5'],
+      ['dispatch', '--title', 'task', '--mdoel', 'gpt-5'],
       { cwd: resolve('.'), encoding: 'utf8' },
     ) as SpawnSyncReturns<string>;
 
@@ -159,8 +179,15 @@ describe('parseDispatchArgs', () => {
     expect(JSON.parse(result.stderr)).toEqual({
       success: false,
       errorCode: 'UNKNOWN_OPTION',
-      detail: 'unknown option: --model',
-      option: '--model',
+      detail: 'unknown option: --mdoel',
+      option: '--mdoel',
     });
+  });
+});
+
+describe('parseDispatchArgs task-tree options', () => {
+  it('accepts --kind, --task-id and --task-url', () => {
+    const parsed = parseDispatchArgs(['--title', 't', '--bot-app', 'cli_a', '--kind=review', '--task-id', 'REQ-1', '--task-url', 'https://x/1']);
+    expect(parsed).toMatchObject({ ok: true, value: { kind: 'review', taskId: 'REQ-1', taskUrl: 'https://x/1' } });
   });
 });

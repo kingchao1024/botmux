@@ -11,6 +11,7 @@ import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
 import { isSupportedAskTimeoutMs } from './ask-limits.js';
+import { CODEX_ASYNC_ASK_ORIGIN, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
 
 export interface AskApiContextBody {
   sessionId: string;
@@ -31,6 +32,12 @@ export interface AskApiOrdinaryBody extends AskApiContextBody, AskApiPayloadBody
    *  retries) so a re-POST after a daemon restart re-attaches to the same ask.
    *  Optional — legacy callers omit it and the broker synthesizes one. */
   requestId?: string;
+  originKind?: string;
+  acknowledge?: boolean;
+  asyncUserInput?: CodexAsyncUserInput;
+  /** Optional narrowing only; never grants talk/approval authority. */
+  answererOpenId?: string;
+  asyncFailure?: 'limit' | 'invalid_questions';
   /** Deprecated ordinary-client hint kept only for rolling compatibility.
    *  The daemon may consult it when the authenticated route is `/api/asks`,
    *  but the endpoint path remains authoritative and S1 never accepts it. */
@@ -141,10 +148,15 @@ export type AskApiBodyError =
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
+  | 'bad_input'
+  | 'bad_answererOpenId'
   | 'bad_inputMode'
+  | 'bad_allowCustom'
   | 'bad_multiSelect'
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
+  | 'bad_acknowledge'
+  | 'bad_asyncUserInput'
   | 'bad_notBeforeMs'
   | 'bad_expiresAtMs'
   | 'bad_time_window'
@@ -236,13 +248,32 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     expiresAtMs = parsedExpiresAt;
   }
   const hasS1Timing = notBeforeMs !== undefined || expiresAtMs !== undefined;
+  let originKind: string | undefined;
   if (Object.hasOwn(r, 'originKind')) {
     if (hasS1Timing) return { error: 'unexpected_field' };
-    if (r.originKind !== 'explicit' && r.originKind !== 'hook') {
+    if (r.originKind !== 'explicit' && r.originKind !== 'hook' && r.originKind !== CODEX_ASYNC_ASK_ORIGIN) {
       return { error: 'bad_originKind' };
     }
+    // The `host_*` namespace ('host_explicit', 'host_cross_principal_*') is
+    // daemon-internal: those claimants are constructed in-process and the
+    // broker grants the label GC / handoff / persistence exemptions. An HTTP
+    // client must never mint one by typing it — it would collect the privileges
+    // without any daemon-owned record. Reject at the boundary.
+    if (r.originKind.startsWith('host_')) {
+      return { error: 'bad_originKind' };
+    }
+    originKind = r.originKind;
   }
+
+  if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
+
+  if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
+    || (r.asyncFailure !== 'limit' && r.asyncFailure !== 'invalid_questions'))) return { error: 'bad_asyncUserInput' };
   let questions: AskQuestion[];
+  const asyncUserInput = r.asyncUserInput === undefined ? undefined : parseCodexAsyncUserInput(r.asyncUserInput);
+  if ((r.asyncUserInput !== undefined && !asyncUserInput)
+    || (originKind === CODEX_ASYNC_ASK_ORIGIN) !== (asyncUserInput !== undefined)
+    || (asyncUserInput && requestId !== asyncUserInput.itemId)) return { error: 'bad_asyncUserInput' };
 
   if (hasS1Timing) {
     if (Object.hasOwn(r, 'prompt') || Object.hasOwn(r, 'options')) {
@@ -256,7 +287,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   } else if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseAskQuestions(r.questions);
+    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput });
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {
@@ -371,7 +402,12 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (r.rootMessageId !== null && typeof r.rootMessageId !== 'string') {
     return { error: 'bad_rootMessageId' };
   }
+  if (r.answererOpenId !== undefined && (originKind !== 'explicit' || typeof r.answererOpenId !== 'string'
+    || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(r.answererOpenId))) return { error: 'bad_answererOpenId' };
+  // Native hooks keep their existing text-reply contract; only explicit CLI form asks opt in.
+  if (questions.some(q => q.input) && originKind !== 'explicit') return { error: 'bad_input' };
   const parsed: AskApiBody = {
+    ...(r.answererOpenId !== undefined ? { answererOpenId: r.answererOpenId as string } : {}),
     sessionId: r.sessionId,
     chatId: r.chatId,
     larkAppId: r.larkAppId,
@@ -379,9 +415,13 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     questions,
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
-    ...(Object.hasOwn(r, 'originKind')
-      ? { deprecatedOriginKindHint: r.originKind as 'explicit' | 'hook' }
+    ...(originKind === 'explicit' || originKind === 'hook'
+      ? { deprecatedOriginKindHint: originKind }
       : {}),
+    ...(originKind === CODEX_ASYNC_ASK_ORIGIN ? { originKind } : {}),
+    ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
+    ...(asyncUserInput ? { asyncUserInput } : {}),
+    ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),
   };
   // Reject semantics this receiver did not parse instead of silently creating
   // a different kind of Ask. Identity claims remain on the raw body for the

@@ -85,6 +85,7 @@ describe('daemon discovery', () => {
       workflowIpcProtocol: 'v1',
       receiptAuthorityProtocolVersion: 1,
       receiptAuthorityActivationEpoch: 'e'.repeat(43),
+      dispatchLaunchIpcProtocol: 'v1',
       botName: 'codex-loopy',
       cliId: 'codex',
       pid: 123,
@@ -98,6 +99,7 @@ describe('daemon discovery', () => {
       workflowIpcProtocol: 'v1',
       receiptAuthorityProtocolVersion: 1,
       receiptAuthorityActivationEpoch: 'e'.repeat(43),
+      dispatchLaunchIpcProtocol: 'v1',
       botName: 'codex-loopy',
       cliId: 'codex',
     })]);
@@ -120,6 +122,19 @@ describe('daemon discovery', () => {
     expect(listOnlineDaemons()[0]).not.toHaveProperty('receiptAuthorityActivationEpoch');
     expect(listOnlineDaemons()[0]).not.toHaveProperty('sessionStoreProtocol');
     expect(listOnlineDaemons()[0]).not.toHaveProperty('botmuxVersion');
+    // An older daemon never claims to apply a workflow run's working dir.
+    expect(listOnlineDaemons()[0]).not.toHaveProperty('workflowNodeWorkingDir');
+  });
+
+  it('passes through the workflow node working-dir capability only in its known form', () => {
+    writeFileSync(join(dir, 'dashboard-daemons', 'wd.json'), JSON.stringify({
+      larkAppId: 'wd', ipcPort: 7960, workflowNodeWorkingDir: 'v1', lastHeartbeat: Date.now(),
+    }));
+    writeFileSync(join(dir, 'dashboard-daemons', 'wd-odd.json'), JSON.stringify({
+      larkAppId: 'wd-odd', ipcPort: 7961, workflowNodeWorkingDir: 'v2', lastHeartbeat: Date.now(),
+    }));
+    expect(findOnlineDaemon('wd')).toMatchObject({ workflowNodeWorkingDir: 'v1' });
+    expect(findOnlineDaemon('wd-odd')).not.toHaveProperty('workflowNodeWorkingDir');
   });
 
   it('passes through sessionStoreProtocol and botmuxVersion without inventing them', () => {

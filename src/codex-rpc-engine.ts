@@ -28,15 +28,23 @@ import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, readdirSync
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
+import { MIN_POLL_REQUEST_BUDGET_MS } from './core/codex-poll-budget.js';
 import {
   CODEX_OUTPUT_LIMIT_ERROR_CODE,
+  CODEX_CAPACITY_ERROR_CODE,
+  isCodexCapacityError,
   isExactCodexOutputLimitError,
 } from './services/codex-transcript.js';
+import type { CodexServiceTier } from './services/codex-service-tier.js';
+import { validateCodexServiceTier, type CodexServiceTierCheck } from './services/codex-service-tier-catalog.js';
+import { pidIsSignalable } from './utils/process-alive.js';
+import { PROCESS_TABLE_MAX_BUFFER } from './utils/exec-limits.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
 
 function rpcTurnErrorCode(error: unknown, fallback = 'rpc_turn_failed'): string {
+  if (isCodexCapacityError(error)) return CODEX_CAPACITY_ERROR_CODE;
   if (isExactCodexOutputLimitError(error)) return CODEX_OUTPUT_LIMIT_ERROR_CODE;
   if (error && typeof error === 'object') {
     const record = error as Record<string, unknown>;
@@ -61,9 +69,7 @@ async function findFreePort(): Promise<number> {
   });
 }
 
-function isAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
+const isAlive = pidIsSignalable;
 
 function isProcessGroupAlive(pid: number): boolean {
   if (process.platform === 'win32') return isAlive(pid);
@@ -97,6 +103,7 @@ export interface CodexRpcEngineOpts {
   model?: string;
   modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
+  serviceTier?: CodexServiceTier;
   /** Feature gates owned by the app-server process (the viewer TUI does not
    *  execute model tools in RPC mode). */
   appServerFeatures?: string[];
@@ -131,10 +138,17 @@ export interface CodexRpcEngineDependencies {
   isProcessGroupAlive?(pid: number): boolean;
   hasExactProcessGroupIdentity?(pid: number, expectedUrl?: string): boolean;
   signalProcessGroup?(pid: number, signal: NodeJS.Signals): void;
+  validateServiceTier?(input: {
+    cliBin: string;
+    env: NodeJS.ProcessEnv;
+    model?: string;
+    serviceTier?: CodexServiceTier;
+  }): Promise<CodexServiceTierCheck>;
 }
 
 const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
   spawnProcess: (command, args, options) => spawn(command, args, options),
+  validateServiceTier: validateCodexServiceTier,
 };
 
 export interface CodexRpcTurnIdentity {
@@ -216,7 +230,6 @@ const APP_SERVER_STOP_POLL_INTERVAL_MS = 25;
  *  waitForThreadUpdatedAfter against a flaky end-of-window request. 50ms is
  *  comfortably above localhost RPC round-trip yet negligible vs the callers'
  *  200ms–10s budgets. */
-const MIN_POLL_REQUEST_BUDGET_MS = 50;
 
 export class CodexRpcEngine {
   private child?: ChildProcess;
@@ -356,6 +369,13 @@ export class CodexRpcEngine {
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
     await this.reapStaleAppServer();
+    const tierCheck = await (this.dependencies.validateServiceTier ?? validateCodexServiceTier)({
+      cliBin: this.opts.cliBin,
+      env: this.opts.env,
+      model: this.opts.model,
+      serviceTier: this.opts.serviceTier,
+    });
+    if (!tierCheck.ok) throw new Error(`Codex service tier rejected: ${tierCheck.error}`);
     this.port = await findFreePort();
     const globalArgs = this.opts.bypassHookTrust
       ? ['--dangerously-bypass-hook-trust']
@@ -413,7 +433,8 @@ export class CodexRpcEngine {
     // therefore silently drifts model/provider whenever the app-server default
     // changed between restarts. Verified on codex-cli 0.145.0 + traecli 0.200.19.
     // The safe path is to send nothing model-related and let the app-server
-    // restore the full persisted triple. Fresh thread/start still stamps both.
+    // restore the full persisted triple. serviceTier is a thread-level tier and
+    // remains the only non-model resume override. Fresh thread/start stamps it too.
     const params: Json = { ...this.threadParams(true), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
     const r = await this.request('thread/resume', params);
@@ -443,6 +464,7 @@ export class CodexRpcEngine {
       ephemeral: false,
       persistExtendedHistory: true,
       config,
+      ...(this.opts.serviceTier ? { serviceTier: this.opts.serviceTier } : {}),
     };
   }
 
@@ -709,18 +731,19 @@ export class CodexRpcEngine {
    * restart paths; this barrier prevents a native descendant outliving its Node
    * wrapper during parent-process shutdown.
    */
-  async stopAndWait(): Promise<void> {
+  async stopAndWait(timeoutMs = APP_SERVER_STOP_GRACE_MS + APP_SERVER_STOP_KILL_SETTLE_MS): Promise<boolean> {
     this.stop({ scheduleKill: false });
     const pid = this.child?.pid;
-    if (!pid) return;
-    if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_GRACE_MS)) {
+    if (!pid) return false;
+    const graceMs = Math.min(timeoutMs, APP_SERVER_STOP_GRACE_MS);
+    if (await this.waitForProcessGroupExit(pid, graceMs)) {
       this.removeMarkerIfOwned();
-      return;
+      return true;
     }
     this.signalManagedProcessGroup(pid, 'SIGKILL');
-    if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
+    if (await this.waitForProcessGroupExit(pid, Math.max(1, timeoutMs - graceMs))) {
       this.removeMarkerIfOwned();
-      return;
+      return true;
     }
     throw new Error(
       `codex app-server process group ${pid} still alive after SIGTERM ${APP_SERVER_STOP_GRACE_MS}ms and SIGKILL settle ${APP_SERVER_STOP_KILL_SETTLE_MS}ms`,
@@ -743,7 +766,7 @@ export class CodexRpcEngine {
     let argv = '';
     try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
     catch {
-      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER }); }
       catch { return false; }
     }
     if (!/\bapp-server\b/.test(argv)) return false;

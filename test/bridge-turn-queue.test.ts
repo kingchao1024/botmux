@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -433,6 +433,25 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].assistantUuids).toEqual(['a1', 'a2', 'a3']);
   });
 
+  it('a turn read in the same batch after another turn\'s duration marker stays its own turn', () => {
+    // A rotation switch replays every turn the bridge did not read at once:
+    // two background-task wake-ups, then one after a Lark turn.
+    const notification = (uuid: string) => user(uuid, `<task-notification>\n<task-id>${uuid}</task-id>\n</task-notification>`);
+    const done = (uuid: string): TranscriptEvent => ({ type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint('lark question'));
+    q.ingest([
+      notification('n1'), assistant('a1', 'first wake-up reply'), done('d1'),
+      notification('n2'), assistant('a2', 'second wake-up reply'), done('d2'),
+      user('u1', 'lark question'), assistant('a3', 'lark answer'), done('d3'),
+      notification('n3'), assistant('a4', 'third wake-up reply'), done('d4'),
+    ]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready.map(turn => [turn.isLocal === true, turn.assistantUuids])).toEqual([
+      [true, ['a1']], [true, ['a2']], [false, ['a3']], [true, ['a4']],
+    ]);
+  });
+
   it('headless local turn does not block a Lark turn that arrives next', () => {
     const q = new BridgeTurnQueue();
     // In-flight assistant text after a daemon restart — synthesises a headless turn.
@@ -662,6 +681,10 @@ describe('BridgeTurnQueue', () => {
         message: { role: 'user', content: [{ type: 'text', text: 'Continue from where you left off.' }] },
       } as TranscriptEvent;
     }
+    /** Claude Code's last record of a turn: a reply's `end_turn` alone is held for it. */
+    function turnDurationMarker(uuid: string): TranscriptEvent {
+      return { type: 'system', subtype: 'turn_duration', uuid } as TranscriptEvent;
+    }
     function syntheticNoReply(uuid: string, model = '<synthetic>'): TranscriptEvent {
       return {
         type: 'assistant', uuid, isApiErrorMessage: false,
@@ -686,7 +709,7 @@ describe('BridgeTurnQueue', () => {
     it('control: the same record served by a real model is the completed reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8')]);
+      q.ingest([user('u1'), metaContinue('m1'), syntheticNoReply('s1', 'claude-opus-4-8'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['s1']);
@@ -725,7 +748,7 @@ describe('BridgeTurnQueue', () => {
     it('does not downgrade a turn that already completed with a real reply', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), syntheticNoReply('s1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
@@ -741,7 +764,7 @@ describe('BridgeTurnQueue', () => {
     it('lets an API-error line override an earlier completed outcome (recovery must still fire)', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1');
-      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1')]);
+      q.ingest([user('u1'), realReply('a1', 'the real answer'), apiErrorLine('e1'), turnDurationMarker('d1')]);
       const ready = q.drainEmittable();
       expect(ready.length).toBe(1);
       expect(ready[0].assistantUuids).toEqual(['a1']);
@@ -1144,6 +1167,95 @@ describe('BridgeTurnQueue', () => {
       expect(peek[0].assistantUuids).toEqual(['a1']);
     });
 
+    // Real Claude Code 2.1+ shape of a message typed while a turn runs: the
+    // attachment carries the full botmux envelope, rendered to the model as a
+    // system reminder. No `role:user` line follows it.
+    function absorbedQueued(uuid: string, prompt: string, timestamp: string): TranscriptEvent {
+      return {
+        type: 'attachment',
+        uuid,
+        timestamp,
+        attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+        renderedRole: 'system',
+        rendered: [{ content: `<system-reminder>\nThe user sent a new message while you were working:\n${prompt}\n</system-reminder>` }],
+      } as any;
+    }
+
+    it('binds a type-ahead mark to its mid-turn absorbed input and ends it with the host turn', () => {
+      const started: string[] = [];
+      const q = new BridgeTurnQueue(undefined, undefined, (turn, evidence) => {
+        started.push(`${turn.turnId}:${evidence.fullContentMatch}`);
+      });
+      const promptB = '<user_message>用pil 再看一遍</user_message>';
+      q.mark('tA', makeFingerprint('进度如何'), 100, normaliseForFingerprint('进度如何'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', '进度如何'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'both answered'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+
+      // Not split: the running turn keeps collecting the reply.
+      expect(q.peek().map(t => t.turnId)).toEqual(['tA', 'tB']);
+      expect(q.peek()[0].assistantUuids).toEqual(['a-final']);
+      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', assistantUuids: [] });
+      expect(started).toEqual(['tA:true', 'tB:true']);
+
+      // A pruning pass cannot expire it any more: it is started.
+      expect(q.pruneExpired(0, 10_000_000)).toEqual([]);
+
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tA', 'tB']);
+      expect(ready[1].terminalObserved).toBe(true);
+      expect(ready[1].terminalOutcome).toEqual({ status: 'completed' });
+      expect(ready[1].markTimeMs).toBe(5000);
+      expect(q.size()).toBe(0);
+    });
+
+    it('absorbed input stays queued until its host turn closes', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'second request while busy';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', 'first request'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+      ]);
+      expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
+      expect(q.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true })).toEqual([]);
+    });
+
+    it('an absorbed reminder that matches no pending mark changes nothing', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('first request'));
+      q.mark('tB', makeFingerprint('unrelated pending prompt'));
+      q.ingest([
+        user('uA', 'first request'),
+        assistant('a1', 'working'),
+        absorbedQueued('q-absorbed', 'typed directly in the terminal', new Date(5000).toISOString()),
+      ]);
+      expect(q.peek().map(t => [t.turnId, t.started])).toEqual([['tA', true], ['tB', false]]);
+      expect(q.peek()[0].absorbedTurns).toBeUndefined();
+    });
+
+    it('with nothing collecting, the absorbed input collects the rest of the turn', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'follow-up after a worker restart';
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'answer'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tB']);
+      expect(ready[0].assistantUuids).toEqual(['a-final']);
+      expect(ready[0].absorbedIntoTurnId).toBeUndefined();
+    });
+
     it('protects turn with assistant activity from HOL drop even without visible text', () => {
       const q = new BridgeTurnQueue();
       q.mark('t1', makeFingerprint('task 1'));
@@ -1414,19 +1526,18 @@ describe('BridgeTurnQueue', () => {
       expect(q.drainEmittable({ terminalBoundary: true }).map(t => t.turnId)).toContain('lark-1');
     });
 
-    it('worker.ts drains the report BEFORE the empty-ready early return', () => {
-      // Wiring, not policy: a queue that reports perfectly is inert if nobody
-      // drains it. Ordering matters — a head-of-line drop usually lands on a
-      // tick that emits nothing, so draining after `if (ready.length === 0)
-      // return;` would skip exactly the case this fix exists for.
+    // 源码结构护栏(K3)：emitReadyTurns 在 worker.ts 闭包里、没有行为 seam；一次 head-of-line drop
+    // 通常落在什么都不 emit 的 tick 上，若排空放到「ready 为空就 return」之后，journal 条目永不退役，
+    // 每次重启都重放旧 provider 错误成新的「本轮执行失败」卡（#1170，线上实测六次重启两次重放）。
+    // 只钉不变量：排空 + journalBridgeTurnClear 先于空 ready 的提前返回。
+    it('worker retires dropped turns\' journal entries before the empty-ready early return', () => {
       const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
       const fn = source.slice(source.indexOf('function emitReadyTurns('));
       const drainAt = fn.indexOf('takeDroppedNeedingJournalClear()');
-      const earlyReturnAt = fn.indexOf('if (ready.length === 0) return;');
+      const earlyReturnAt = fn.search(/if\s*\(\s*ready\.length\s*===\s*0\s*\)\s*return\b/);
       expect(drainAt).toBeGreaterThan(-1);
       expect(earlyReturnAt).toBeGreaterThan(-1);
       expect(drainAt).toBeLessThan(earlyReturnAt);
-      // ...and it must actually retire the journal entry, not just log.
       expect(fn.slice(drainAt, earlyReturnAt)).toContain('journalBridgeTurnClear(');
     });
   });
@@ -1607,37 +1718,6 @@ describe('BridgeTurnQueue', () => {
       expect(next).toHaveLength(1);
       expect(next[0].turnId).toBe('om_1');
       expect(next[0].assistantUuids).toEqual(['a1']);
-    });
-
-    it('worker.ts bounds the send window by a STARTED pending turn and skips the pre-text gate for scheduled', () => {
-      // Must-fix regression for two of the review findings:
-      //  (1) A scheduled turn is inserted AHEAD of an unstarted Lark mark.
-      //      Using that mark's early flush-time markTimeMs as the window
-      //      upper bound inverts [later, earlier) into an empty range, so the
-      //      turn's real final `botmux send` escapes suppression and posts a
-      //      duplicate. nextPendingMarkTimeMs must require remaining[0].started
-      //      (mirroring the codex bridge).
-      //  (2) The pre-text suppression gate must skip scheduled turns, else a
-      //      short progress send swallows the later long final before the
-      //      transcript text is read.
-      const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-      const fn = source.slice(
-        source.indexOf('function emitReadyTurns('),
-        source.indexOf('function emitReadyCodexTurns('),
-      );
-      expect(fn).toMatch(
-        /remainingPending\.length > 0 && remainingPending\[0\]\.started\s*\n\s*\?\s*remainingPending\[0\]\.markTimeMs/,
-      );
-      expect(fn).toMatch(/if\s*\(!turn\.isScheduled && turn\.isLocal/);
-      // (3) The local-card visibility branch must exclude scheduled turns —
-      //     a fire is isLocal but must be rendered/forwarded, not hidden.
-      expect(fn).toMatch(/if\s*\(turn\.isLocal && !turn\.isScheduled/);
-      // (4) final_output injects the create-time anchor as replyTurnId only
-      //     for a scheduled turn outside zero-injection mode, so the daemon
-      //     posts it into the task's originating topic.
-      expect(fn).toMatch(
-        /\.\.\.\(turn\.isScheduled && !zeroPromptTerminalSync\(\) && turn\.replyAnchorTurnId\s*\n\s*\?\s*\{ replyTurnId: turn\.replyAnchorTurnId \}/,
-      );
     });
 
     // ── Round-3 review: ack spoofing + durable-anchor recovery ──────────────
@@ -1910,5 +1990,216 @@ describe('onLarkTurnStarted evidence', () => {
     q.mark('om_legacy');
     q.ingest([user('u1', marked)]);
     expect(seen).toEqual([false]);
+  });
+});
+
+describe('input held in Claude\'s own queue', () => {
+  const TTL = 120_000;
+  const markAt = Date.parse('2026-10-31T12:20:38.866Z');
+  const iso = (offsetMs: number) => new Date(markAt + offsetMs).toISOString();
+  const text = '<botmux_reminder>r</botmux_reminder> <user_message>do it in parallel</user_message>';
+  const queueOp = (operation: string, offsetMs: number, content?: string, reason?: string, extra?: Record<string, unknown>) => ({
+    type: 'queue-operation', operation, timestamp: iso(offsetMs),
+    ...(content === undefined ? {} : { content }), ...(reason ? { reason } : {}), ...extra,
+  }) as unknown as TranscriptEvent;
+  const absorbed = (uuid: string, prompt: string, offsetMs: number) => ({
+    type: 'attachment', uuid, timestamp: iso(offsetMs),
+    attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+    renderedRole: 'system',
+    rendered: [{ content: `<system-reminder>${prompt}</system-reminder>` }],
+  }) as unknown as TranscriptEvent;
+  function marked(content = text, turnId = 't1', atMs = markAt): BridgeTurnQueue {
+    const q = new BridgeTurnQueue();
+    q.mark(turnId, makeFingerprint(content), atMs, normaliseForFingerprint(content));
+    return q;
+  }
+
+  it('keeps the mark past the TTL and binds it when Claude absorbs the input mid-turn', () => {
+    const started: string[] = [];
+    const q = new BridgeTurnQueue(undefined, undefined, turn => { started.push(turn.turnId); });
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 3_500, text)]);
+    expect(q.pruneExpired(TTL, markAt + TTL + 1)).toEqual([]);
+    q.ingest([
+      queueOp('remove', 137_400, text, 'absorbed_mid_turn'),
+      absorbed('q1', text, 3_000),
+    ]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it('expires a mark with no enqueue record at the TTL, as before', () => {
+    const q = marked();
+    expect(q.pruneExpired(TTL, markAt + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('does not treat another input or an older identical input as this mark being queued', () => {
+    const other = marked();
+    other.ingest([queueOp('enqueue', 1_000, '<task-notification>done</task-notification>')]);
+    expect(isHeldInCliQueue(other.peek()[0])).toBe(false);
+    const older = marked();
+    older.ingest([queueOp('enqueue', -60_000, text)]);
+    expect(isHeldInCliQueue(older.peek()[0])).toBe(false);
+  });
+
+  it('runs the normal TTL from the moment the input leaves the queue unbound', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.ingest([queueOp('remove', 600_000, text, 'cancelled')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('follows queue order for content-less dequeues, past items that are not marks', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 500, '<task-notification>done</task-notification>'),
+      queueOp('enqueue', 1_000, text),
+      queueOp('dequeue', 5_000),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    q.ingest([queueOp('dequeue', 6_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('pairs identical inputs with their marks in order', () => {
+    const q = marked();
+    q.mark('t2', makeFingerprint(text), markAt + 100, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, false]);
+    q.ingest([queueOp('enqueue', 1_000, text)]); // same record replayed by a transcript switch
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, false]);
+    q.ingest([queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+  });
+
+  it('stops holding at the upper bound, so a dropped input cannot block the queue for good', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    expect(q.pruneExpired(TTL, markAt + 1_000 + CLI_QUEUE_HOLD_MAX_MS)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 1_000 + CLI_QUEUE_HOLD_MAX_MS + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('stops holding when Claude returns to its prompt, then runs the normal TTL from there', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.cliQueueDrained(markAt + 600_000);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 600_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('stops holding when a remove carries no content to match', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('remove', 50_000, undefined, 'dropped_by_hook')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('does not hold a mark too short to identify its own enqueue', () => {
+    const q = marked('test');
+    q.ingest([queueOp('enqueue', 1_000, 'please run tests for the bridge module')]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('counts dequeues that share a millisecond', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 500, '<task-notification>done</task-notification>'),
+      queueOp('enqueue', 1_000, text),
+      queueOp('dequeue', 5_000),
+      queueOp('dequeue', 5_000),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('matches a remove to its input by content, not by queue position', () => {
+    const q = marked();
+    q.ingest([
+      queueOp('enqueue', 1_000, text),
+      queueOp('enqueue', 1_500, '<task-notification>second in line</task-notification>'),
+      queueOp('remove', 5_000, '<task-notification>second in line</task-notification>', 'absorbed_mid_turn'),
+    ]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+  });
+
+  it('a new mark is not held by an enqueue that a cleared queue left behind', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.clearPending();
+    q.mark('t2', makeFingerprint(text), markAt + 2_000, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 4_000, text)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(true);
+    q.ingest([queueOp('dequeue', 5_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+  });
+
+  it('holds the next unstarted mark, not one that already started with the same text', () => {
+    const q = marked();
+    q.ingest([{ type: 'user', uuid: 'u1', timestamp: iso(500), message: { role: 'user', content: text } } as unknown as TranscriptEvent]);
+    q.mark('t2', makeFingerprint(text), markAt + 1_000, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().filter(t => !t.isLocal).map(t => [t.turnId, t.started, isHeldInCliQueue(t)]))
+      .toEqual([['t1', true, false], ['t2', false, true]]);
+  });
+
+  it('stops holding once the queue is no longer observable', () => {
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text)]);
+    q.forgetCliQueue(markAt + 10_000);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    expect(q.pruneExpired(TTL, markAt + 10_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('does not fold same-millisecond equal-length records with different content or command ids', () => {
+    // Fleet transcripts contain 14 groups of same-ms records whose texts are
+    // equal length but different (each remove carries its own commandUuid).
+    // A length-based dedup key discarded the second record and drifted the
+    // queue mirror: the second mark never held, or its release never applied.
+    const A = 'please alpha the bridge module now';
+    const B = 'please bravo the bridge module now';
+    expect(A).not.toBe(B);
+    expect(A.length).toBe(B.length);
+    const q = new BridgeTurnQueue();
+    q.mark('t1', makeFingerprint(A), markAt, normaliseForFingerprint(A));
+    q.mark('t2', makeFingerprint(B), markAt, normaliseForFingerprint(B));
+    q.ingest([
+      queueOp('enqueue', 1_000, A, undefined, { commandUuid: 'u-A' }),
+      queueOp('enqueue', 1_000, B, undefined, { commandUuid: 'u-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 2_000, A, 'cancelled', { commandUuid: 'u-A', deliveryId: 'd-A' }),
+      queueOp('remove', 2_000, B, 'cancelled', { commandUuid: 'u-B', deliveryId: 'd-B' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('distinguishes same-ms same-content removes of distinct commands by commandUuid', () => {
+    // Fleet transcripts also contain 5 groups of same-ms removes with IDENTICAL
+    // text but different commandUuid (separate commands), vs 1 group sharing a
+    // commandUuid (a genuine replay). A text-only key would fold the former.
+    const q = marked();
+    q.mark('t2', makeFingerprint(text), markAt + 100, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 2_000, text)]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
+    q.ingest([
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-1', deliveryId: 'd-1' }),
+      queueOp('remove', 3_000, text, 'absorbed_mid_turn', { commandUuid: 'u-2', deliveryId: 'd-2' }),
+    ]);
+    expect(q.peek().map(isHeldInCliQueue)).toEqual([false, false]);
+  });
+
+  it('treats a same-ms same-content enqueue with no command id as a replay, leaving no ghost slot', () => {
+    // enqueues carry no commandUuid: the same ms+text record replayed across a
+    // transcript switch must fold to ONE mirror slot, or a later dequeue order
+    // shifts and the next mark's release lands on the wrong item.
+    const q = marked();
+    q.ingest([queueOp('enqueue', 1_000, text), queueOp('enqueue', 1_000, text)]);
+    q.ingest([queueOp('dequeue', 2_000)]);
+    expect(isHeldInCliQueue(q.peek()[0])).toBe(false);
+    q.mark('t2', makeFingerprint(text), markAt + 2_500, normaliseForFingerprint(text));
+    q.ingest([queueOp('enqueue', 3_000, text), queueOp('dequeue', 3_500)]);
+    expect(q.peek().map(turn => [turn.turnId, isHeldInCliQueue(turn)]))
+      .toEqual([['t1', false], ['t2', false]]);
   });
 });

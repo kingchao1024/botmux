@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { authorizeDelegatedScheduleRun, authorizeDelegatedScheduleSelfManage } from '../src/core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from '../src/core/schedule-delegated-runtime.js';
 import type { ScheduleAuthorityRecord } from '../src/services/schedule-authority-store.js';
 import type { ScheduledTask } from '../src/types.js';
 
@@ -55,18 +55,163 @@ describe('delegated schedule runtime authorization', () => {
     })).rejects.toThrow('no longer a target chat member');
   });
 
-  it('allows only explicitly enabled self-management after live controller checks', async () => {
-    await expect(authorizeDelegatedScheduleSelfManage(authority, {
+  it('allows only explicitly enabled delegated self-management after live controller checks', async () => {
+    await expect(authorizeScheduleSelfManage(authority, {
       selfManageEnabled: true,
+      targetChatId: 'oc_chat',
       adminOpenIds: ['ou_user_target'],
       resolveTargetOpenId: async () => 'ou_user_target',
       listChatMemberOpenIds: async () => ['ou_user_target'],
     })).resolves.toBeUndefined();
-    await expect(authorizeDelegatedScheduleSelfManage(authority, {
+    await expect(authorizeScheduleSelfManage(authority, {
       selfManageEnabled: false,
+      targetChatId: 'oc_chat',
       adminOpenIds: ['ou_user_target'],
       resolveTargetOpenId: async () => 'ou_user_target',
       listChatMemberOpenIds: async () => ['ou_user_target'],
     })).rejects.toThrow('self-management is not allowed');
+  });
+
+  it('lets a direct task stop itself without the delegation opt-in', async () => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority,
+      kind: 'direct',
+      selfManage: false,
+      credentialOpenId: undefined,
+      runScopes: [],
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_chat',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).resolves.toBeUndefined();
+  });
+
+  it('lets a host-terminal task without any controller stop itself', async () => {
+    const hostTask = {
+      ...authority,
+      kind: 'direct' as const,
+      task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined },
+      controlOpenId: undefined,
+      controlUnionId: undefined,
+      credentialOpenId: undefined,
+      runScopes: [],
+      selfManage: false,
+    };
+    const lookups = {
+      resolveTargetOpenId: vi.fn(async () => undefined),
+      listChatMemberOpenIds: vi.fn(async () => []),
+    };
+    await expect(authorizeScheduleSelfManage(hostTask, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_chat',
+      adminOpenIds: [],
+      ...lookups,
+    })).resolves.toBeUndefined();
+    expect(lookups.resolveTargetOpenId).not.toHaveBeenCalled();
+    expect(lookups.listChatMemberOpenIds).not.toHaveBeenCalled();
+
+    // Still bound to the live states: a paused or removed host task stays put.
+    for (const state of ['paused', 'revoked'] as const) {
+      await expect(authorizeScheduleSelfManage({ ...hostTask, state }, {
+        selfManageEnabled: false, targetChatId: 'oc_chat', adminOpenIds: [], ...lookups,
+      })).rejects.toThrow(`schedule authority state is ${state}`);
+    }
+
+    // A naturally completed until-done task keeps one live cleanup turn; the
+    // completedRunStillLive state gate is evaluated before the exemption and
+    // no controller lookup may happen.
+    await expect(authorizeScheduleSelfManage({
+      ...hostTask, state: 'completed',
+      task: { ...hostTask.task, enabled: false, disabledReason: 'once_completed' as const },
+    }, {
+      selfManageEnabled: false, targetChatId: 'oc_chat', adminOpenIds: [], ...lookups,
+    })).resolves.toBeUndefined();
+    expect(lookups.resolveTargetOpenId).not.toHaveBeenCalled();
+    expect(lookups.listChatMemberOpenIds).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ controlOpenId: 'ou_gone', controlUnionId: undefined }, 'no longer an allowed bot operator'],
+    [{ controlOpenId: undefined, controlUnionId: 'on_gone' }, 'no longer an allowed bot operator'],
+    [{ controlOpenId: 'ou_gone', controlUnionId: 'on_gone' }, 'no longer an allowed bot operator'],
+    // A sender whose open_id Lark left empty is recorded, not absent.
+    [{ controlOpenId: '', controlUnionId: undefined }, 'no longer an allowed bot operator'],
+    [{ controlOpenId: '', controlUnionId: '' }, 'no longer an allowed bot operator'],
+  ])('keeps the live controller check for a direct task recording %o', async (control, message) => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority, kind: 'direct', selfManage: false, credentialOpenId: undefined, runScopes: [], ...control,
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_chat',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).rejects.toThrow(message);
+  });
+
+  it('keeps legacy tasks outside scheduled self-management', async () => {
+    await expect(authorizeScheduleSelfManage({ ...authority, kind: 'legacy' }, {
+      selfManageEnabled: true,
+      targetChatId: 'oc_chat',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).rejects.toThrow('self-management is not allowed');
+  });
+
+  it('allows the exact final live turn to remove a naturally completed task', async () => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority,
+      kind: 'direct',
+      state: 'completed',
+      task: {
+        ...authority.task,
+        enabled: false,
+        disabledReason: 'once_completed',
+      },
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_target',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async chatId => chatId === 'oc_target' ? ['ou_user_target'] : [],
+    })).resolves.toBeUndefined();
+  });
+
+  it.each(['paused', 'revoked'] as const)(
+    'keeps a manually %s direct task outside scheduled self-management',
+    async state => {
+      await expect(authorizeScheduleSelfManage({
+        ...authority,
+        kind: 'direct',
+        state,
+        task: {
+          ...authority.task,
+          enabled: false,
+          disabledReason: 'manual',
+        },
+      }, {
+        selfManageEnabled: false,
+        targetChatId: 'oc_chat',
+        adminOpenIds: ['ou_user_target'],
+        resolveTargetOpenId: async () => 'ou_user_target',
+        listChatMemberOpenIds: async () => ['ou_user_target'],
+      })).rejects.toThrow(`schedule authority state is ${state}`);
+    },
+  );
+
+  it('checks self-management against the chat hosting the current scheduled turn', async () => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority,
+      kind: 'direct',
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_other_target',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async chatId => chatId === 'oc_chat' ? ['ou_user_target'] : [],
+    })).rejects.toThrow('no longer a target chat member');
   });
 });

@@ -6,7 +6,6 @@ import { canResolveGateWait, normalizeGateWaitInput, selectedResolution } from '
 import { readJournal } from '../workflows/v3/journal.js';
 import { loadAuthorizedV3Run } from '../workflows/v3/run-envelope.js';
 import { materialize } from '../workflows/v3/state.js';
-import type { VerifiedTaskControlGateResolution } from './task-control-plane-authority.js';
 import type {
   DaemonTaskControlApprovalSource,
   TaskControlApprovalGateBinding,
@@ -77,7 +76,7 @@ export function createV3TaskControlApprovalSource(input: {
       }
     },
     get(request) {
-      const { approvalRef, larkAppId, gate } = request;
+      const { larkAppId, gate } = request;
       try {
         const runDir = safeRunDir(input.baseDir, gate.runId);
         const binding = readV3RunChatBinding(runDir);

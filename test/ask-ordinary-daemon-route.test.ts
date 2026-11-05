@@ -17,6 +17,18 @@ vi.mock('../src/core/ask-broker.js', async () => {
   return { ...actual, registerAsk: (...args: unknown[]) => mocks.registerAsk(...args) };
 });
 
+vi.mock('../src/core/explicit-ask-continuation.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/core/explicit-ask-continuation.js')>(
+    '../src/core/explicit-ask-continuation.js',
+  );
+  return {
+    ...actual,
+    createExplicitAskContinuation: () => ({
+      wait: (...args: unknown[]) => mocks.registerAsk(...args),
+    }),
+  };
+});
+
 import { __testOnly_resetBotRegistry, registerBot } from '../src/bot-registry.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -174,7 +186,7 @@ describe('ordinary Ask rolling compatibility through the daemon route', () => {
     expect(responseBody).toMatchObject({ kind: 'answered', answers: [['yes']] });
     expect(mocks.registerAsk).toHaveBeenCalledTimes(1);
     expect(mocks.registerAsk.mock.calls[0]?.[0]).toMatchObject({
-      originKind: 'explicit',
+      originKind: 'host_explicit',
       backendSurvivesRestart: true,
     });
   });

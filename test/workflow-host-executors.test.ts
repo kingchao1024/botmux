@@ -362,7 +362,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
       config: {
         session: {
           get dataDir() {
-            return tempDataDir;
+            return join(tempDataDir, 'session');
           },
         },
       },
@@ -399,7 +399,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
   it('re-invoke with same input idempotent (returns same taskId)', async () => {
     vi.resetModules();
     vi.doMock('../src/config.js', () => ({
-      config: { session: { get dataDir() { return tempDataDir; } } },
+      config: { session: { get dataDir() { return join(tempDataDir, 'session'); } } },
     }));
     vi.doMock('../src/utils/logger.js', () => ({
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -429,7 +429,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
   it('classifies IdempotencyConflictError as fatal/IdempotencyConflict', async () => {
     vi.resetModules();
     vi.doMock('../src/config.js', () => ({
-      config: { session: { get dataDir() { return tempDataDir; } } },
+      config: { session: { get dataDir() { return join(tempDataDir, 'session'); } } },
     }));
     vi.doMock('../src/utils/logger.js', () => ({
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -453,7 +453,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
   it('reconciler readOnlyLookup returns task externalRefs by idempotency key', async () => {
     vi.resetModules();
     vi.doMock('../src/config.js', () => ({
-      config: { session: { get dataDir() { return tempDataDir; } } },
+      config: { session: { get dataDir() { return join(tempDataDir, 'session'); } } },
     }));
     vi.doMock('../src/utils/logger.js', () => ({
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -498,7 +498,7 @@ describe('botmuxScheduleExecutor invoke()', () => {
   it('freezes relative time once, rejects non-runnable shapes, and detects stale approval', async () => {
     vi.resetModules();
     vi.doMock('../src/config.js', () => ({
-      config: { session: { get dataDir() { return tempDataDir; } } },
+      config: { session: { get dataDir() { return join(tempDataDir, 'session'); } } },
     }));
     vi.doMock('../src/utils/logger.js', () => ({
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -549,6 +549,30 @@ describe('botmuxScheduleExecutor invoke()', () => {
       { ...freshTopic, silent: true },
       Date.now(),
     )).toEqual({ ok: true });
+    const dynamicFreshTopic = parseScheduleInput({
+      ...base,
+      schedule: 'every 30m',
+      executionPosition: 'new-topic',
+      topicTitle: '{{date}} {{owner}}',
+      ownerOpenId: 'ou_owner123',
+    });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(dynamicFreshTopic, Date.now())).toEqual({ ok: true });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(
+      { ...dynamicFreshTopic, silent: true },
+      Date.now(),
+    )).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+      message: 'topic_title_template_silent_unsupported',
+    });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(
+      { ...dynamicFreshTopic, ownerOpenId: undefined },
+      Date.now(),
+    )).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+      message: 'topic_title_owner_unavailable',
+    });
     expect(botmuxScheduleExecutor.validateBeforeIntent!(
       parseScheduleInput({ ...base, schedule: 'every 30m', executionPosition: 'topic' }),
       Date.now(),

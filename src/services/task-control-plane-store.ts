@@ -3045,11 +3045,6 @@ export class TaskControlPlaneStore {
     }
   }
 
-  private trustedMappingExists(taskGuid: string): boolean {
-    return !!this.db.prepare('SELECT dispatch_root FROM control_trusted_mappings WHERE lark_app_id=? AND task_guid=?')
-      .get(this.larkAppId, taskGuid);
-  }
-
   registerTrustedMapping(input: RegisterTrustedTaskControlMappingInput): RegisterTrustedTaskControlMappingResult {
     this.assertWritable();
     const dispatchRoot = nonEmpty(input.dispatchRoot, 'dispatchRoot');

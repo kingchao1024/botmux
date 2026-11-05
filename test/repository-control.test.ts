@@ -35,7 +35,7 @@ function releaseSnapshot(overrides: Record<string, unknown> = {}): Record<string
     remoteRef: 'refs/remotes/origin/main',
     remoteCommitSha: 'a'.repeat(40),
     worktreeClean: true,
-    bunVersion: '1.4.2',
+    bunVersion: '1.4.3',
     buildToolchainHash: '9'.repeat(64),
     artifactPath: '/srv/botmux.next',
     artifactTreeHash: 'c'.repeat(64),

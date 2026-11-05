@@ -8,7 +8,13 @@
 
 机器人回一张卡片：「✅ 已新建群「卡片竞态 bug」👉 <加群链接>」，点进去直接开聊即可——整个群就是一个独立会话。
 
-> 空群名时用时间戳兜底。建好后**不自动开会话**，进群找机器人开聊即可。
+> 空群名时先用时间戳占位，收到第一条消息后自动起名（见下文）。建好后**不自动开会话**，进群找机器人开聊即可。
+
+## 自动群名与头像
+
+不写群名时，新群先用占位名「新会话 MM/DD HH:mm」。你在新群里发出第一条有内容的消息后，机器人会按内容总结一个短标题并改群名，和群聊模式（私聊会话群）一样。写了群名则以你的群名为准。
+
+头像默认是会话群同款的 botmux logo + 渐变底色；`--avatar name` 改用群名文字头像（自动改名后按新群名重绘），`--avatar off` 保留飞书默认头像。更多参数见 [建群参数与默认配置](https://github.com/deepcoldy/botmux/blob/master/docs/guide/group-creation.md)。
 
 ## 多机器人一起建群
 
@@ -36,6 +42,32 @@
 
 ![Dashboard 新建群](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300986_dash-newgroup.png)
 <p class="cap">「New Group」：填群名、绑定目录、勾选要拉进群的机器人</p>
+
+## 私聊专属群的自动命名
+
+在 Dashboard「Bot 配置 → 会话 → 私聊/专属群 → 专属群命名方式」选择并保存。配置按 Bot 生效，未配置时仍使用 **AI 摘要**：
+
+| 选项 | 行为 |
+| --- | --- |
+| AI 摘要（`ai-summary`，默认） | 先创建占位群名，再独立生成简短摘要。 |
+| 复用 Agent 会话标题（`session-title`，新增） | 使用当前常驻 Agent 发布的会话标题，不额外调用模型；标题未就绪时保留占位名。 |
+| 仅截断原文（`truncate`） | 保留首条消息的截断群名。 |
+
+Codex 的 AI 摘要复用隔离的 app-server 标题生成器，替代 `codex exec`：固定 low 推理，临时 `CODEX_HOME` 只复制登录凭证与 provider 接线（源 `config.toml` 的 `model` / `model_provider` / `model_providers`），其余用户配置（hooks、插件、MCP、`projects`/信任、`profiles`、features 等）一律不复制；关闭 hooks、插件、MCP、工具与项目指令加载。之所以必须带上 provider：只复制凭证会让走自定义网关（`base_url` / `env_key` / 内联 `http_headers`）的 Bot 掉回 Codex 内置 `openai` provider，要么直接失败只能保留占位名，要么改用宿主账号在默认端点计费。源 `config.toml` 存在却无法安全读取（符号链接、多硬链接、超限、读取期间被改动）或解析失败时，宁可不改名也不生成标题——不会静默走错 provider。可在「摘要模型（Codex）」填写账号可用的轻量模型 ID；留空沿用 Bot 模型。此覆盖只用于专属群 AI 摘要，不改变对话模型或原生会话标题模型。其他 CLI 的摘要生成路径保持原样。共享生成器也用于 `/g` 的 Codex 摘要，`/g` 继续沿用 Bot 模型及原有权限门控。
+
+也可在对应 Bot 的 `bots.json` 设置：
+
+```json
+{
+  "sessionGroup": {
+    "naming": { "mode": "session-title", "maxLen": 12 }
+  }
+}
+```
+
+要独立指定摘要模型，使用 `"naming": { "mode": "ai-summary", "model": "你的可用轻量模型ID" }`。
+
+复用模式接收 Codex 原生语义标题，或经 Botmux 会话改名发布的标题（含 Agent 改名以及用户在 Dashboard、会话内发起的改名）；不会主动扫描所有 CLI 的内部标题。去掉 `[BotMux·Lark]` 前缀后应用长度限制和 `sessionGroup.namePrefix`。首次命名成功后不持续追随修改；普通群和子话题不受此模式控制。人工修改过群名时不覆盖；缺少可信出生群名的旧记录保留现状。失败保留候选标题，后续群消息按既有退避与次数限制重试。
 
 ## 私聊自动建群：关闭后切换标签
 

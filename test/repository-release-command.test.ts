@@ -8,6 +8,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+const fixtureGitEnv = {
+  ...process.env,
+  GIT_AUTHOR_NAME: 'Release Test',
+  GIT_COMMITTER_NAME: 'Release Test',
+  GIT_AUTHOR_EMAIL: 'release-test@example.invalid',
+  GIT_COMMITTER_EMAIL: 'release-test@example.invalid',
+};
 import {
   createHostReleaseTransactionAdapters,
   hasTransactionBoundReleaseEvidence,
@@ -76,7 +83,7 @@ function snapshot(overrides: Record<string, unknown> = {}): Record<string, unkno
     remoteRef: 'refs/remotes/origin/main',
     remoteCommitSha: input.commitSha,
     worktreeClean: true,
-    bunVersion: '1.4.2',
+    bunVersion: '1.4.3',
     buildToolchainHash: '9'.repeat(64),
     artifactPath: input.artifactPath,
     artifactTreeHash: input.artifactTreeHash,
@@ -164,11 +171,9 @@ describe('repository release command surface', () => {
     const dataDir = tempDataDir();
     const workdir = tempDataDir();
     execFileSync('git', ['init', '-q', workdir]);
-    execFileSync('git', ['-C', workdir, 'config', 'user.email', 'release-test@example.invalid']);
-    execFileSync('git', ['-C', workdir, 'config', 'user.name', 'Release Test']);
     writeFileSync(join(workdir, 'tracked.txt'), 'base\n');
     execFileSync('git', ['-C', workdir, 'add', 'tracked.txt']);
-    execFileSync('git', ['-C', workdir, 'commit', '-qm', 'base']);
+    execFileSync('git', ['-C', workdir, 'commit', '-qm', 'base'], { env: fixtureGitEnv });
     appendFileSync(join(workdir, 'tracked.txt'), 'dirty\n');
     const realIdentity = resolveRepositoryIdentitySync(workdir);
     const freeze = {
@@ -202,13 +207,11 @@ describe('repository release command surface', () => {
     const dataDir = tempDataDir();
     const workdir = tempDataDir();
     execFileSync('git', ['init', '-q', workdir]);
-    execFileSync('git', ['-C', workdir, 'config', 'user.email', 'release-test@example.invalid']);
-    execFileSync('git', ['-C', workdir, 'config', 'user.name', 'Release Test']);
     writeFileSync(join(workdir, 'package.json'), '{"name":"release-fixture"}\n');
     writeFileSync(join(workdir, 'bun.lock'), 'lockfileVersion = 1\n');
     writeFileSync(join(workdir, 'tracked.txt'), 'base\n');
     execFileSync('git', ['-C', workdir, 'add', '.']);
-    execFileSync('git', ['-C', workdir, 'commit', '-qm', 'base']);
+    execFileSync('git', ['-C', workdir, 'commit', '-qm', 'base'], { env: fixtureGitEnv });
     execFileSync('git', ['-C', workdir, 'update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const realIdentity = resolveRepositoryIdentitySync(workdir);
     const commitSha = execFileSync('git', ['-C', workdir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -244,7 +247,7 @@ describe('repository release command surface', () => {
         commitSha,
         treeSha,
         remoteCommitSha: commitSha,
-        buildToolchainHash: releaseBuildToolchainHash(workdir, '1.4.2'),
+        buildToolchainHash: releaseBuildToolchainHash(workdir, '1.4.3'),
         artifactPath,
         artifactTreeHash: flatFixtureTreeHash(artifactFiles),
         rollbackArtifactPath,
@@ -273,12 +276,10 @@ describe('repository release command surface', () => {
     const dataDir = tempDataDir();
     const workdir = tempDataDir();
     execFileSync('git', ['init', '-q', workdir]);
-    execFileSync('git', ['-C', workdir, 'config', 'user.email', 'release-test@example.invalid']);
-    execFileSync('git', ['-C', workdir, 'config', 'user.name', 'Release Test']);
     writeFileSync(join(workdir, 'package.json'), '{"name":"release-fixture"}\n');
     writeFileSync(join(workdir, 'bun.lock'), 'lockfileVersion = 1\n');
     execFileSync('git', ['-C', workdir, 'add', '.']);
-    execFileSync('git', ['-C', workdir, 'commit', '-qm', 'base']);
+    execFileSync('git', ['-C', workdir, 'commit', '-qm', 'base'], { env: fixtureGitEnv });
     execFileSync('git', ['-C', workdir, 'update-ref', 'refs/remotes/origin/main', 'HEAD']);
     const realIdentity = resolveRepositoryIdentitySync(workdir);
     const commitSha = execFileSync('git', ['-C', workdir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -289,7 +290,7 @@ describe('repository release command surface', () => {
       snapshot: snapshot({
         repoKey: realIdentity.repoKey, canonicalCommonDir: realIdentity.canonicalCommonDir,
         worktreePath: workdir, commitSha, treeSha, remoteCommitSha: commitSha,
-        buildToolchainHash: releaseBuildToolchainHash(workdir, '1.4.2'),
+        buildToolchainHash: releaseBuildToolchainHash(workdir, '1.4.3'),
         artifactPath: join(workdir, 'missing-artifact'),
         rollbackArtifactPath: join(workdir, 'missing-rollback'),
       }),

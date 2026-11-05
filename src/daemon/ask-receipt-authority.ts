@@ -25,15 +25,12 @@ import {
   importAskReceiptPublicKey,
   normalizeAskSubmitValue,
   snapshotAskCallbackData,
-  type AskAnswerProvenanceIssue,
   type AskAnswerProvenanceIssuer,
   type AskAnswerProvenanceRedeemer,
   type AskAnswerProvenanceToken,
   type AskPersistenceIntegrityAuthority,
-  type AskPersistenceIntegrityV1,
   type AskProvenanceExpectation,
   type AskReceiptEventClaimResult,
-  type AskReceiptPersistInput,
   type AskReceiptPayloadV1,
   type SignedAskReceiptV1,
 } from '../core/ask-receipt.js';
@@ -71,12 +68,6 @@ function nonEmptyString(value: unknown): value is string {
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
     && Object.getPrototypeOf(value) === Object.prototype;
-}
-
-function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }
 
 function safeTimestamp(value: unknown): value is number {

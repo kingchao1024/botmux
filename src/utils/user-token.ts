@@ -26,6 +26,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { logger } from './logger.js';
+import { withFileLockSync } from './file-lock.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 import { readGlobalConfig } from '../global-config.js';
 
@@ -57,6 +58,53 @@ function tokenPathForApp(appId: string, openId?: string): string {
   return isUsableOpenId(openId)
     ? join(TOKEN_DIR, `user-token-${appId}-${openId}.json`)
     : join(TOKEN_DIR, `user-token-${appId}.json`);
+}
+
+/** appId is concatenated into a filename next to the token. Same shape rule as open_id. */
+const APP_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
+
+function userTokenEpochPath(appId: string, openId: string): string {
+  return join(TOKEN_DIR, `user-token-epoch-${appId}-${openId}`);
+}
+
+function parseUserTokenEpoch(text: string): number {
+  const n = Number(text.trim());
+  return Number.isInteger(n) && n >= 0 && n < Number.MAX_SAFE_INTEGER ? n : 0;
+}
+
+/** Unlocked read. Callers inside `withFileLockSync(tokenPath)` must use this, not a locking wrapper. */
+function readUserTokenEpochUnlocked(appId: string, openId: string): number {
+  try {
+    return parseUserTokenEpoch(readFileSync(userTokenEpochPath(appId, openId), 'utf8'));
+  } catch {
+    return 0;
+  }
+}
+
+function writeUserTokenEpochUnlocked(appId: string, openId: string, epoch: number): void {
+  atomicWriteFileSync(userTokenEpochPath(appId, openId), String(epoch), { mode: 0o600 });
+}
+
+/**
+ * Snapshot of the per-person epoch. Taken outside the token lock at the start
+ * of a login or refresh; the lock re-reads it before any write. A revoke that
+ * lands in between makes the two differ and the write is dropped.
+ */
+function readUserTokenEpoch(appId: string, openId: string): number {
+  if (!isUsableOpenId(openId) || !APP_ID_RE.test(appId)) return 0;
+  return readUserTokenEpochUnlocked(appId, openId);
+}
+
+/**
+ * Test-only. Runs after the callback has read the clicker's epoch and before
+ * the locked replace, so a test can advance that epoch in the gap a second
+ * process would win. Production leaves this null.
+ */
+let afterCallbackOwnerEpochReadForTest: ((openId: string, epoch: number) => void) | null = null;
+export function __setAfterCallbackOwnerEpochReadForTest(
+  fn: ((openId: string, epoch: number) => void) | null,
+): void {
+  afterCallbackOwnerEpochReadForTest = fn;
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -108,6 +156,15 @@ interface PendingLogin {
    * 具体的人而不是整个 bot。缺省（旧链路 / 无 sender 的入口）→ 写 per-app 文件。
    */
   openId?: string;
+  /**
+   * Initiator's epoch when the link was created, written into the pending file
+   * so a different process (the dashboard callback) can see it. Used only when
+   * the person who finishes the login is that same initiator. A forwarded link
+   * reads the clicker's epoch after user_info instead. Missing on a pending
+   * file from before this field existed, treated as 0: someone who has revoked
+   * since (epoch ≥ 1) is refused and must /login again.
+   */
+  authEpoch?: number;
   createdAt: number;
 }
 
@@ -165,13 +222,98 @@ function loadTokenFromPath(path: string): TokenStore | null {
   }
 }
 
-function saveTokenForApp(token: TokenStore, appId: string, openId?: string): void {
+function saveTokenForAppUnlocked(token: TokenStore, appId: string, openId?: string): void {
   const path = tokenPathForApp(appId, openId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   // 0600：OAuth token 是密钥，且原子写每次重建文件，不传 mode 会把用户
   // 手动收紧过的权限在自动刷新时悄悄改回 0644。
   atomicWriteFileSync(path, JSON.stringify(token, null, 2), { mode: 0o600 });
+}
+
+interface TokenReplacementResult {
+  saved: boolean;
+  token: TokenStore;
+  droppedScopes: string[];
+  superseded: boolean;
+  /** The file is gone, or this login's epoch was revoked. Do not keep the in-memory token. */
+  absent?: boolean;
+}
+
+type TokenReplacementPolicy = 'authorization' | 'refresh';
+
+function sameTokenVersion(left: TokenStore, right: TokenStore): boolean {
+  return left.access_token === right.access_token
+    && left.refresh_token === right.refresh_token
+    && left.expires_at === right.expires_at
+    && left.refresh_expires_at === right.refresh_expires_at
+    && left.scope === right.scope;
+}
+
+/**
+ * The only token-file writer. The lock makes the final re-read, monotonic
+ * scope check and atomic rename one cross-process critical section shared by
+ * daemon, dashboard and refresh paths.
+ *
+ * `expected` is used by refresh: if another process replaced the credential
+ * while the network request was in flight, the fresh on-disk token wins.
+ */
+function replaceTokenForApp(
+  token: TokenStore,
+  appId: string,
+  brand: Brand,
+  openId?: string,
+  expected?: TokenStore,
+  policy: TokenReplacementPolicy = 'authorization',
+  epoch?: number,
+): TokenReplacementResult {
+  const path = tokenPathForApp(appId, openId);
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return withFileLockSync(path, () => {
+    if (isUsableOpenId(openId) && epoch !== undefined && readUserTokenEpochUnlocked(appId, openId) !== epoch) {
+      return {
+        saved: false,
+        token,
+        droppedScopes: [],
+        superseded: true,
+        absent: true,
+      };
+    }
+    const current = loadTokenForApp(appId, brand, openId);
+    // Refresh must not recreate a file a revoke deleted while the network
+    // request was in flight. `expected && !current` used to fall through and save.
+    if (expected && !current) {
+      return {
+        saved: false,
+        token,
+        droppedScopes: [],
+        superseded: true,
+        absent: true,
+      };
+    }
+    if (expected && current && !sameTokenVersion(current.token, expected)) {
+      return {
+        saved: false,
+        token: current.token,
+        droppedScopes: [],
+        superseded: true,
+      };
+    }
+    const replacementScopes = new Set(splitScopes(token.scope));
+    const droppedScopes = splitScopes(current?.token.scope)
+      .filter(scope => !replacementScopes.has(scope));
+    if (policy === 'authorization' && droppedScopes.length > 0) {
+      return {
+        saved: false,
+        token: current!.token,
+        droppedScopes,
+        superseded: false,
+      };
+    }
+    saveTokenForAppUnlocked(token, appId, openId);
+    return { saved: true, token, droppedScopes, superseded: false };
+  }, { maxWaitMs: 30_000 });
 }
 
 function isValid(isoDate: string): boolean {
@@ -227,6 +369,46 @@ function loadTokenForApp(
   return null;
 }
 
+function reportedExpiry(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || !Number.isFinite(Date.parse(trimmed))) return undefined;
+  return trimmed;
+}
+
+/**
+ * Whether this person has a usable legacy bot-app user token, plus the expiry
+ * times stored beside it.
+ *
+ * Strictly that person's file: an unusable open_id does not fall through to
+ * the unattributed per-app token, and the result never includes access or
+ * refresh token contents. A still-refreshable access token counts as
+ * authorized — the same rule as {@link getTokenStatus}.
+ */
+export function userTokenAuthState(
+  appId: string,
+  brand: Brand = 'feishu',
+  openId?: string,
+): { state: 'authorized' | 'needs-login' | 'unknown'; expiresAt?: string; refreshExpiresAt?: string } {
+  if (!isUsableOpenId(openId)) return { state: 'unknown' };
+  try {
+    const loaded = loadTokenForApp(appId, brand, openId);
+    if (!loaded) return { state: 'needs-login' };
+    const { token } = loaded;
+    const accessValid = isValid(token.expires_at);
+    const refreshValid = isValid(token.refresh_expires_at) || (!token.refresh_expires_at && !!token.refresh_token);
+    const expiresAt = reportedExpiry(token.expires_at);
+    const refreshExpiresAt = reportedExpiry(token.refresh_expires_at);
+    return {
+      state: accessValid || refreshValid ? 'authorized' : 'needs-login',
+      ...(expiresAt ? { expiresAt } : {}),
+      ...(refreshExpiresAt ? { refreshExpiresAt } : {}),
+    };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
 /**
  * 这个 app 下所有已授权的人。用于 Dashboard 的「已授权 N 人」与 /login status。
  * 只读文件名与内容里的归属字段，**不返回任何 token 内容**。
@@ -270,6 +452,28 @@ export function lookupAuthorizedUserName(
   return token.userName;
 }
 
+/**
+ * Delete this person's token for this app and bump the epoch so an in-flight
+ * refresh, device poll, or OAuth callback cannot write it back.
+ *
+ * Only the per-person file is removed. The legacy per-app file and
+ * `user-token.json` have no provable owner and stay. The epoch file stays too:
+ * it is what makes the next write fail.
+ */
+export function clearUserToken(appId: string, brand: Brand, openId: string): boolean {
+  if (!isUsableOpenId(openId) || !APP_ID_RE.test(appId)) return false;
+  const path = tokenPathForApp(appId, openId);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  return withFileLockSync(path, () => {
+    const next = readUserTokenEpochUnlocked(appId, openId) + 1;
+    writeUserTokenEpochUnlocked(appId, openId, next);
+    const current = loadTokenFromPath(path);
+    if (!current || current.openId !== openId || !tokenMatches(current, appId, brand)) return false;
+    try { unlinkSync(path); } catch { /* already absent */ }
+    return !existsSync(path);
+  }, { maxWaitMs: 30_000 });
+}
+
 // ─── Token refresh ────────────────────────────────────────────────────────────
 
 async function refreshToken(
@@ -279,6 +483,7 @@ async function refreshToken(
   brand: Brand = 'feishu',
   signal?: AbortSignal,
 ): Promise<TokenStore | null> {
+  const authEpoch = isUsableOpenId(token.openId) ? readUserTokenEpoch(appId, token.openId) : undefined;
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
@@ -315,10 +520,35 @@ async function refreshToken(
     };
 
     // 写回原来那个文件：per-person token 刷新后仍是 per-person，不能落到
-    // per-app 路径去覆盖别的东西。
-    try { saveTokenForApp(updated, appId, token.openId); } catch { /* best-effort */ }
-    logger.info('[user-token] Refreshed User Access Token');
-    return updated;
+    // per-app 路径去覆盖别的东西。网络请求期间若另一进程已经换发了 token，
+    // 锁内版本检查会保留较新的磁盘版本。
+    try {
+      const replacement = replaceTokenForApp(
+        updated,
+        appId,
+        brand,
+        token.openId,
+        token,
+        'refresh',
+        authEpoch,
+      );
+      if (replacement.saved) {
+        if (replacement.droppedScopes.length > 0) {
+          logger.warn(
+            `[user-token] Refreshed User Access Token with reduced scopes: `
+            + replacement.droppedScopes.join(', '),
+          );
+        } else {
+          logger.info('[user-token] Refreshed User Access Token');
+        }
+      }
+      // Revoked or deleted while the refresh was in flight. The body we just
+      // received must not be handed back or written later.
+      if (!replacement.saved && replacement.absent) return null;
+      return replacement.token;
+    } catch {
+      return null;
+    }
   } catch (err: any) {
     logger.debug(`[user-token] Refresh failed: ${err.message}`);
     return null;
@@ -402,13 +632,41 @@ const DEFAULT_PORT = 9768;
  * 普通登录只申请消息读取、资源访问和授权续期。
  * 飞书会校验授权链接里的每个 scope；默认捆绑文档权限会让仅开通消息能力的
  * 应用在授权页直接失败（20027），连基础登录也无法完成。其它能力通过
- * `/login --scope ...` 或专项入口按需追加，不根据已有 token 隐式扩大申请范围。
+ * `/login --scope ...` 或专项入口按需追加。对已经授权过的同一用户，再次按需
+ * 授权时必须同时带上旧 token 的 scope，否则飞书返回的新 token 会覆盖旧 token，
+ * 把本次未显式请求的既有能力静默降权。
  */
 const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
   'offline_access',
 ].join(' ');
+
+function splitScopes(scope: string | undefined): string[] {
+  return (scope ?? '').split(/\s+/).filter(Boolean);
+}
+
+/**
+ * Build a monotonic authorization request for one verified app/user pair.
+ *
+ * The stored token is consulted only through the strict per-user lookup, so
+ * Alice's incremental authorization can never inherit Bob's scopes. Token
+ * validity is irrelevant here: even an expired access token is authoritative
+ * metadata for which scopes must not be dropped by its replacement.
+ */
+function authorizationScopes(
+  appId: string,
+  brand: Brand,
+  extraScopes: string[],
+  openId: string,
+): string[] {
+  const existing = loadTokenForApp(appId, brand, openId);
+  return [...new Set([
+    ...DEFAULT_SCOPES.split(' '),
+    ...extraScopes,
+    ...splitScopes(existing?.token.scope),
+  ])];
+}
 
 type UserAuthorizationPollResult =
   | { status: 'pending' }
@@ -429,7 +687,8 @@ export async function requestUserAuthorization(
   poll: () => Promise<UserAuthorizationPollResult>;
 }> {
   if (!isUsableOpenId(openId) || !isCurrent()) throw new Error('authorization_origin_changed');
-  const scopes = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])];
+  const authEpoch = readUserTokenEpoch(appId, openId);
+  const scopes = authorizationScopes(appId, brand, extraScopes, openId);
   const response = await fetch(`${larkHosts(brand).accounts}/oauth/v1/device_authorization`, {
     method: 'POST',
     headers: {
@@ -501,7 +760,7 @@ export async function requestUserAuthorization(
       if (!isCurrent()) return { status: 'failed', error: 'authorization_origin_changed' };
       if (Date.now() >= expiresAt) return { status: 'failed', error: 'expired_token' };
       const now = Date.now();
-      saveTokenForApp({
+      const replacement = replaceTokenForApp({
         access_token: data.access_token,
         refresh_token: data.refresh_token,
         token_type: data.token_type,
@@ -514,7 +773,13 @@ export async function requestUserAuthorization(
         brand,
         openId,
         ...(authorized.userName ? { userName: authorized.userName } : {}),
-      }, appId, openId);
+      }, appId, brand, openId, undefined, 'authorization', authEpoch);
+      if (!replacement.saved) {
+        return {
+          status: 'failed',
+          error: replacement.absent ? 'authorization_revoked' : 'authorization_scope_stale',
+        };
+      }
       return { status: 'ready', token: data.access_token };
     } catch {
       return { status: 'failed', error: signal.aborted ? 'authorization_timeout' : 'authorization_failed' };
@@ -600,8 +865,12 @@ export function generateAuthUrl(
   const state = randomBytes(32).toString('hex');
   const redirectUri = resolveOAuthRedirectUri();
 
-  // 基础 scope + 调用方按需追加（去重）。文档订阅入口会带 DOC_COMMENT_OAUTH_SCOPES。
-  const scope = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])].join(' ');
+  // 基础 scope + 调用方按需追加 + 这个用户已有的 scope（去重）。旧 scope 必须
+  // 一起申请，否则新 token 覆盖同一用户的旧文件时会造成静默降权。
+  const scopes = isUsableOpenId(openId)
+    ? authorizationScopes(appId, brand, extraScopes, openId)
+    : [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])];
+  const scope = scopes.join(' ');
   const params = new URLSearchParams({
     client_id: appId,
     redirect_uri: redirectUri,
@@ -620,7 +889,7 @@ export function generateAuthUrl(
     appId,
     appSecret,
     brand,
-    ...(isUsableOpenId(openId) ? { openId } : {}),
+    ...(isUsableOpenId(openId) ? { openId, authEpoch: readUserTokenEpoch(appId, openId) } : {}),
     createdAt: Date.now(),
   });
   savePendingLogin(pendingLogins.get(state)!);
@@ -799,7 +1068,6 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
 
     const ownerOpenId = authorized.openId;
     const mismatched = isUsableOpenId(pending.openId) && pending.openId !== authorized.openId;
-
     const token: TokenStore = {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
@@ -815,7 +1083,42 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       ...(authorized.userName ? { userName: authorized.userName } : {}),
     };
 
-    saveTokenForApp(token, pending.appId, ownerOpenId);
+    // Normally generateAuthUrl already merged the requester's stored scopes.
+    // Re-check against the actual clicker before overwrite as well: a forwarded
+    // link (or a concurrent token update) can make those two identities/states
+    // differ. Never replace a broader credential with a narrower one.
+    //
+    // Same person: the epoch frozen into the pending file when the link was
+    // created. That file is what the dashboard process loads, so a /logout in
+    // the daemon (which only bumps the on-disk epoch) is visible here without
+    // a cross-process cancel flag. Any revoke after the link was issued makes
+    // the locked re-read differ, including a revoke between agree and user_info.
+    // A pending file from before this field existed has no authEpoch and is
+    // treated as 0, so a person who has revoked since is refused and must
+    // /login again.
+    //
+    // Someone else finished a forwarded link: their epoch is read now. A revoke
+    // of theirs after this read and before the locked replace is refused. A
+    // revoke of theirs that already happened before user_info returns still
+    // saves — the clicker is unknowable until then (known residual: both a
+    // fresh consent after their own /logout, and the slice between their agree
+    // click and user_info).
+    const samePerson = isUsableOpenId(pending.openId) && pending.openId === ownerOpenId;
+    const authEpoch = isUsableOpenId(ownerOpenId)
+      ? (samePerson ? (pending.authEpoch ?? 0) : readUserTokenEpoch(pending.appId, ownerOpenId))
+      : undefined;
+    afterCallbackOwnerEpochReadForTest?.(ownerOpenId, authEpoch ?? 0);
+    const replacement = replaceTokenForApp(
+      token, pending.appId, pending.brand, ownerOpenId, undefined, 'authorization', authEpoch,
+    );
+    if (!replacement.saved && replacement.absent) {
+      return '❌ 授权已撤销，本次没有保存。请重新 /login。';
+    }
+    if (!replacement.saved) {
+      logger.warn(`[user-token] 放弃保存：新 token 缺少旧 scope（${replacement.droppedScopes.join(', ')}）`);
+      return `❌ 授权未完成：新 token 缺少已有权限 ${replacement.droppedScopes.join(' ')}，`
+        + '为避免覆盖后降权，本次没有保存。请由本人重新发起授权。';
+    }
     logger.info(`[user-token] OAuth login successful, token saved for ${pending.appId} (per-user)`);
 
     const expiresAt = new Date(token.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
