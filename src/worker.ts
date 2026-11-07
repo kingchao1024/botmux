@@ -220,7 +220,7 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
-import { drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
+import { ClaudeStopFailureTranscriptEvidence, drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import { InputDeliveryEvidenceTracker } from './services/input-delivery-evidence.js';
 import {
@@ -7528,6 +7528,7 @@ let bridgeOffset = 0;
 /** Transcript records older than this process were written while an earlier
  *  worker generation watched (or nobody did): replayed history, not live. */
 const WORKER_STARTED_AT_MS = Date.now();
+const claudeStopFailureEvidence = new ClaudeStopFailureTranscriptEvidence();
 const bridgeQueue = new BridgeTurnQueue(
   notifyTerminalTurnStarted,
   (taskId, anchor) => {
@@ -7535,6 +7536,7 @@ const bridgeQueue = new BridgeTurnQueue(
     syncCronTaskAnchorsToDaemon();
   },
   notifyNativeTranscriptConsumedLarkTurn,
+  (events, path) => claudeStopFailureEvidence.observe(events, path),
 );
 /** Background work (Agent / Bash / Monitor; Grok bash / monitor) launched by
  *  the CLI and not yet stopped, plus whether the main turn is open.
@@ -21280,6 +21282,9 @@ function postTerminalPromptFenceHolds(
  *  after a grace period the hook settles the open turn instead — the daemon
  *  then continues or reports it like any other failed terminal — or, with no
  *  open turn left, tells the chat. See services/claude-stop-failure.ts. */
+const claudeStopFailureNoticedTurns = new Set<string>();
+const CLAUDE_STOP_FAILURE_NOTICED_TURNS_MAX = 64;
+
 function handleClaudeStopFailure(
   msg: Extract<DaemonToWorker, { type: 'claude_stop_failure' }>,
   opts: { notifyOnly?: boolean } = {},
@@ -21295,13 +21300,27 @@ function handleClaudeStopFailure(
   const timer = handleClaudeStopFailureReport(msg.report, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }, {
     owner: { cliPid: bridgeCliPid, cliSessionIds, transcriptPath: bridgeJsonlPath },
     activeTurn: { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
-    schedule: (delayMs, run) => setTimeout(run, delayMs),
+    schedule: (delayMs, run) => {
+      const handle = setTimeout(run, delayMs);
+      handle.unref?.();
+      return handle;
+    },
     catchUp: () => { if (bridgeJsonlPath) bridgeIngest(); },
     settledStatus: (turnId, dispatchAttempt) => emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt),
     cliIdle: () => isPromptReady,
     isKnownTurn: turnId => turnId === currentBotmuxTurnId || retiredTurnIds.has(turnId)
       || queuedTypeAheadTurns.some(queued => queued.turnId === turnId),
     lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
+    transcriptEvidence: claudeStopFailureEvidence,
+    claimTurnNotice: (turnId, dispatchAttempt) => {
+      const key = `${turnId}\u0000${dispatchAttempt ?? ''}`;
+      if (claudeStopFailureNoticedTurns.has(key)) return false;
+      claudeStopFailureNoticedTurns.add(key);
+      if (claudeStopFailureNoticedTurns.size > CLAUDE_STOP_FAILURE_NOTICED_TURNS_MAX) {
+        claudeStopFailureNoticedTurns.delete(claudeStopFailureNoticedTurns.values().next().value!);
+      }
+      return true;
+    },
     now: Date.now,
     emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
       emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable);
@@ -21316,7 +21335,7 @@ function handleClaudeStopFailure(
     },
     log,
   }, opts);
-  timer?.unref?.();
+  void timer;
 }
 
 /** An isolated session's hook client falls back to the relay outbox once the

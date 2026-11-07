@@ -814,8 +814,11 @@ export async function commitRepoSelection(
           codexAppInputGateFrozen: true,
         };
       }
-      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput);
-      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput);
+      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput, ds.pendingRawTurnId);
+      else if (hasBufferedInput && wrappedInput) {
+        rememberLastCliInput(ds, pendingPrompt, wrappedInput,
+          ds.pendingFollowUpTurnIds?.at(-1) ?? ds.pendingFollowUpTurnId);
+      }
       // Keep the reservation and every buffered opening field intact through
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
@@ -2401,7 +2404,7 @@ export async function handleCardAction(
     // only ever driven through /quote would keep that flag forever — final text
     // answers still arrive, but its streaming card is permanently dead with no
     // visible cause and no way for the user to revive it.
-    rememberLastCliInput(ds, transcript.text, cliInput);
+    rememberLastCliInput(ds, transcript.text, cliInput, turnId);
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
@@ -4033,7 +4036,7 @@ export async function handleCardAction(
       // Start the cooldown only after acceptance: a rejected click must not
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, failedTurn.turnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;

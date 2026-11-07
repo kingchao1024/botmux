@@ -8,6 +8,7 @@
  * modern writers and removers never address that legacy pathname.
  */
 import { createHash } from 'node:crypto';
+import { parseLarkConnectionHealth, type LarkConnectionHealth } from '../im/lark/transport/connection-health.js';
 import {
   closeSync,
   constants,
@@ -37,6 +38,7 @@ export interface DaemonDescriptorIdentity {
 
 export interface OnlineDaemonInfo {
   larkAppId: string;
+  larkConnection?: LarkConnectionHealth | null;
   ipcPort: number;
   /** Random per-process audience for authenticated Workflow v3 mutations. */
   bootInstanceId?: string;
@@ -378,6 +380,11 @@ function parseDescriptor(
 
   return {
     larkAppId: d.larkAppId,
+    ...(d.larkConnection === null
+      ? { larkConnection: null }
+      : parseLarkConnectionHealth(d.larkConnection)
+        ? { larkConnection: parseLarkConnectionHealth(d.larkConnection) }
+        : {}),
     ipcPort: d.ipcPort as number,
     ...(typeof d.bootInstanceId === 'string' && d.bootInstanceId
       ? { bootInstanceId: d.bootInstanceId }

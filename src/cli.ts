@@ -9362,7 +9362,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       // protected precondition (which the CLI cannot rebind).
       const updates = readScheduleUpdate(rest);
       if (!trustedRemoteRunnerRelay) await detectAuthenticatedCurrentSession('operate');
-      await managedMutation('update', updates);
+      await managedMutation('update', { ...updates });
       console.log(`✅ 已更新任务 ${id} 的配置；后续执行生效，未触发补跑。`);
       break;
     }

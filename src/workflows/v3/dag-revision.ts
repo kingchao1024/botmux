@@ -50,6 +50,7 @@ import { latestAttemptIdFor, nextAttemptIdFor } from './attempt-numbering.js';
 import { materialize } from './state.js';
 import { withJournalMutationSync } from './journal.js';
 import { affectedNodesFrom } from './revisit-plan.js';
+import { v3CheckpointProblems, v3CheckpointsWithoutDependants, v3NodePlacement, v3PlacementProblems } from './placement.js';
 import type { V3RunSnapshot } from './state.js';
 
 // ─── Files ────────────────────────────────────────────────────────────────
@@ -152,6 +153,7 @@ export const V3_UPDATE_NODE_FIELDS = [
   'override',
   'revisitTo',
   'checkpoint',
+  'placement',
   'input',
   'maxIterations',
   'body',
@@ -755,6 +757,11 @@ export interface PlanV3DagRevisionInput {
   liftSpentRerunBudget?: boolean;
   /** Injected for tests; defaults to reading the done node's manifest. */
   readProducts?: (nodeId: string) => V3DoneNodeProducts | undefined;
+  /** The run's frozen executor. Checkpoints only take effect when goal nodes
+   *  run on bots, so only then is a checkpoint nothing depends on refused. */
+  nodeExecutor?: 'bot';
+  /** Bot display names for the §5.2 refusals (default: the app id). */
+  nameOf?: (larkAppId: string) => string;
 }
 
 /** A rerun refused because the revisit budget is spent: the initiator can
@@ -834,9 +841,11 @@ function nodeDefinitionWithoutWiring(node: V3Node): unknown {
 
 /** What the node's executor works on: its definition minus the checkpoint
  *  mark, which only says whether the main bot looks at the result once the
- *  node is done (§13.6). Toggling it never invalidates work in progress. */
+ *  node is done (§13.6), and minus the placement, which only says where the
+ *  not-yet-started node will be handed off (§5.2). Toggling either never
+ *  invalidates work in progress or a gate approval. */
 function nodeWorkDefinition(node: V3Node): unknown {
-  const { checkpoint: _checkpoint, ...rest } = nodeDefinitionWithoutWiring(node) as V3Node;
+  const { checkpoint: _checkpoint, placement: _placement, ...rest } = nodeDefinitionWithoutWiring(node) as V3Node;
   return rest;
 }
 
@@ -1069,6 +1078,18 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
           }
         }
         const node = raw[indexOf(op.nodeId)]!;
+        // §5.2: a node is handed off where its placement says when it starts;
+        // once an attempt went out (or the node ran before), its retries and
+        // revisits stay where it is. Only a node that has not started — or
+        // still waits at its gate, nothing handed off yet — may move.
+        if (Object.prototype.hasOwnProperty.call(op.set, 'placement')
+          && lifecycle !== 'notStarted' && lifecycle !== 'gateWaiting') {
+          const wanted = op.set.placement === null ? 'topic' : op.set.placement;
+          if (wanted !== v3NodePlacement(node as unknown as V3Node)) {
+            problems.push(`${where}: node "${op.nodeId}" has already started — its placement cannot change (only a node that has not started may move between the main topic and a node topic)`);
+            return;
+          }
+        }
         for (const [key, value] of Object.entries(op.set)) {
           if (value === null) delete node[key];
           else node[key] = cloneRaw(value);
@@ -1202,6 +1223,53 @@ export function planV3DagRevision(input: PlanV3DagRevisionInput): PlanV3DagRevis
   }
   const nextById = new Map(next.nodes.map((node) => [node.id, node]));
   const approvedById = new Map(approvedDag.nodes.map((node) => [node.id, node]));
+
+  // §5.2 hard rules 1 and 2 on the flow as it will run: who executes each
+  // node after this revision (this patch's reassignment, else an earlier
+  // one, else its definition). Rule 3 is the entry point's (it needs the
+  // main session; see applyV3RunEdit).
+  const mainApp = snapshotForSelector(knownBots, '')?.larkAppId ?? '';
+  const placementProblems = v3PlacementProblems({
+    dag: next,
+    mainLarkAppId: mainApp,
+    executorOf: (nodeId) => {
+      const move = reassigned.get(nodeId);
+      if (move) return snapshotForSelector(knownBots, move.to)?.larkAppId ?? move.to;
+      const defined = definedBotOf(nextById.get(nodeId));
+      return (added.has(nodeId) ? undefined : snap.assignments.get(nodeId))
+        ?? snapshotForSelector(knownBots, defined)?.larkAppId ?? defined ?? mainApp;
+    },
+    ...(input.nameOf ? { nameOf: input.nameOf } : {}),
+  });
+  if (placementProblems.length > 0) return { ok: false, problems: placementProblems.map((problem) => problem.message) };
+  // §13.6: an edit may not leave a checkpoint that nothing depends on (newly
+  // marked, its last dependant removed or rewired away, or one the flow
+  // already had). Only one that may still (re)complete counts. "May redo it"
+  // must match the supersede effects computed below exactly: the rerun cone
+  // re-dispatches a node only while it still has an effective instance.
+  //  - done: redone by this edit's reruns (itself or downstream of one) runs
+  //    again as a new instance;
+  //  - cancelled: an early-release loser is cancelled WITH its instance, so a
+  //    cone supersede revives it; one cancelled before dispatch has no
+  //    instance and stays cancelled;
+  //  - skipped: normally a pending node that never dispatched (no instance);
+  //    but a blocked node re-queued on its same instance
+  //    (nodeRetryRequested resetGate) and then skipped KEEPS the instance, so
+  //    the same cone-supersede revival applies to it.
+  if (input.nodeExecutor === 'bot') {
+    const redone = new Set([...rerun].flatMap((nodeId) => affectedNodesFrom(next, nodeId)));
+    const settled = (nodeId: string): boolean => {
+      if (added.has(nodeId)) return false;
+      const state = snap.nodes.get(nodeId);
+      if (state?.status === 'done') return !redone.has(nodeId);
+      if (state?.status === 'skipped' || state?.status === 'cancelled') {
+        return !redone.has(nodeId) || !state.effectiveInstanceId;
+      }
+      return false;
+    };
+    const sinks = v3CheckpointsWithoutDependants(next).filter((nodeId) => !settled(nodeId));
+    if (sinks.length > 0) return { ok: false, problems: v3CheckpointProblems(sinks) };
+  }
 
   // Updates that turned out to be no-ops do not count as changes.
   const changed = [...updated].filter((nodeId) => {

@@ -1566,7 +1566,7 @@ describe('silent scheduled turn lifecycle', () => {
     const turnId = forkedTurnId();
     expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
 
-    rememberLastCliInput(ds, '真实用户消息', '真实用户消息');
+    rememberLastCliInput(ds, '真实用户消息', '真实用户消息', 'om_user');
     expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
   });
 });

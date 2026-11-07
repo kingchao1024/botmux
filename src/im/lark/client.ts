@@ -1115,6 +1115,9 @@ export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode |
   return undefined;
 }
 
+/** Strict-cache alias used by callers that must not trigger a provider probe. */
+export const getCachedChatModeStrict = getCachedChatMode;
+
 export async function getChatMode(
   larkAppId: string,
   chatId: string,

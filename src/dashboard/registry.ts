@@ -2,8 +2,10 @@ import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { createHash } from 'node:crypto';
 import { watch, type FSWatcher } from 'node:fs';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
+import type { LarkConnectionHealth } from '../im/lark/transport/connection-health.js';
 
 export interface DaemonInfo {
+  larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   botName: string;
   /** CLI adapter id from bots.json, e.g. codex / claude-code / traex. */

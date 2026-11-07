@@ -22,6 +22,8 @@ import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTrig
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
 import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { retainPinEffort, validateModelPin, type ModelPin } from './model-pin.js';
+import { resolveSessionModelPinView } from './session-model.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -7395,6 +7397,36 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
   }
 }
 
+/** Persist first; a failed runtime apply must never claim that the pin was lost. */
+export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefined): boolean {
+  if (!pin && !ds.session.modelPin) return false;
+  if (pin) pin = retainPinEffort(pin, ds.session.modelPin);
+  if (isSessionTransferring(ds) || isSessionRestartInFlight(ds)) {
+    throw new Error('会话正在迁移或重启，请稍后重试');
+  }
+  if (ds.session.dispatchLaunchSpec) throw new Error('dispatch 会话使用冻结的启动规格，不支持话题固定');
+  if (pin && isSharedAdoptSession(ds)) throw new Error('接管（adopt）的会话由外部 CLI 自己管理模型，不能设置话题固定');
+  const cfg = getBot(ds.larkAppId).config;
+  if (pin) {
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
+    if (cfg.cliId && cliId !== cfg.cliId) throw new Error('会话 CLI 与 bot CLI 不匹配，不能设置固定');
+    const error = validateModelPin(pin, { cliId, backendType: ds.initConfig?.backendType ?? ds.session.backendType ?? cfg.backendType });
+    if (error) throw new Error(error);
+  }
+  const before = ds.session.modelPin;
+  ds.session.modelPin = pin;
+  try { sessionStore.updateSession(ds.session, { modelPinWrite: true }); }
+  catch (error) { ds.session.modelPin = before; throw error; }
+  if (!pin) ds.modelPinCleared = true;
+  else delete ds.modelPinCleared;
+  dashboardEventBus.publish({ type: 'session.update', body: {
+    sessionId: ds.session.sessionId,
+    patch: { modelPin: resolveSessionModelPinView(ds, cfg) ?? null },
+  } });
+  try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`[${tag(ds)}] Pin card refresh failed: ${String(error)}`); }
+  return true;
+}
+
 function latestTraexAutoModelForRespawn(ds: DaemonSession): TraexAutoModelConfig | null | undefined {
   try {
     const policy = resolveSessionLaunchModelChoice(ds, getBot(ds.larkAppId).config).traexAutoModel;
@@ -7502,7 +7534,7 @@ export function requestSessionRestart(
       if (status !== 'in_progress' && topicEffortRestartReadiness.get(ds.session.sessionId)?.attemptId === settingAttempt) {
         topicEffortRestartReadiness.delete(ds.session.sessionId);
       }
-      await observer.notify(status);
+      await observer.notify(status, settingAttempt!);
     },
   } : observer;
   const result = restartCoordinator.request(ds.session.sessionId, restartObserver, attemptId => {
@@ -11795,7 +11827,8 @@ const pendingCodexCliEffort = new WeakSet<DaemonSession>();
 
 /** A native menu receipt saves a future-turn preference, never activeRuntime. */
 export function updateCodexCliEffort(
-  ds: DaemonSession, effort: string, timeoutMs = 35_000,
+  ds: DaemonSession, effort: string, timeoutMs = 35_000, canApply: () => boolean = () => true,
+  _actor?: { source: 'command' | 'card'; setBy: string },
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
   const cfg = ds.initConfig ?? ds.session;
@@ -11810,6 +11843,8 @@ export function updateCodexCliEffort(
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
     || pendingCodexCliEffort.has(ds)) return Promise.resolve({ status: 'unavailable', reason: 'cli_menu_unavailable' });
   if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) return Promise.resolve({ status: 'invalid' });
+  try { if (!canApply()) return Promise.resolve({ status: 'unavailable' }); }
+  catch { return Promise.resolve({ status: 'unavailable' }); }
   const generation = ds.workerGeneration;
   const nativeId = ds.session.cliSessionId;
   const sessionGeneration = ds.session.workerGeneration;
@@ -11831,7 +11866,8 @@ export function updateCodexCliEffort(
     };
     const onMessage = (msg: WorkerToDaemon): void => {
       if (msg.type !== 'codex_cli_effort_result' || msg.requestId !== requestId) return;
-      if (!current()) return finish({ status: 'error' });
+      try { if (!current() || !canApply()) return finish({ status: 'error' }); }
+      catch { return finish({ status: 'error' }); }
       if (msg.status === 'future_only' && msg.reason === 'cli_next_turn') {
         const selected = effort as NonNullable<Session['reasoningEffort']>;
         const before = ds.session.reasoningEffort;
@@ -11863,6 +11899,8 @@ export function updateCodexCliEffort(
       if (!afterWorkerIpcBootstrap(worker, () => {
         if (settled) return;
         if (!current()) return finish({ status: 'unavailable' });
+        try { if (!canApply()) return finish({ status: 'unavailable' }); }
+        catch { return finish({ status: 'unavailable' }); }
         worker.send({ type: 'codex_cli_effort', requestId, effort,
           deadline: Date.now() + Math.max(1, timeoutMs - 2_000) } satisfies DaemonToWorker);
       })) finish({ status: 'unavailable' });
@@ -11874,6 +11912,8 @@ export function updateCodexAppEffort(
   ds: DaemonSession,
   effort: string,
   timeoutMs = 35_000,
+  canApply: () => boolean = () => true,
+  _actor?: { source: 'command' | 'card'; setBy: string },
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
   // 优先级 snapshot ?? session.cliId（刻意不回落到 bot 配置）：只对已有 live worker 的
@@ -11884,6 +11924,8 @@ export function updateCodexAppEffort(
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) {
     return Promise.resolve({ status: 'unavailable' });
   }
+  try { if (!canApply()) return Promise.resolve({ status: 'unavailable' }); }
+  catch { return Promise.resolve({ status: 'unavailable' }); }
   const requestId = randomUUID();
   return new Promise(resolve => {
     let settled = false;
@@ -11897,7 +11939,8 @@ export function updateCodexAppEffort(
     };
     const onMessage = (msg: WorkerToDaemon): void => {
       if (msg.type !== 'codex_app_effort_result' || msg.requestId !== requestId) return;
-      finish(ds.worker === worker ? msg : { status: 'error' });
+      try { finish(ds.worker === worker && canApply() ? msg : { status: 'error' }); }
+      catch { finish({ status: 'error' }); }
     };
     const onExit = (): void => finish({ status: 'error' });
     const timer = setTimeout(() => finish({ status: 'error' }), timeoutMs);
@@ -11908,6 +11951,8 @@ export function updateCodexAppEffort(
       if (!afterWorkerIpcBootstrap(worker, () => {
         if (settled) return;
         if (ds.worker !== worker) return finish({ status: 'unavailable' });
+        try { if (!canApply()) return finish({ status: 'unavailable' }); }
+        catch { return finish({ status: 'unavailable' }); }
         worker.send({ type: 'codex_app_effort', requestId, effort } satisfies DaemonToWorker);
       })) {
         finish({ status: 'unavailable' });
@@ -12928,6 +12973,7 @@ async function forkFromSource(
           childDs,
           opts?.forkTaskText ?? (typeof initialPrompt === 'string' ? initialPrompt : initialPrompt.content),
           initialPrompt,
+          opts?.turnId,
         );
       }
       fkw(
@@ -17432,7 +17478,7 @@ function setupWorkerHandlers(
           if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
             content: followUp.cliInput,
             ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
-          }, { codexAppInputAccepted: !!followUpCodexAppInput });
+          }, followUp.turnId, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
         invalidateStuckWarning(ds, 'prompt_ready');

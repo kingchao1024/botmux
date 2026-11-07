@@ -8,7 +8,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
-import { startLarkConnection } from './transport/connection.js';
+import { startLarkConnection, type LarkConnection } from './transport/connection.js';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
@@ -29,8 +29,7 @@ import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.j
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
-import { isTeamGroupChat } from '../../services/team-groups-store.js';
-import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
+import { isPlatformTeamBot, isPlatformTeamBotTrustedBy, isPlatformHallChat, isPlatformTeamMember, isTeamGroupChatFor, isLegacyTeamGroupChat } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { readBotAdminUnions } from '../../services/bot-admin-unions-store.js';
 import { isStewardSilentJoin } from '../../services/steward-auto-join.js';
@@ -1728,12 +1727,28 @@ export function resolveSiblingBotNameByUnionId(
  */
 export function isTrustedTeamBotSender(
   dataDir: string,
+  larkAppId: string,
   chatId: string | undefined,
   senderUnionId: string | undefined,
 ): boolean {
   return isTeamBot(dataDir, senderUnionId)
-    || isPlatformTeamBot(dataDir, senderUnionId)
-    || isTeamGroupChat(dataDir, chatId);
+    || isPlatformTeamBotTrustedForReceiver(dataDir, larkAppId, senderUnionId)
+    || isTeamGroupChatFor(dataDir, larkAppId, chatId);
+}
+
+function isConfiguredOnThisMachine(appId: string): boolean {
+  const id = appId.trim();
+  if (!id) return false;
+  try { return loadBotConfigsCached().some(cfg => (cfg.larkAppId ?? '').trim() === id); }
+  catch { return false; }
+}
+
+export function isPlatformTeamBotTrustedForReceiver(
+  dataDir: string,
+  larkAppId: string,
+  senderUnionId: string | undefined,
+): boolean {
+  return isPlatformTeamBotTrustedBy(dataDir, larkAppId, senderUnionId, isConfiguredOnThisMachine);
 }
 
 /** Update the per-bot cross-reference from @mention data in an event.
@@ -2432,7 +2447,7 @@ export function evaluateBotTalk(
   // 黑名单否决不可被 bot 独有的团队拉群 chat 维度腿复活：被黑 bot 即使出现在团队
   // 拉群里也照样拒绝（人侧 evaluateTalk 已挡 union 腿，这里挡 chat 腿）。
   if (ev.reason === 'blocked') return ev;
-  return isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
+  return isTrustedTeamBotSender(config.session.dataDir, larkAppId, chatId, senderUnionId)
     ? { allowed: true, reason: 'teamBot' }
     : ev;
 }
@@ -4925,9 +4940,9 @@ async function processCommentEvent(
 }
 
 export interface LarkEventDispatcherRuntime {
-  connect(): Lark.WSClient;
+  connect(): LarkConnection;
   connectPrimary(input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   };
   close(): void;
@@ -5321,7 +5336,7 @@ export function createLarkEventDispatcherRuntime(
         // (see team-bots-store). Done BEFORE the @mention gate so even a non-@
         // message in a team group teaches us the teammate. Cheap + idempotent.
         const senderUnionId = sender.sender_id?.union_id as string | undefined;
-        if (senderUnionId && isTeamGroupChat(config.session.dataDir, chatId)) {
+        if (senderUnionId && isLegacyTeamGroupChat(config.session.dataDir, chatId)) {
           recordTeamBot(config.session.dataDir, { unionId: senderUnionId });
         }
         // 机器人大厅：bot 消息只用于身份登记（上面已学 sender union / mentions
@@ -6993,7 +7008,7 @@ export function createLarkEventDispatcherRuntime(
     };
   }
 
-  let wsClient: Lark.WSClient | undefined;
+  let wsClient: LarkConnection | undefined;
   let listenerPollInFlight = false;
   let listenerPollTimer: NodeJS.Timeout | undefined;
   let initialListenerPollTimer: NodeJS.Timeout | undefined;
@@ -7146,7 +7161,7 @@ export function createLarkEventDispatcherRuntime(
     });
   };
 
-  const connect = (): Lark.WSClient => {
+  const connect = (): LarkConnection => {
     if (wsClient) return wsClient;
     wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand, {
       onReady: settlePrimaryTransportReady,
@@ -7184,7 +7199,7 @@ export function createLarkEventDispatcherRuntime(
   };
 
   const connectPrimary = (input: { signal: AbortSignal }): {
-    client: Lark.WSClient;
+    client: LarkConnection;
     ready: Promise<void>;
   } => {
     primaryLeadershipSignal = input.signal;
@@ -7298,7 +7313,7 @@ export function startLarkEventDispatcher(
   brand: Brand = 'feishu',
   durableInboxShadow?: DurableInboxStore,
   askReceiptProvenanceIssuer?: AskAnswerProvenanceIssuer,
-): Lark.WSClient {
+): LarkConnection {
   return createLarkEventDispatcherRuntime(
     larkAppId,
     larkAppSecret,

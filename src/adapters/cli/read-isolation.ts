@@ -165,10 +165,11 @@ export function credentialIsolationRequired(input: {
   askReceiptSigningKeyExists: boolean;
   askCardEventLedgerExists?: boolean;
   askPersistStoreExists?: boolean;
+  protectedHomePaths?: string[];
 }): boolean {
   return input.markerExists || input.deviceCredentialExists
     || input.askReceiptSigningKeyExists || input.askCardEventLedgerExists === true
-    || input.askPersistStoreExists === true;
+    || input.askPersistStoreExists === true || (input.protectedHomePaths?.length ?? 0) > 0;
 }
 
 export type CredentialOnlyIsolationGate =
