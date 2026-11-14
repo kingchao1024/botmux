@@ -76,6 +76,8 @@ it.skipIf(!tmuxAvailable)('submits the first prompt left in the composer once th
   const workingDir = join(root, 'work');
   const claudeDir = join(root, 'claude-config');
   for (const dir of [home, dataDir, workingDir, claudeDir]) mkdirSync(dir);
+  // The fixture tests CLI readiness, after the shell has finished starting.
+  writeFileSync(join(home, '.zshrc'), '# disposable test home\n');
   mkdirSync(join(home, '.botmux'), { mode: 0o700 });
   const eventsFile = join(root, 'events.jsonl');
   const pidFile = join(root, 'cli-pid');
@@ -105,7 +107,7 @@ it.skipIf(!tmuxAvailable)('submits the first prompt left in the composer once th
     }
   };
   try {
-    child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+    child = spawnNodeTsScript(process.env.BOTMUX_TEST_WORKER_JS ?? resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: privateTmuxEnv(root, {
         HOME: home, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,

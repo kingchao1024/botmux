@@ -1428,6 +1428,49 @@ describe('TmuxPipeBackend managed launch file', () => {
 });
 
 describe('TmuxPipeBackend managed session', () => {
+  it('holds the CLI launch until pipe-pane is subscribed', () => {
+    const be = new TmuxPipeBackend('bmx-startup', { createSession: true, ownsSession: true });
+    try {
+      be.spawn('/bin/echo', ['hello'], spawnOpts());
+      const { body } = takePaneLaunchFile(newSessionArgs());
+      expect(body).toMatch(/wait-for.*botmux-pipe-start-/);
+      expect(body.indexOf('wait-for')).toBeLessThan(body.indexOf('exec /usr/bin/env'));
+      const release = mockedExecFileSync.mock.calls.findIndex(([, args]) =>
+        Array.isArray(args) && args.includes('wait-for') && args.includes('-S'));
+      expect(release).toBeGreaterThanOrEqual(0);
+      const subscribe = mockedExecSync.mock.calls.findIndex(([cmd]) => String(cmd).includes('pipe-pane'));
+      expect(mockedExecSync.mock.invocationCallOrder[subscribe]).toBeLessThan(mockedExecFileSync.mock.invocationCallOrder[release]!);
+    } finally { be.kill(); }
+  });
+
+  it('does not release the CLI when the output subscription fails', () => {
+    const be = new TmuxPipeBackend('bmx-startup', { createSession: true, ownsSession: true });
+    mockedExecSync.mockImplementation((cmd: any) => {
+      if (String(cmd).includes('pipe-pane')) {
+        throw Object.assign(new Error('pipe rejected'), { status: 1, stderr: 'pipe rejected' });
+      }
+      return Buffer.from('');
+    });
+    expect(() => be.spawn('/bin/echo', ['hello'], spawnOpts())).toThrow('pipe rejected');
+    expect(mockedExecFileSync.mock.calls.some(([, args]) => Array.isArray(args) && args.includes('wait-for'))).toBe(false);
+  });
+
+  it('recycles the FIFO reader when the launch release fails', () => {
+    const before = __testOnly_liveFifoReaderCount();
+    const realMock = mockedExecFileSync.getMockImplementation()!;
+    mockedExecFileSync.mockImplementation(((bin, args, options) => {
+      if (Array.isArray(args) && args.includes('wait-for')) {
+        throw Object.assign(new Error('release rejected'), { status: 1, stderr: 'release rejected' });
+      }
+      return realMock(bin, args, options);
+    }) as typeof execFileSync);
+    const be = new TmuxPipeBackend('bmx-startup', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('/bin/echo', ['hello'], spawnOpts())).toThrow('release rejected');
+      expect(__testOnly_liveFifoReaderCount()).toBe(before);
+    } finally { be.kill(); }
+  });
+
   it('creates detached session and applies botmux tmux options', () => {
     const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
     be.spawn('/bin/echo', ['hello'], spawnOpts());
@@ -2324,6 +2367,21 @@ describe('TmuxPipeBackend.onData', () => {
   function lastStream() {
     return vi.mocked(createReadStream).mock.results.at(-1)!.value as any;
   }
+
+  it('replays raw startup output once to the first listener, before live chunks', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    const stream = lastStream();
+    const startup = '\x1b[2J❯ ready\x1b]7501;state=idle:app=traecli\x1b\\';
+    stream.emit('data', Buffer.from(startup, 'utf8'));
+    const first: string[] = [];
+    const second: string[] = [];
+    be.onData(data => first.push(data));
+    be.onData(data => second.push(data));
+    stream.emit('data', Buffer.from('live'));
+    expect(first).toEqual([startup, 'live']);
+    expect(second).toEqual(['live']);
+  });
 
   it('forwards a whole fifo chunk to registered listeners', () => {
     const be = new TmuxPipeBackend('0:2.0');

@@ -44,7 +44,7 @@ export function renderSkillCatalogBlock(
   });
   return [
     `<botmux_skills mode="${manifest.policyMode}">`,
-    '  <instruction>Prefer these botmux priority skills when they match the task. Read an entrypoint with `botmux skill show <name>` and referenced files with `botmux skill read <name> <relative-path>`.</instruction>',
+    '  <instruction>Before using any task tool, compare the request with every description below; you must read every matching skill entrypoint with `botmux skill show <name>`, follow its instructions, and use `botmux skill read <name> <relative-path>` for referenced files. Keep this preflight separate from task work and stop if a required read fails. Do not bulk-read unmatched skills.</instruction>',
     ...skills,
     '</botmux_skills>',
   ].join('\n');

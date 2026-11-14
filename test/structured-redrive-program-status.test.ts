@@ -22,6 +22,8 @@ import type { CliId } from '../src/adapters/cli/types.js';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { BusyReadyFallbackGate } from '../src/utils/busy-ready-fallback.js';
+import { shouldBlockStructuredPromptReady } from '../src/services/structured-bridge-clis.js';
+import { CodexBridgeQueue, STRUCTURED_SUBMIT_START_GRACE_MS } from '../src/services/codex-bridge-queue.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 /** Claude at its composer while it works: the statusLine row replaces the
@@ -58,7 +60,7 @@ function worker(cliId: CliId, screen: string) {
     bridgeJsonlPath: undefined,
     // The turn's transcript is not holding readiness back here.
     hasStructuredLifecycleBlock: () => false,
-    codexBridgeQueue: { preStartLeaseRemainingMs: () => undefined },
+    codexBridgeQueue: new CodexBridgeQueue(),
     stopStructuredStartGraceRecheck: () => {},
     scheduleStructuredStartGraceRecheck: () => {},
     pruneExpiredStructuredHeadsAndEmit: () => false,
@@ -85,6 +87,53 @@ function worker(cliId: CliId, screen: string) {
 }
 
 describe('replaying a prompt-ready deferred by an in-flight write', () => {
+  it.each(['coco', 'cursor', 'doubao', 'antigravity', 'codex'] as CliId[])(
+    'holds a confirmed submit until its bounded lease expires for %s', cliId => {
+      const { redrive, markPromptReady, scope } = worker(cliId, CLAUDE_WORKING_WITHOUT_BUSY_FOOTER);
+      let now = 1_000;
+      const queue = new CodexBridgeQueue(() => now);
+      queue.mark('om_submit', 'submitted input');
+      queue.confirmPendingTurn('om_submit');
+      const recheck = vi.fn();
+      scope.codexBridgeQueue = queue;
+      scope.rpcTurnsAwaitingActivation = new Set();
+      scope.rpcLifecycleFailClosedOwners = new Set();
+      scope.rpcTerminalHydrationOwners = new Set();
+      scope.traexQuotaPending = false;
+      scope.shouldBlockStructuredPromptReady = shouldBlockStructuredPromptReady;
+      scope.hasStructuredLifecycleBlock = loadWorkerFunction('hasStructuredLifecycleBlock', scope);
+      scope.scheduleStructuredStartGraceRecheck = recheck;
+      scope.pruneExpiredStructuredHeadsAndEmit = () => queue.pruneExpiredPreStartHeads().length > 0;
+      const probe = vi.fn();
+      scope.probeBusyPatternIdle = probe;
+      scope.idleDetector = { programStatusHeldBusy: () => false, feed: probe, fireIdle: probe };
+
+      redrive();
+      expect(markPromptReady).not.toHaveBeenCalled();
+      expect(probe).not.toHaveBeenCalled();
+      expect(scope.structuredRejectedReadyEvidenceGeneration).toBe(1);
+      expect(recheck).toHaveBeenCalledWith(STRUCTURED_SUBMIT_START_GRACE_MS);
+
+      now += STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+      redrive();
+      expect(queue.peek()).toEqual([]);
+      expect(scope.structuredRejectedReadyEvidenceGeneration).toBeUndefined();
+      expect(probe).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('discards a pre-start screen sample once a non-blocking transcript turn starts', () => {
+    const { redrive, markPromptReady, scope } = worker('coco', CLAUDE_WORKING_WITHOUT_BUSY_FOOTER);
+    const queue = scope.codexBridgeQueue as CodexBridgeQueue;
+    queue.mark('om_started', 'submitted input');
+    queue.ingest([{ kind: 'user', uuid: 'user-start', timestampMs: Date.now(), text: 'submitted input' }]);
+    expect(queue.hasBlockingTurn()).toBe(true);
+
+    redrive();
+
+    expect(scope.structuredRejectedReadyEvidenceGeneration).toBeUndefined();
+    expect(markPromptReady).not.toHaveBeenCalled();
+  });
   it('does not mark a turn ready that the CLI reported working after the deferral', () => {
     const { detector, idleEdges, markPromptReady, redrive, scope } = worker('claude-code', CLAUDE_WORKING_WITHOUT_BUSY_FOOTER);
     // 16:38:21.5: Claude took the input and reports working.

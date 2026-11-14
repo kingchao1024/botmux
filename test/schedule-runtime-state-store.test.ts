@@ -70,7 +70,93 @@ function state(kind: ScheduleRuntimeStateKind, chatId = 'oc_demo'): Record<strin
   };
 }
 
+function writeDeliverySequence(
+  dataDir: string,
+  chatId: string,
+  states: Record<string, unknown>[],
+): ReturnType<typeof writeScheduleRuntimeState> {
+  let expectedSha256 = 'missing';
+  let result: ReturnType<typeof writeScheduleRuntimeState> | undefined;
+  for (const next of states) {
+    result = writeScheduleRuntimeState({ kind: 'delivery', chatId, expectedSha256, next, dataDir });
+    expectedSha256 = result.sha256;
+  }
+  if (!result) throw new Error('delivery sequence must not be empty');
+  return result;
+}
+
 describe('schedule runtime state store', () => {
+  it.each([undefined, 42, 'not-a-message-id'])('rejects an invalid failed message id: %s', messageId => {
+    const next = { ...state('delivery'), status: 'delivery_failed', messageId };
+    expect(() => writeDeliverySequence(tempDataDir(), 'oc_demo', [next]))
+      .toThrow(/delivery_failed_message_invalid/);
+  });
+
+  it.each(['delivery_failed', 'delivered'])('cannot initialize a ledger in %s', status => {
+    expect(() => writeDeliverySequence(tempDataDir(), 'oc_demo', [{
+      ...state('delivery'), status, messageId: 'om_invented',
+      deliveryVerifiedAt: '2026-09-27T10:00:02.000Z',
+    }])).toThrow(/delivery_initial_state_invalid/);
+  });
+
+  it('rejects a replayed claim for the same run', () => {
+    expect(() => writeDeliverySequence(tempDataDir(), 'oc_demo', [state('delivery'), state('delivery')]))
+      .toThrow(/delivery_already_claimed/);
+  });
+
+  it.each([null, 'om_already_sent'])('retries only before a message id exists: %s', messageId => {
+    const dataDir = tempDataDir();
+    const initial = state('delivery');
+    const failed = writeDeliverySequence(dataDir, 'oc_demo', [
+      initial, { ...initial, status: 'delivery_failed', messageId, lastError: 'send_or_readback_failed' },
+    ]);
+    const retry = () => writeScheduleRuntimeState({
+      kind: 'delivery', chatId: 'oc_demo', expectedSha256: failed.sha256,
+      next: initial, dataDir,
+    });
+    if (messageId === null) expect(retry).not.toThrow();
+    else expect(retry).toThrow(/delivery_retry_message_exists/);
+  });
+
+  it.each(['task1234:not-a-time', 'task1234:2026-09-28'])('rejects malformed run key %s', runKey => {
+    expect(() => writeDeliverySequence(tempDataDir(), 'oc_demo', [{ ...state('delivery'), runKey }]))
+      .toThrow(/invalid_run_key/);
+  });
+
+  it('opens a new run only with a strictly newer timestamp', () => {
+    const dataDir = tempDataDir();
+    const initial = { ...state('delivery'), runKey: 'task1234:2026-09-28T10:00:00.000Z' };
+    const delivered = writeDeliverySequence(dataDir, 'oc_demo', [
+      initial,
+      { ...initial, status: 'sent', messageId: 'om_current' },
+      {
+        ...initial, status: 'delivered', messageId: 'om_current',
+        deliveryVerifiedAt: '2026-09-28T10:00:02.000Z',
+      },
+    ]);
+    const openRun = (runKey: string) => writeScheduleRuntimeState({
+      kind: 'delivery', chatId: 'oc_demo', expectedSha256: delivered.sha256,
+      next: { ...state('delivery'), runKey }, dataDir,
+    });
+    expect(() => openRun('task1234:2026-09-27T10:00:00.000Z')).toThrow(/delivery_run_not_newer/);
+    expect(() => openRun('task1234:2026-09-29T10:00:00.000Z')).not.toThrow();
+  });
+
+  it.each(['delivery_failed', 'delivered'])('a failed ledger cannot invent a message in %s', status => {
+    const dataDir = tempDataDir();
+    const initial = state('delivery');
+    const failed = writeDeliverySequence(dataDir, 'oc_demo', [
+      initial, { ...initial, status: 'delivery_failed', lastError: 'send_failed' },
+    ]);
+    expect(() => writeScheduleRuntimeState({
+      kind: 'delivery', chatId: 'oc_demo', expectedSha256: failed.sha256,
+      next: {
+        ...initial, status, messageId: 'om_invented',
+        deliveryVerifiedAt: '2026-09-27T10:00:02.000Z',
+      },
+      dataDir,
+    })).toThrow(/delivery_message_introduction_invalid/);
+  });
   it('creates and reads an allowlisted state file with a CAS token', () => {
     const dataDir = tempDataDir();
     const created = writeScheduleRuntimeState({

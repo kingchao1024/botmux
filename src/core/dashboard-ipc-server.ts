@@ -4,6 +4,10 @@ import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
 import { readOncallBusinessName, readOncallChoices } from '../services/oncall-platform.js';
 import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
+import { allowsTaskModelOverride } from './launch-model-capability.js';
+import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
+import type { RestartObserver } from './restart-coordinator.js';
+import { ensureBotChatGrantMatrix } from '../cli/exact-chat-grant-client.js';
 import { isSessionEffortChangeInFlight } from './worker-pool.js';
 import { scheduleActiveRuntimePatch } from './worker-pool.js';
 import { botModelPins, clearModelPins } from './model-pin-store.js';
@@ -273,7 +277,7 @@ import {
   cancelReadonlyTaskContinuationExplicit,
   startReadonlyTaskContinuation,
 } from '../services/readonly-task-continuation.js';
-import { listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { findOnlineDaemon, listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { updateMessage, sendUserMessage, sendEphemeralCard } from '../im/lark/client.js';
@@ -1579,6 +1583,7 @@ async function handleManagedOriginAttestation(
         turnId: liveTurnId,
         scheduleCreator,
         scheduleOperator,
+        allowArbitraryMention: scheduleBot?.config.allowArbitraryMention === true,
         ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
         larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
@@ -3182,36 +3187,30 @@ ipcRoute('POST', '/api/sessions/:sessionId/prune', async (_req, res, params) => 
   });
 });
 
-/** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
- *  mirroring the /resume route — so a Feishu-side observer sees why the CLI just
- *  restarted under them (the IM `/restart` command and the card button notify
- *  too; the dashboard was the lone silent path). `fresh` = the worker was gone
- *  and we re-forked it (revive) rather than doing an in-place CLI restart.
- *  Best-effort and fire-and-forget; never blocks the HTTP response. */
-function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
-  if (!ds.larkAppId) return;
-  // No-transport session (apiOnly bot or HTTP virtual chat) has no Feishu chat
-  // to post a restart notice into — skip (the raw sendMessage/replyMessage below
-  // bypass sessionReply's gate). Best-effort path; a silent skip is correct.
-  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
-  const loc = localeForBot(ds.larkAppId);
+/** Keep the restart's status in one scope-aware card, using its frozen CLI name. */
+function dashboardRestartNotifier(ds: DaemonSession): RestartObserver['notify'] {
+  if (!ds.larkAppId) return () => {};
   const botCfg = getBot(ds.larkAppId).config;
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })) return () => {};
+  const loc = localeForBot(ds.larkAppId);
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime)
     ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId ?? 'claude-code');
-  const text = fresh
-    ? t('card.action.restarted_fresh', { cliName }, loc)
-    : t('cmd.restart.in_progress', { cliName }, loc);
-  const notice = JSON.stringify({ text });
-  if (ds.scope === 'chat' && ds.chatId) {
-    getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-      .then((mode) => mode === 'topic' && ds.session.rootMessageId
-        ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-      .catch(err => logger.debug(`[restart] failed to post chat-scope restart notice: ${err}`));
-  } else if (ds.session.rootMessageId) {
-    replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-      .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
-  }
+  return restartStatusCardNotifier({
+    larkAppId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    render: status => buildRestartStatusCard({ status, cliName, source: 'dashboard', locale: loc }),
+    post: async notice => {
+      if (ds.scope === 'chat' && ds.chatId) {
+        const mode = await getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true });
+        return mode === 'topic' && ds.session.rootMessageId
+          ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'interactive', true)
+          : sendMessage(ds.larkAppId, ds.chatId, notice, 'interactive');
+      }
+      if (ds.session.rootMessageId) {
+        return replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'interactive', true);
+      }
+    },
+  });
 }
 
 /** Privileged host recovery: worker capabilities and request actor claims do not authorize this route. */
@@ -3329,36 +3328,24 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
     });
   }
   const cliId = ds.session.cliId ?? 'unknown';
-  if (ds.worker && !ds.worker.killed) {
-    // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
-    // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
-    // Correlated through the restart coordinator like IM /restart: the
-    // in-worker respawn emits no second `ready`, so only the attemptId-matched
-    // restart_result lifts the workerReady fence (#1863).
-    const sessionId = params.sessionId;
-    const restart = requestSessionRestart(ds, {
-      source: 'dashboard',
-      notify: status => {
-        if (status === 'failed' || status === 'timed_out') {
-          logger.warn(`[restart] dashboard restart of ${sessionId} ${status}`);
-        }
-      },
-    });
-    if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
-    if (restart.startFailure) {
-      return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
-    }
-    postRestartNotice(ds, false);
-    return jsonRes(res, 200, { ok: true, sessionId, cliId, revived: false });
+  const revived = !ds.worker || ds.worker.killed;
+  // The coordinator also tears down a surviving pane before reviving a worker.
+  const sessionId = params.sessionId;
+  const notify = dashboardRestartNotifier(ds);
+  const restart = requestSessionRestart(ds, {
+    source: 'dashboard',
+    notify: (status, attemptId) => {
+      if (status === 'failed' || status === 'timed_out') {
+        logger.warn(`[restart] dashboard restart of ${sessionId} ${status}`);
+      }
+      return notify(status, attemptId);
+    },
+  });
+  if (!restart) return jsonRes(res, 409, { ok: false, error: 'session_transferring' });
+  if (restart.startFailure) {
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(restart.startFailure.error) });
   }
-  // Worker is gone but the session is still active — idle-suspended (over the
-  // per-bot cap), lazy-restored after a daemon restart, or crash-loop-stopped.
-  // Revive it the same way the Feishu card restart does (forkWorker), so the
-  // dashboard isn't a dead-end: a 409 here would leave NO working control to
-  // bring the CLI back (the resume button only shows for closed sessions).
-  forkWorker(ds, '', ds.hasHistory);
-  postRestartNotice(ds, true);
-  jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
+  return jsonRes(res, 200, { ok: true, sessionId, cliId, revived });
   });
 });
 
@@ -7937,7 +7924,7 @@ function parseScheduleModelWrite(
 
   let botCfg: BotConfig | undefined;
   try { botCfg = getBot(larkAppId).config; } catch { botCfg = undefined; }
-  if (!isConfigurableReasoningCliId(botCfg?.cliId)) {
+  if (!allowsTaskModelOverride(botCfg?.cliId)) {
     return {
       ok: false,
       field: 'model',
@@ -10566,9 +10553,11 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
-    // Dashboard-created schedules default to this daemon process directory.
-    // It remains the Bash execution cwd, not a file-path resolution base.
-    scheduleWorkingDir: process.cwd(),
+    // Validate the bot default just as a session launch does.
+    scheduleWorkingDir: (() => {
+      const validated = defaultWorkingDir ? validateWorkingDir(defaultWorkingDir) : undefined;
+      return validated?.ok ? validated.resolvedPath : process.cwd();
+    })(),
     // Private Dashboard payload only. File-backed preconditions must live under
     // this daemon-owned host directory; it is never derived from workingDir.
     schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
@@ -13308,6 +13297,8 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     notifyOwnerOpenId?: unknown;
     bindWorkingDir?: unknown;
     roleProfileId?: unknown;
+    chatMode?: unknown;
+    botCollaboration?: unknown;
   };
   try {
     body = await readJsonBody<{
@@ -13320,11 +13311,19 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       notifyOwnerOpenId?: string;
       bindWorkingDir?: string;
       roleProfileId?: string;
+      chatMode?: unknown;
+      botCollaboration?: unknown;
     }>(req);
   } catch {
     return jsonRes(res, 400, { error: 'bad_json' });
   }
   const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
+  if (body.chatMode !== undefined && body.chatMode !== 'group' && body.chatMode !== 'topic') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_mode' });
+  }
+  if (body.botCollaboration !== undefined && typeof body.botCollaboration !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_bot_collaboration' });
+  }
   if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
     return jsonRes(res, 400, { error: 'larkAppIds_required' });
   }
@@ -13370,6 +13369,19 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
       creatorLarkAppId: cachedLarkAppId,
       larkAppIds: body.larkAppIds as string[],
       name,
+      chatMode: body.chatMode,
+      ...(body.botCollaboration === true ? {
+        ensureBotCollaboration: async (chatId: string, joinedBotAppIds: string[]) => {
+          await ensureBotChatGrantMatrix(chatId, joinedBotAppIds, {
+            findDaemon: findOnlineDaemon,
+            secret: () => {
+              const secret = loadDashboardSecret(dashboardSecretPath());
+              if (!secret) throw new Error('dashboard_secret_unavailable');
+              return secret;
+            },
+          });
+        },
+      } : {}),
       userOpenIds: userIds,
       ownerUnionIds,
       transferOwnerUnionId: transferOwnerUnionId ?? undefined,

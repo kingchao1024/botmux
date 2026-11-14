@@ -510,6 +510,7 @@ describe('Daemon IPC convergence: observe, relay, transferSession, and turn attr
     expect(onDeferredScheduleTurnSettled).toHaveBeenCalledWith(ds, {
       turnId: coldTurn,
       source: 'idle',
+      workerGeneration: 1,
     });
   });
 

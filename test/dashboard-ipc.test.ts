@@ -11,12 +11,12 @@ vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
 }));
 import type { ChildProcess } from 'node:child_process';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setProjectStageAdvanceTriggerHandler, setDurableSessionListHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setProjectStageAdvanceTriggerHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setTaskControlCanaryPhaseASendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -48,6 +48,7 @@ scheduleStore.setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import { initSessionGroups, registerSessionGroup } from '../src/services/session-groups-store.js';
+import { recordTeamBot } from '../src/services/team-bots-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as sandboxStore from '../src/services/sandbox-store.js';
@@ -102,6 +103,17 @@ import {
   REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
 } from '../src/im/lark/reply-card-style.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import {
+  canonicalProjectTaskControlCanaryFence,
+  projectTaskControlCanaryAbandonedRecord,
+  projectTaskControlCanaryFenceFingerprint,
+  projectTaskControlCanaryFenceRecord,
+} from '../src/services/project-group-store.js';
+import {
+  groupCollaborationModeConfigFingerprint,
+  readGroupCollaborationMode,
+} from '../src/services/group-collaboration-mode-store.js';
+import { persistTaskControlSuccessCertificateSync } from '../src/core/dispatch-registry.js';
 
 if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
   throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
@@ -237,6 +249,7 @@ afterEach(async () => {
   if (ORIGINAL_COORDINATION_MODE === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
   else process.env.BOTMUX_COORDINATION_MODE = ORIGINAL_COORDINATION_MODE;
   setTurnResultRuntime(undefined);
+  setTaskControlCanaryPhaseASendHandler(null);
   clearMessageListenerRunPreviewStore();
   // Restart attempts live in a module-level coordinator; never let one test's
   // in-flight attempt make a later restart of the same session id "join".
@@ -504,6 +517,55 @@ describe('dashboard IPC server', () => {
 describe('POST /api/sessions/:sessionId/project report trust boundary', () => {
   const SESSION_ID = 'project-report-session';
   const CAPABILITY = 'ab'.repeat(32);
+  const RETIRE_ACTION = {
+    action: 'retire_completion_gate', gateId: 'child', expectedDefinitionFingerprint: 'pcg1:old',
+    authorizationRef: 'om_authorization', reason: '失败终态已归档',
+  } as const;
+  const REPLACE_ACTION = {
+    action: 'replace_completion_gate', gateId: 'child', expectedDefinitionFingerprint: 'pcg1:old', newGateId: 'child-v2',
+    sourceChatId: 'oc_child', dispatchRoot: 'om_child_v2',
+    taskGuid: '11111111-1111-4111-8111-111111111111', label: '子群第二轮验收',
+    authorizationRef: 'om_authorization',
+    reason: '失败终态已归档，改用第二轮验收',
+  } as const;
+  const PREPARE_CANARY_ACTION = {
+    action: 'prepare_task_control_canary', authorizationRef: 'om_authorization', planSha256: 'a'.repeat(64),
+    dispatchSpec: {
+      dispatchOperationId: 'b'.repeat(50), taskGuid: '11111111-1111-4111-8111-111111111111',
+      controllerAppId: 'cli_coordinator', workerAppId: 'cli_worker',
+      reviewerAppId: 'cli_reviewer', acceptorAppId: 'cli_acceptor',
+      targetChatId: 'oc_project', targetAppIds: ['cli_worker', 'cli_reviewer'], writeScopes: ['/tmp'],
+      title: 'TaskControl canary', purpose: 'verify audit-only lifecycle',
+      owners: ['Worker', 'Reviewer'], botOpenIds: ['ou_worker', 'ou_reviewer'],
+      acceptanceRequested: true, seedText: 'seed', taskControlMode: 'audit_only',
+      phaseA: {
+        historicalDispatchRoot: 'om_historical', historicalTaskGuid: '22222222-2222-4222-8222-222222222222',
+        mappedWorkerAppId: 'cli_historical_worker', failedReportContent: 'expected failed report',
+        failedReportSha256: createHash('sha256').update('expected failed report').digest('hex'),
+        instructionTemplateVersion: 'TaskControlPhaseAInstruction.v1',
+        instructionTemplate: 'exact phase A instruction',
+        instructionTemplateSha256: createHash('sha256').update('exact phase A instruction').digest('hex'),
+      },
+    },
+  } as const;
+  const ABANDON_CANARY_ACTION = {
+    action: 'abandon_task_control_canary', authorizationRef: 'om_authorization',
+    fenceFingerprint: `tccq1:${'a'.repeat(64)}`, expectedConfigHash: `pgc1:${'b'.repeat(64)}`,
+  } as const;
+
+  function authorizationPrompt(action: Record<string, unknown>): string {
+    const { authorizationRef: _authorizationRef, ...summary } = action;
+    const prefix = action.action === 'retire_completion_gate' || action.action === 'replace_completion_gate'
+      ? '授权执行 BotMux completion gate 变更：' : '授权执行 BotMux TaskControl canary 操作：';
+    return prefix + JSON.stringify(summary);
+  }
+
+  function humanTurn(action: Record<string, unknown>, callerOverrides: Record<string, unknown> = {}) {
+    return {
+      turnId: 'om_authorization', userPrompt: authorizationPrompt(action),
+      caller: { requestUserOpenId: 'ou_owner', requestLarkAppId: 'cli_coordinator', senderType: 'user', ...callerOverrides },
+    };
+  }
 
   async function postProject(body: Record<string, unknown>): Promise<Response> {
     const path = `/api/sessions/${SESSION_ID}/project`;
@@ -515,27 +577,63 @@ describe('POST /api/sessions/:sessionId/project report trust boundary', () => {
     });
   }
 
-  async function setupProjectReportRoute() {
+  async function setupProjectReportRoute(options: {
+    activeInteractiveTurn?: Record<string, any>;
+    managedTurnId?: string | null;
+    managedCallerOpenId?: string | null;
+    managedSenderKind?: 'human' | 'bot' | null;
+    poisonedTeamBotUnionId?: string;
+    ownerOpenId?: string;
+    allowedOperatorOpenIds?: string[];
+  } = {}) {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-project-report-'));
     const previousDataDir = config.session.dataDir;
     config.session.dataDir = dataDir;
     setLarkAppId('cli_coordinator');
+    const activeCaller = options.activeInteractiveTurn?.caller;
+    const managedTurnId = options.managedTurnId === undefined
+      ? options.activeInteractiveTurn?.turnId : options.managedTurnId;
+    const managedCallerOpenId = options.managedCallerOpenId === undefined
+      ? activeCaller?.requestUserOpenId : options.managedCallerOpenId;
+    let managedSenderKind = options.managedSenderKind;
+    if (managedSenderKind === undefined) {
+      if (activeCaller?.senderType === 'user') managedSenderKind = 'human';
+      else if (activeCaller?.senderType === 'bot') managedSenderKind = 'bot';
+    }
+    if (options.allowedOperatorOpenIds) {
+      const bot = registerBot({
+        larkAppId: 'cli_coordinator', larkAppSecret: 'test-secret', cliId: 'traex', apiOnly: false,
+        allowedUsers: options.allowedOperatorOpenIds,
+      } as any);
+      bot.resolvedAllowedUsers = [...options.allowedOperatorOpenIds];
+    }
+    if (options.poisonedTeamBotUnionId) {
+      recordTeamBot(dataDir, { unionId: options.poisonedTeamBotUnionId, name: 'poisoned roster entry' });
+    }
     workerPool.setActiveSessionsRegistry(new Map([[SESSION_ID, {
-      session: { sessionId: SESSION_ID },
+      session: { sessionId: SESSION_ID, ownerOpenId: options.ownerOpenId },
       worker: null, workerPort: null, workerToken: null,
       larkAppId: 'cli_coordinator', chatId: 'oc_project', chatType: 'group', scope: 'chat',
       spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(), hasHistory: true,
-      managedTurnOrigin: { capability: CAPABILITY },
+      managedTurnOrigin: {
+        capability: CAPABILITY,
+        ...(typeof managedTurnId === 'string' ? { turnId: managedTurnId } : {}),
+        ...(typeof managedCallerOpenId === 'string' ? { callerOpenId: managedCallerOpenId } : {}),
+        ...(managedSenderKind ? { senderKind: managedSenderKind } : {}),
+      },
+      ...(options.activeInteractiveTurn ? { activeInteractiveTurn: options.activeInteractiveTurn } : {}),
     } as any]]));
     const runReport = vi.spyOn(projectCoordinator, 'runReport').mockResolvedValue({
       project: { workstreams: [] } as any,
       write: false,
     });
+    const run = vi.spyOn(projectCoordinator, 'run').mockResolvedValue({ workstreams: [] } as any);
     setIpcAuthSecret(TEST_IPC_SECRET);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
     return {
-      runReport, dataDir,
+      runReport, run, dataDir,
       cleanup: () => {
+        run.mockRestore();
         runReport.mockRestore();
         setProjectStageAdvanceTriggerHandler(null);
         workerPool.setActiveSessionsRegistry(new Map());
@@ -544,6 +642,287 @@ describe('POST /api/sessions/:sessionId/project report trust boundary', () => {
       },
     };
   }
+
+  it.each([
+    { name: 'no active human', options: {} },
+    { name: 'stale authorization message', options: { activeInteractiveTurn: { ...humanTurn(RETIRE_ACTION), turnId: 'om_other' } } },
+    { name: 'stale managed turn', options: { managedTurnId: 'om_other' } },
+    { name: 'stale managed caller', options: { managedCallerOpenId: 'ou_other' } },
+    { name: 'managed bot classification', options: { managedSenderKind: 'bot' as const } },
+    { name: 'missing managed classification', options: { managedSenderKind: null } },
+    { name: 'bot caller', options: { activeInteractiveTurn: humanTurn(RETIRE_ACTION, { senderType: 'bot' }) } },
+    {
+      name: 'scheduled caller',
+      options: { activeInteractiveTurn: humanTurn(RETIRE_ACTION, { source: 'schedule_creator', taskId: 'task-1' }) },
+    },
+    {
+      name: 'wrong app',
+      options: { activeInteractiveTurn: humanTurn(RETIRE_ACTION, { requestLarkAppId: 'cli_other' }) },
+    },
+    {
+      name: 'unauthorized human', options: {
+        activeInteractiveTurn: humanTurn(RETIRE_ACTION, { requestUserOpenId: 'ou_viewer' }),
+        allowedOperatorOpenIds: ['ou_owner'],
+      },
+    },
+    {
+      name: 'poisoned team-bot roster', options: {
+        activeInteractiveTurn: humanTurn(RETIRE_ACTION, { requestUserOpenId: 'ou_attacker', requestUserUnionId: 'on_attacker' }),
+        poisonedTeamBotUnionId: 'on_attacker', allowedOperatorOpenIds: ['ou_owner'],
+      },
+    },
+    { name: 'generic approval', options: { activeInteractiveTurn: { ...humanTurn(RETIRE_ACTION), userPrompt: '授权' } } },
+    { name: 'missing summary', options: { activeInteractiveTurn: { ...humanTurn(RETIRE_ACTION), userPrompt: undefined } } },
+    {
+      name: 'negated summary',
+      options: { activeInteractiveTurn: { ...humanTurn(RETIRE_ACTION), userPrompt: `不要${authorizationPrompt(RETIRE_ACTION)}` } },
+    },
+    { name: 'changed fingerprint', options: {}, action: { ...RETIRE_ACTION, expectedDefinitionFingerprint: 'pcg1:new' } },
+    {
+      name: 'changed replacement', options: { activeInteractiveTurn: humanTurn(REPLACE_ACTION) },
+      action: { ...REPLACE_ACTION, dispatchRoot: 'om_other_root' },
+    },
+    {
+      name: 'malformed open id',
+      options: { activeInteractiveTurn: humanTurn(RETIRE_ACTION, { requestUserOpenId: 'not-an-open-id' }), ownerOpenId: 'not-an-open-id' },
+    },
+    {
+      name: 'non-message turn', options: { activeInteractiveTurn: { ...humanTurn(RETIRE_ACTION), turnId: 'turn_authorization' } },
+      action: { ...RETIRE_ACTION, authorizationRef: 'turn_authorization' },
+    },
+  ])('rejects completion-gate mutation for $name', async scenario => {
+    const fixture = await setupProjectReportRoute({
+      ownerOpenId: 'ou_owner',
+      ...(scenario.name === 'no active human' ? {} : { activeInteractiveTurn: humanTurn(RETIRE_ACTION) }),
+      ...scenario.options,
+    });
+    try {
+      const response = await postProject({ ...(scenario.action ?? RETIRE_ACTION), originCapability: CAPABILITY });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ ok: false, error: 'project_completion_gate_authorization_required' });
+      expect(fixture.run).not.toHaveBeenCalled();
+    } finally { fixture.cleanup(); }
+  });
+
+  it.each([
+    { name: 'owner retirement', action: RETIRE_ACTION, actor: 'ou_owner' },
+    { name: 'operator retirement', action: RETIRE_ACTION, actor: 'ou_operator' },
+    { name: 'operator replacement', action: REPLACE_ACTION, actor: 'ou_operator' },
+    { name: 'bot mention', action: RETIRE_ACTION, actor: 'ou_owner', mention: true },
+  ])('accepts exact current human authorization for $name', async scenario => {
+    const turn = humanTurn(scenario.action, { requestUserOpenId: scenario.actor });
+    if (scenario.mention) turn.userPrompt = `@主控 Bot ${turn.userPrompt}`;
+    const fixture = await setupProjectReportRoute({
+      activeInteractiveTurn: turn, ownerOpenId: 'ou_owner', allowedOperatorOpenIds: ['ou_owner', 'ou_operator'],
+    });
+    if (scenario.mention) getBot('cli_coordinator').botName = '主控 Bot';
+    try {
+      const response = await postProject({ ...scenario.action, authorizedByOpenId: 'ou_forged', originCapability: CAPABILITY });
+      expect(response.status).toBe(200);
+      expect(fixture.run).toHaveBeenCalledWith(expect.anything(), { ...scenario.action, authorizedByOpenId: scenario.actor });
+    } finally { fixture.cleanup(); }
+  });
+
+  it.each([RETIRE_ACTION, PREPARE_CANARY_ACTION])('host HMAC cannot bypass human authorization for $action', async action => {
+    const fixture = await setupProjectReportRoute();
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(action),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        ok: false, error: action === RETIRE_ACTION
+          ? 'project_completion_gate_authorization_required' : 'project_task_control_canary_authorization_required',
+      });
+      expect(fixture.run).not.toHaveBeenCalled();
+    } finally { fixture.cleanup(); }
+  });
+
+  it.each(['ou_owner', 'ou_operator'])('installs only the exact human-authorized canary fence for %s', async actor => {
+    const fixture = await setupProjectReportRoute({
+      activeInteractiveTurn: humanTurn(PREPARE_CANARY_ACTION, { requestUserOpenId: actor }),
+      ownerOpenId: 'ou_owner', allowedOperatorOpenIds: ['ou_owner', 'ou_operator'],
+    });
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...PREPARE_CANARY_ACTION, authorizedByOpenId: 'ou_forged' }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(fixture.run).toHaveBeenCalledWith(expect.anything(), {
+        action: 'install_task_control_canary_fence',
+        fence: {
+          ...PREPARE_CANARY_ACTION.dispatchSpec, schemaVersion: 'TaskControlCanaryFence.v1',
+          targetAppIds: ['cli_reviewer', 'cli_worker'], owners: ['Reviewer', 'Worker'],
+          botOpenIds: ['ou_reviewer', 'ou_worker'], coordinatorSessionId: SESSION_ID,
+          originTurnId: 'om_authorization', authorizationRef: 'om_authorization',
+          authorizedByOpenId: actor, planSha256: PREPARE_CANARY_ACTION.planSha256,
+        },
+      });
+    } finally { fixture.cleanup(); }
+  });
+
+  it.each([
+    { name: 'stale message', options: { activeInteractiveTurn: { ...humanTurn(PREPARE_CANARY_ACTION), turnId: 'om_other' } } },
+    { name: 'stale managed origin', options: { managedTurnId: 'om_other' } },
+    { name: 'bot', options: { activeInteractiveTurn: humanTurn(PREPARE_CANARY_ACTION, { senderType: 'bot' }) } },
+    { name: 'schedule', options: { activeInteractiveTurn: humanTurn(PREPARE_CANARY_ACTION, { source: 'schedule_creator', taskId: 'task-1' }) } },
+    { name: 'wrong app', options: { activeInteractiveTurn: humanTurn(PREPARE_CANARY_ACTION, { requestLarkAppId: 'cli_foreign' }) } },
+    {
+      name: 'unauthorized human', options: {
+        activeInteractiveTurn: humanTurn(PREPARE_CANARY_ACTION, { requestUserOpenId: 'ou_viewer' }), allowedOperatorOpenIds: ['ou_owner'],
+      },
+    },
+    { name: 'changed plan', options: {}, action: { ...PREPARE_CANARY_ACTION, planSha256: 'c'.repeat(64) } },
+    {
+      name: 'changed dispatch', options: {},
+      action: { ...PREPARE_CANARY_ACTION, dispatchSpec: { ...PREPARE_CANARY_ACTION.dispatchSpec, dispatchOperationId: 'd'.repeat(50) } },
+    },
+  ])('rejects canary prepare for $name', async scenario => {
+    const fixture = await setupProjectReportRoute({
+      activeInteractiveTurn: humanTurn(PREPARE_CANARY_ACTION), ownerOpenId: 'ou_owner', ...scenario.options,
+    });
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(scenario.action ?? PREPARE_CANARY_ACTION),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ ok: false, error: 'project_task_control_canary_authorization_required' });
+      expect(fixture.run).not.toHaveBeenCalled();
+    } finally { fixture.cleanup(); }
+  });
+
+  it('rejects capability-only canary maintenance even with the exact human prompt', async () => {
+    const fixture = await setupProjectReportRoute({ activeInteractiveTurn: humanTurn(PREPARE_CANARY_ACTION), ownerOpenId: 'ou_owner' });
+    try {
+      const response = await postProject({ ...PREPARE_CANARY_ACTION, originCapability: CAPABILITY });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ ok: false, error: 'project_task_control_canary_host_authority_required' });
+      expect(fixture.run).not.toHaveBeenCalled();
+    } finally { fixture.cleanup(); }
+  });
+
+  it('routes an exact Phase A send through the daemon-owned handler', async () => {
+    const fixture = await setupProjectReportRoute();
+    const handler = vi.fn().mockResolvedValue({ state: 'delivered', messageId: 'om_phase_a' });
+    setTaskControlCanaryPhaseASendHandler(handler);
+    try {
+      const fenceFingerprint = `tccq1:${'a'.repeat(64)}`;
+      const instructionTemplateSha256 = 'b'.repeat(64);
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'send_task_control_phase_a', fenceFingerprint, instructionTemplateSha256 }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true, state: 'delivered', messageId: 'om_phase_a' });
+      expect(handler).toHaveBeenCalledWith({
+        dataDir: config.session.dataDir, chatId: 'oc_project', larkAppId: 'cli_coordinator',
+        coordinatorSessionId: SESSION_ID, fenceFingerprint, instructionTemplateSha256,
+      });
+    } finally { fixture.cleanup(); }
+  });
+
+  it('checks the exact abandonment prompt before inspecting durable state', async () => {
+    const fixture = await setupProjectReportRoute({ activeInteractiveTurn: humanTurn(ABANDON_CANARY_ACTION), ownerOpenId: 'ou_owner' });
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ABANDON_CANARY_ACTION),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ ok: false, error: 'project_task_control_canary_fence_missing' });
+    } finally { fixture.cleanup(); }
+  });
+
+  it.each(['enabled', 'disabled', 'abandoned'] as const)('re-enters abandonment safely from %s residue', async residue => {
+    const fixture = await setupProjectReportRoute({
+      activeInteractiveTurn: humanTurn(ABANDON_CANARY_ACTION), ownerOpenId: 'ou_owner',
+    });
+    const fence = canonicalProjectTaskControlCanaryFence({
+      ...PREPARE_CANARY_ACTION.dispatchSpec, coordinatorSessionId: SESSION_ID,
+      originTurnId: 'om_prepare', authorizationRef: 'om_prepare',
+      authorizedByOpenId: 'ou_owner', planSha256: PREPARE_CANARY_ACTION.planSha256,
+    });
+    const fenceFingerprint = projectTaskControlCanaryFenceFingerprint(fence);
+    const liveRecord = projectTaskControlCanaryFenceRecord(fence, '2026-09-30T00:00:00.000Z');
+    const tombstone = projectTaskControlCanaryAbandonedRecord(fence, {
+      authorizationRef: 'om_authorization', authorizedByOpenId: 'ou_owner', abandonedAt: '2026-09-30T01:00:00.000Z',
+    }, liveRecord.openedAt);
+    const record = residue === 'abandoned' ? tombstone : liveRecord;
+    const enabledConfig = {
+      schemaVersion: 1 as const, chatId: 'oc_project', mode: 'project' as const, coordinatorAppId: 'cli_coordinator',
+      workerAppIds: ['cli_worker', 'cli_reviewer', 'cli_acceptor'], autoEnrollWorkers: true,
+      taskControlPlane: { mode: 'audit_only' as const, acceptorAppId: 'cli_acceptor', maxActiveMappings: 1 as const },
+      createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:00.000Z',
+    };
+    const { taskControlPlane: _taskControlPlane, ...disabledConfig } = enabledConfig;
+    const storedConfig = residue === 'enabled' ? enabledConfig : disabledConfig;
+    writeFileSync(join(fixture.dataDir, 'group-collaboration-modes.json'), JSON.stringify({
+      schemaVersion: 1, configs: { oc_project: storedConfig },
+    }));
+    writeFileSync(join(fixture.dataDir, 'project-groups.json'), JSON.stringify({
+      schemaVersion: 3, projects: { oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator', coordinatorSessionId: SESSION_ID,
+        title: '项目', goal: '验证 abandonment re-entry', phase: '维护', focus: residue, status: 'active',
+        blockers: [record.summary], blockerRecords: [record], workstreams: [], completionGates: [],
+        dispatchReservations: [], milestones: [],
+        createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T01:00:00.000Z',
+      } },
+    }));
+    const expectedConfigHash = groupCollaborationModeConfigFingerprint(enabledConfig);
+    const action = { ...ABANDON_CANARY_ACTION, fenceFingerprint, expectedConfigHash };
+    fixture.run.mockResolvedValueOnce({ workstreams: [], blockerRecords: [tombstone] } as any);
+    const active = workerPool.getActiveSessionsRegistry()!.get(SESSION_ID)!;
+    active.activeInteractiveTurn!.userPrompt = authorizationPrompt(action);
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(action),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(readGroupCollaborationMode(fixture.dataDir, 'oc_project')).toEqual(storedConfig);
+      expect(fixture.run).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: action.action, authorizationRef: action.authorizationRef, expectedConfigHash,
+        fence, authorizedByOpenId: 'ou_owner',
+      }));
+    } finally { fixture.cleanup(); }
+  });
+
+  it('reports an exact durable abandonment tombstone and success certificate through read-only status', async () => {
+    const fixture = await setupProjectReportRoute();
+    const fence = canonicalProjectTaskControlCanaryFence({
+      ...PREPARE_CANARY_ACTION.dispatchSpec, coordinatorSessionId: SESSION_ID,
+      originTurnId: 'om_authorization', authorizationRef: 'om_authorization',
+      authorizedByOpenId: 'ou_owner', planSha256: PREPARE_CANARY_ACTION.planSha256,
+    });
+    const tombstone = projectTaskControlCanaryAbandonedRecord(fence, {
+      authorizationRef: 'om_abandon', authorizedByOpenId: 'ou_owner', abandonedAt: '2026-09-30T01:00:00.000Z',
+    }, '2026-09-30T00:00:00.000Z');
+    writeFileSync(join(fixture.dataDir, 'project-groups.json'), JSON.stringify({
+      schemaVersion: 3, projects: { oc_project: {
+        schemaVersion: 3, revision: 2, chatId: 'oc_project', larkAppId: 'cli_coordinator', coordinatorSessionId: SESSION_ID,
+        title: '项目', goal: '检查 tombstone', phase: '维护', focus: '只读状态', status: 'active',
+        blockers: [tombstone.summary], blockerRecords: [tombstone], workstreams: [], completionGates: [],
+        dispatchReservations: [], milestones: [],
+        createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T01:00:00.000Z',
+      } },
+    }));
+    const certificate = persistTaskControlSuccessCertificateSync(join(fixture.dataDir, 'orchestrate-dispatch.json'), {
+      operationId: fence.dispatchOperationId, chatId: 'oc_project',
+      fenceFingerprint: projectTaskControlCanaryFenceFingerprint(fence), dispatchRoot: 'om_canary',
+      taskGuid: fence.taskGuid, evidence: { phaseA: { settled: true }, phaseB: { settled: true } },
+      createdAt: '2026-09-30T00:59:59.000Z',
+    });
+    try {
+      const response = await fetchDaemonIpc(handle!.port, `/api/sessions/${SESSION_ID}/project`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'task_control_canary_status' }),
+      }, TEST_IPC_SECRET);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: true, fenceFingerprint: expect.stringMatching(/^tccq1:[a-f0-9]{64}$/),
+        abandoned: { schemaVersion: 'TaskControlCanaryAbandoned.v1', authorizationRef: 'om_abandon', authorizedByOpenId: 'ou_owner' },
+        successCertificate: certificate, successCertificateHash: certificate.certificateHash,
+      });
+    } finally { fixture.cleanup(); }
+  });
 
   function stageEventFixture(
     now = '2026-10-03T00:00:00.000Z',
@@ -6345,6 +6724,7 @@ describe('POST /api/sessions/:sessionId/restart', () => {
   });
 
   it('uses the frozen compatible runtime name in the restart notice', async () => {
+    sessionStore.init('runtime-app');
     registerBot({
       larkAppId: 'runtime-app',
       larkAppSecret: 'secret',
@@ -6385,7 +6765,7 @@ describe('POST /api/sessions/:sessionId/restart', () => {
         { method: 'POST' },
       );
 
-      expect(res.status).toBe(200);
+      expect(res.status, JSON.stringify(await res.json())).toBe(200);
       await vi.waitFor(() => expect(replySpy).toHaveBeenCalled());
       // The restart status card, posted into the thread.
       expect(replySpy.mock.calls[0]![3]).toBe('interactive');
@@ -12709,6 +13089,7 @@ describe('POST /api/groups/create', () => {
       name: undefined,
       botIds: [],
       userIds: [],
+      chatMode: undefined,
     });
     expect(addSpy).toHaveBeenCalledWith('test-app', 'oc_new', ['cli_X']);
     expect(spy).toHaveBeenCalledWith('test-app', 'oc_new', process.cwd());
@@ -12730,12 +13111,16 @@ describe('POST /api/groups/create', () => {
     });
 
     expect((await post({ larkAppIds: ['test-app'], chatMode: 'thread' })).status).toBe(400);
+    expect((await post({ larkAppIds: ['test-app'], chatMode: 'normal' })).status).toBe(400);
     expect((await post({ larkAppIds: ['test-app'], botCollaboration: 'yes' })).status).toBe(400);
     expect(createSpy).not.toHaveBeenCalled();
 
     const plain = await (await post({ larkAppIds: ['test-app', 'cli_X'] })).json();
     expect(createSpy).toHaveBeenLastCalledWith('test-app', { name: undefined, botIds: [], userIds: [], chatMode: undefined });
     expect('collaborationError' in plain).toBe(false);
+
+    expect((await post({ larkAppIds: ['test-app'], chatMode: 'group' })).status).toBe(200);
+    expect(createSpy).toHaveBeenLastCalledWith('test-app', expect.objectContaining({ chatMode: 'group' }));
 
     const topic = await (await post({ larkAppIds: ['test-app', 'cli_X'], chatMode: 'topic', botCollaboration: true })).json();
     expect(createSpy).toHaveBeenLastCalledWith('test-app', expect.objectContaining({ chatMode: 'topic' }));

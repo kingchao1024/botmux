@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildProjectGroupCard,
   COLLAPSED_COMPLETED_WORKSTREAM_LIMIT,
@@ -50,6 +50,95 @@ function makeProject(overrides: Partial<ProjectGroupState> = {}): ProjectGroupSt
 }
 
 describe('buildProjectGroupCard workstream table', () => {
+  it('keeps audit-only TaskControl metadata out of the legacy workstream projection', () => {
+    const base = makeProject();
+    const workstream = {
+      ...base.workstreams[0]!,
+      taskControl: {
+        taskGuid: '11111111-1111-4111-8111-111111111111',
+        phaseId: 'workstream:11111111-1111-4111-8111-111111111111',
+        mappingRef: 'topic-message:om_root', mappingStatus: 'registered' as const,
+        sourceKind: 'project_group' as const, controllerAppId: 'cli_test', workerAppId: 'cli_worker',
+        reviewerAppId: 'cli_reviewer', acceptorAppId: 'cli_acceptor', projectRevision: 2,
+        reservationId: 'reservation-1', coordinatorSessionId: 'sess-1', originTurnId: 'turn-1',
+        reservationCreatedAt: base.createdAt, reservationExpiresAt: base.updatedAt, rootCreateTime: base.createdAt,
+        reservationProof: {
+          schemaVersion: 'ProjectDispatchReservationProof.v1' as const, larkAppId: 'cli_test', issuedAt: base.createdAt,
+          keyId: 'tcpr1:key', signature: 'a'.repeat(64),
+        },
+      },
+    };
+    const serialized = JSON.stringify(buildProjectGroupCard(makeProject({ workstreams: [workstream] })));
+    expect(serialized).toContain('进行中');
+    expect(serialized).not.toContain(workstream.taskControl.taskGuid);
+    expect(serialized).not.toContain(workstream.taskControl.reservationId);
+    expect(serialized).not.toContain('audit_only');
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it.each(['status-dashboard', 'compact-list'] as const)('shows parent gates without exposing evidence in %s', templateId => {
+    const base = makeProject();
+    const card = buildProjectGroupCard(makeProject({
+      manualProgress: 100,
+      completionGates: [{
+        gateId: 'botmux-clean', sourceChatId: 'oc_child', dispatchRoot: 'om_child',
+        taskGuid: '11111111-1111-4111-8111-111111111111', label: 'BotMux clean canary',
+        definitionFingerprint: 'pcg1:fingerprint', status: 'pending', reason: 'source_workstream_incomplete',
+        createdAt: base.createdAt, updatedAt: base.updatedAt,
+      }],
+    }), 'feishu', { templateId }) as any;
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain('父级完成门（1）');
+    expect(serialized).toContain('待满足');
+    expect(serialized).not.toContain('BotMux clean canary');
+    expect(serialized).not.toContain('11111111-1111-4111-8111-111111111111');
+    expect(serialized).not.toContain('pcg1:fingerprint');
+  });
+
+  it('renders expired satisfied gates as pending revalidation', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-29T12:05:01.000Z'));
+    const base = makeProject();
+    const card = buildProjectGroupCard(makeProject({
+      completionGates: [{
+        gateId: 'child', sourceChatId: 'oc_child', dispatchRoot: 'om_child',
+        taskGuid: '11111111-1111-4111-8111-111111111111', label: '子群验收',
+        definitionFingerprint: 'pcg1:fingerprint', status: 'satisfied', reason: 'verified',
+        checkedAt: '2026-09-29T12:00:00.000Z', validUntil: '2026-09-29T12:05:00.000Z',
+        evidence: { sourceProjectRevision: 7, reviewerVerdictId: 'rv_1',
+          terminalEventId: 'evt-delivered', deliveryReceiptId: 'rcpt-1' },
+        createdAt: base.createdAt, updatedAt: base.updatedAt,
+      }],
+    })) as any;
+    expect(JSON.stringify(card)).toContain('待复核 1');
+    expect(JSON.stringify(card)).not.toContain('已满足 1');
+  });
+
+  it('excludes retired gates from the visible aggregate', () => {
+    const base = makeProject();
+    const card = buildProjectGroupCard(makeProject({
+      completionGates: [{
+        gateId: 'child-v1', sourceChatId: 'oc_child', dispatchRoot: 'om_child_v1',
+        taskGuid: '11111111-1111-4111-8111-111111111111', label: '子群验收 v1',
+        definitionFingerprint: 'pcg1:old', status: 'blocked', reason: 'source_workstream_failed',
+        retirement: { retiredAt: base.updatedAt, retiredBySessionId: 'session-main',
+          authorizationRef: 'om_authorization', authorizedByOpenId: 'ou_authorizer',
+          reason: '由新一轮验收替代', replacementGateId: 'child-v2' },
+        createdAt: base.createdAt, updatedAt: base.updatedAt,
+      }, {
+        gateId: 'child-v2', sourceChatId: 'oc_child', dispatchRoot: 'om_child_v2',
+        taskGuid: '22222222-2222-4222-8222-222222222222', label: '子群验收 v2',
+        definitionFingerprint: 'pcg1:new', status: 'pending', reason: 'not_evaluated',
+        replacesGateId: 'child-v1', createdAt: base.createdAt, updatedAt: base.updatedAt,
+      }],
+    })) as any;
+    const serialized = JSON.stringify(card);
+    expect(serialized).toContain('父级完成门（1）');
+    expect(serialized).toContain('待满足 1');
+    expect(serialized).not.toContain('阻塞 1');
+    expect(serialized).not.toContain('child-v1');
+    expect(serialized).not.toContain('ou_authorizer');
+  });
   it('auto-sizes rows with the shared cap while keeping its own blue header style', () => {
     const card = buildProjectGroupCard(makeProject()) as any;
     const table = card.body.elements.find((e: any) => e.tag === 'table');

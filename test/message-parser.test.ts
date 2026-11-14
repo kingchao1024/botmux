@@ -27,6 +27,13 @@ function makeMsg(msgType: string, content: object | string) {
 // ─── API message metadata ─────────────────────────────────────────────────
 
 describe('parseApiMessage metadata', () => {
+  it('preserves chat_id so quoted-message callers can verify the delivery target', () => {
+    const result = parseApiMessage({
+      ...makeMsg('text', { text: 'delivered' }),
+      chat_id: 'oc_delivery_target',
+    });
+    expect(result.chatId).toBe('oc_delivery_target');
+  });
   it('preserves root_id when present', () => {
     const result = parseApiMessage({
       ...makeMsg('text', { text: 'reply' }),

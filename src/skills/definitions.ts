@@ -333,6 +333,8 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 \`\`\`json
 {
   "messageId": "om_xxx",
+  "chatId": "oc_xxx",
+  "rootId": "",
   "senderId": "ou_xxx",
   "senderType": "user|app",
   "msgType": "text|post|interactive|image|file|merge_forward_expanded",
@@ -1634,6 +1636,13 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 - 开新话题靠 \`botmux dispatch\`（发种子消息 + 在线程里 @ 子 bot，子 bot 即在该话题各起独立会话）。**子 bot 必须已在群里且 mentionable**（有 include_bot 权限）。
 - 一条话题里可以有多个 bot（如 coder+reviewer），它们在该话题内互相 @ 协作。
 - **反方向同理（你 → 子 bot）**：子 bot 的会话只在它的子话题里。你要跟某个子 bot 说话（追问/补任务/确认），**一律 \`botmux dispatch --into <子话题root> --bot <子bot>\`** 发进它的子话题——**绝不要在主群 \`botmux send --mention <子bot>\`**，那条 @ 到不了它在子话题的会话，反而会在主群另起一个无上下文的新会话（与上面的回报问题完全对称）。子 bot 回报后你通常只需聚合，不必回它；要回也走 \`--into\`。（\`botmux send\` 已加护栏：误 @ 活跃子 bot 会被拦下并提示，确需强发才 \`--anyway\`。）
+
+## TaskControl 边界
+
+- 项目群的 TaskControl 执行真源是 daemon plane；普通非项目会话继续使用插件 TaskControl，两边不得为同一任务双写。
+- 只有项目群配置明确开启 audit-only，且 dispatch 显式传入 \`--task-control audit-only\` 时，才会建立 daemon mapping。未声明的 workstream 保持原有流程。
+- audit-only 只记录可信 mapping、事件和差异，不接管项目卡状态，不启用 writeback、pump 或 freeze。
+- 不能只凭 \`botmux report\` 回执或项目卡文案宣布终态。主控必须核对可信事件、交付回执、独立评审和项目写入结果。
 
 ## 流程
 

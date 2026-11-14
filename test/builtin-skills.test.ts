@@ -310,6 +310,15 @@ describe('built-in botmux-orchestrate skill', () => {
   });
 });
 
+describe('built-in botmux-orchestrate TaskControl', () => {
+  it('keeps project-group TaskControl on the daemon plane and requires evidence before terminal claims', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
+    expect(skill!.content).toContain('项目群的 TaskControl 执行真源是 daemon plane');
+    expect(skill!.content).toContain('普通非项目会话继续使用插件 TaskControl');
+    expect(skill!.content).toContain('不能只凭 `botmux report` 回执或项目卡文案宣布终态');
+  });
+});
+
 describe('built-in botmux-whiteboard skill', () => {
   it('is NOT in BUILTIN_SKILLS — installed conditionally on the whiteboard toggle', () => {
     // The whiteboard feature is off by default, so its skill must not be written

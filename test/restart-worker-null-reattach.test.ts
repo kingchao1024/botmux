@@ -110,7 +110,13 @@ describe('P1 requestSessionRestart without a live worker', () => {
   });
 
   async function restartWithoutWorker(extra: Record<string, unknown> = {}) {
-    const { requestSessionRestart, __testOnly_resetRestartCoordinator } = await import('../src/core/worker-pool.js');
+    const { requestSessionRestart, __testOnly_resetRestartCoordinator, initWorkerPool } = await import('../src/core/worker-pool.js');
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 0,
+      closeSession: vi.fn(),
+    });
     __testOnly_resetRestartCoordinator();
     const ds: any = { session: { sessionId: `null-reattach-${Math.random()}` }, larkAppId: 'cli_app', hasHistory: true, ...extra };
     const result = requestSessionRestart(ds, { source: 'slash', notify: vi.fn(async () => {}) } as any);

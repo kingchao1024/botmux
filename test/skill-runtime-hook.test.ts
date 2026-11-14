@@ -4,6 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { config } from '../src/config.js';
+import { runSkillSessionCommand } from '../src/core/skills/cli-session-command.js';
 
 const hook = fileURLToPath(new URL('../scripts/skill-runtime-hook.py', import.meta.url));
 
@@ -73,7 +75,24 @@ describe('skill runtime hook', () => {
     const skillRead = run({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'botmux skill show tdd' } });
     expect(skillRead.stdout).toBe('');
 
-    writeFileSync(join(dataDir, 'skill-preflight', 's1.json'), JSON.stringify({ status: 'satisfied', skill: 'tdd' }));
+    const skillDir = join(dataDir, 'skills', 'tdd');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, 'SKILL.md'), '# TDD\nRead the tests before editing.\n');
+    writeFileSync(join(dataDir, 'skill-manifests', 's1.json'), JSON.stringify({
+      sessionId: 's1', generatedAt: '2026-09-28T00:00:00.000Z',
+      prioritySkills: [{ name: 'tdd', rootDir: skillDir, entrypoint: 'SKILL.md' }],
+    }));
+    const previousDataDir = config.session.dataDir;
+    try {
+      config.session.dataDir = dataDir;
+      const read = runSkillSessionCommand(['show', 'tdd'], {
+        SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'app-1',
+      });
+      expect(read.code).toBe(0);
+      expect(read.stdout).toContain('# TDD');
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
     expect(run({ hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/repo/a.ts' } }).stdout).toBe('');
   });
 

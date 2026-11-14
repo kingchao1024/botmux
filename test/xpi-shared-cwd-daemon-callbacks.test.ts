@@ -126,6 +126,15 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
       atMostOnce?: true;
     };
     expect(message.type).toBe('message');
+    expect(ds.activeInteractiveTurn).toEqual({
+      turnId: 'turn-current',
+      caller: {
+        requestLarkAppId: 'app-xpi-callbacks',
+        requestUserOpenId: 'ou_synthetic',
+        senderType: 'user',
+      },
+      userPrompt: 'queued then accepted',
+    });
 
     // Exercise the worker's real crash-replay policy with the exact daemon IPC
     // envelope. The plain sibling proves that a restart replay scan occurred;

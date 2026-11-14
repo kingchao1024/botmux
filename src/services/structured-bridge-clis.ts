@@ -129,6 +129,15 @@ export function isStructuredBridgeLifecycleBlockingCli(cliId: string | undefined
   return !!cliId && LIFECYCLE_BLOCKING_SET.has(cliId);
 }
 
+export function shouldBlockStructuredPromptReady(input: {
+  cliId: string | undefined;
+  preStartLeaseActive: boolean;
+  blockingTurnActive: boolean;
+}): boolean {
+  if (input.preStartLeaseActive) return true;
+  return isStructuredBridgeLifecycleBlockingCli(input.cliId) && input.blockingTurnActive;
+}
+
 /** Worker `codexBridgeFallbackActive` — the ALWAYS CLIs (including cursor, in
  *  every mode), plus antigravity only under zero-prompt (it has no /adopt
  *  bridge — never active in adopt mode even if both flags are passed). */

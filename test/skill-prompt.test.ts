@@ -34,6 +34,9 @@ describe('skill prompt catalog', () => {
     const block = renderSkillCatalogBlock(manifest());
 
     expect(block).toContain('<botmux_skills mode="priority">');
+    expect(block).toContain('Before using any task tool');
+    expect(block).toContain('read every matching skill');
+    expect(block).toContain('Do not bulk-read unmatched skills');
     expect(block).toContain('name="deploy"');
     expect(block).toContain('botmux skill show deploy');
   });

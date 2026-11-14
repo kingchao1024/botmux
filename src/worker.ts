@@ -434,7 +434,7 @@ import {
   isStructuredBridgeAdoptIdleCli,
   isStructuredBridgeAdoptInputCli,
   isStructuredBridgeFallbackActive,
-  isStructuredBridgeLifecycleBlockingCli,
+  shouldBlockStructuredPromptReady,
 } from './services/structured-bridge-clis.js';
 import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
@@ -12080,8 +12080,13 @@ function hasStructuredLifecycleBlock(): boolean {
   if (codexBridgeQueue.peek().some(turn =>
     turn.rpcActive === true && turn.finalText === undefined,
   )) return true;
-  return isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)
-    && codexBridgeQueue.hasBlockingTurn();
+  // A successful submit precedes the transcript's user turn. Keep this
+  // bounded hand-off authoritative for every structured adapter.
+  return shouldBlockStructuredPromptReady({
+    cliId: lastInitConfig?.cliId,
+    preStartLeaseActive: codexBridgeQueue.preStartLeaseRemainingMs() !== undefined,
+    blockingTurnActive: codexBridgeQueue.hasBlockingTurn(),
+  });
 }
 
 /** 当前 worker 驱动的结构化桥接 CLI 是不是 `cliId`。
@@ -19825,6 +19830,12 @@ function redriveRejectedStructuredReady(): void {
     return;
   }
 
+  // A screen sample captured before structured start cannot prove completion.
+  if (codexBridgeQueue.hasBlockingTurn()) {
+    structuredRejectedReadyEvidenceGeneration = undefined;
+    log('Discarding pre-start prompt-ready signal after structured turn start');
+    return;
+  }
   structuredRejectedReadyEvidenceGeneration = undefined;
   // The CLI reported `working` (or `blocked` on a permission / question
   // prompt) over OSC 7501 after the prompt edge being replayed here, e.g. for

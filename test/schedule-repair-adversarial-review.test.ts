@@ -431,7 +431,7 @@ describe('schedule repair adversarial overlap probes', () => {
     await frame();
     await frame(undefined, 'working');
     await vi.advanceTimersByTimeAsync(1_200);
-    expect(settled).toHaveBeenCalledExactlyOnceWith(ds, { turnId: run.turnId, source: 'idle' });
+    expect(settled).toHaveBeenCalledExactlyOnceWith(ds, { turnId: run.turnId, source: 'idle', workerGeneration: 1 });
     expect(store.getRecord(APP, run.taskId)?.task.lastStatus).toBe('error');
     expect(logFor(run)?.outcome).toBe('error');
     expect(ds.lastScreenStatus).toBe('working');

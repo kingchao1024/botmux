@@ -1,59 +1,46 @@
-# Local Botmux overlay
+# Local Botmux development checkout
 
-This checkout keeps upstream Botmux and the local production changes separate:
+This checkout is a private development and deployment workspace. Local commits,
+experiments, and temporary uncommitted changes may live here directly.
 
-- `master` tracks `origin/master` and stays unmodified.
-- The active overlay integration branch contains the local commits rebased on
-  top of `origin/master`.
+- `master` is the working branch. It may diverge from `origin/master` and may
+  carry uncommitted changes while work is in progress.
 - Botmux plugins live in separate repositories and are used for supported
   extension points: skills, MCP servers, CLI commands, dashboard pages, host
   services, and plugin-owned card actions.
 
-## Remotes and source of truth
+## Remotes
 
-- `origin` is the preferred synchronization source. Fetch and rebase the overlay
-  from its `master` branch.
-- `upstream` is the fork's primary repository reference. It is useful for
-  comparison, but the overlay update script does not rebase from it by default.
-- The retained overlay integration branch contains the deployable private
-  changes.
+- `origin` — private repository (`code.byted.org:wangchao.2048/botmux`),
+  preferred source for this workspace.
+- `upstream` — GitHub fork reference, useful for comparison.
+- `botmux-public` — public Botmux upstream (`deepcoldy/botmux`).
 
-The overlay integration branch stays based on `origin/master`. Publishing is an
-explicit operator action after validation; the update script never pushes.
+Fetching or merging is an explicit action. Use a separate worktree for a clean
+comparison when needed; preserve in-progress changes in this checkout.
+
+## Plugins first
 
 The S1 Ask receipt/authority path and the built-in Ask card renderer cannot be
 plugins in Botmux 3.18.13. Botmux reserves the `ask_` callback namespace and has
-no general daemon/worker hook. Those changes therefore remain in this overlay.
+no general daemon/worker hook. Those changes therefore remain in this checkout.
 
-## Update
+## Legacy overlay update script
 
-From the active overlay integration worktree, run:
+`scripts/update-local-overlay.sh` encodes an older workflow that required a
+clean worktree and an overlay integration branch rebased on `origin/master`.
+It is optional and is not required for ordinary development.
 
-```bash
-./scripts/update-local-overlay.sh
-```
+## Build and deployment
 
-The script fetches `origin/master`, rebases the local commits, runs the focused
-Ask/S1 and plugin-card-action tests, builds the project, compiles a versioned
-binary, and runs the compiled-binary smoke test. It does not deploy or restart
-the live service and does not push the branch.
+The root fleet's user-level `botmux.service` executes this checkout's
+`dist/cli.js` directly. Check the running entrypoint before changing build
+artifacts. Build validation should use an isolated copy while that fleet is
+live; an in-place `bun run build` replaces its deployment artifact.
 
-If the rebase stops on a conflict, preserve both the upstream behavior and the
-local security invariant, add the resolved files, and continue with
-`git rebase --continue`. Never skip the tests after resolving a conflict.
-
-## Deployment boundary
-
-Validated binaries are copied to:
-
-```text
-~/.local/lib/botmux-overlay/releases/
-```
-
-The stable `current` symlink, the command wrapper, and the systemd override must
-all resolve to the same binary before restarting `botmux.service`. Keep the prior
-target and configuration backup until the new fleet, Dashboard HTTP endpoint,
-session registry, and a real Lark send/Ask callback have been verified.
+Publishing or restarting production requires explicit authorization and
+validation. Keep the prior artifact and configuration backup until the fleet,
+Dashboard, session registry, and a real Lark send/Ask callback are verified.
 
 On Linux hosts where `botmux.service` is enabled, restart production only with
 `systemctl --user restart botmux.service`. Do not run `botmux start`,

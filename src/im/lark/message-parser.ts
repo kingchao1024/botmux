@@ -616,6 +616,7 @@ export function parseApiMessage(msg: any, numberer?: ImgNumberer, options?: { re
   return {
     messageId: msg.message_id ?? '',
     rootId: msg.root_id ?? msg.thread_id ?? '',
+    ...(typeof msg.chat_id === 'string' && msg.chat_id.trim() ? { chatId: msg.chat_id.trim() } : {}),
     senderId: msg.sender?.id ?? '',
     senderType: msg.sender?.sender_type ?? 'unknown',
     ...(senderName ? { senderName } : {}),

@@ -4,11 +4,31 @@ import { builtinSkillContent, builtinSkillEntries, isWithheldFromWorkflowNodeSes
 import type { SessionSkillManifest } from './types.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { workflowSessionKind } from '../../workflows/session-kind.js';
+import { appendSkillInvocationAudit, satisfySkillPreflight, type SkillInvocationAction } from './invocation-audit.js';
 
 export interface SkillCommandResult {
   code: number;
   stdout: string;
   stderr: string;
+}
+
+function audited(
+  env: Record<string, string | undefined>,
+  action: SkillInvocationAction,
+  skill: string,
+  resource: string | undefined,
+  run: () => SkillCommandResult,
+): SkillCommandResult {
+  try {
+    const result = run();
+    appendSkillInvocationAudit(env, action, skill, result.code === 0 ? 'ok' : 'error', resource);
+    if (action === 'show' && result.code === 0) satisfySkillPreflight(env, skill);
+    return result;
+  } catch (err: any) {
+    appendSkillInvocationAudit(env, action, skill, 'error', resource);
+    // Preserve the outer command's linked/external resource diagnostics.
+    throw err;
+  }
 }
 
 function sessionIdFromEnv(env: Record<string, string | undefined>): string | undefined {
@@ -77,7 +97,9 @@ export function runSkillSessionCommand(
       ? { ...env, BOTMUX_REPLY_STYLE: undefined }
       : env;
     const builtin = builtinSkillContent(name, builtinEnv);
-    if (builtin) return { code: 0, stdout: builtin.endsWith('\n') ? builtin : builtin + '\n', stderr: '' };
+    if (builtin) return audited(env, 'show', name, undefined, () => ({
+      code: 0, stdout: builtin.endsWith('\n') ? builtin : builtin + '\n', stderr: '',
+    }));
   }
   if (sub === 'resources') {
     const name = args[1];
@@ -91,7 +113,10 @@ export function runSkillSessionCommand(
   if (sub === 'read') {
     const name = args[1];
     const path = args[2];
-    if (!name || !path) return { code: 2, stdout: '', stderr: 'usage: botmux skill read <name> <path>\n' };
+    if (!name || !path) {
+      if (name) appendSkillInvocationAudit(env, 'read', name, 'error');
+      return { code: 2, stdout: '', stderr: 'usage: botmux skill read <name> <path>\n' };
+    }
     if (builtinSkillContent(name, env)) {
       return { code: 1, stdout: '', stderr: `built-in skill ${name} has no resources\n` };
     }
@@ -130,19 +155,28 @@ export function runSkillSessionCommand(
     if (sub === 'show') {
       const name = args[1];
       if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skill show <name>\n' };
-      return { code: 0, stdout: readSkillEntrypoint(manifest, name).content, stderr: '' };
+      return audited(env, 'show', name, undefined, () => ({
+        code: 0, stdout: readSkillEntrypoint(manifest, name).content, stderr: '',
+      }));
     }
     if (sub === 'read') {
       const name = args[1];
       const path = args[2];
       if (!name || !path) return { code: 2, stdout: '', stderr: 'usage: botmux skill read <name> <path>\n' };
-      return { code: 0, stdout: readSkillResource(manifest, name, path).content, stderr: '' };
+      return audited(env, 'read', name, path, () => ({
+        code: 0, stdout: readSkillResource(manifest, name, path).content, stderr: '',
+      }));
     }
     if (sub === 'resources') {
       const name = args[1];
       const skill = manifest.prioritySkills.find((candidate) => candidate.name === name);
-      if (!name || !skill) return { code: 2, stdout: '', stderr: 'usage: botmux skill resources <name>\n' };
-      return { code: 0, stdout: listSkillResources(manifest, name).join('\n') + '\n', stderr: '' };
+      if (!name || !skill) {
+        if (name) appendSkillInvocationAudit(env, 'resources', name, 'error');
+        return { code: 2, stdout: '', stderr: 'usage: botmux skill resources <name>\n' };
+      }
+      return audited(env, 'resources', name, undefined, () => ({
+        code: 0, stdout: listSkillResources(manifest, name).join('\n') + '\n', stderr: '',
+      }));
     }
     return { code: 2, stdout: '', stderr: `unknown skill command: ${sub}\n` };
   } catch (err: any) {

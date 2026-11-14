@@ -70,7 +70,9 @@ import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
-import { readGlobalConfig } from '../global-config.js';
+import { configuredProtectedMcpEnvKeys, readGlobalConfig } from '../global-config.js';
+import { prepareProtectedMcpWorkerProvisioning, protectedMcpCurrentRedactedEnvKeys, type ProtectedMcpWorkerPolicy } from './protected-mcp-capabilities.js';
+import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } from './retired-runtime-exit.js';
 import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
@@ -1085,11 +1087,25 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED'] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', 'BOTMUX_PROTECTED_EGRESS_SOCKET'] as const;
+
+function workerProtectedMcpPolicy(pluginIds?: readonly string[]): ProtectedMcpWorkerPolicy {
+  const global = readGlobalConfig();
+  const capabilities = global.protectedMcpCapabilities;
+  // This pool has no secret provisioning transport. Carry only the isolation
+  // policy; granting a capability without its host containment must fail closed.
+  const { workerPolicy } = prepareProtectedMcpWorkerProvisioning(
+    resolveEffectivePluginIds({ plugins: pluginIds ? [...pluginIds] : undefined }, global),
+    homedir(), capabilities, false,
+  );
+  workerPolicy.redactEnv = protectedMcpCurrentRedactedEnvKeys(capabilities, configuredProtectedMcpEnvKeys());
+  return workerPolicy;
+}
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  for (const key of workerProtectedMcpPolicy().redactEnv) delete env[key];
   // Defense in depth for a daemon started from a contaminated PM2 snapshot.
   // Genuine workflow workers bypass this pool and receive their markers from
   // workflows/v3/ephemeral-pool.ts.
@@ -3763,7 +3779,7 @@ function sessionAgentConfig(
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
     // above), the bot's config profile belongs to the bot's own CLI, not the
     // selected one. ds.session.cliConfigDir stays unset for these sessions.
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort: resolveTopicReasoningEffort(ds.session, selected.cliId, model, reasoningEffort), serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort: resolveSessionLaunchEffort(ds, botCfg, model, reasoningEffort), serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -3887,7 +3903,7 @@ function sessionAgentConfig(
     model,
     traexAutoModel: modelChoice.traexAutoModel,
     modelBackendVariant: ds.session.modelBackendVariant,
-    reasoningEffort: resolveTopicReasoningEffort(ds.session, ds.session.cliId ?? botCfg.cliId, model, ds.session.reasoningEffort),
+    reasoningEffort: resolveSessionLaunchEffort(ds, botCfg, model, ds.session.reasoningEffort),
     serviceTier: sessionServiceTier(ds, ds.session.cliId ?? botCfg.cliId),
     launchShell: botCfg.launchShell,
     startupCommands: botCfg.startupCommands,
@@ -7763,7 +7779,7 @@ export function resolveSessionEnvForSession(
   botCfg: BotConfig,
   backendType: BackendType = sessionEnvBackendType(ds, botCfg),
 ): ResolvedSessionEnv {
-  return resolveSessionEnv({
+  const resolved = resolveSessionEnv({
     bot: botCfg,
     backendType,
     skipBotSet: !!(ds.session?.cliLaunchSnapshot || ds.session?.cliInstanceBinding),
@@ -7779,6 +7795,10 @@ export function resolveSessionEnvForSession(
       }),
     },
   });
+  for (const key of workerProtectedMcpPolicy(botCfg.plugins).redactEnv) delete resolved.composed.set[key];
+  resolved.env = Object.keys(resolved.composed.set).length ? resolved.composed.set : undefined;
+  resolved.fingerprint = sessionEnvFingerprint(resolved.composed, botCfg.envPolicy);
+  return resolved;
 }
 
 /**
@@ -8100,6 +8120,12 @@ export function requestSessionRestart(
       // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
       // fresh CLI instead of reattaching the old one and falsely reporting a
       // successful restart.
+      const cb = requireCallbacks();
+      const workingDir = cb.getSessionWorkingDir(ds);
+      if (workingDir && !existsSync(workingDir)) {
+        cb.onMissingWorkingDir?.(ds, workingDir, {});
+        throw new MissingWorkingDirError(workingDir);
+      }
       destroyLivePaneBeforeRestart(ds);
       forkWorker(ds, '', {
         resume: ds.hasHistory,
@@ -17748,6 +17774,13 @@ function forkWorkerPrepared(
     sessionStore.updateSession(ds.session);
   }
   const initSessionEnv = resolveSessionEnvForSession(ds, botCfg, resolvedBackendType);
+  const protectedMcpPolicy = workerProtectedMcpPolicy(botCfg.plugins);
+  if (protectedHttpEgressPolicy) {
+    ds.protectedLoopbackProxyAttestation = {
+      secret: randomBytes(32).toString('hex'),
+      workerGeneration,
+    };
+  }
 
   // Prepend the botmux wrapper bin dir to PATH so CLIs can call `botmux send` etc.
   // Single source of truth (resolveBotmuxWrapperBinDir): core-only → dedicated
@@ -18335,6 +18368,9 @@ function forkWorkerPrepared(
     ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
     ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     pluginBindings: botCfg.plugins,
+    protectedMcpPolicy,
+    protectedHttpEgressPolicy,
+    protectedLoopbackProxyAttestation: ds.protectedLoopbackProxyAttestation,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
       ? { runnerBuildId: runtimeIdentity.id }
@@ -24227,6 +24263,10 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
+        if (!ownsLifecycleMutation()) {
+          reportUndeliveredFinal(msg, 'lifecycle_authority_revoked');
+          break;
+        }
         deliverFinalOutputWithShutdownDrain(ds, finalOutput, t, ownsLifecycleMutation);
         break;
       }
@@ -26636,8 +26676,10 @@ export function forkAdoptWorker(
   // session-manager restore branch converts a sandbox adopt to a cold-start
   // before it ever reaches here; this is the last-line fail-closed backstop,
   // which also strips any stale adopt metadata it is handed.
-  if (adoptSandboxBlocked(botCfg, ds.session)) {
-    logger.warn(`[${t}] sandbox-enabled session: refusing to adopt existing CLI (would run unsandboxed)`);
+  if (adoptSandboxBlocked(botCfg, ds.session)
+    || ds.session.protectedHttpEgressPolicy
+    || collectProtectedHttpEgressPolicies(resolveEffectivePluginIds(botCfg, readGlobalConfig())).length > 0) {
+    logger.warn(`[${t}] protected session: refusing to adopt existing CLI (spawn-time confinement is unavailable)`);
     // Strip stale adopt state so the session doesn't linger as a worker=null
     // pseudo-adopt whose NEXT message
     // would still be routed as a bridge/adopt session. It cold-starts sandboxed
@@ -26888,6 +26930,7 @@ export function forkAdoptWorker(
     // matching observe backend from adoptSource and those source-specific fields.
     backendType: adoptBackendType,
     adoptMode: true,
+    protectedMcpPolicy: workerProtectedMcpPolicy(botCfg.plugins),
     envPolicy: botCfg.envPolicy,
     adoptSource: adopted.source ?? adoptBackendType,
     adoptTmuxTarget: adopted.tmuxTarget,

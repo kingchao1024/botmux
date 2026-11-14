@@ -634,6 +634,8 @@ export class TmuxPipeBackend implements SessionBackend {
   private legacyRetention = false;
   /** Set after pipe-pane subscription is active so kill() knows to cancel it. */
   private pipeAttached = false;
+  /** Only this fresh launch waits on this nonce; reattach/adopt never wait. */
+  private readonly startupChannel = `botmux-pipe-start-${randomBytes(16).toString('hex')}`;
   /** Identity of the session THIS spawn() created (`<server pid> <session id>
    *  <created>`), so a spawn that fails after creating it can retire exactly
    *  that session — never a same-named one another generation created. The
@@ -867,6 +869,13 @@ export class TmuxPipeBackend implements SessionBackend {
           );
         }
         this.pipeAttached = true;
+        if (this.createSession) {
+          // wait-for keeps a signal until its waiter arrives, so a slow shell
+          // startup cannot miss the release. No CLI bytes precede pipe-pane.
+          execFileSync('tmux', [...this.tmuxArgs, 'wait-for', '-S', this.startupChannel], {
+            stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv(opts.env),
+          });
+        }
         this.startLifecycleWatcher();
         break;
       } catch (err: any) {
@@ -1214,7 +1223,13 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   onData(cb: (data: string) => void): void {
+    const firstListener = this.dataCbs.length === 0;
     this.dataCbs.push(cb);
+    // spawn() can receive startup OSC reports before the worker installs its
+    // detector. Replay the bounded raw tail once; snapshots omit OSC metadata.
+    if (firstListener && this.recentOutput) {
+      try { cb(this.recentOutput); } catch { /* same isolation as live listeners */ }
+    }
   }
 
   onExit(cb: (code: number | null, signal: string | null) => void): void {
@@ -1849,11 +1864,16 @@ export class TmuxPipeBackend implements SessionBackend {
     // profile, so it only loads the argv before exec'ing it.
     const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
     const shellKind = shellKindForPath(shellSpec.shell);
+    const gateCommand = 'command ' + ['tmux', ...this.tmuxArgs, 'wait-for', this.startupChannel]
+      .map(arg => shellKind === 'fish'
+        ? `'${arg.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`
+        : shellescape(arg)).join(' ');
+    const launchGate = `${gateCommand}${shellKind === 'fish' ? '; or exit $status' : ' || exit $?'}\n`;
     const launchFile = writePaneLaunchFile(opts.paneLaunchDir, opts.strictEnv
-      ? { kind: shellKind, script: 'exec "$@"', argv: strictPaneCommand(bin, args, opts) }
+      ? { kind: shellKind, script: launchGate + 'exec "$@"', argv: strictPaneCommand(bin, args, opts) }
       : {
         kind: shellKind,
-        script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
+        script: launchGate + shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
         argv: [
           opts.cwd,
           ...buildBotmuxEnvAssignments(

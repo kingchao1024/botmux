@@ -1,5 +1,13 @@
 # TraeX Bot 技能治理记录
 
+## 2026-09-28 运行态审计修订
+
+后续运行态审计确认，`botmux-core` 的成员同时由 BotMux 内建路由和内建 skill catalog 提供；把该 Pack 再放进每个 Bot 的 priority policy 会重复注入说明。治理口径调整为：Bot 保留按职责分配的非内建 Skill，取消 `pack:botmux-core` 的逐 Bot 分配；Pack 定义继续保留，内建能力不删除。新策略仅影响新会话。
+
+同时新增两层约束：priority skill 命中任务时须在任务工具动作前读取完整入口；`botmux skill show/read/resources` 产生不含正文的 session-scoped 审计记录。Trae Bot 另通过受管 hook 执行首工具 preflight，以及仅对已分配 `share-context-memory` 的会话执行自动 recall/save。
+
+下文的分配表、数量、Home 和验证结果保留为 2026-09-23 的历史快照。2026-11-14 恢复此修订时没有再次执行生产配置治理或重启；当前代码恢复和验收记录见 `docs/reports/2026-11-14-public-merge-report.md`。
+
 ## 治理结果
 
 9 个 TraeX Bot 已从同一份 25 项直配清单改为“BotMux 基础能力 + 公共基线 + 角色能力包 + 专项技能”。三个 `dev-*` Bot 保持完全同构，继续作为可互换开发池；它们的模型、后端档位、推理强度和并发上限统一为 `gpt-5.6-terra`、`max`、`high`、`30`。
@@ -54,7 +62,7 @@ BotMux 中已创建 8 个 Pack，当前 revision 都是 1。每个 Pack 只引�
 
 主 Bot 已显式引用 `skill:bytedance-meego`，其他 8 个 Bot 没有引用。确认显式策略能正常解析后，`/root/.botmux/config.json` 中的 `skills.trustProjectSkills` 已从 `all` 改为 `off`。这样不会因为 Bot 切换工作目录而自动获得项目 Skill，也消除了该 Skill 同时来自 registry 和项目目录时的重复来源告警。
 
-今后新增 Skill 先安装或注册，再按职责加入 Pack 或单独分配。无法明确归类时保持未分配。BotMux 托管 Bot 默认引用 `botmux-core`；新增 `botmux-*` Skill 经过兼容性检查后加入该 Pack。standalone TraeX 不依赖飞书话题上下文，继续禁用这些桥接 Skill。
+今后新增 Skill 先安装或注册，再按职责加入 Pack 或单独分配。无法明确归类时保持未分配。BotMux 托管 Bot 直接使用内建路由和内建 skill catalog，不再重复引用 `botmux-core`；新增 `botmux-*` Skill 经过兼容性检查后加入内建目录，并可继续同步维护该 Pack 作为分组清单。standalone TraeX 不依赖飞书话题上下文，继续禁用这些桥接 Skill。
 
 ## Trae Home 现状
 

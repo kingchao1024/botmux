@@ -3,6 +3,8 @@ import { t, type Locale } from '../../i18n/index.js';
 import { threadAppLink, type Brand } from './lark-hosts.js';
 import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
+  activeProjectCompletionGates,
+  projectCompletionGateOpen,
   projectRemainingSummary,
   projectTitleWithoutTaskMarker,
   visibleProjectWorkstreams,
@@ -260,6 +262,8 @@ function uniquePlanItems(items: string[]): string[] {
 
 function projectProgressSummary(project: ProjectGroupState, runtime?: ProjectGroupCardRuntime): string {
   if (project.status === 'completed') return '目标已完成';
+  const openGates = activeProjectCompletionGates(project).filter(gate => projectCompletionGateOpen(gate, runtime?.now)).length;
+  if (openGates > 0) return `${openGates} 项父级完成门未满足`;
   const visible = visibleProjectWorkstreams(project);
   if (visible.length === 0) {
     if (project.blockers.length > 0) return `${project.blockers.length} 项阻塞`;
@@ -617,6 +621,34 @@ interface TemplateBodyContext {
   runtime?: ProjectGroupCardRuntime;
 }
 
+function completionGateElement(project: ProjectGroupState, now?: number): Record<string, unknown> {
+  const gates = activeProjectCompletionGates(project);
+  const counts = gates.reduce((result, gate) => {
+    const stale = gate.status === 'satisfied' && projectCompletionGateOpen(gate, now);
+    if (gate.status === 'satisfied' && !stale) result.satisfied += 1;
+    else if (gate.status === 'blocked') result.blocked += 1;
+    else if (stale) result.stale += 1;
+    else result.pending += 1;
+    return result;
+  }, { pending: 0, blocked: 0, stale: 0, satisfied: 0 });
+  const rows = [
+    counts.pending > 0 ? `<text_tag color='purple'>待满足 ${counts.pending}</text_tag>` : '',
+    counts.blocked > 0 ? `<text_tag color='orange'>阻塞 ${counts.blocked}</text_tag>` : '',
+    counts.stale > 0 ? `<text_tag color='purple'>待复核 ${counts.stale}</text_tag>` : '',
+    counts.satisfied > 0 ? `<text_tag color='green'>已满足 ${counts.satisfied}</text_tag>` : '',
+  ].filter(Boolean).join(' · ');
+  return {
+    tag: 'interactive_container', behaviors: [], width: 'fill', height: 'auto', corner_radius: '8px',
+    has_border: false, disabled: false, background_style: 'purple-50', padding: '10px 12px 10px 12px',
+    direction: 'vertical', horizontal_spacing: '4px', vertical_spacing: '4px',
+    horizontal_align: 'left', vertical_align: 'top', margin: '8px 0px 0px 0px',
+    elements: [{
+      tag: 'markdown', content: `<font color='purple'>**父级完成门（${gates.length}）**</font>\n${rows}`,
+      text_align: 'left', text_size: 'normal', margin: '0px 0px 0px 0px',
+    }],
+  };
+}
+
 function statusDashboardBody(context: TemplateBodyContext): Array<Record<string, unknown>> {
   const { project, brand, config, runtime } = context;
   const visible = visibleProjectWorkstreams(project);
@@ -624,6 +656,7 @@ function statusDashboardBody(context: TemplateBodyContext): Array<Record<string,
     ...focusElements(project, config),
     ...planElements(project, brand, runtime),
   ];
+  if (activeProjectCompletionGates(project).length > 0) body.push(completionGateElement(project, runtime?.now));
   if (sectionEnabled(config, 'blockers') && project.blockers.length > 0) body.push(blockerElement(project));
   if (sectionEnabled(config, 'workstreams') && visible.length > 0) {
     const completedDisplay = resolveProjectProgressCardCompletedDisplay(config);
@@ -701,6 +734,7 @@ function compactListBody(context: TemplateBodyContext): Array<Record<string, unk
       }],
     },
   ];
+  if (activeProjectCompletionGates(project).length > 0) body.push(completionGateElement(project, runtime?.now));
   if (sectionEnabled(config, 'blockers') && project.blockers.length > 0) body.push(blockerElement(project));
   if (sectionEnabled(config, 'workstreams') && visible.length > 0) {
     const completedDisplay = resolveProjectProgressCardCompletedDisplay(config);

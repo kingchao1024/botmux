@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -52,7 +52,18 @@ describe('botmux skill session command', () => {
   });
 
   it('shows SKILL.md entrypoint', () => {
-    expect(runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 's1' }).stdout).toContain('# Deploy');
+    expect(runSkillSessionCommand(['show', 'deploy'], {
+      BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'app-1', SESSION_DATA_DIR: dataDir,
+    }).stdout).toContain('# Deploy');
+    const auditPath = join(dataDir, 'audit', 'skill-invocations.ndjson');
+    const records = readFileSync(auditPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(records).toEqual([expect.objectContaining({
+      sessionId: 's1', larkAppId: 'app-1', action: 'show', skill: 'deploy', outcome: 'ok',
+    })]);
+    expect(JSON.stringify(records)).not.toContain('# Deploy');
+    expect(statSync(auditPath).mode & 0o777).toBe(0o600);
+    const state = JSON.parse(readFileSync(join(dataDir, 'skill-preflight', 's1.json'), 'utf8'));
+    expect(state).toEqual(expect.objectContaining({ status: 'satisfied', skill: 'deploy' }));
   });
 
   it('renders botmux-send from the explicit per-session reply style env', () => {
@@ -78,7 +89,47 @@ describe('botmux skill session command', () => {
   });
 
   it('reads relative resources', () => {
-    expect(runSkillSessionCommand(['read', 'deploy', 'references/release.md'], { BOTMUX_SESSION_ID: 's1' }).stdout).toContain('# Release');
+    expect(runSkillSessionCommand(['read', 'deploy', 'references/release.md'], {
+      BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'app-1', SESSION_DATA_DIR: dataDir,
+    }).stdout).toContain('# Release');
+    const record = JSON.parse(readFileSync(join(dataDir, 'audit', 'skill-invocations.ndjson'), 'utf8').trim());
+    expect(record).toEqual(expect.objectContaining({
+      action: 'read', skill: 'deploy', resource: 'references/release.md', outcome: 'ok',
+    }));
+  });
+
+  it('audits failed skill reads without exposing content', () => {
+    const result = runSkillSessionCommand(['show', 'missing'], {
+      BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'app-1', SESSION_DATA_DIR: dataDir,
+    });
+    expect(result.code).toBe(1);
+    const record = JSON.parse(readFileSync(join(dataDir, 'audit', 'skill-invocations.ndjson'), 'utf8').trim());
+    expect(record).toEqual(expect.objectContaining({ action: 'show', skill: 'missing', outcome: 'error' }));
+    expect(record).not.toHaveProperty('content');
+  });
+
+  it('audits named malformed read and resources invocations', () => {
+    const env = { BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'app-1', SESSION_DATA_DIR: dataDir };
+    expect(runSkillSessionCommand(['read', 'deploy'], env).code).toBe(2);
+    expect(runSkillSessionCommand(['resources', 'missing'], env).code).toBe(2);
+    const records = readFileSync(join(dataDir, 'audit', 'skill-invocations.ndjson'), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    expect(records).toEqual([
+      expect.objectContaining({ action: 'read', skill: 'deploy', outcome: 'error' }),
+      expect.objectContaining({ action: 'resources', skill: 'missing', outcome: 'error' }),
+    ]);
+  });
+
+  it('keeps skill reads available when the audit path is unwritable', () => {
+    const blocker = join(dataDir, 'not-a-directory');
+    writeFileSync(blocker, 'x');
+    const result = runSkillSessionCommand(['show', 'deploy'], {
+      BOTMUX_SESSION_ID: 's1', SESSION_DATA_DIR: dataDir,
+      BOTMUX_SKILL_INVOCATION_AUDIT_PATH: join(blocker, 'audit.ndjson'),
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('# Deploy');
+    expect(existsSync(join(blocker, 'audit.ndjson'))).toBe(false);
   });
 
   it('enumerates an empty resource set for an in-memory built-in without a session manifest', () => {

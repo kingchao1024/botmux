@@ -94,6 +94,8 @@ async function withTraexWorker(
   const inputFile = join(root, 'input');
   const pidFile = join(root, 'pid');
   const fakeCli = join(root, 'traex');
+  // An empty disposable HOME otherwise blocks zsh in its first-run installer.
+  writeFileSync(join(root, '.zshrc'), '# disposable test home\n');
   const doneFile = join(root, 'done');
   writeFileSync(history, '');
   writeFileSync(fakeCli, [
@@ -128,7 +130,7 @@ async function withTraexWorker(
     const options = { cwd: resolve('.'), env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any };
     child = process.env.BOTMUX_TEST_WORKER_BINARY
       ? spawn(process.env.BOTMUX_TEST_WORKER_BINARY, ['__worker'], options)
-      : spawnNodeTsScript(resolve('src/worker.ts'), [], options);
+      : spawnNodeTsScript(process.env.BOTMUX_TEST_WORKER_JS ?? resolve('src/worker.ts'), [], options);
     child.on('message', message => messages.push(message as WorkerToDaemon));
     child.stdout?.on('data', chunk => logs.push(chunk.toString()));
     child.stderr?.on('data', chunk => logs.push(chunk.toString()));
@@ -140,6 +142,9 @@ async function withTraexWorker(
       prompt: 'first-traex-input', turnId: 'om_first',
       larkAppId: 'app_test', larkAppSecret: 'test',
     });
+    // Match the production readiness clock, armed after backend startup.
+    // Shell/backend setup must not consume the scenario's 10-second budget.
+    await waitFor(() => existsSync(pidFile), 'fake CLI started');
     await run({ messages, logs, pasted, doneFile, send, waitFor });
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) {

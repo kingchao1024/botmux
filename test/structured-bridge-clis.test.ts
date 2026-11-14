@@ -12,6 +12,7 @@ import {
   isStructuredBridgeAdoptIdleCli,
   isStructuredBridgeAdoptInputCli,
   isStructuredBridgeLifecycleBlockingCli,
+  shouldBlockStructuredPromptReady,
   supportsZeroPromptStructuredBridge,
   supportsTranscriptReplyDelivery,
   STRUCTURED_BRIDGE_ALWAYS_CLI_IDS,
@@ -98,6 +99,23 @@ describe('structured-bridge-clis', () => {
     expect(isStructuredBridgeFallbackActive('doubao')).toBe(true);
     expect(supportsZeroPromptStructuredBridge('doubao')).toBe(true);
     expect(supportsTranscriptReplyDelivery('doubao')).toBe(true);
+  });
+});
+
+describe('structured prompt readiness', () => {
+  it('blocks every adapter during pre-start and lifecycle-complete adapters after start', () => {
+    expect(shouldBlockStructuredPromptReady({
+      cliId: 'traex', preStartLeaseActive: true, blockingTurnActive: true,
+    })).toBe(true);
+    expect(shouldBlockStructuredPromptReady({
+      cliId: 'traex', preStartLeaseActive: false, blockingTurnActive: true,
+    })).toBe(isStructuredBridgeLifecycleBlockingCli('traex'));
+    expect(shouldBlockStructuredPromptReady({
+      cliId: 'codex', preStartLeaseActive: false, blockingTurnActive: true,
+    })).toBe(true);
+    expect(shouldBlockStructuredPromptReady({
+      cliId: 'claude-code', preStartLeaseActive: false, blockingTurnActive: true,
+    })).toBe(false);
   });
 });
 
