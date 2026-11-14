@@ -225,6 +225,17 @@ export interface ProjectWorkstreamArchive {
 
 export interface ProjectWorkstream extends Partial<ProjectWorkstreamArchive> {
   dispatchRoot: string;
+  /** Imported association metadata, not business completion. Missing on legacy
+   * dispatch rows; never turn a closed/moved CLI into a completed task. */
+  attachment?: {
+    sourceSessionId: string;
+    sourceLarkAppId: string;
+    revision: number;
+    routeRevision?: number;
+    source?: 'relay' | 'bind' | 'adopt' | 'resume_import' | 'fork' | 'manual';
+    state: 'pending' | 'active' | 'moved' | 'closed' | 'unknown';
+    reportCapability: 'verified' | 'manual' | 'unavailable';
+  };
   threadId?: string;
   title: string;
   purpose: string;
@@ -913,8 +924,31 @@ export function projectCompletionGateFingerprint(input: Pick<
   })).digest('hex')}`;
 }
 
+function blockerRecordsFromLegacy(legacy: readonly string[], openedAt: string): ProjectBlockerRecord[] {
+  return normalizedBlockerRecords(legacy.map((summary, index) => ({
+    blockerId: `manual:legacy:${String(index).padStart(4, '0')}:${createHash('sha256').update(summary).digest('hex').slice(0, 16)}`,
+    source: 'manual' as const,
+    summary,
+    openedAt,
+  })));
+}
+
 export function refreshProjectBlockerProjection(project: ProjectGroupState): void {
-  project.blockerRecords = normalizedBlockerRecords(project.blockerRecords);
+  const raw = project as unknown as Record<string, unknown>;
+  if (Array.isArray(raw.blockerRecords)) {
+    project.blockerRecords = normalizedBlockerRecords(raw.blockerRecords as ProjectBlockerRecord[]);
+  } else {
+    // Callers that hand back a legacy-surface project (string `blockers`, no records)
+    // get the same upgrade path as a legacy on-disk registry instead of a hard failure.
+    const legacy = Array.isArray(raw.blockers) && raw.blockers.every(item => typeof item === 'string')
+      ? raw.blockers as string[]
+      : undefined;
+    if (!legacy) throw new Error(`${PROJECT_GROUP_STORE_FILE} has an invalid blocker projection`);
+    const openedAt = typeof raw.updatedAt === 'string' && Number.isFinite(Date.parse(raw.updatedAt))
+      ? raw.updatedAt
+      : new Date(0).toISOString();
+    project.blockerRecords = blockerRecordsFromLegacy(legacy, openedAt);
+  }
   project.blockers = blockerSummaries(project.blockerRecords);
 }
 
@@ -1102,23 +1136,39 @@ export function mutateProjectGroupSync(
   });
 }
 
+export function isVisibleProjectWorkstream(item: ProjectWorkstream): boolean {
+  return item.attachment?.state !== 'moved';
+}
+
+export function visibleProjectWorkstreams(project: ProjectGroupState): ProjectWorkstream[] {
+  return project.workstreams.filter(isVisibleProjectWorkstream);
+}
+
 export function projectOverallProgress(project: ProjectGroupState): number {
   if (project.status === 'completed') return 100;
   const gated = projectCompletionGatesOpen(project);
   if (project.manualProgress !== undefined) return gated ? Math.min(project.manualProgress, 99) : project.manualProgress;
-  if (project.workstreams.length === 0) return 0;
-  const total = project.workstreams.reduce((sum, item) => sum + item.progress, 0);
-  const progress = Math.round(total / project.workstreams.length);
+  const visible = visibleProjectWorkstreams(project);
+  if (visible.length === 0) return 0;
+  const total = visible.reduce((sum, item) => sum + item.progress, 0);
+  const progress = Math.round(total / visible.length);
   return gated ? Math.min(progress, 99) : progress;
+}
+
+const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
+
+/** The title as shown in the group: without the trailing `[task:<32 hex>]` id
+ *  some coordinators append. The stored title keeps it. */
+export function projectTitleWithoutTaskMarker(title: string): string {
+  return title.replace(TASK_TITLE_MARKER_RE, '').trim();
 }
 
 export function projectRemainingSummary(project: ProjectGroupState): string {
   if (project.remaining?.trim()) return project.remaining.trim();
   const openGates = activeProjectCompletionGates(project).filter(gate => projectCompletionGateOpen(gate)).length;
   if (openGates > 0) return `${openGates} 个父级完成门`;
-  if (project.workstreams.length === 0) return project.status === 'completed' ? '无' : '待拆解';
-  const pending = project.workstreams.filter(
-    item => item.status !== 'completed' && item.status !== 'cancelled',
-  ).length;
+  const visible = visibleProjectWorkstreams(project);
+  if (visible.length === 0) return project.status === 'completed' ? '无' : '待拆解';
+  const pending = visible.filter(item => item.status !== 'completed' && item.status !== 'cancelled').length;
   return pending === 0 ? '无' : `${pending} 个子任务`;
 }

@@ -2,6 +2,7 @@ import type { ProjectCoordinatorAction } from '../services/project-coordinator.j
 
 export type ProjectCliResult =
   | { ok: true; help: true }
+  | { ok: true; help: false; sessionId?: string; json: boolean; workstream: Record<string, unknown> }
   | { ok: true; help: false; sessionId?: string; json: boolean; action: ProjectCoordinatorAction }
   | { ok: false; error: string };
 
@@ -163,6 +164,59 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
     };
   }
   if (subcommand === 'workstream') {
+    const publicCommand = args[0];
+    const publicAllowedByAction: Record<string, readonly string[]> = {
+      inspect: ['--root', '--source-session', '--source-app', '--grant'],
+      attach: ['--root', '--source-session', '--source-app', '--title', '--purpose', '--revision', '--grant'],
+      rename: ['--root', '--title'],
+      update: ['--root', '--status', '--content', '--progress', '--remaining', '--milestone', '--revision'],
+      status: ['--root'],
+      grant: [],
+      notifications: ['--mode'],
+    };
+    if (publicCommand && publicAllowedByAction[publicCommand]) {
+      const rest = args.slice(1);
+      const allowed = new Set([...publicAllowedByAction[publicCommand]!, '--session-id', '--json']);
+      for (let i = 0; i < rest.length; i++) {
+        const token = rest[i]!;
+        const flag = token.split('=')[0]!;
+        if (!allowed.has(flag)) return { ok: false, error: `未知选项: ${token}` };
+        if (flag === '--json') continue;
+        const value = token.includes('=') ? token.slice(token.indexOf('=') + 1) : rest[++i];
+        if (!value?.trim() || value.startsWith('--')) return { ok: false, error: `${flag} 需要一个值` };
+      }
+      const root = one(rest, '--root');
+      if (!['grant', 'status', 'notifications'].includes(publicCommand) && !root) return { ok: false, error: '--root 必填' };
+      if (publicCommand === 'notifications' && !['ignore', 'notify'].includes(one(rest, '--mode') ?? '')) {
+        return { ok: false, error: '--mode 必须是 ignore 或 notify' };
+      }
+      if (root && !/^om_[A-Za-z0-9_-]{1,128}$/.test(root)) return { ok: false, error: '--root 必须是话题根消息 ID' };
+      if ((publicCommand === 'inspect' || publicCommand === 'attach') && (!one(rest, '--source-session') || !one(rest, '--source-app'))) {
+        return { ok: false, error: '--source-session 和 --source-app 必填' };
+      }
+      const title = one(rest, '--title')?.trim();
+      if (publicCommand === 'rename' && (!title || ['子任务', '子项目'].includes(title) || Array.from(title).length > 24)) {
+        return { ok: false, error: '--title 必须具体、非空且不超过 24 字' };
+      }
+      const status = one(rest, '--status');
+      if (publicCommand === 'update' && !['pending', 'in_progress', 'blocked', 'completed', 'failed'].includes(status ?? '')) {
+        return { ok: false, error: '--status 必须是合法任务状态' };
+      }
+      const progress = parseProgress(one(rest, '--progress'));
+      if (progress === 'invalid') return { ok: false, error: '--progress 必须是 0-100 的整数' };
+      const revision = one(rest, '--revision');
+      if (revision && !/^[1-9]\d{0,9}$/.test(revision)) return { ok: false, error: '--revision 必须是正整数' };
+      return { ok: true, help: false, sessionId: one(rest, '--session-id'), json: has(rest, '--json'),
+        workstream: {
+          action: publicCommand, rootMessageId: root, sourceSessionId: one(rest, '--source-session'),
+          sourceLarkAppId: one(rest, '--source-app'), title, purpose: one(rest, '--purpose'),
+          grant: one(rest, '--grant'), status, progress,
+          content: one(rest, '--content'), remaining: one(rest, '--remaining'), milestone: one(rest, '--milestone'),
+          expectedRevision: revision ? Number(revision) : undefined,
+          mode: one(rest, '--mode'),
+        },
+      };
+    }
     if (args[0] === 'archive') {
       const archiveArgs = args.slice(1);
       const allowed = new Set([

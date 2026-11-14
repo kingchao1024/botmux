@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { messageListenerTaskAnchor } from './message-listener-silence.js';
 import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
@@ -53,7 +54,15 @@ export interface TriggerSessionDeps {
  * public TriggerRequest schema: an untrusted connector must not choose a turn
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
+  /** Reject a host-only event before reserving its at-most-once turn lease. */
+  validateBeforeClaim?: () => void;
+  /** Final synchronous host-side policy fence for internal metadata events.
+   * Public trigger JSON cannot supply this callback. */
+  validateBeforeDispatch?: () => void;
   stableTurnId?: string;
+  /** Trusted dashboard listener execution; never accepted from the public trigger API. */
+  messageListenerRun?: import('./message-listener-silence.js').SilentMessageListenerRun;
+  messageListenerAutoClose?: boolean;
   /** A loud idempotent relay must not be replayed by worker crash recovery. */
   atMostOnce?: boolean;
   /** Synchronous write-ahead hook invoked immediately before worker IPC/fork.
@@ -871,6 +880,7 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
+    internal?.validateBeforeDispatch?.();
     // Every accepted external input owns its generated turn, including quiet
     // report follow-ups on an already-running worker. Keep its reply anchor
     // independent of presentation and final-output suppression options.
@@ -1280,7 +1290,7 @@ async function triggerSessionTurnAdmitted(
       return { ok: false, errorCode: rootTarget.errorCode, error: rootTarget.error };
     }
     chatId = rootTarget.chatId;
-    ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
+    if (!internal?.messageListenerRun) ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
   }
 
   if (!chatId) {
@@ -1419,6 +1429,7 @@ async function triggerSessionTurnAdmitted(
       | { reuse: TriggerResponse }
       | { retry: TriggerResponse }
       | { lease: idempotencyStore.IdempotencyRecord | undefined } => {
+      internal?.validateBeforeClaim?.();
       if (!turnLeaseKey) return { lease: undefined };
       // At-most-once cannot be held through the queued-activation durable tail:
       // that staging path (admitQueuedActivationTail → promotion → queuedActivation
@@ -1827,7 +1838,12 @@ async function triggerSessionTurnAdmitted(
     : await getChatMode(larkAppId, chatId, { forceRefresh: true }));
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
+  if (internal?.messageListenerRun) {
+    anchor = messageListenerTaskAnchor(stableTurnId ?? internal.messageListenerRun.sourceMessageId);
+    scope = 'thread';
+  }
   const shouldOpenOwnTopic = !rootMessageId
+    && !internal?.messageListenerRun
     && !httpVirtual
     && (opensExplicitTopic || externalEventOpensOwnTopic(chatMode, regularGroupMode));
   if (shouldOpenOwnTopic && topicMessage !== null) {
@@ -1859,7 +1875,10 @@ async function triggerSessionTurnAdmitted(
     const current = deps.activeSessions.get(key);
     if (current) return { kind: 'existing' as const, ds: current };
 
-    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group', undefined, { source: 'http' });
+    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group', undefined, {
+      source: 'http', messageListenerRun: internal?.messageListenerRun,
+    });
+    if (internal?.messageListenerAutoClose) session.messageListenerAutoClose = true;
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
     session.larkAppId = larkAppId;

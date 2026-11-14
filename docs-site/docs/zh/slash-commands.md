@@ -24,7 +24,7 @@
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令）。关闭后再发消息会开新会话 |
 | `/resume [会话id]` | 本话题/本群**没有会话**时恢复已关闭的会话：不带参数恢复这里最近关闭的一个；带别处的会话 id 时像 `/fork` 一样复制到这里继续（继承完整上下文，原会话不动；仅支持可 fork 的 CLI；Codex / TraeX 的已关闭会话无法确认启动形态，需到原处恢复）。**有会话时**原样交给 CLI 自带的 `/resume`。有对话权限即可使用；跨位置复制凭会话 id（只在原聊天可见、不可猜），信任级别同 `/fork` |
-| `/dismiss` | 专属会话群顶层专用：卡片确认后关闭群内本机 Bot 的全部会话，再解散整个群（仅建群者本人且具备操作权限；代码与 worktree 保留；私聊、普通群、子话题、adopt 会话不支持）。只想关闭会话、保留群聊请用 `/close` |
+| `/dismiss` | 卡片确认后关闭群内本机 Bot 的全部会话，再解散整个群。专属会话群：只能在顶层发，仅建群者本人且具备操作权限；普通群和话题群：需要操作权限，并且 Bot 是群主、是群里唯一的 Bot，否则直接回复没有权限、不关任何会话。代码与 worktree 保留；私聊、adopt 会话不支持。只想关闭会话、保留群聊请用 `/close` |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
 | `/fork <任务>` | 继承当前会话的完整上下文，新建一个并行的分身话题（私聊、话题群、普通群的会话话题内都能用）；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
@@ -48,7 +48,7 @@
 | `/introduce` | 让本群机器人互相登记 `open_id`，用于协作时精确 @ 对方 |
 | `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时）。若该 bot 开启了 `summaryMemory`，总结会追加写入配置的记忆文件（`summaryMemoryPath`，默认 `summary.md`），且 `/summary` 后跟随的文字会作为「只总结从这条起」的硬边界；未开启记忆时，后随文字仅作为本次总结的侧重提示 |
 | `[标题] /t [/repo <仓库> \| /repo wt <仓库> [分支]] [/model <模型>] [/effort <档位>] [<首轮任务>]`（别名 `/topic`） | 普通群内强制新开话题，一条消息把标题、仓库（或在仓库上新建 worktree）、模型、推理强度、首轮任务一次交代完。换行等价于空格；标题写在 `/t` **之前**（飞书话题列表显示的是原消息，机器人改不了）；带空格的路径用双引号；任一项写错整条不生效并回一句用法错误。裸 `/t` 进入话题设置 |
-| `/th [<首轮任务>]`、`/tw [<首轮任务>]`（等价 `/t here …` / `/t worktree …`） | 生命周期变体：`/th` 在**当前群会话的工作目录**里开新话题；`/tw` 先从该目录建一个按话题确定性命名、可被多 bot 共享的 worktree 再开话题。可与标题、`/model`、`/effort` 同用，但**不与 `/repo` 同用**（一个说用当前目录、一个点名仓库，相斥即拒） |
+| `/th [<首轮任务>]`、`/tw [<首轮任务>]`（等价 `/t here …` / `/t worktree …`） | 生命周期变体：`/th` 在**当前群会话的工作目录**里开新话题；`/tw` 先从该目录建一个按话题确定性命名、可被多 bot 共享的 worktree 再开话题。可与标题、`/model`、`/effort` 同用，但**不与 `/repo` 同用**（一个说用当前目录、一个点名仓库，相斥即拒）。首轮任务也可以是技能或斜杠命令（`/th /goal …`、`/th /status` 等），与 `/t` 后跟命令同样处理，只是目录换成当前群会话目录；`/tw` 后不能直接跟 daemon 命令（`/status` `/cd` `/close` `/help` 等，worktree 还没建好，会直接回提示）。写了标题或 `/model` `/effort` 时，后面的 `/xxx` 仍按头部指令校验，与 `/t` 相同 |
 | `/issue` | 打开 Issue Board 看板卡片，直接在卡片上领取 botmux 平台任务：选好仓库后自动建群、拉你进去、绑定平台任务并开工。需要本机已绑定平台，且发起人在该 bot 的 `allowedUsers` 里；卡片只有发起人能操作 |
 | `/issue status` | 在任务群里发，查这个群绑着哪条平台任务、现在什么状态：平台状态 / 领取人 / 本机绑定 / 有没有回写还堵在发件箱里。只读，同样限该 bot 的 `allowedUsers` |
 | `/issue done` | 在任务群里发，**验收通过**，把任务推到平台终态。agent 交付只能到「待验收」，标完成是人的决策。完成后 claim 被平台清掉，这条领取不能再释放。同样限该 bot 的 `allowedUsers` |
@@ -98,7 +98,7 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 两条命令都默认可用，需要操作权限（管理员 / `allowedUsers`，或用 `canTalkDaemonCommands` 放开）。
 
 - **`/rename <标题>`**：在已有会话里发，改 Botmux 会话名（Dashboard、`/sessions` 列表跟着变），运行中的 Codex / Claude Code 会同步改原生会话名。飞书群名、话题名不变。
-- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
+- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。也可以写程序名或简写，不区分大小写：`/cli cc` 或 `/cli claude` 选 Claude Code，`/cli omp` 选 Oh My Pi，`/cli agy` 选 Antigravity；完整 `cliId` 优先，所以 `/cli codex` 选的是 Codex 而不是同样跑 `codex` 的 Codex App。一个简写对应多个 CLI（如 `trae` 同时是 TRAE CLI 的新旧两代）时不替你选，会列出候选让你改发完整 ID。只发 `/cli` 列出全部可选 CLI 和简写。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
 
 ## 群负责人（Agent 工具）
 
@@ -109,6 +109,10 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 设置/取消要求当前轮真实发送者明确命中该机器人的管理员名单。会话 owner、其他机器人、定时任务和过期轮次不能代替真人授权。只作用于当前普通群，不支持跨群指定目标，也不接管自动管理的会话群。
 
 负责人接有对话权限的人的群顶层未 @ 消息；只点名其他成员时让路，@all 不算转交。群名追加机器人名，取消时保留人工改名。原有 ambient、never 和 reply-mode 独立生效；负责人是群级身份与交接，不是新的响应模式，也不保证全群只有一个机器人回复。
+
+**负责人接的消息开不开话题**：默认不开，免 @ 接下的顶层消息照旧平铺回复。回复模式为 `shared` 的普通群里，想让它像 @ 本机器人那样把回复挂到那条消息下面的话题，在 Dashboard 同一处打开「群负责人接的消息也开话题」（或 `/botconfig set chatManagerSharedTopic on`）。会话仍是群里同一个；要先打开「群负责人」；其它回复模式不受影响。话题里继续说话要不要 @，仍按本群的「群聊 @ 策略」：默认「必须 @」时话题内续话也要 @，配成「话题内免 @」、`never` 或 `ambient` 后才可免 @ 续话。
+
+![Dashboard 中「群负责人接的消息也开话题」开关](/img/chat-manager-shared-topic-dashboard.png)
 
 切换时先让旧负责人 clear，成功后再让新负责人 set。每次负责人免 @ 放行都核对群描述标记，读取失败不沿用旧状态；必须同时存在本地管理员启用记录。描述超长拒绝，不截断人写的说明。
 
@@ -196,11 +200,13 @@ Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex CLI / App 的 `/effort` 例外，见上文）。
 
-`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
+**Riff 后端无透传面**：Riff 没有本地 CLI，上述斜杠命令不会以按键方式送达，而是按普通消息封装成**一次远端任务**，命令文本也不会进入任何斜杠解析器。因此在 Riff 会话里发 `/compact`、`/model` 等（含 `customPassthroughCommands` 自定义项）等价于发一条普通对话文本，不会被拆成多次远端任务。
 
-部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
+`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Mojo 后端上，`/fast` 仍走透传分支，会被 fail-closed 明确拒绝、给出提示，而不会静默生效。Riff 后端则按上一段处理：`/fast` 不进透传，而是作为普通消息封装成一次远端任务，同样不会切换档位。
 
-想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。
+部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex / Seed / Relay / TRAE CLI（`traex`）默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。`/goal` 的子命令和行为以所用 CLI 版本为准。
+
+想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。也可以在 Dashboard「Bot 配置 → Slash 命令 → 额外透传命令」里改：上方列出当前 CLI 已默认透传的命令，下方逐个增删额外命令（Enter、逗号或 Tab 生成一项，也可一次粘贴多个）。这里只填命令名，参数在会话里随命令一起发；额外命令只在 CLI 正在运行的会话里透传，不会像 `/goal` 那样在新话题里冷启动会话。
 
 **一条消息里级联多条透传命令**（会话内，CLI 已在跑）：每行一条透传命令，最后可以接正文，botmux 会按书写顺序逐条送出，每条之间等 CLI 空闲——
 

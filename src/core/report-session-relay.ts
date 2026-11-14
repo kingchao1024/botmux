@@ -45,6 +45,11 @@ export interface ReportSessionRelaySessionView {
   receiver: boolean;
   scope?: 'thread' | 'chat';
   rootMessageId?: string;
+  /** Host-derived source owner identity. A caller-selectable field in the
+   * request body never supplies imported-workstream authority. */
+  ownerKey?: string;
+  /** Host-monotonic route epoch, distinct from worker/native restarts. */
+  routeRevision?: number;
   liveOrigin?: VcMeetingLiveManagedOrigin;
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId?: string; turnId?: string };
@@ -145,6 +150,10 @@ export function prepareAutomaticDispatchReport(input: {
   sourceLarkAppId: string;
   /** fork 决策类型要求 source.turnId（回执幂等哈希消费）；调用点本就持有当前 turnId。 */
   sourceTurnId: string;
+  /** Imported sources need the same owner proof as explicit reports. Legacy
+   * dispatched topics do not require this new field. */
+  sourceOwnerKey?: string;
+  sourceRouteRevision?: number;
   content: string;
 }): Extract<ReportSessionRelayDecision, { ok: true }> | undefined {
   if (!input.dispatchRoot || !input.content.trim()) return undefined;
@@ -156,6 +165,10 @@ export function prepareAutomaticDispatchReport(input: {
   const registryEntry = input.registry[input.dispatchRoot];
   const projectRequired = !!registryEntry && typeof registryEntry === 'object' && !Array.isArray(registryEntry)
     && Object.hasOwn(registryEntry, 'access');
+  if (binding.attachment && (binding.attachment.sourceSessionId !== input.sourceSessionId
+    || binding.attachment.sourceLarkAppId !== input.sourceLarkAppId
+    || binding.attachment.ownerKey !== input.sourceOwnerKey
+    || binding.attachment.sourceRouteRevision !== input.sourceRouteRevision)) return undefined;
   return {
     ok: true,
     source: { sessionId: input.sourceSessionId, larkAppId: input.sourceLarkAppId, turnId: input.sourceTurnId },
@@ -351,6 +364,17 @@ export function authorizeReportSessionRelayRequest(
   const registryEntry = input.registry[dispatchRoot];
   const projectRequired = !!registryEntry && typeof registryEntry === 'object' && !Array.isArray(registryEntry)
     && Object.hasOwn(registryEntry, 'access');
+
+  if (resolved.binding.reply && current.larkAppId !== resolved.binding.reply.reporterLarkAppId) {
+    return { ok: false, status: 403, error: 'report_reply_reporter_mismatch' };
+  }
+  const attachment = resolved.binding.attachment;
+  if (attachment && (attachment.sourceSessionId !== current.sessionId
+    || attachment.sourceLarkAppId !== current.larkAppId
+    || attachment.ownerKey !== current.ownerKey
+    || attachment.sourceRouteRevision !== current.routeRevision)) {
+    return { ok: false, status: 403, error: 'dispatch_attachment_source_mismatch' };
+  }
 
   const decision: Extract<ReportSessionRelayDecision, { ok: true }> = {
     ok: true,

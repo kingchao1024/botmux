@@ -9,10 +9,12 @@
  * extra silences, never a conclusion about what happened to the message.
  */
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
+import { classifyStuckPage } from '../utils/stuck-detector.js';
 
 export type SubmitFailureDiagnosisReason =
   | 'logged_out'        // 登录/鉴权门
   | 'interactive_menu'  // 菜单/迁移/hooks review/确认框等键盘选择界面
+  | 'session_locked'
   | 'draft_parked'      // 正文停在 composer，尚未提交
   | 'still_active'      // CLI 仍有持续活动证据（弱证据，只用于有限度静默，不用于下结论）
   | 'unknown';
@@ -92,11 +94,10 @@ function matchScreenRule(rules: readonly ScreenRule[], screen: string): string |
 // on-screen evidence the payload is stuck unsubmitted.
 const CLAUDE_PASTED_TEXT_CHIP = /\[\s*pasted text\s+#\d+(?:\s*\+\d+\s+lines?)?\s*\]/i;
 
-function claudeComposerDraftMatch(screen: string): string | undefined {
+/** Bodies of the ❯ input boxes on screen, bottom-most first. */
+function* claudeComposerBodies(screen: string): Generator<string> {
   const rows = screen.split(/\r?\n/);
   const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line);
-  // Only the last input box, bounded by two full-width rules, is evidence.
-  // Assistant transcript text or an idle suggestion outside it is not a draft.
   for (let bottom = rows.length - 1; bottom >= 0; bottom--) {
     if (!separator(rows[bottom])) continue;
     let top = bottom - 1;
@@ -104,11 +105,32 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
     if (top < 0) continue;
     const body = rows.slice(top + 1, bottom);
     if (!/^\s*❯/.test(body[0] ?? '')) continue;
-    const bodyText = body.join('\n');
+    yield body.join('\n');
+  }
+}
+
+function claudeComposerDraftMatch(screen: string): string | undefined {
+  // Only the last input box, bounded by two full-width rules, is evidence.
+  // Assistant transcript text or an idle suggestion outside it is not a draft.
+  for (const bodyText of claudeComposerBodies(screen)) {
     if (bodyText.includes('<user_message>')) return 'draft_parked:claude_composer';
     if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return 'draft_parked:claude_pasted_chip';
+    return undefined;
   }
   return undefined;
+}
+
+/** Whether Claude's last input box still holds `input`: the chip of a multi-line
+ *  paste, or its opening text (compared without whitespace and the `\` of typed
+ *  soft newlines, so wrapped or multi-line drafts still match). */
+export function claudeComposerHoldsInput(screenText: string, input: string): boolean {
+  const compact = (text: string) => text.replace(/[\s\\]+/g, '');
+  const head = compact(input).slice(0, 40);
+  for (const bodyText of claudeComposerBodies(stripAnsiScreenText(screenText))) {
+    if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return true;
+    return head.length > 0 && compact(bodyText.replace(/^\s*❯/, '')).includes(head);
+  }
+  return false;
 }
 
 export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): SubmitFailureDiagnosis {
@@ -117,6 +139,9 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
   const screen = stripAnsiScreenText(input.screenText ?? '');
   const loggedOut = matchScreenRule(LOGGED_OUT_RULES, screen);
   if (loggedOut) return { reason: 'logged_out', evidence: 'screen', matched: loggedOut };
+  if (classifyStuckPage(screen) === 'session lock') {
+    return { reason: 'session_locked', evidence: 'screen', matched: 'session_locked:writer_lock' };
+  }
   const interactiveMenu = matchScreenRule(INTERACTIVE_MENU_RULES, screen);
   if (interactiveMenu) return { reason: 'interactive_menu', evidence: 'screen', matched: interactiveMenu };
   const draftParked = matchScreenRule(DRAFT_PARKED_RULES, screen);
@@ -252,5 +277,6 @@ export function shouldWaitThroughBusyTurn(state: {
   // A gate screen means the CLI is parked on a question; it is not executing.
   if (state.diagnosisReason === 'logged_out') return false;
   if (state.diagnosisReason === 'interactive_menu') return false;
+  if (state.diagnosisReason === 'session_locked') return false;
   return state.waitsSoFar < (state.maxWaits ?? SUBMIT_BUSY_TURN_MAX_WAITS);
 }

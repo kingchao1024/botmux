@@ -1,4 +1,8 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
@@ -55,7 +59,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'privateCard',
+      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'goalStatusCard', 'privateCard',
       'cotEnabled', 'replyCardShowTools', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
@@ -352,6 +356,12 @@ describe('dashboard bot payload helpers', () => {
       customPassthroughCommands: '',
       canTalkDaemonCommands: '',
     });
+  });
+
+  it('projects daemon-provided default CLI command names without inventing them for old daemons', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { defaultPassthroughCommands: ['/goal', '/model', 3, 'invalid'] }))
+      .toMatchObject({ defaultPassthroughCommands: ['/goal', '/model'] });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).defaultPassthroughCommands).toBeUndefined();
   });
 
   it('projects launchShell so the dashboard preserves it after refresh', () => {
@@ -699,6 +709,35 @@ describe('dashboard bot payload helpers', () => {
     expect(offlineRow({ grantDelegateBots: 'ou_platform_bot' }).grantDelegateBots).toEqual([]);
     expect(botDefaultsPayload({ larkAppId: 'cli_live' }, { grantDelegateBots: ['ou_x', 42] }).grantDelegateBots)
       .toEqual(['ou_x']);
+  });
+
+  it('archiveCodex shows an explicit per-bot override (also offline) next to the current global value', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bot-payload-archive-'));
+    const previous = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    const file = join(dir, 'config.json');
+    process.env.BOTMUX_GLOBAL_CONFIG_FILE = file;
+    try {
+      const offlineRow = (raw: Record<string, unknown>) => botDefaultsPayload(
+        { larkAppId: 'cli_offline' },
+        { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig(raw) },
+      );
+      for (const globalOn of [false, true]) {
+        writeFileSync(file, JSON.stringify({ sessionCleanup: { archiveCodex: globalOn } }));
+        invalidateGlobalConfigCache();
+        // 显式关闭在全局开启时也要原样显示，离线行同样不能退回「跟随全局」。
+        expect(offlineRow({ archiveCodex: false })).toMatchObject({ archiveCodex: false, archiveCodexDefault: globalOn });
+        expect(offlineRow({ archiveCodex: true })).toMatchObject({ archiveCodex: true, archiveCodexDefault: globalOn });
+        expect(botDefaultsPayload({ larkAppId: 'cli_live' }, { archiveCodex: false }).archiveCodex).toBe(false);
+        // 未设置 / 非法手改值：null = 跟随全局。
+        expect(offlineRow({})).toMatchObject({ archiveCodex: null, archiveCodexDefault: globalOn });
+        expect(offlineRow({ archiveCodex: 'off' }).archiveCodex).toBeNull();
+      }
+    } finally {
+      if (previous === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+      else process.env.BOTMUX_GLOBAL_CONFIG_FILE = previous;
+      invalidateGlobalConfigCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  claudeComposerHoldsInput,
   decideSessionStartGatedSubmitWarning,
   diagnoseSubmitFailure,
   diagnoseBackendSubmitFailure,
@@ -247,6 +248,7 @@ const DIAG_KEYS = [
   'submitDiag.logged_out',
   'submitDiag.interactive_menu',
   'submitDiag.draft_parked',
+  'submitDiag.session_locked',
 ] as const;
 
 describe('submitDiag i18n 文案接缝', () => {
@@ -323,6 +325,15 @@ describe('collapsed pasted-text chip in Claude composer', () => {
     expect(diagnoseSubmitFailure({ screenText: emptyComposer, cliId: 'claude-code' }).reason).toBe('unknown');
   });
 
+  it('ignores a complete historical composer example when the current composer is empty', () => {
+    const quotedComposer = [
+      RULE, '❯ [Pasted text #2 +3 lines]', RULE,
+      'That was the earlier example.',
+      RULE, '❯ ', RULE,
+    ].join('\n');
+    expect(diagnoseSubmitFailure({ screenText: quotedComposer, cliId: 'claude-code' }).reason).toBe('unknown');
+  });
+
   it('needs the composer prompt marker: a chip-shaped line elsewhere in a box is not a draft', () => {
     const noPrompt = [RULE, '[Pasted text #2 +3 lines]', '  some other pane content', RULE].join('\n');
     expect(diagnoseSubmitFailure({ screenText: noPrompt, cliId: 'claude-code' }).reason).toBe('unknown');
@@ -331,6 +342,36 @@ describe('collapsed pasted-text chip in Claude composer', () => {
   it('is gated to the claude-code family like the expanded-composer rule', () => {
     expect(diagnoseSubmitFailure({ screenText: parkedChipScreen, cliId: 'codex' }).reason).toBe('unknown');
     expect(diagnoseSubmitFailure({ screenText: parkedChipScreen }).reason).toBe('unknown');
+  });
+});
+
+describe('claudeComposerHoldsInput', () => {
+  const RULE = '─'.repeat(40);
+  const input = 'please review the attached handoff and summarise the open risks';
+
+  it('matches the input soft-wrapped across composer rows', () => {
+    const screen = [RULE, '❯ please review the attached handoff and', '  summarise the open risks', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, input)).toBe(true);
+  });
+
+  it('matches a typed multi-line draft whose soft newlines still show their backslash', () => {
+    const screen = [RULE, '❯ short\\', '  second line of the draft', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, 'short\nsecond line of the draft')).toBe(true);
+  });
+
+  it('matches the collapsed chip of a multi-line paste', () => {
+    const screen = [RULE, '❯ [Pasted text #1 +12 lines]', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, 'line one\nline two')).toBe(true);
+  });
+
+  it('does not match once the input left the composer for the transcript', () => {
+    const screen = [`> ${input}`, '', '● Working on it', RULE, '❯ ', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, input)).toBe(false);
+  });
+
+  it('does not match a different draft in the composer', () => {
+    const screen = [RULE, '❯ something the user typed in the web terminal', RULE].join('\n');
+    expect(claudeComposerHoldsInput(screen, input)).toBe(false);
   });
 });
 
@@ -421,6 +462,12 @@ describe('shouldWaitThroughBusyTurn', () => {
   it('never extends over a login gate or an interactive menu', () => {
     expect(shouldWaitThroughBusyTurn({ ...base, diagnosisReason: 'logged_out' })).toBe(false);
     expect(shouldWaitThroughBusyTurn({ ...base, diagnosisReason: 'interactive_menu' })).toBe(false);
+  });
+
+  it('never extends over a recognised session writer lock', () => {
+    expect(shouldWaitThroughBusyTurn({
+      busy: true, diagnosisReason: 'session_locked', waitsSoFar: 0,
+    })).toBe(false);
   });
 
   it('still extends when a draft is parked, because that alone proves nothing either way', () => {

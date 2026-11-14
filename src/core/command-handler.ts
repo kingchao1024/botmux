@@ -1,6 +1,8 @@
 import { resolveSessionModelPinView } from './session-model.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
+import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
+import { resetSessionCodexModelSelection } from './worker-pool.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -16,13 +18,16 @@ import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effec
 import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { requestMeegoLogin } from '../services/meego-auth.js';
+import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
+import { meegoLoginCommand } from './provider-auth-request.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
 import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
-import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
+import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import { markReportReplyInput } from './report-source-reply.js';
@@ -41,11 +46,11 @@ import { buildDismissConfirmCard, buildDismissReceiptCard } from '../im/lark/dis
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { ALL_CLI_IDS, cliAliasesSelecting, createCliAdapterSync, resolveCliName } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
@@ -55,7 +60,7 @@ import { logger } from '../utils/logger.js';
 import { isStoreFileUnavailableError } from '../utils/json-file.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
-import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -110,6 +115,7 @@ import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
+import { clearChatReplyMode, resolveRegularGroupMode, setChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
@@ -140,8 +146,10 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
-import { writeSessionModelPin, sessionAcceptsDirectCommand } from './worker-pool.js';
+import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
+import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
@@ -159,10 +167,10 @@ import {
 import { isSessionGroup } from '../services/session-groups-store.js';
 import { tagClosedSessionGroup } from '../services/feed-group-tagger.js';
 import { dismissSessionGroup } from './dismiss-command.js';
-import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from './resume-result-message.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
-import { readProjectGroup } from '../services/project-group-store.js';
+import { projectTitleWithoutTaskMarker, readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
 import { readPlatformTeamSync } from '../services/platform-team-store.js';
@@ -236,6 +244,16 @@ function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backe
   return undefined;
 }
 
+function cliSelectionUsage(loc: Locale): string {
+  // An unrestricted bot: drops only the CLIs `/cli` refuses everywhere (riff).
+  const ids = ALL_CLI_IDS.filter(id => !cliSelectionSecurityError({}, id, 'default'));
+  const aliases = ids.flatMap(id => {
+    const names = cliAliasesSelecting(id);
+    return names.length ? [`${names.join(' / ')} → ${id}`] : [];
+  });
+  return t('cmd.cli.usage', { aliases: aliases.join('\n'), ids: ids.join(', ') }, loc);
+}
+
 /**
  * Adapter-scoped default passthrough commands (e.g. Codex's `/goal`).
  *
@@ -284,7 +302,7 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
  * cycle). Re-exported here so existing callers are unaffected. */
 export { cliHasNoRawPassthroughSurface } from './passthrough-commands.js';
 
-export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
+export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string, includeCustom = true): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
   // Resolve the EFFECTIVE CLI once and thread it through every layer below
@@ -310,13 +328,15 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
   // turn ledger and the runner rejects non-frame input, wedging the session.
   // ebsd is interactive but still has no raw surface: service mode requires the
   // service-user envelope and its own writer/terminal-marker ledger for every
-  // external message. Keep all of these on the normal structured turn path.
+  // external message. Riff turns every write into its own remote task, so a
+  // typed command never reaches a slash parser. Keep all of these on the
+  // normal structured turn path.
   if (cliHasNoRawPassthroughSurface(effectiveCliId)) return new Set();
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
   }
   try {
-    for (const c of getBot(larkAppId).config.customPassthroughCommands ?? []) {
+    for (const c of includeCustom ? getBot(larkAppId).config.customPassthroughCommands ?? [] : []) {
       const normalized = normalizePassthroughCommand(c);
       if (normalized) effective.add(normalized);
     }
@@ -1660,9 +1680,14 @@ export async function handleCotCommand(
   }
 
   const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
-  // Master switch defaults ON — only an explicit false means disabled.
+  // /cot controls all enabled process destinations for the effective reply mode.
   const masterOn = (() => {
-    try { return getBot(larkAppId).config.cotEnabled !== false; } catch { return false; }
+    try {
+      const cfg = getBot(larkAppId).config;
+      const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+      const unified = ds?.currentTurnId ? replyCardModeFor(ds) !== 'legacy' : cfg.replyCardMode === 'unified';
+      return cfg.cotEnabled !== false || (unified && cfg.replyCardNativeCot === true);
+    } catch { return false; }
   })();
 
   if (sub === 'off') {
@@ -1694,6 +1719,7 @@ export async function handleCotCommand(
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid, beforeWrite) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid, beforeWrite }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
+        updateReplyCardNativeThinking(ds, update);
         return;
       }
       // Turn in flight with thinking already accumulated — render right away
@@ -1829,10 +1855,7 @@ function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, 
   if (result.ok) {
     const cliName = sessionCliDisplayName(result.ds);
     const resultLoc = localeForBot(result.ds.larkAppId);
-    if (result.recoveryPending) return t('card.action.resume_started_remote', { cliName }, resultLoc);
-    return resumeStartsFresh(result.ds.session)
-      ? t('card.action.resume_success_fresh', { cliName }, resultLoc)
-      : t('card.action.resume_success', { cliName }, resultLoc);
+    return resumeSuccessMessage(result, cliName, resultLoc);
   }
   switch (result.error) {
     case 'not_closed': return t('card.action.resume_not_closed', undefined, loc);
@@ -1944,6 +1967,26 @@ export async function handleCommand(
       }
 
       case '/models': {
+        if (message.content.trim().toLowerCase() === '/models inherit') {
+          if (!ds) {
+            await replyNoSession(replyHere, loc);
+            break;
+          }
+          if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+            await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
+            break;
+          }
+          if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode) {
+            await sessionReply(rootId, t('cmd.models.inherit_unsupported', undefined, loc));
+            break;
+          }
+          if (!resetSessionCodexModelSelection(ds)) {
+            await sessionReply(rootId, t('cmd.models.inherit_unavailable', undefined, loc));
+            break;
+          }
+          await sessionReply(rootId, t('cmd.models.inherit_saved', undefined, loc));
+          break;
+        }
         const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
         if (atTopLevel && larkAppId) {
           await showDefaultModelPicker(larkAppId, rootId, message.senderId, sessionReply, loc);
@@ -2095,21 +2138,19 @@ export async function handleCommand(
           break;
         }
         const botCfg = getBot(ds.larkAppId).config;
-        const rawArgs = message.content.replace(/^\/cli\s*/i, '').trim();
-        const args = rawArgs.split(/\s+/u);
-        const requestedId = args[0];
-        let selectedCliId: CliId | undefined;
-        if (args.length === 1) {
-          try {
-            selectedCliId = createCliAdapterSync(requestedId as CliId).id as CliId;
-          } catch {
-            // Keep the normal invalid-CLI response below.
-          }
-        }
-        if (!selectedCliId) {
-          await sessionReply(rootId, 'Usage: /cli <cliId>\nUnknown or invalid CLI.');
+        const args = message.content.replace(/^\/cli\s*/i, '').trim().split(/\s+/u).filter(Boolean);
+        const requested = args.length === 1 ? resolveCliName(args[0]!) : undefined;
+        if (requested?.kind === 'ambiguous') {
+          const choices = requested.candidates.map(id => t('cmd.cli.choice', { cliId: id, name: getCliDisplayName(id) }, loc)).join(', ');
+          await sessionReply(rootId, t('cmd.cli.ambiguous', { input: args[0]!, choices }, loc));
           break;
         }
+        if (requested?.kind !== 'cli') {
+          const usage = cliSelectionUsage(loc);
+          await sessionReply(rootId, args.length === 1 ? `${t('cmd.cli.unknown', { input: args[0]! }, loc)}\n${usage}` : usage);
+          break;
+        }
+        const selectedCliId = requested.cliId;
         if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;
@@ -2450,7 +2491,7 @@ export async function handleCommand(
         const chatId = message.chatId ?? ds?.chatId;
         if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
           || !canOperate(appId, chatId, message.senderId, message.senderUnionId)) {
-          await sessionReply(rootId, t('cmd.dismiss.owner_only', undefined, loc));
+          await sessionReply(rootId, t(chatId && !isSessionGroup(chatId) ? 'cmd.dismiss.operator_only' : 'cmd.dismiss.owner_only', undefined, loc));
           break;
         }
         const parsed = /^\/dismiss(?:\s+--confirm=([a-f0-9]{64}))?\s*$/i.exec(message.content.trim());
@@ -2459,7 +2500,7 @@ export async function handleCommand(
           break;
         }
         const result = await dismissSessionGroup({
-          larkAppId: appId, chatId, rootId, senderId: message.senderId,
+          larkAppId: appId, chatId, rootId, chatType: message.chatType ?? ds?.chatType, senderId: message.senderId,
           confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
@@ -2468,7 +2509,7 @@ export async function handleCommand(
           try {
             const offers = await offerWorktreeCleanup(appId, result.workingDirs);
             await sendUserMessage(appId, message.senderId,
-              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, loc }), 'interactive');
+              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, ordinaryGroup: result.ordinaryGroup, loc }), 'interactive');
           } catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
         } else if (result.status === 'confirm') {
           await sessionReply(rootId, buildDismissConfirmCard({
@@ -2476,6 +2517,7 @@ export async function handleCommand(
             invokerOpenId: message.senderId,
             confirmationState: result.state,
             rows: result.sessions.map(s => closeWorktreeSessionRow({ ...s.session, larkAppId: s.larkAppId }, s.resident, loc)),
+            ordinaryGroup: result.ordinaryGroup,
             loc,
           }), 'interactive');
         } else if (result.status === 'peer_offline') {
@@ -2661,8 +2703,7 @@ export async function handleCommand(
                 residual: closeResult.residual,
               };
             }
-            return { status: 'closed' as const, current, card, privateCard,
-              closedCardPatchQueued: closeResult.closedCardPatchQueued === true };
+            return { status: 'closed' as const, current, card, privateCard };
           });
           if (!closed) {
             await replyNoSession(replyHere, loc);
@@ -2715,12 +2756,31 @@ export async function handleCommand(
           }
           // Run only after a clean explicit close, never on crash/restart/refusal.
           // The already-closed session and its receipt do not wait for OAuth/IM.
-          void tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId)
+          const closeTagging = pluginCommandGateway.replacesCloseTag(closed.current.larkAppId)
+            ? Promise.resolve({ status: 'skipped' as const })
+            : tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId);
+          void closeTagging
+            .catch(() => ({ status: 'failed' as const }))
             .then(async result => {
-              if (result.status === 'skipped') return;
-              await sessionReply(rootId, result.status === 'updated'
-                ? t('cmd.close.tag_updated', { name: result.name }, loc)
-                : t('cmd.close.tag_failed', undefined, loc));
+              if (result.status !== 'skipped') {
+                try {
+                  await sessionReply(rootId, result.status === 'updated'
+                    ? t('cmd.close.tag_updated', { name: result.name }, loc)
+                    : t('cmd.close.tag_failed', undefined, loc));
+                } catch (error) { logger.warn(`[${logTag}] close tag receipt failed: ${error}`); }
+              }
+              const outcomes = await pluginCommandGateway.afterClose({
+                larkAppId: closed.current.larkAppId, eventId: message.messageId, issuedAt: Number(message.createTime) || Date.now(),
+                command: '/close', args: '',
+                chat: { chatId: closed.current.chatId, chatType: closed.current.session.chatType ?? message.chatType ?? null, anchor: rootId },
+                sender: { openId: message.senderId ?? null, unionId: message.senderUnionId ?? null },
+                privileges: { canTalk: true, canOperate: canOperate(closed.current.larkAppId, closed.current.chatId, message.senderId, message.senderUnionId) },
+                locale: loc,
+              });
+              for (const outcome of outcomes) {
+                if (!outcome.ok) await sessionReply(rootId, '会话已关闭，但插件后续操作未确认，请检查群分类。');
+                else if (outcome.reply?.kind === 'text') await sessionReply(rootId, outcome.reply.text);
+              }
             }).catch(err => logger.warn(`[${logTag}] close tag notification failed: ${err}`));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
@@ -2732,10 +2792,9 @@ export async function handleCommand(
                 await sendEphemeralCard(closed.current.larkAppId, closed.current.chatId, openId, closed.card)
                   .catch(err => logger.warn(`[${logTag}] private close card delivery failed: ${err}`));
               }
-            } else if (closed.current.scope === 'chat' || !closed.closedCardPatchQueued) {
-              // A thread's live card already has its closing PATCH queued. Keep
-              // the fallback when no PATCH was queued, and preserve the separate
-              // operator confirmation for chat-scoped sessions.
+            } else {
+              // The live card's closing PATCH may land far above the /close
+              // message, so the operator also gets a confirmation where they typed.
               await deliverEphemeralOrReply(
                 closed.current,
                 message.senderId,
@@ -3297,6 +3356,15 @@ export async function handleCommand(
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (!emptyStart && pendingTurnId) await deps.prepareTurn?.(current, pendingTurnId);
+            // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+            // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+            if (!emptyStart && !pendingRawInput && pendingTurnId) {
+              recordTurnExplicitMention(current, pendingTurnId, messageMentionsBot(
+                { mentions: current.pendingMentions },
+                current.larkAppId,
+                selfBot.botOpenId,
+              ));
+            }
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
@@ -4445,12 +4513,14 @@ export async function handleCommand(
         const loginOpenId = message.senderId;
         // Any reply carrying an authorization link reaches only the sender: a
         // group member opening someone else's link would authorize as THEMSELVES.
+        const loginChatId = ds?.chatId ?? message.chatId;
         const authLinkReply = (text: string, privateCommand = '/login') => deliverAuthLink({
           privateChat: (ds?.chatType ?? message.chatType) === 'p2p',
           openId: isUsableOpenId(loginOpenId) ? loginOpenId : undefined,
           text,
           replyInPlace: content => sessionReply(rootId, content),
           sendDirect: (openId, content) => sendUserMessage(botCfg2.larkAppId, openId, content),
+          ...(loginChatId ? { sendEphemeral: (openId: string, card: string) => sendEphemeralCard(botCfg2.larkAppId, loginChatId, openId, card) } : {}),
           locale: loc,
           privateCommand,
         });
@@ -4490,6 +4560,39 @@ export async function handleCommand(
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        // `/login meego [dcar]` — the person's Meego login, kept once per person
+        // for every session of this bot. Independent of where ByteCloud
+        // credentials come from: the platform does not issue Meego logins.
+        // meegle keeps one login per tenant, so a dcar user names the tenant
+        // here the way `bytedcli meego login --tenant dcar` does.
+        const meegoArgs = subCmd.split(/\s+/);
+        if (meegoArgs[0] === 'meego') {
+          const tenantArg = meegoArgs.slice(1).join(' ').replace(/^--tenant(?:=|\s+)/, '').toLowerCase();
+          if (tenantArg && !MEEGO_TENANTS.includes(tenantArg as MeegoTenant)) {
+            await sessionReply(rootId, t('cmd.login.meego_tenant_invalid', { tenants: MEEGO_TENANTS.join(' / ') }, loc));
+            break;
+          }
+          const tenant = tenantArg ? tenantArg as MeegoTenant : undefined;
+          if (!bytedcliGoverned) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
+            break;
+          }
+          if (!isUsableOpenId(loginOpenId)) {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+            break;
+          }
+          const login = await requestMeegoLogin(loginOpenId, tenant);
+          if (login.state === 'link') {
+            await authLinkReply([
+              t('auth_link.meego_title', undefined, loc), login.authUrl, '', t('auth_link.meego_footer', undefined, loc),
+            ].join('\n'), meegoLoginCommand(tenant));
+          } else {
+            await sessionReply(rootId, login.state === 'ready'
+              ? t('cmd.login.meego_ready', undefined, loc)
+              : t('provider_auth.unavailable', { provider: 'Meego', detail: login.detail }, loc));
+          }
+          break;
+        }
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
         if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
           && (subCmd === '' || explicitGoverned)) {
@@ -5616,7 +5719,7 @@ export async function handleCommand(
           const workers = (result.config.workerAppIds ?? []).map(botDisplayName).join('、')
             || t('cmd.project.none', undefined, loc);
           const runtime = result.project
-            ? `${result.project.title} · ${result.project.phase}`
+            ? `${projectTitleWithoutTaskMarker(result.project.title)} · ${result.project.phase}`
             : t('cmd.project.waiting', undefined, loc);
           const workerPolicy = t(result.config.autoEnrollWorkers
             ? 'cmd.project.worker_policy_auto'
@@ -6652,6 +6755,20 @@ export async function handleCommand(
           break;
         }
 
+        // 分身登记在新群 chatId 上（chat-scope），而 new-topic 下顶层消息按 thread/messageId
+        // 路由，永远命不中它。只给这个新群写群级 chat-topic 覆盖（不动 Bot 默认）：顶层
+        // 平铺命中分身，群内原生话题仍各自独立。必须在 forkSession 登记之前写入。
+        let forkReplyModePinned = false;
+        if (resolveRegularGroupMode(forkAppId, forkChatId) === 'new-topic') {
+          try {
+            const pin = await setChatReplyMode(forkAppId, forkChatId, 'chat-topic');
+            forkReplyModePinned = pin.ok;
+            if (!pin.ok) logger.warn(`[${logTag}] /fork --create: pin chat-topic on ${forkChatId} failed: ${pin.reason}`);
+          } catch (err: any) {
+            logger.warn(`[${logTag}] /fork --create: pin chat-topic on ${forkChatId} threw: ${err?.message ?? err}`);
+          }
+        }
+
         // Fork the session into the new chat (chat-scope, group). The new chat
         // is empty by construction, so no target-anchor conflict. Source is
         // never touched.
@@ -6678,6 +6795,14 @@ export async function handleCommand(
             if (!dis.ok) logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband failed: ${dis.error}`);
           } catch (e: any) {
             logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband threw: ${e?.message ?? e}`);
+          }
+          if (forkReplyModePinned) {
+            try {
+              const unpin = await clearChatReplyMode(forkAppId, forkChatId);
+              if (!unpin.ok) logger.warn(`[${logTag}] /fork --create: unpin reply mode on ${forkChatId} failed: ${unpin.reason}`);
+            } catch (e: any) {
+              logger.warn(`[${logTag}] /fork --create: unpin reply mode on ${forkChatId} threw: ${e?.message ?? e}`);
+            }
           }
           const errKey = forkResult.error === 'worker_busy' ? 'cmd.fork.mid_turn'
             : forkResult.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
@@ -7214,6 +7339,9 @@ export async function startCodexAppThreadSession(
     current.session.title = `Codex App: ${title}`;
     current.session.cliId = existingAppServerEndpoint ? 'codex' : 'codex-app';
     current.session.cliSessionId = thread.threadId;
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'adopt';
+    markProjectImportPending(current.session);
     if (existingAppServerEndpoint) {
       // Do not reuse a possibly frozen runner/wrapper from the temporary
       // BotMux shell this topic started with. The next fork freezes the current
@@ -7235,6 +7363,7 @@ export async function startCodexAppThreadSession(
     current.session.adoptedFrom = undefined;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
+    noteProjectAssociationChanged(current.session);
     return { status: 'switched' as const, anchor: sessionAnchorId(current) };
   });
   if (switched.status === 'gone') {
@@ -7350,12 +7479,25 @@ export async function startAdoptSession(
     current.session.serviceTier = 'inherit';
     current.adoptedFrom = adoptedFromForTarget(target);
     current.session.adoptedFrom = { ...current.adoptedFrom };
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'adopt';
+    markProjectImportPending(current.session);
     sessionStore.updateSession(current.session);
-    forkAdoptWorker(current);
+    const admission = forkAdoptWorker(current);
+    if (admission !== 'accepted') {
+      current.session.projectImportPending = false;
+      sessionStore.updateSession(current.session);
+      return { status: 'rejected' as const, anchor: sessionAnchorId(current) };
+    }
+    noteProjectAssociationChanged(current.session);
     return { status: 'adopted' as const, anchor: sessionAnchorId(current) };
   });
   if (adopted.status === 'gone') {
     await replyNoSession((content) => sessionReply(sessionAnchorId(ds), content), loc);
+    return;
+  }
+  if (adopted.status === 'rejected') {
+    await sessionReply(adopted.anchor, '外部会话未成功接入，请检查接入限制后重试。');
     return;
   }
   if (adopted.status === 'pending') {
@@ -7454,11 +7596,15 @@ export async function startResumeImportSession(
     current.session.workingDir = target.cwd;
     current.session.cliSessionId = target.cliSessionId;
     current.session.title = target.title || `Import: ${project}`;
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'resume_import';
+    markProjectImportPending(current.session);
     // Resume sandbox decision is left to forkWorker (resume=true → not
     // sandboxed, matching restore semantics). Mark history so this is a resume.
     current.hasHistory = true;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
+    noteProjectAssociationChanged(current.session);
     return { status: 'resumed' as const, anchor: sessionAnchorId(current) };
   });
   if (resumed.status === 'gone') {

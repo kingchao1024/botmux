@@ -11,6 +11,8 @@ import {
   requestCredentialGrant,
   platformCredentialsUrl,
   CREDENTIAL_GRANT_PATH,
+  FIRST_ATTEMPT_TIMEOUT_MS,
+  TOTAL_BUDGET_MS,
   type CredentialGrantClientOptions,
 } from '../src/platform/credential-grant-client.js';
 
@@ -86,6 +88,64 @@ describe('requestCredentialGrant', () => {
   ])('rejects a bytedcli grant with %s', async (_label, variables) => {
     const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables } }]);
     const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(!r.ok && r.reason).toBe('invalid_response');
+  });
+
+  // A daemon from before regional tokens rejects a whole grant carrying them,
+  // so a platform may only send them when the request names the partitions.
+  it('asks a bytedcli grant for every partition, and a lark-cli grant for none', async () => {
+    const reply = (tool: string, variables: Record<string, string>) =>
+      ({ status: 200, json: { ok: true, tool, unionId: 'on_alice', expiresAt: future(), variables } });
+    const { calls, http } = fakeHttp([
+      reply('bytedcli', { BYTEDCLI_USER_CLOUD_JWT: 'cloud' }),
+      reply('lark-cli', { LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't' }),
+    ]);
+    await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    await requestCredentialGrant(REQ, { binding: BINDING, http });
+    expect((calls[0]!.body as Record<string, unknown>).cloudJwtRegions).toEqual(['i18n', 'i18nbd', 'tx']);
+    expect(calls[1]!.body).not.toHaveProperty('cloudJwtRegions');
+  });
+
+  it('accepts the partition JWTs a bytedcli grant was asked for, and the partitions the platform tried', async () => {
+    const variables = {
+      BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CODE_JWT: 'code',
+      BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n', BYTEDCLI_USER_CLOUD_JWT_I18NBD: 'bd', BYTEDCLI_USER_CLOUD_JWT_TX: 'tx',
+    };
+    const { http } = fakeHttp([{ status: 200, json: {
+      ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables, cloudJwtRegions: ['tx', 'i18n', 'cn', 7],
+    } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(r.ok && r.value.variables).toEqual(variables);
+    // Only partitions this daemon asked for are read back.
+    expect(r.ok && r.value.cloudJwtRegions).toEqual(['i18n', 'tx']);
+  });
+
+  it('reads no tried partitions from a platform that predates them', async () => {
+    const { http } = fakeHttp([
+      { status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: { BYTEDCLI_USER_CLOUD_JWT: 'cloud' } } },
+      { status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: { BYTEDCLI_USER_CLOUD_JWT: 'cloud' }, cloudJwtRegions: 'i18n' } },
+    ]);
+    for (let i = 0; i < 2; i++) {
+      const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+      expect(r.ok).toBe(true);
+      expect(r.ok && r.value).not.toHaveProperty('cloudJwtRegions');
+    }
+  });
+
+  it('drops only a partition JWT that arrives unusable, keeping the rest of the grant', async () => {
+    const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'bytedcli', unionId: 'on_alice', expiresAt: future(), variables: {
+      BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n',
+      BYTEDCLI_USER_CLOUD_JWT_TX: 'tx\nexport X=1', BYTEDCLI_USER_CLOUD_JWT_I18NBD: 7,
+    } } }]);
+    const r = await requestCredentialGrant({ ...REQ, tool: 'bytedcli' }, { binding: BINDING, http });
+    expect(r.ok && r.value.variables).toEqual({ BYTEDCLI_USER_CLOUD_JWT: 'cloud', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n' });
+  });
+
+  it('rejects partition JWTs smuggled into a lark-cli grant', async () => {
+    const { http } = fakeHttp([{ status: 200, json: { ok: true, tool: 'lark-cli', unionId: 'on_alice', expiresAt: future(), variables: {
+      LARKSUITE_CLI_APP_ID: 'a', LARKSUITE_CLI_USER_ACCESS_TOKEN: 't', BYTEDCLI_USER_CLOUD_JWT_I18N: 'i18n',
+    } } }]);
+    const r = await requestCredentialGrant(REQ, { binding: BINDING, http });
     expect(!r.ok && r.reason).toBe('invalid_response');
   });
 
@@ -219,6 +279,103 @@ describe('requestCredentialGrant transport failures', () => {
       expect(!r.ok && r.reason).toBe('network');
       // The retry gets exactly what is left of the budget.
       expect(calls).toEqual([200, 1_200]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** A platform that answers request i after `delays[i]` ms (`null`: never)
+   *  and drops a request once the client aborts it, like `postJson`. */
+  function slowPlatform(delays: Array<number | null>) {
+    const calls: Array<{ timeoutMs: number }> = [];
+    let firstCall!: () => void;
+    // Bun's fake clock can fire a due timer before microtasks already queued
+    // run, so advancing it before the request reached the transport would
+    // start the request after its own timeout.
+    const reached = new Promise<void>(resolve => { firstCall = resolve; });
+    const http: NonNullable<CredentialGrantClientOptions['http']> = {
+      post: (_url, _body, opts: any) => new Promise((resolve, reject) => {
+        const delay = delays[calls.length] ?? null;
+        calls.push({ timeoutMs: opts.timeoutMs });
+        firstCall();
+        const timer = delay === null ? undefined : setTimeout(() => resolve(GRANT_200), delay);
+        opts.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+      }),
+    };
+    return { calls, http, reached };
+  }
+
+  // On a platform cache miss the grant is minted on the spot, and once started
+  // the platform finishes it even if the client gave up. Observed mints: ~3.7s
+  // typical, ~4s at p99, a few up to ~6s.
+  it('waits out a slow on-the-spot mint (6s) on the first attempt instead of abandoning it', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([6_000, 6_000]);
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http });
+      await reached;
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(r.ok).toBe(true);
+      expect(calls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves the retry after a silent first attempt at least 4.5s, enough for a typical mint', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([null, 4_500]);
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http });
+      await reached;
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(r.ok).toBe(true);
+      expect(calls).toHaveLength(2);
+      expect(calls[1]!.timeoutMs).toBeGreaterThanOrEqual(4_500);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The total matches the 30s the daemon gives a local bytedcli invocation, so
+  // a mint that went slow twice still lands inside the turn's identity budget.
+  it('gives the retry the rest of the 30s budget: a 20s retry mint still lands', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([null, 20_000]);
+      const t0 = Date.now();
+      let settledAfter: number | undefined;
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http })
+        .then(r => { settledAfter = Date.now() - t0; return r; });
+      await reached;
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(r.ok).toBe(true);
+      expect(calls.map(c => c.timeoutMs)).toEqual([FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS - FIRST_ATTEMPT_TIMEOUT_MS]);
+      expect(settledAfter).toBe(FIRST_ATTEMPT_TIMEOUT_MS + 20_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('with the default budgets, gives up exactly at the total budget, not sooner', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([null, null]);
+      const t0 = Date.now();
+      let settledAfter: number | undefined;
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http })
+        .then(r => { settledAfter = Date.now() - t0; return r; });
+      await reached;
+      await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS - 1);
+      expect(settledAfter).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(!r.ok && r.reason).toBe('network');
+      expect(settledAfter).toBe(TOTAL_BUDGET_MS);
+      expect(calls).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }

@@ -26,16 +26,16 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
       () => runScenario(backendType, mode),
-      65_000,
+      mode === 'session-lock' ? 120_000 : 65_000,
     );
   }
 }
@@ -69,7 +69,9 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
     renameSync(`${frameFile}.tmp`, frameFile);
     return id;
   }
-  const initial = nativeViewport
+  const initial = mode === 'session-lock'
+    ? readFileSync(resolve('test/fixtures/stuck-pages/traex-0.213.1-session-lock.txt'), 'utf8').trimEnd().split('\n')
+    : nativeViewport
     ? COMPOSER.map(row => mode === 'native-viewport-loading' ? row.replace('GPT-6-Astra xhigh', 'loading') : row)
     : mode.startsWith('resumed-repository-notice')
     ? ['■ Conversation interrupted - use /feedback if something went wrong', '',
@@ -88,7 +90,36 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
     : mode === 'loaded-banner'
       ? ['│ model: GPT-6-Astra xhigh /model to change │', '│ directory: /tmp/loading │',
         ...COMPOSER.map(row => row.replace(' · ~ · ', ' · /tmp/loading · '))]
-      : ['TraeCode CLI (v0.211.1)', '', ...COMPOSER];
+      : mode === 'shortcut-only-footer'
+        // TraeX 0.214.1 cold start: empty composer plus a bare shortcut hint,
+        // with no model/context footer until the model list fetch resolves.
+        ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo', '  permissions: YOLO mode',
+          ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+          '  ? for shortcuts']
+        : mode === 'bare-hint-two-row-footer'
+          // approval_policy=never or a custom permission profile suppresses
+          // the standard permission label: the context row stays, but the
+          // second footer row is only the native shortcut hint.
+          ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo',
+            ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+            '  GPT-6-Astra xhigh · /tmp/repo · Context —',
+            '  ? for shortcuts']
+          : mode === 'truncated-cwd-footer'
+            // A cwd wider than the pane truncates the model/context row with
+            // U+2026 before the Context cell renders.
+            ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo',
+              ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+              '  GPT-6-Astra xhigh · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…',
+              '  ? for shortcuts']
+            : mode === 'warning-hint-footer'
+              // A startup diagnostic warning is right-aligned on the bare
+              // hint row (`⚠ N warning(s) · f2 to view`); it is a notice and
+              // must not block first-prompt admission.
+              ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo',
+                ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+                '  GPT-6-Astra xhigh · /tmp/repo · Context —',
+                '  ? for shortcuts' + ' '.repeat(80) + '⚠ 1 warning · f2 to view']
+              : ['TraeCode CLI (v0.211.1)', '', ...COMPOSER];
   // #2247 later taught the byte-stream readyPattern the same cursor-painted
   // shape: the stripped redraw now matches through the preceding rule, so
   // recognition no longer depends on the viewport poller. The same rule arm
@@ -234,13 +265,21 @@ await import(${JSON.stringify(resolve('src/worker.ts'))});
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
       workingDir: dataDir, cliId: 'traex', cliPathOverride: fakeCli, backendType,
-      ...(mode === 'resume' || mode.startsWith('resumed-repository-notice') || nativeViewport ? { resume: true, cliSessionId: nativeId } : {}),
+      ...(mode === 'resume' || mode === 'session-lock' || mode.startsWith('resumed-repository-notice') || nativeViewport ? { resume: true, cliSessionId: nativeId } : {}),
       ...(mode === 'per-bot-home' ? { env: { TRAE_HOME: traeHome } } : {}),
       prompt: 'only-this-traex-startup-input', turnId: 'om_first',
       dispatchAttempt: 1, durablePrimaryInbox: true,
       larkAppId: 'app_test', larkAppSecret: 'test',
     } satisfies DaemonToWorker);
-    await waitFor(() => existsSync(seenFile), 'first frame');
+    await waitFor(() => existsSync(seenFile), 'first frame', mode === 'session-lock' ? 60_000 : 12_000);
+    if (mode === 'session-lock') {
+      await waitFor(() => messages.some(message => message.type === 'stuck_warning'
+        && message.reason === 'input_held' && message.matchedPattern === 'session lock'),
+      'session-lock hold card', 25_000);
+      expect(existsSync(inputFile), logs.join('')).toBe(false);
+      expect(messages.some(message => message.type === 'turn_input_committed')).toBe(false);
+      paint(['TraeCode CLI (v0.213.1)', '', ...COMPOSER]);
+    }
     if (heldIdle) await waitFor(() => existsSync(idleHeld), 'first idle edge held');
     if (nativeViewport) {
       const pane = execFileSync('tmux', [...tmuxSocketArgs(preferredManagedTmuxSocket(env)),

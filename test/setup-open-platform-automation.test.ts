@@ -384,6 +384,55 @@ describe('Open Platform payload helpers', () => {
     });
     expect(buildSafeSettingPayload('cli_x').redirectURL).toEqual(['http://127.0.0.1:9768/callback']);
   });
+
+  it('tenant-only 名字进 user 桶时落 missingUserScopes 且不借用 tenant 目录 ID', () => {
+    const entries = extractOpenPlatformScopeEntries({
+      data: { appScopeList: [{ id: 101, name: 'spark:app:read' }], userScopeList: [] },
+    });
+    expect(mapManifestScopesToOpenPlatformIds({ scopes: { user: ['spark:app:read'] } }, entries)).toEqual({
+      tenantScopeIds: [],
+      userScopeIds: [],
+      missingTenantScopes: [],
+      missingUserScopes: ['spark:app:read'],
+    });
+  });
+
+  it('user-only 名字进 tenant 桶时落 missingTenantScopes 且不借用 user 目录 ID', () => {
+    const entries = extractOpenPlatformScopeEntries({
+      data: { appScopeList: [], userScopeList: [{ scopeId: '202', scopeName: 'offline_access' }] },
+    });
+    expect(mapManifestScopesToOpenPlatformIds({ scopes: { tenant: ['offline_access'] } }, entries)).toEqual({
+      tenantScopeIds: [],
+      userScopeIds: [],
+      missingTenantScopes: ['offline_access'],
+      missingUserScopes: [],
+    });
+  });
+
+  it('同名 scope 在两个桶各取各的 ID，未标桶的目录项两边都可用', () => {
+    const entries = extractOpenPlatformScopeEntries({
+      data: {
+        appScopeList: [{ id: 101, name: 'im:message' }],
+        userScopeList: [{ scopeId: '202', scopeName: 'im:message' }],
+      },
+    });
+    expect(mapManifestScopesToOpenPlatformIds(
+      { scopes: { tenant: ['im:message'], user: ['im:message'] } },
+      entries,
+    )).toMatchObject({ tenantScopeIds: ['101'], userScopeIds: ['202'] });
+
+    const unbucketed = extractOpenPlatformScopeEntries({ data: { list: [{ id: 303, name: 'docs:doc' }] } });
+    expect(unbucketed).toEqual([{ id: '303', name: 'docs:doc', bucket: undefined }]);
+    expect(mapManifestScopesToOpenPlatformIds(
+      { scopes: { tenant: ['docs:doc'], user: ['docs:doc'] } },
+      unbucketed,
+    )).toEqual({
+      tenantScopeIds: ['303'],
+      userScopeIds: ['303'],
+      missingTenantScopes: [],
+      missingUserScopes: [],
+    });
+  });
 });
 
 describe('filterScopeManifest — 只申请缺失项，避免全量 manifest 过度申请', () => {
@@ -3181,6 +3230,10 @@ describe('automateOpenPlatformSetup', () => {
     if (result.ok) {
       expect(result.scopeCount).toBe(0);
       expect(result.skippedScopeCount).toBe(3);
+      expect(result.skippedScopes).toEqual({
+        tenant: ['im:message', 'contact:user.base:readonly'],
+        user: ['auth:user_access_token:read'],
+      });
     }
     expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
   });
@@ -3304,6 +3357,7 @@ describe('automateOpenPlatformSetup', () => {
           'im.chat.member.user.deleted_v1',
           'im.message.updated_v1',
           'im.message.recalled_v1',
+          'im.chat.disbanded_v1',
           'vc.bot.meeting_invited_v1',
           'vc.bot.meeting_activity_v1',
           'vc.bot.meeting_ended_v1',
@@ -3331,8 +3385,8 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('im.message.receive_v1');
       expect(result.eventWarning).toBeTruthy();
     }
-    // 批量失败后逐个重试过:baseline 6 + 可选 4 + VC app 3 + VC user 1 = 批量 1 次 + 单个 14 次
-    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(15);
+    // 批量失败后逐个重试过:baseline 6 + 可选 5 + VC app 3 + VC user 1 = 批量 1 次 + 单个 15 次
+    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(16);
     // 核心事件缺失时不再继续发版,避免发布一个收不到消息的版本
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
   });
@@ -3390,7 +3444,7 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
     if (result.ok) {
       expect(result.missingVcEvents).toEqual(vcEvents);
-      expect(result.subscribedEventCount).toBe(11); // 6 baseline 事件 + 4 可选事件 + 1 回调
+      expect(result.subscribedEventCount).toBe(12); // 6 baseline 事件 + 5 可选事件 + 1 回调
       expect(result.eventWarning).toContain('VC 会议事件未确认订阅');
       // VC listener 保存门必须拦下这种结果(dashboard 两条分支都走这个门)
       expect(vcListenerEventGateError(result)).toContain('vc.bot.meeting_invited_v1');

@@ -23,6 +23,7 @@
 | 定时任务按某个时区算 | 通用设置 → 定时任务 → 时区 | `scheduleTimeZone` | 跟随主机 |
 | `/g` 建的群自动加前缀 | 通用设置 → 群聊创建 | `groupNamePrefix` | 不加 |
 | 选仓卡里不显示 worktree | 通用设置 → 仓库选择 | `repoPickerMode` | 仓库 + worktree |
+| 新建的 worktree 放到大数据盘 | 通用设置 → Worktree | `worktreeRoot` | 建在主仓库旁边 |
 | 下载新版走代理 | 系统与维护 → 自动维护 → GitHub 下载代理 | `httpProxy` | 不设 |
 | `/login` 授权后不用手动粘贴链接 | 通用设置 → 访问权限 → OAuth 回调基址 | `oauthRedirectBase` | 不设 |
 
@@ -64,6 +65,8 @@
 | 空闲阈值（`olderThanHours`） | 最后一条消息早于多久才清：24 小时 / 72 小时 / 7 天 三选一 | 7 天（168） |
 | 检查频率（`intervalMinutes`） | 每隔几分钟检查一次，最少 5 分钟 | 60 |
 | 关闭/清理时同步归档 Codex（`archiveCodex`） | 关会话时（手动关闭或空闲清理）顺手归档对应的 Codex 会话，重新打开时恢复 | 关 |
+
+单个 Bot 可在 Dashboard「Bot 配置 → 会话 → Codex 原生归档」里选择跟随全局、开启或关闭（只对 Codex Bot 显示）；也可用 `/config set archiveCodex on` 或 `/config set archiveCodex off` 覆盖此开关，`/config unset archiveCodex` 恢复继承。也可在 `bots.json` 对应 Bot 条目设置 `"archiveCodex": true` 或 `false`。命令修改对后续关闭/清理立即生效，已开始的关闭沿用开始时的值；已有归档会话仍可恢复。
 
 它和「会话控制」页上手动点「清理空闲」用的是**同一套判断**，只是自动跑。只清真正空闲的会话：正在运行、被锁定、还有待处理的选仓或需要你处理的提醒的会话，都不会被关。
 
@@ -136,6 +139,7 @@ botmux worker-budget unset                           # 清掉自定义，回到�
 
 - **`/g` 群名前缀**（通用设置 → 群聊创建，`groupNamePrefix`）：用 `/group` 或 `/g` 建群时，群名前面自动加上这段文字，例如 `AI讨论·`。别的建群方式不加。清空保存就关掉，最多约 2 秒生效。详见[一键新建会话群](/group)。
 - **仓库选择卡模式**（通用设置 → 仓库选择，`repoPickerMode`）：`all`（默认，仓库和它的 worktree 都列出来）或 `repos`（只列主仓库）。选了 `repos` 后，直接写 `/repo <worktree 路径>` 仍然能进 worktree。
+- **worktree 存放目录**（通用设置 → Worktree，`worktreeRoot`）：botmux 新建的 worktree 放到这个目录下，例如 `/data00/worktrees`，适合系统盘小、另有大数据盘的机器。目录下按主仓库所在路径分层：`/root/iserver/botmux` 的 worktree 会建成 `/data00/worktrees/root/iserver/botmux-wt-…`，所以不同位置的同名仓库不会冲突。填一个已存在、可写的目录的绝对路径（可以 `~/` 开头）。只影响之后新建的 worktree，已有的留在原处照常使用，之后再换目录也不影响。这个目录之后若不存在或不可写（比如数据盘没挂上、被重新挂成只读），新 worktree 会临时建回主仓库旁边，并在日志里告警。清空保存就恢复为建在主仓库旁边，最多约 2 秒生效。
 
 ## 网络与访问
 
@@ -143,7 +147,7 @@ botmux worker-budget unset                           # 清掉自定义，回到�
 |---|---|---|
 | GitHub 下载代理（`httpProxy`） | 系统与维护 → 自动维护 | 独立二进制版自更新时，从 GitHub 下载用的 HTTP 代理，如 `http://127.0.0.1:7890`。不填就用 `HTTPS_PROXY` / `HTTP_PROXY`，都没有就直连。npm / pnpm / Bun 安装走它们自己的代理配置 |
 | OAuth 回调基址（`oauthRedirectBase`） | 通用设置 → 访问权限 | 飞书授权（如 `/login`）完成后跳回这个地址，Dashboard 自动收下，不用再手动粘贴回调链接。适合 botmux 不在你自己电脑上跑的情况。只填协议 + 主机 + 端口，如 `http://10.1.2.3:7891`。改完到任一机器人的「会话群标签」里点一次「修复开放平台回调」，否则飞书会报 20029 |
-| 远程访问终端（`remoteAccess`） | 通用设置 → 访问权限 | 默认关。这台机器绑定了中心平台时才显示。打开后，会话终端、卡片上的终端按钮和 webhook 地址都换成平台链接，关掉就用本机链接 |
+| 远程访问终端（`remoteAccess`） | 通用设置 → 访问权限 | 默认关。这台机器绑定了[中心平台](/platform)时才显示。打开后，会话终端、卡片上的终端按钮和 webhook 地址都换成平台链接，关掉就用本机链接 |
 
 网页终端本身的说明见 [Web 终端](/web-terminal)。
 

@@ -17,7 +17,7 @@ import { homedir } from 'node:os';
 import { withBotsJsonLock } from '../setup/bots-store.js';
 import { FileLockTimeoutError, type FileLockOptions } from '../utils/file-lock.js';
 import { writeRawConfigAtomic } from './config-store.js';
-import { migrateLegacySandboxFields } from '../adapters/cli/fs-policy.js';
+import { migrateLegacySandboxFields, isLoadableSandboxPaths } from '../adapters/cli/fs-policy.js';
 import { logger } from '../utils/logger.js';
 
 /** The bots.json path the daemon will load (same resolution as loadBotConfigs). */
@@ -53,6 +53,10 @@ export async function migrateSandboxConfigOnDisk(
         if (!m) continue;
         entry.sandbox = m.sandbox;
         if (m.sandboxPaths) entry.sandboxPaths = m.sandboxPaths;
+        // Migration ran on a malformed sandboxPaths but the sanitized legacy
+        // fields yield no paths: keeping the old value would brick the strict
+        // loader on the next start, so drop it (legacy fields stay on disk).
+        else if (!isLoadableSandboxPaths(entry.sandboxPaths)) delete entry.sandboxPaths;
         migrated.push(typeof entry.larkAppId === 'string' ? entry.larkAppId : '<unknown>');
       }
       if (!migrated.length) return { migrated };

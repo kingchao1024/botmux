@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src/services/feedback-policy-resolver.js';
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
@@ -371,6 +372,21 @@ describe('bot-config store', () => {
     expect(effectiveReplyDelivery('app_default', cliId)).toBe('transcript');
   });
 
+  it.each(['grok-4.7', 'grok-4.7-build-fast'])('toggles zero injection without dropping %s xhigh', async model => {
+    const { registry, store } = await loaded({ cliId: 'grok', model, reasoningEffort: 'xhigh', replyDelivery: 'send', backendType: 'tmux' });
+    const zero = store.findConfigField('promptInjection')!;
+    expect(await store.applyConfigField('app_default', zero, 'none')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none', replyDelivery: 'send' });
+    expect(registry.getBot('app_default').config).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'grok')).toBe('transcript');
+
+    expect(await store.applyConfigField('app_default', zero, 'default')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'default' });
+    expect(effectiveReplyDelivery('app_default', 'grok')).toBe('send');
+  });
+
   it.each(['codex', 'traex'])('supports zero injection with local %s RPC input', async (cliId) => {
     const { store } = await loaded({ cliId, codexRpcInput: true });
     expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
@@ -606,6 +622,31 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('keeps an explicit buttonAlign left on the bot layer so it can override a team right', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    const team = { enabled: true, buttonAlign: 'right' } as const;
+    const stored = (raw: string) => {
+      const result = store.coerceConfigValue(spec, raw);
+      expect(result.ok).toBe(true);
+      return (result as { ok: true; value: unknown }).value as FeedbackPolicyLayer;
+    };
+
+    const explicitLeft = stored('{"enabled":true,"buttonAlign":"left"}');
+    expect(explicitLeft.buttonAlign).toBe('left');
+    const effective = resolveEffectiveFeedbackPolicy({ team, bot: explicitLeft })!;
+    expect(effective.enabled).toBe(true);
+    expect('buttonAlign' in effective).toBe(false);
+
+    // No buttonAlign on the bot layer: the team value is inherited.
+    const unset = stored('{"enabled":true}');
+    expect('buttonAlign' in unset).toBe(false);
+    expect(resolveEffectiveFeedbackPolicy({ team, bot: unset })?.buttonAlign).toBe('right');
+
+    expect(stored('{"enabled":true,"buttonAlign":"right"}').buttonAlign).toBe('right');
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"buttonAlign":"center"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
   it('persists presentation rules through the config store and reloads the same policy', async () => {
@@ -848,6 +889,26 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().model).toBeUndefined();
     expect(registry.getBot('app_default').config.model).toBeUndefined();
+  });
+
+  it('archiveCodex preserves both overrides across reload and unset restores inheritance', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('archiveCodex')!;
+    expect(spec.effect).toBe('immediate');
+    for (const enabled of [true, false]) {
+      expect((await store.applyConfigField('app_default', spec, enabled)).ok).toBe(true);
+      expect(readConfig().archiveCodex).toBe(enabled);
+      expect(registry.getBot('app_default').config.archiveCodex).toBe(enabled);
+      const [reloaded] = registry.parseBotConfigsFromText(readFileSync(configPath, 'utf8'));
+      expect(reloaded.archiveCodex).toBe(enabled);
+    }
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('archiveCodex');
+    expect(registry.getBot('app_default').config.archiveCodex).toBeUndefined();
+    const snapshot = store.getConfigSnapshot('app_default');
+    expect(snapshot.ok && snapshot.rows.find(field => field.key === 'archiveCodex')?.value).toBe('inherit');
+    const [invalid] = registry.parseBotConfigsFromText(JSON.stringify([{ ...readConfig(), archiveCodex: 'false' }]));
+    expect(invalid.archiveCodex).toBeUndefined();
   });
 
   it('displayName round-trips, fires the refresher hook, and clears on null', async () => {
@@ -1851,6 +1912,35 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
   });
 
+  it.each(['cursor', 'doubao', 'antigravity'])('invariant backstop: updateBotSandboxMode rejects switching a zero-injection %s bot to scratch (rmwBotEntry path, no promptInjection write)', async cliId => {
+    const { registry } = await loaded({ cliId, promptInjection: 'none' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('zero_prompt_unsupported');
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+    // oncall keeps zero injection working
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'oncall')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', sandbox: 'oncall' });
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can leave scratch', async () => {
+    await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'off')).ok).toBe(true);
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(readConfig().promptInjection).toBe('none');
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can turn zero injection off', async () => {
+    const { store } = await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const r = await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'default');
+    expect(r.ok).toBe(true);
+    expect(readConfig().promptInjection).not.toBe('none');
+    expect(readConfig().sandbox).toBe('scratch');
+  });
+
   it('invariant backstop: updateBotSandboxMode rejects switching a cursor+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
     const { registry } = await loaded({ cliId: 'cursor', replyDelivery: 'transcript' });
     const sandboxStore = await import('../src/services/sandbox-store.js');
@@ -2573,6 +2663,29 @@ describe('bot-config store', () => {
     const r = await store.applyConfigField('app_missing', spec, 'x');
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('bot_not_registered');
+  });
+
+  it('persists idleSpinSuspend without dropping other bot fields', async () => {
+    const { registry, store } = await loaded({ workingDir: '/tmp/keep-me', maxLiveWorkers: 12 });
+    const spec = store.findConfigField('idleSpinSuspend')!;
+    const coerced = store.coerceConfigValue(spec, JSON.stringify({ cpuPercent: 30, cliIds: ['traex'] }));
+    expect(coerced.ok).toBe(true);
+    const r = await store.applyConfigField('app_default', spec, (coerced as any).value);
+    expect(r.ok).toBe(true);
+    const persisted = readConfig();
+    expect(persisted.idleSpinSuspend).toMatchObject({ cpuPercent: 30, cliIds: ['traex'] });
+    expect(persisted.workingDir).toBe('/tmp/keep-me');
+    expect(persisted.maxLiveWorkers).toBe(12);
+    expect(registry.getBot('app_default').config.idleSpinSuspend).toMatchObject({ cpuPercent: 30 });
+  });
+
+  it('rejects an out-of-range idleSpinSuspend without writing', async () => {
+    const { store } = await loaded({ maxLiveWorkers: 12 });
+    const spec = store.findConfigField('idleSpinSuspend')!;
+    const coerced = store.coerceConfigValue(spec, JSON.stringify({ cpuPercent: 0 }));
+    expect(coerced.ok).toBe(false);
+    expect(readConfig().idleSpinSuspend).toBeUndefined();
+    expect(readConfig().maxLiveWorkers).toBe(12);
   });
 });
 

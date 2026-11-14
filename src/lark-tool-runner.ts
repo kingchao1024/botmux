@@ -2,6 +2,8 @@ import { execFileSync, spawn } from 'node:child_process';
 import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, larkToolPassthroughEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
 import { larkToolExecutionArgs } from './core/lark-tool-command.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import { isHeadlessSessionChatId } from './core/types.js';
+import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from './platform/credential-grant-budget.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
 
 const isLarkAppId = (value: string): boolean => /^cli_[A-Za-z0-9]{4,64}$/.test(value);
@@ -24,9 +26,10 @@ async function main(): Promise<void> {
       ?? binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
     if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) throw new Error('The bound bot daemon is unavailable');
     const payload = JSON.stringify({ mode: invocation.mode });
+    // `--as user` can run a platform credential grant inside this request.
     const response = await loopbackFetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(binding.sessionId)}/${LARK_TOOL_ROUTE}`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
-      body: payload, signal: AbortSignal.timeout(15_000),
+      body: payload, signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
     });
     const raw = await response.text();
     const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; error?: string; code?: string; issuer?: string };
@@ -44,7 +47,7 @@ async function main(): Promise<void> {
     identity = { mode: invocation.mode, credential: result.credential, ...(platformUser ? { appId: result.appId } : {}) };
   }
   if (invocation.showHelp) {
-    process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en')}\n`);
+    process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en', isHeadlessSessionChatId(process.env.BOTMUX_CHAT_ID ?? ''))}\n`);
   }
   const args = larkToolExecutionArgs(invocation);
   const childEnv = isPassthrough

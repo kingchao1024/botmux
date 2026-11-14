@@ -6,8 +6,14 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fnpm-downloads.json" alt="npm downloads (all botmux packages)"></a>
+  <a href="https://github.com/deepcoldy/botmux/actions/workflows/ci.yml?query=branch%3Amaster"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fci.json" alt="CI"></a>
+  <a href="https://github.com/deepcoldy/botmux/actions/workflows/midscene-e2e.yml?query=branch%3Amaster"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fmidscene.json" alt="Midscene E2E"></a>
   <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg" alt="platform: Linux | macOS">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="#贡献者"><img src="https://img.shields.io/github/contributors/deepcoldy/botmux.svg" alt="contributors"></a>
+  <a href="https://github.com/deepcoldy/botmux/commits/master"><img src="https://img.shields.io/github/commit-activity/m/deepcoldy/botmux.svg" alt="commit activity"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
 
@@ -21,7 +27,7 @@
 </p>
 
 <p align="center">
-  <a href="https://deepcoldy.github.io/botmux/img/video-promo.mp4"><img src="docs/assets/botmux-promo-poster.jpg" width="900" alt="botmux 宣传视频：点击播放"></a>
+  <a href="https://deepcoldy.github.io/botmux/img/video-promo.mp4"><img src="docs/assets/botmux-promo-cover.gif" width="900" alt="botmux 视频简介：点击播放"></a>
 </p>
 
 ---
@@ -76,6 +82,17 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 更多特性：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [最终回答三态反馈](docs/feedback-capability-current-implementation.md) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体展示](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
 
+## 中心化平台（开源，可自托管）
+
+单机用 botmux 不需要任何中心服务。机器多了、要在外网打开、或者想和团队一起用时，可以自己部署开源的 **[Botmux Platform](https://github.com/botmux-ai/botmux-platform)**（MIT），用飞书登录，把各台机器上的 botmux 汇总到一个网站：
+
+- **随处打开**：每台机器主动向平台建立出站隧道，不用开入站端口；在网页上就能打开任意一台机器的 Dashboard 和 Web 终端，飞书单点登录。
+- **机器总览**：在线状态、daemon 版本、一键升级，可以给机器加协管者。
+- **团队协作**：团队与飞书协作群、Issue 看板，还能找到同团队、在别人机器上的机器人拉进群一起干活。
+- **个人凭据库**：在平台授权一次飞书，平台按需给已绑定的机器发短期凭据，机器人就能以你的身份调用 lark-cli。
+
+接入一台机器：在平台网页点「绑定新机器」，把给出的 `botmux bind <绑定凭证>` 拿到这台机器的终端执行。部署方式见 [平台仓库](https://github.com/botmux-ai/botmux-platform)，接入与使用见 [中心化平台文档](https://deepcoldy.github.io/botmux/platform)，也可以先看 [3 分钟讲解视频](https://github.com/user-attachments/assets/52136d9e-841e-4e52-a297-8dcad561c7dc)。
+
 ## 按 Bot 设置零注入
 
 适合 lead-bot 派活、sub-bot 专注执行的多 Agent 流水线。开启后，botmux 仅传递纯净的任务正文与附件，跳过所有框架级系统提示、逐轮提醒、身份信封、角色描述和技能目录注入，由底层 CLI 转写自动采集回传最终回答。
@@ -93,28 +110,12 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 `claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) · `doubao` ([Doubao CLI 安装与使用](docs/doubao.md)) …
 
-- **会话级 CLI 切换**：会话尚未启动前，可通过 `/cli <cliId>` 为当前会话临时指定已注册的 CLI。
+- **会话级 CLI 切换**：会话尚未启动前，可通过 `/cli <cliId>` 为当前会话临时指定已注册的 CLI；也认程序名和简写（如 `/cli cc`、`/cli omp`）。
 - **Codex 多账号与实例池**：同一 Bot 支持通过 [会话级 Codex 实例](docs/codex-instances.md) 配置多登录目录与分配策略。
 - **兼容发行版**：Codex 衍生版和 Kimi TUI 衍生版可直接保留原 `cliId` 并通过 `cliRuntime` 声明独立身份，详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。
 - **共享记忆（可选）**：通过 [OpenViking 共享记忆示例](examples/openviking-memory/README.md) 让多个本地 Agent 共享用户与项目级长期记忆。
 
 完整 `cliId` 列表与网关 / wrapper 详细配置见 [多 CLI 适配器文档](https://deepcoldy.github.io/botmux/adapters)。
-
-### Doubao CLI 快速接入
-
-需要包含 `doubao` 适配器的 Botmux 版本。先安装 Doubao CLI 并在运行 Botmux 的同一系统用户下完成原生登录，再配置 Bot：
-
-```bash
-npm install -g '@bytedance/doubao-cli' --registry=https://registry.npmjs.org
-doubao --version
-doubao                      # 完成登录并确认输入框可用，再 /exit
-botmux setup                # CLI 选 Doubao，选择实际项目目录
-botmux start
-```
-
-已有 Bot 可在 Dashboard 选择 Doubao，或在原 `bots.json` 条目中设置 `"cliId": "doubao"` 和实际 `workingDir`，保留应用凭证与其他配置；保存后重启并新建会话。`model` 可省略，指定时使用原生 `/model` 的当前账号显示名。
-
-多行任务一次提交，Web 终端按 **Esc** 打断；最终回答自动从原生日志回收，重启按原生数字 ID 精确续聊，不猜“最近会话”。默认传 `--permission-mode always_allow`，应限制为可信用户/项目；**Botmux 二进制不依赖 Node，但 Doubao 的 npm 安装与 launcher 需要 Node/npm**。内网安装、本机 HTTP 试用、权限说明和当前限制见 [Doubao 使用指南](docs/doubao.md)。Linux 原生运行/文件沙箱与既有终端 `/adopt` 专用桥接未完成实机验收，勿将普通对话支持等同于全部能力支持。
 
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper
 
@@ -145,5 +146,15 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 botmux 或许是目前专为飞书（Feishu/Lark）打造的开源项目中贡献者最多的一个——这离不开每一位参与者。感谢所有提交过代码、文档，以及提出 issue 的朋友：
 
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
+  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux&amp;max=500&amp;columns=16" alt="contributors" />
+</a>
+
+## Star 趋势
+
+<a href="https://star-history.com/#deepcoldy/botmux&amp;Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date&amp;theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" />
+    <img src="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" alt="botmux Star 趋势" width="720" />
+  </picture>
 </a>

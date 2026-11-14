@@ -73,8 +73,10 @@
 | 拉黑某人 | `blockedUsers` |
 | 限制 agent 能读写的文件 | `sandbox`（见[文件沙盒](/sandbox)） |
 | 嫌实时卡片吵 | `disableStreamingCard`、`hiddenStreamingCardButtons` |
+| bot 给别人用，回复里不带开发机路径和本机地址 | `hideLocalAddresses`（见[隐藏开发机地址](#hide-local-addresses)） |
 | 一轮只用一张卡显示进度和答复 | `replyCardMode: "unified"` |
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
+| 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
 | 盯住告警群，有告警就自动处理 | 群消息监听（见[群消息监听](#message-listener)） |
 | 额度用完自动交给另一个 bot | `quotaFallbackBot` |
 | 不让 botmux 往 prompt 里塞任何东西 | `promptInjection: "none"` |
@@ -278,7 +280,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 | 字段 | 说明 |
 |------|------|
 | `family` | `chrome` 或 `edge` |
-| `pluginRoot` | 自定义插件目录（绝对路径）。一般不用填，默认从 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存里选最新版本 |
+| `pluginRoot` | 自定义插件目录（绝对路径），填了就只用这一份。一般不用填，默认在 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存和 Codex / ChatGPT 桌面端自带的插件里，选版本最新且文件完整的一份 |
 | `autoApproveOrigins` | 访问 HTTP/HTTPS 站点时不再逐站弹授权卡。默认关闭；登录凭据、上传下载、浏览历史和完整开发者工具不在自动授权范围内，也不会写入「始终允许」 |
 
 使用前提和边界：
@@ -476,7 +478,6 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 
 同一个 stdio MCP 子进程重启后，一次性密钥通道目前不会再次交付，受保护工具会退回只读；需重建会话恢复。不同出站策略收集入口的用户错误提示尚待统一。
 
-||||||| 15acd8dde
 ### 按触发人身份调用 CLI（`triggerUserAuth`） {#trigger-user-auth}
 
 **默认关闭。** 打开后，这个 Bot 会话里的 `lark-cli` / `bytedcli` 用「发这条消息的人」自己的授权调用，而不是本机的登录态。适合多人共用一个 Bot：谁发的消息，就以谁的身份读文档、查日程、调内部平台。
@@ -496,7 +497,7 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 - 只有 `enabled` 写成 `true` 才算开。`tools` 不写表示覆盖全部工具；写了不认识的工具名会直接报错，不会悄悄降级。
 - 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
 - 绝不会退回到 Bot 或其他人的身份代跑。`bytedcli` 没有 Bot 身份，没授权就是失败。
-- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用中心化平台 / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用[中心化平台](/platform) / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
 
 #### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
 
@@ -510,7 +511,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 
 | 字段 | 说明 |
 |------|------|
-| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi 普通会话，从下一轮生效 |
+| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi / Kimi 普通会话，从下一轮生效 |
 | `replyCardShowTools` | 仅 `unified`：设 `false` 隐藏卡里的工具调用，思考摘要和进度照常显示 |
 | `disableStreamingCard` | `true` 时不发实时终端状态卡。Web 终端照常运行，最终答复照常发送 |
 | `hiddenStreamingCardButtons` | 隐藏实时卡上的按钮，可选 `output`、`terminal`、`writeLink`、`compact`、`stop`、`close`。例如 `["terminal", "writeLink", "close"]`。也可用 `/botconfig set hiddenStreamingCardButtons terminal,close` |
@@ -522,6 +523,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 | `replyCardActions` | 普通答复卡上显示一个紧凑的操作菜单（打开终端 / 切换模型 / 关闭会话）。默认关闭 |
 | `askOptionLayout` | `botmux ask` 选项按钮的排布：`compact`（默认，自动换行）或 `vertical`（每行一个，长选项更好读） |
 | `writableTerminalLinkInCard` | `true` 时卡片里直接放可写终端链接（看得到卡片的人都能操作终端）。默认藏在「获取写权限」按钮后面，只私发给点击的人 |
+| `goalStatusCard` | `true` 时，Codex / TRAE 会话设定原生目标后发一张目标状态卡，原地更新状态和 CLI 累计时长；默认关闭。静默、私有回复、文档、会议等会话不显示 |
 | `privateCard` | `true` 时 `/card` 只发给管理员可见的私有卡片，只在普通群有效，且不会实时刷新 |
 | `silentTurnReactions` | `true` 时，关了实时卡的会话不再给消息贴「冲!」/ ✅ 表情 |
 | `receivedReactionEmoji` / `doneReactionEmoji` | 换掉「已收到」/「已完成」表情（飞书 emoji_type），默认 `GoGoGo` / `DONE`。把两者设成一样，可以避免 CLI 提前判定空闲时过早出现 ✅ |
@@ -581,6 +583,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 | `replyDelivery` | 最终答复怎么送到飞书。`send`（除 Doubao 外所有 CLI 的默认）：模型自己执行 `botmux send`；`transcript`：botmux 从 CLI 的会话记录里自动取本轮最后的回答发出去。见下方说明 |
 | `senderTag` | 默认开启：每条转给 CLI 的消息都带一个 `<sender ... />` 标签，告诉模型是谁在说话。只有写 `false` 才关闭 |
 | `senderTagHideEmail` | 默认关闭。开启后 `<sender>` 标签里不带邮箱，姓名和 ID 保留 |
+| `hideLocalAddresses` | 默认关闭：模型回复原样发到飞书。开启后把开发机路径和本机服务地址挡在回复外。见下方[隐藏开发机地址](#hide-local-addresses) |
 | `promptInjection` | `"default"`（默认）或 `"none"`。`none` 是零注入模式：botmux 不加任何系统提示和提醒，只传任务原文和附件，并自动回传最终答复。见下方说明 |
 | `envelopeInjection` | 仅 Claude Code：`auto` 时把每轮的提醒内容改由 hook 注入，终端输入框里只剩消息本身；默认 `off` 保持原样 |
 | `topicUnavailablePolicy` | 原话题被删除或不可用时怎么办。见[原话题不可用策略](/topic-unavailable-policy) |
@@ -622,6 +625,23 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 - 代价：Dashboard 的会话洞察没法再从标签判断发言人类型，`/adopt` 识别 botmux 会话时少了一条线索。
 - Dashboard 里「发言人标签」开关改的就是这个字段。
 
+### 隐藏开发机地址（`hideLocalAddresses`） {#hide-local-addresses}
+
+飞书用户在自己的客户端里看回复，打不开开发机上的文件和本机服务。bot 给别人用时可以打开这个开关；只给自己用、需要在回复里看到排障路径的保持默认关闭。
+
+```text
+/botconfig set hideLocalAddresses on
+/botconfig set hideLocalAddresses off
+```
+
+默认关闭时，回复和卡片原样发出，提示里也不加相关规则。开启后：
+
+- 模型的回复（`botmux send`、自动转发的最终答复、动态单卡、思考过程消息、文档评论回复）发到飞书前，开发机上的绝对路径、`file://` 这类本地协议和本机服务地址会被替换：工作目录里的源码换成仓库相对路径，其它换成「【内部文件】」；技能链接只保留名称。`/dev/null`、`/proc` 这类不指向用户文件的系统路径保留。
+- 系统提示里加一条完整规则（每个会话一次），每轮提醒里加一句，要求模型不放这类地址，文件改用附件或真实可访问的链接。
+- 卡片按钮或链接指向本机地址时整条拒发，模型会收到 `LOCAL_ADDRESS_OUTBOUND_REJECTED`；botmux 自己生成的 Web 终端、Dashboard 链接照常发送。
+- 回复处理和每轮提醒立即生效；系统提示里的完整规则从下一个新会话起生效。
+- Dashboard「Bot 配置 → 消息卡片 → 开发机地址」里的开关改的就是这个字段。
+
 ### 零注入模式（`promptInjection: "none"`）
 
 适合「主 bot 派活、子 bot 专心执行」的多 Agent 流水线，或者你就是不想让 botmux 往 prompt 里加任何东西。
@@ -659,6 +679,14 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 - 不经过 shell，要用管道、重定向就写成 `bash -c '…'`；只带最少的环境变量（不含应用密钥）。
 - stdin 收到 JSON：`{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`；也可以读环境变量 `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID`。
 - 10 分钟没结束会被强制结束。
+
+### 上线欢迎语（`welcomeMessage`） {#welcome-message}
+
+填一段文字，机器人首次成功上线后会私聊主管理员（见 `ownerOpenId`）一次。用 `botmux setup add` / `botmux setup edit` 的 `--welcome-message "…"` 或 `--welcome-message-file <文件>` 设置，edit 传 `--welcome-message -` 清空；Dashboard 里暂时不能改。`--welcome-message` 的值始终按原文发送，以 `@` 开头也不会当成文件路径。
+
+- 发送记录在 daemon 数据目录的 `welcome-sent/<AppID>.json`，发过之后重启不再发，改欢迎语内容也不会重发。删掉这个文件可以让它重发，但距上次发送不到 1 小时的会被飞书去重。
+- 发送失败、还解析不到主管理员时不影响启动，下次启动重试。
+- core-only（`apiOnly`）bot 和多副本部署（`BOTMUX_COORDINATION_MODE=primary`，各副本不共享发送记录）不发送，daemon 日志里会写明原因。
 
 ## 群消息监听 {#message-listener}
 

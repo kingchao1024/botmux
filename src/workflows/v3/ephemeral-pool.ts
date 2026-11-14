@@ -10,6 +10,10 @@
 import { buildBotWorkerEnv } from '../../core/env-policy.js';
 import { protectedMcpCurrentRedactedEnvKeys, protectedMcpIsolationPolicy } from '../../core/protected-mcp-capabilities.js';
 import { configuredProtectedMcpEnvKeys, readGlobalConfig } from '../../global-config.js';
+import { SessionController } from '../../core/session-controller.js';
+import { SessionContractStore } from '../../services/session-contract-store.js';
+import { sessionContractsEnabled } from '../../services/session-contract.js';
+import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
 import { getBot } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
@@ -35,6 +39,7 @@ import {
   type RunNode,
   type RunNodeRequest,
   type RunNodeResult,
+  type RuntimeAttestation,
   type WorkerSessionInfo,
 } from './contract.js';
 import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
@@ -299,6 +304,7 @@ async function runNodeImpl(
     cliPathOverride: req.botSnapshot.cliPathOverride,
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
+    reasoningEffort: req.botSnapshot.reasoningEffort,
     envPolicy: req.botSnapshot.envPolicy,
     ...workerSessionEnv,
     // Workflow nodes receive no write capability or secret channel, but must
@@ -333,6 +339,16 @@ async function runNodeImpl(
     botName: req.node.bot,
     locale: 'zh' as const,
   };
+  const contractStore = sessionContractsEnabled() ? new SessionContractStore(workerDataDir, req.botSnapshot.larkAppId) : undefined;
+  const contractSession = { larkAppId: req.botSnapshot.larkAppId, session: { sessionId, status: 'active' }, cliReadyGeneration: 0 } as DaemonSession;
+  const controller = contractStore ? new SessionController(contractSession, contractStore) : undefined;
+  const generation = (controller?.store.read(controller.ref)?.worker?.generation ?? 0) + 1;
+  const bootstrap = controller?.bindWorker(generation);
+  const execution = controller?.admitInput(req.attemptId, undefined, req.attemptId);
+  const scopedInit = bootstrap ? { ...init, sessionContract: bootstrap, sessionCommand: { version: 2 as const, execution } } : init;
+  const goalBinding = req.botSnapshot.cliInstanceBinding?.source === 'goal'
+    ? req.botSnapshot.cliInstanceBinding
+    : undefined;
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
@@ -350,6 +366,42 @@ async function runNodeImpl(
     let goalSent = false;
     let sessionReadyNotified = false;
     let cancelReason: unknown;
+    let observedRuntime: Extract<WorkerEvent, { type: 'active_runtime' }> | undefined;
+
+    function runtimeAttestation(): RuntimeAttestation | undefined {
+      if (!observedRuntime) return undefined;
+      return {
+        cliId: req.botSnapshot.cliId,
+        source: 'worker-active-runtime',
+        model: observedRuntime.model,
+        reasoningEffort: observedRuntime.reasoningEffort,
+        ...(goalBinding ? { codexHome: goalBinding.codexHome } : {}),
+      };
+    }
+
+    function goalRuntimeError(
+      runtime: RuntimeAttestation | undefined,
+      workerStatus: RunNodeResult['status'],
+    ): RunNodeResult['error'] | undefined {
+      if (!goalBinding) return undefined;
+      if (!runtime) {
+        // A worker that already failed (spawn gate, crash, timeout) keeps its
+        // own failure; missing evidence only overrides an otherwise-ok run.
+        if (workerStatus !== 'ok') return undefined;
+        return {
+          code: 'GOAL_RUNTIME_UNVERIFIED',
+          message: 'goal-scoped Codex worker produced no active-runtime attestation',
+        };
+      }
+      if (runtime.model !== req.botSnapshot.model
+        || runtime.reasoningEffort !== req.botSnapshot.reasoningEffort) {
+        return {
+          code: 'GOAL_RUNTIME_MISMATCH',
+          message: `goal-scoped Codex runtime mismatch: expected ${req.botSnapshot.model ?? 'null'}/${req.botSnapshot.reasoningEffort ?? 'null'}, observed ${runtime.model ?? 'null'}/${runtime.reasoningEffort ?? 'null'}`,
+        };
+      }
+      return undefined;
+    }
 
     const hardDeadline = setTimeout(() => {
       finish('fail', 'timeout');
@@ -381,7 +433,7 @@ async function runNodeImpl(
       clearTimeout(hardDeadline);
       if (quiesceTimer) clearTimeout(quiesceTimer);
       if (manifestTimer) clearTimeout(manifestTimer);
-      try { worker.send({ type: 'close' }); } catch { /* worker may be gone */ }
+      try { sendClose(); } catch { /* worker may be gone */ }
       sigtermTimer = setTimeout(() => {
         try { worker.kill('SIGTERM'); } catch { /* worker may be gone */ }
       }, 250);
@@ -392,6 +444,11 @@ async function runNodeImpl(
         void appendLine(stderrPath(req), `[v3] worker exit grace expired; escalating to SIGKILL`);
         try { worker.kill('SIGKILL'); } catch { /* worker may be gone */ }
       }, 250 + deps.cancelGraceMs);
+    }
+    function sendClose(): void {
+      const operation = controller?.beginControl('close').operation;
+      if (operation) controller!.controlStarted(operation.operationId);
+      worker.send({ type: 'close', ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), operationId: operation?.operationId } } : {}) });
     }
 
     function finish(status: RunNodeResult['status'], reason: string): void {
@@ -425,7 +482,7 @@ async function runNodeImpl(
         sigkillTimer = undefined;
       }
       void appendLine(stderrPath(req), `[v3] cancel signal received; sending close+SIGINT`);
-      try { worker.send({ type: 'close' }); } catch { /* already gone */ }
+      try { sendClose(); } catch { /* already gone */ }
       try { worker.kill('SIGINT'); } catch { /* already gone */ }
       sigkillTimer = setTimeout(() => {
         void appendLine(stderrPath(req), `[v3] cancel grace expired; escalating to SIGKILL`);
@@ -445,13 +502,15 @@ async function runNodeImpl(
 
     function sendInit(): void {
       if (initSent) return;
-      worker.send(init);
+      worker.send(scopedInit);
       initSent = true;
     }
 
     function sendGoalIfReady(): void {
       if (!initSent || webPort === undefined || goalSent) return;
-      worker.send({ type: 'raw_input', content: buildGoalCommand(req) });
+      if (controller && !controller.ds.cliReady) return;
+      worker.send({ type: 'raw_input', content: buildGoalCommand(req), turnId: req.attemptId,
+        ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), execution } } : {}) });
       goalSent = true;
       startManifestWatch();
     }
@@ -472,7 +531,28 @@ async function runNodeImpl(
       manifestTimer = setTimeout(poll, deps.manifestPollMs);
     }
 
-    worker.on('message', (event: WorkerEvent) => {
+    const handleMessage = (event: WorkerEvent): void => {
+      if (controller && bootstrap && event.type !== 'worker_ipc_ready') {
+        if (event.type === 'runtime_binding_started' || event.type === 'runtime_binding') {
+          if (!controller.admitsRegistration(event.type, event.bindingId, event.sessionContract, bootstrap.worker)) return;
+          if (event.type === 'runtime_binding_started') {
+            controller.reserveBinding(event.bindingId, bootstrap.worker);
+            worker.send({ type: 'runtime_contract_reserved', bindingId: event.bindingId, runtime: controller.store.binding(controller.ref, event.bindingId)?.ref, mayStart: !['closed', 'closing'].includes(controller.store.read(controller.ref)!.lifecycle) });
+          }
+          else {
+            const runtime = controller.bindRuntime(event.bindingId, bootstrap.worker, event.identity, event.operationId);
+            worker.send({ type: 'runtime_contract_assigned', bindingId: event.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
+              executions: controller.store.executions(controller.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
+              admissionStates: controller.store.executions(controller.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) });
+            for (const deferred of controller.store.deferredEvents<WorkerEvent>(controller.ref, event.bindingId)) handleMessage(deferred);
+          }
+          return;
+        }
+        const admission = controller.ingest(event as unknown as import('../../core/session-controller.js').ControlledWorkerMessage, bootstrap.worker);
+        if (admission.kind === 'reject' || admission.kind === 'defer') return;
+        if (event.sessionContract) controller.store.acknowledgeDeferred(controller.ref, event.sessionContract.eventId);
+        if (admission.kind === 'historical' && event.type !== 'final_output') return;
+      }
       if (cancelRequested) {
         // CLI exit is not the outer worker exit.  The worker may still own a
         // PTY, file descriptors, or sandbox cleanup, so no IPC message may
@@ -508,6 +588,9 @@ async function runNodeImpl(
             finish('fail', 'goal-send-failed');
           }
           break;
+        case 'active_runtime':
+          observedRuntime = event;
+          break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
           finish('fail', 'worker-error');
@@ -517,7 +600,8 @@ async function runNodeImpl(
           finish(event.code === 0 && event.signal == null ? 'ok' : 'fail', 'cli-exit');
           break;
       }
-    });
+    };
+    worker.on('message', handleMessage);
 
     forwardWorkerError = (err) => {
       if (cancelRequested) return;
@@ -537,6 +621,12 @@ async function runNodeImpl(
       if (quiesceTimer) clearTimeout(quiesceTimer);
       if (manifestTimer) clearTimeout(manifestTimer);
       cancelSignal?.removeEventListener('abort', onAbort);
+      if (controller && bootstrap) {
+        const operation = controller.operation();
+        if (operation?.kind === 'close') controller.controlResult(operation.operationId, 'confirmed');
+        controller.workerLost(bootstrap.worker);
+      }
+      contractStore?.close();
       if (cancelRequested) {
         settled = true;
         void appendLine(stderrPath(req), `[v3] worker closed after cancellation code=${code ?? 'null'}`);
@@ -545,14 +635,27 @@ async function runNodeImpl(
           manifestPath,
           cancelReason,
           sessionInfo: sessionInfo(),
+          ...(runtimeAttestation() ? { runtime: runtimeAttestation() } : {}),
         });
         return;
       }
       settled = true;
-      const status = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
+      const runtime = runtimeAttestation();
+      const workerStatus = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
+      const runtimeError = goalRuntimeError(runtime, workerStatus);
+      const status = runtimeError ? 'fail' : workerStatus;
       const reason = pendingResult?.reason ?? 'worker-exit';
+      if (runtimeError) {
+        void appendLine(stderrPath(req), `[v3] ${runtimeError.code}: ${runtimeError.message}`);
+      }
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
-      resolve({ status, manifestPath, sessionInfo: sessionInfo() });
+      resolve({
+        status,
+        manifestPath,
+        sessionInfo: sessionInfo(),
+        ...(runtime ? { runtime } : {}),
+        ...(runtimeError ? { error: runtimeError } : {}),
+      });
     });
 
     try {

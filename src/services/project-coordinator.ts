@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { loadDashboardSecret } from '../dashboard/auth.js';
 import {
@@ -12,6 +12,7 @@ import {
   buildProjectGroupCard,
   buildProjectGroupOnboardingCard,
   buildProjectGroupStartedNoticeCard,
+  type ProjectGroupCardRuntime,
   type ProjectGroupOnboardingCardInput,
 } from '../im/lark/project-group-card.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
@@ -63,6 +64,7 @@ import {
   type ProjectCompletionGateEvidence,
   type ProjectCompletionGateStatus,
   type ProjectDispatchReservation,
+  visibleProjectWorkstreams,
   type ProjectGroupState,
   type ProjectGroupStatus,
   type ProjectGroupRegistryReader,
@@ -112,12 +114,17 @@ export interface ProjectCoordinatorTransport {
   isMessageWithdrawn(error: unknown): boolean;
   isMessageUpdateExpired(error: unknown): boolean;
   brand(larkAppId: string): Brand;
+  resolveCardRuntime?(
+    project: ProjectGroupState,
+    dataDir: string,
+  ): Promise<ProjectGroupCardRuntime | undefined> | ProjectGroupCardRuntime | undefined;
 }
 
 export type ProjectCoordinatorAction =
   | { action: 'init'; title: string; goal: string; phase?: string; focus?: string; remaining?: string }
   | { action: 'status' }
   | { action: 'refresh' }
+  | { action: 'workstream_rename'; dispatchRoot: string; title: string }
   | {
       action: 'update'; goal?: string; phase?: string; focus?: string; progress?: number;
       remaining?: string; blocker?: string; clearBlockers?: boolean; milestone?: string; nextMilestone?: string;
@@ -229,6 +236,7 @@ export type ProjectCoordinatorAction =
         operationId: string; fenceFingerprint: string; sourceSessionId: string;
         sourceTurnId: string; workerGeneration: number; reportRequestId: string;
       };
+      expectedAttachment?: { sourceSessionId: string; revision: number; coordinatorSessionId: string };
     };
 
 export interface ProjectCoordinatorContext {
@@ -309,6 +317,11 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
     };
   }
   if (action === 'status') return { action };
+  if (action === 'workstream_rename') {
+    const dispatchRoot = stringField(body, 'dispatchRoot');
+    const title = stringField(body, 'title');
+    return dispatchRoot && title ? { action, dispatchRoot, title } : undefined;
+  }
   if (action === 'update') {
     const progress = body.progress === undefined || typeof body.progress === 'number' ? body.progress as number | undefined : undefined;
     if (body.progress !== undefined && progress === undefined) return undefined;
@@ -433,6 +446,11 @@ export function parseProjectCoordinatorAction(raw: unknown): ProjectCoordinatorA
         ? body.reviewRound as number : undefined,
       ...(phaseAReport ? { phaseAReport } : {}),
       ...(repositoryLeaseRef ? { repositoryLeaseRef } : {}),
+      ...(body.expectedAttachment && typeof body.expectedAttachment === 'object'
+        && typeof (body.expectedAttachment as Record<string, unknown>).sourceSessionId === 'string'
+        && typeof (body.expectedAttachment as Record<string, unknown>).coordinatorSessionId === 'string'
+        && Number.isSafeInteger((body.expectedAttachment as Record<string, unknown>).revision)
+        ? { expectedAttachment: body.expectedAttachment as { sourceSessionId: string; revision: number; coordinatorSessionId: string } } : {}),
     };
   }
   if (action === 'fail_dispatch') {
@@ -2250,7 +2268,7 @@ export class ProjectCoordinator {
     });
   }
 
-  run(context: ProjectCoordinatorContext, action: ProjectCoordinatorAction): Promise<ProjectGroupState> {
+  run(context: ProjectCoordinatorContext, action: ProjectCoordinatorAction, beforeApply?: () => void): Promise<ProjectGroupState> {
     if (action.action === 'install_task_control_canary_fence') {
       return Promise.resolve().then(() => this.installTaskControlCanaryFence(context, action));
     }
@@ -2291,9 +2309,10 @@ export class ProjectCoordinator {
       || action.action === 'bind_dispatch_root'
       || action.action === 'mark_task_control_mapping'
       || action.action === 'sync_completion_gate') {
-      return this.apply(context, action);
+      return this.apply(context, action, beforeApply);
     }
     return queued(`${context.dataDir}:${context.chatId}`, async () => {
+      beforeApply?.();
       if (action.action === 'status') {
         const current = readProjectGroup(context.dataDir, context.chatId);
         if (!current) throw new Error('project_not_found');
@@ -2305,7 +2324,7 @@ export class ProjectCoordinator {
         if (current.larkAppId !== context.larkAppId) throw new Error('project_coordinator_mismatch');
         return this.publish(context, current);
       }
-      const changed = await this.apply(context, action);
+      const changed = await this.apply(context, action, beforeApply);
       if (action.action === 'report' && changed.workstreams
         .some(item => item.dispatchRoot === action.dispatchRoot && item.access?.mode === 'write')) {
         return changed;
@@ -2344,7 +2363,7 @@ export class ProjectCoordinator {
       // persists card metadata (first submit) or only re-projects the
       // card without changing store bytes (replay).
       const replayFlag = { wasReplay: false };
-      const applied = await this.apply(context, action, replayFlag);
+      const applied = await this.apply(context, action, undefined, replayFlag);
       try {
         return { project: await this.publish(context, applied, false, false, !replayFlag.wasReplay) };
       } catch (error) {
@@ -2359,12 +2378,13 @@ export class ProjectCoordinator {
   runReport(
     context: ProjectCoordinatorContext,
     action: Extract<ProjectCoordinatorAction, { action: 'report' }>,
+    beforeApply?: () => void,
   ): Promise<{ project: ProjectGroupState; write: boolean; projectionWarning?: string }> {
     return queued(`${context.dataDir}:${context.chatId}`, async () => {
       const execute = async () => {
         const applied = action.phaseAReport
           ? this.applyTaskControlPhaseAFailedReport(context, action)
-          : await this.apply(context, action);
+          : await this.apply(context, action, beforeApply);
         const write = applied.workstreams
           .some(item => item.dispatchRoot === action.dispatchRoot && item.access?.mode === 'write');
         try {
@@ -2568,12 +2588,14 @@ export class ProjectCoordinator {
         | 'claim_task_control_turn_admission'
         | 'begin_task_control_phase_a_instruction' | 'complete_task_control_phase_a_instruction';
     }>,
+    beforeApply?: () => void,
     replayDetection?: { wasReplay: boolean },
   ): Promise<ProjectGroupState> {
     const reservedAccess = action.action === 'reserve_dispatch' && action.access.mode === 'write'
       ? { mode: 'write' as const, scopes: normalizeDispatchWriteScopes(action.access.scopes) }
       : action.action === 'reserve_dispatch' ? action.access : undefined;
     const next = await mutateProjectGroup(context.dataDir, context.chatId, (current, registry) => {
+      beforeApply?.();
       const now = action.action === 'sync_completion_gate'
         ? new Date(action.checkedAt).toISOString()
         : (action.action === 'reserve_dispatch' || action.action === 'close'
@@ -2608,6 +2630,10 @@ export class ProjectCoordinator {
       const previousCoordinatorSessionId = current.coordinatorSessionId;
       const previousRevision = current.revision;
       const previousUpdatedAt = current.updatedAt;
+      if (action.action === 'report' && action.expectedAttachment
+        && current.coordinatorSessionId !== action.expectedAttachment.coordinatorSessionId) {
+        throw new Error('project_attachment_revision_conflict');
+      }
       // A chat-scope session may be recreated after an explicit close or daemon
       // migration. The authenticated live session for the same bot+chat becomes
       // the new report target; topic-scoped sessions are rejected by the route.
@@ -3016,6 +3042,14 @@ export class ProjectCoordinator {
         delete item.delivery;
         delete item.review;
         item.updatedAt = now;
+      } else if (action.action === 'workstream_rename') {
+        const item = current.workstreams.find(candidate => candidate.dispatchRoot === action.dispatchRoot);
+        if (!item) throw new Error('workstream_not_found');
+        const title = action.title.trim();
+        if (!title || title === '子任务' || title === '子项目') throw new Error('project_workstream_title_required');
+        if (Array.from(title).length > 24) throw new Error('project_workstream_title_too_long');
+        item.title = title;
+        item.updatedAt = now;
       } else if (action.action === 'update') {
         if (action.goal !== undefined) current.goal = boundedText(action.goal, 500, current.goal);
         if (action.phase !== undefined) current.phase = boundedText(action.phase, 80, current.phase);
@@ -3293,7 +3327,28 @@ export class ProjectCoordinator {
           }
           item.updatedAt = now;
         } else {
-          if (readGroupCollaborationMode(context.dataDir, context.chatId)?.mode === 'project') {
+          // A project-mode dispatch normally needs a task-control reservation.
+          // A host-attached workstream is the exception: its dispatch entry was
+          // written by the attachment service from a host-proved source grant
+          // (signed reportBinding + host-bound coordinator identity), so the
+          // signed registry entry itself is the authorization.
+          const attachedRegistration = (() => {
+            const registryPath = join(context.dataDir, 'orchestrate-dispatch.json');
+            try {
+              const registry = JSON.parse(readFileSync(registryPath, 'utf8')) as Record<string, unknown>;
+              const entry = registry[root] as Record<string, unknown> | undefined;
+              if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+              // The host wrote this dispatch row and bound a signed report
+              // target to it; the attachment service re-verifies that signature
+              // (and its coordinator identity) before it mutates anything.
+              const binding = entry.reportBinding;
+              return (typeof binding === 'string' && binding.length > 0)
+                || (!!binding && typeof binding === 'object' && !Array.isArray(binding))
+                ? entry : undefined;
+            } catch { return undefined; }
+          })();
+          if (!attachedRegistration
+            && readGroupCollaborationMode(context.dataDir, context.chatId)?.mode === 'project') {
             throw new Error('project_dispatch_reservation_required');
           }
           const status = action.status ?? 'pending';
@@ -3322,6 +3377,11 @@ export class ProjectCoordinator {
         if (!item) throw new Error('workstream_not_found');
         if (item.status === 'cancelled') throw new Error('project_workstream_cancelled');
         const beforeStage = structuredClone(item);
+        if (action.expectedAttachment && (item.attachment?.sourceSessionId !== action.expectedAttachment.sourceSessionId
+          || item.attachment.revision !== action.expectedAttachment.revision || item.attachment.state !== 'active'
+          || context.coordinatorSessionId !== action.expectedAttachment.coordinatorSessionId)) {
+          throw new Error('project_attachment_revision_conflict');
+        }
         if (item.access?.mode === 'write') {
           const reporterAppId = action.reporterAppId?.trim();
           if (!reporterAppId) throw new Error('project_reporter_identity_required');
@@ -3477,7 +3537,7 @@ export class ProjectCoordinator {
   ): Promise<ProjectGroupState> {
     let project = initial;
     if (resolveThreadIds) {
-      const resolutions = await Promise.all(project.workstreams
+      const resolutions = await Promise.all(visibleProjectWorkstreams(project)
         .filter(item => !item.threadId)
         .map(async item => ({ dispatchRoot: item.dispatchRoot, threadId: await this.transport.resolveThreadId(project.larkAppId, item.dispatchRoot) })));
       const found = resolutions.filter((item): item is { dispatchRoot: string; threadId: string } => !!item.threadId);
@@ -3494,7 +3554,8 @@ export class ProjectCoordinator {
     }
     const mode = readGroupCollaborationMode(context.dataDir, context.chatId);
     const cardConfig = mode?.progressCard;
-    const cardJson = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), cardConfig));
+    const runtime = await this.transport.resolveCardRuntime?.(project, context.dataDir);
+    const cardJson = JSON.stringify(buildProjectGroupCard(project, this.transport.brand(project.larkAppId), cardConfig, runtime));
     if (project.card?.messageId) {
       try {
         await this.transport.updateCard(project.larkAppId, project.card.messageId, cardJson);

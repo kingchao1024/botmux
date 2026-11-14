@@ -39,7 +39,13 @@ import {
   type RunChatBinding,
 } from './grill-state.js';
 import { finalizeSpec, validateSpec, SpecValidationError } from './spec.js';
-import { runArchitect as realRunArchitect, type RunArchitectInput, type RunArchitectResult } from './architect.js';
+import {
+  allocateArchitectAttempt,
+  runArchitect as realRunArchitect,
+  type ArchitectAttempt,
+  type RunArchitectInput,
+  type RunArchitectResult,
+} from './architect.js';
 import { loadDag } from './dag-loader.js';
 import { DagValidationError } from './dag.js';
 import { isValidRunId } from './ops-projection.js';
@@ -282,9 +288,11 @@ export interface SpecFinalizeOutcome {
 
 /**
  * All grill-host read/modify/write transactions share one run-scoped lock.
- * `architect` holds it across the worker await because the worker always
- * reuses `architect/attempts/001` and begins by deleting that directory.
- * Without the lock, two calls can delete/mix one another's attempt artifacts.
+ * `architect` holds it across the worker await: it allocates the next
+ * `architect/attempts/NNN` under it, a second call would take the in-flight
+ * `architect_running` for a crashed one and start another worker, and a
+ * `revise-spec` in between would leave the finished DAG recorded against a
+ * spec it was not compiled from.
  *
  * Lock order is deliberately fixed as:
  *
@@ -412,6 +420,8 @@ export interface ArchitectOutcome {
   ok: boolean;
   state: GrillState;
   problems?: string[];
+  /** The attempt this call ran, once allocated: its worker's logs are here. */
+  attemptDir?: string;
 }
 
 /**
@@ -443,11 +453,14 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
     const previousProblems = cur.status === 'spec_approved' ? cur.problems ?? [] : [];
     transition(runDir, 'architect_running', { problems: undefined }, now);
 
+    let attempt: ArchitectAttempt | undefined;
     let res: RunArchitectResult;
     try {
+      attempt = allocateArchitectAttempt(runDir);
       res = await deps.runArchitect({
         runId: cur.runId,
         runDir,
+        attempt,
         specPath: cur.specPath,
         specJsonPath: cur.specJsonPath,
         botSnapshot: deps.botSnapshot,
@@ -464,8 +477,9 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
       assertRunNotCommitted(runDir, mustRead(runDir), 'architect');
       const problems = [err instanceof Error ? err.message : String(err)];
       const state = transition(runDir, 'spec_approved', { problems }, now);
-      return { ok: false, state, problems };
+      return { ok: false, state, problems, ...(attempt ? { attemptDir: attempt.attemptDir } : {}) };
     }
+    const attemptDir = attempt.attemptDir;
 
     assertRunNotCommitted(runDir, mustRead(runDir), 'architect');
     if (res.status !== 'ok' || !res.dagPath || !res.notesPath) {
@@ -474,7 +488,7 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
         !res.notesPath ? 'architect 未产出 architect-notes.md' : undefined,
       ].filter((p): p is string => Boolean(p));
       const state = transition(runDir, 'spec_approved', { problems }, now);
-      return { ok: false, state, problems };
+      return { ok: false, state, problems, attemptDir };
     }
 
     // Assertion 2: do NOT trust architect's self-claim — host validates the dag.
@@ -506,7 +520,7 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
     } catch (err) {
       const problems = (err as { problems?: string[] }).problems ?? [err instanceof Error ? err.message : String(err)];
       const state = transition(runDir, 'spec_approved', { problems }, now);
-      return { ok: false, state, problems };
+      return { ok: false, state, problems, attemptDir };
     }
 
     const state = transition(
@@ -520,7 +534,7 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
       },
       now,
     );
-    return { ok: true, state };
+    return { ok: true, state, attemptDir };
   });
 }
 
@@ -593,6 +607,10 @@ export function authorizeAdHocRun(
      *  the main topic root, the session, the initiator) is produced by
      *  拉群开始 and given here. Refused when the grill has a binding of its own. */
     chatBinding?: RunChatBinding;
+    /** Bot runs only, without `workingDirOverride`: the launching draft's
+     *  project, recorded as `nodeProjectDir` (the caller has checked that
+     *  every executing bot's daemon reads it). Snapshots are not touched. */
+    nodeProjectDir?: string;
   } = {},
 ): AdHocRunAuthorizationResult {
   // A bot-executed run freezes the directory exactly as an ephemeral one does
@@ -600,6 +618,7 @@ export function authorizeAdHocRun(
   // executing bots' daemons read it as an explicit choice to check and apply
   // (design §15.4). Callers pass the absolute, already range-checked path.
   const nodeWorkingDir = opts.nodeExecutor === 'bot' ? opts.workingDirOverride : undefined;
+  const nodeProjectDir = opts.nodeExecutor === 'bot' && nodeWorkingDir === undefined ? opts.nodeProjectDir : undefined;
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
   // run.json publishers. Keep this exact order; see the lock-order invariant
@@ -683,6 +702,7 @@ export function authorizeAdHocRun(
       ...(chatBinding?.ownerOpenId ? { authorizedByOpenId: chatBinding.ownerOpenId } : {}),
       ...(opts.nodeExecutor ? { nodeExecutor: opts.nodeExecutor } : {}),
       ...(nodeWorkingDir !== undefined ? { nodeWorkingDir } : {}),
+      ...(nodeProjectDir !== undefined ? { nodeProjectDir } : {}),
       ...(opts.nodeExecutor && opts.handoffIdentity ? { handoffIdentity: opts.handoffIdentity } : {}),
       ...(opts.nodeExecutor && opts.initiator ? { initiator: opts.initiator } : {}),
       ...(opts.nodeExecutor && opts.flowConfirmation
@@ -1399,6 +1419,7 @@ export async function cmdWorkflowHost(
       });
       if (!out.ok) {
         console.error(`architect/validateDag 失败（已退回 spec_approved，可修 spec 重跑）:\n  - ${out.problems!.join('\n  - ')}`);
+        if (out.attemptDir) console.error(`本次编排的日志：${out.attemptDir}`);
         process.exitCode = 1;
         return;
       }

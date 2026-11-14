@@ -15,6 +15,7 @@ import {
 import { triggerSessionTurn } from '../src/core/trigger-session.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { downloadMessageResource } from '../src/im/lark/client.js';
 import { __testOnly_driveApiCall } from '../src/im/lark/doc-comment.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -131,6 +132,7 @@ describe('no-transport sessions on the daemon IPC surface', () => {
 
     for (const [label, chatId, appId] of [
       ['HTTP virtual chat on a normal bot', 'http_async_nt', 'app_normal'],
+      ['CLI headless chat on a normal bot', 'headless_hl_11111111-1111-4111-8111-111111111111', 'app_normal'],
       ['apiOnly bot in a real-looking chat', 'oc_real_nt', 'local_riff'],
     ] as const) {
       find.mockReturnValue(activeSession(chatId, appId));
@@ -140,6 +142,13 @@ describe('no-transport sessions on the daemon IPC surface', () => {
         body: JSON.stringify({ name: 'new', proactive: true, originCapability: CAP }),
       });
       expect(await rename.json(), label).toMatchObject({ ok: false, error: 'no_feishu_transport' });
+      const project = await fetch(`${base}/project`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'init', title: 'must not persist', goal: 'must not send', originCapability: CAP }),
+      });
+      expect(project.status, label).toBe(409);
+      expect(await project.json(), label).toMatchObject({ ok: false, error: 'no_feishu_transport' });
       const history = await fetch(`${base}/history`);
       expect(history.status, label).toBe(200);
       expect(await history.json(), label).toMatchObject({ ok: true, messages: [], hint: 'no_feishu_transport' });
@@ -195,7 +204,7 @@ describe('no-transport sessions on the daemon IPC surface', () => {
     // exposeReceiverStreamingCard opt-in it delegated to) is gone; the final
     // group-posting policy (silent vs listener_thread) is enforced separately in
     // managedFinalOutputSuppressed, not here.
-    const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
+    const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const goalCardEnabled =');
     expect(block).not.toContain('vcMeetingReceiver');
     expect(block).not.toContain('vcReceiverStreamingCardSuppressed');
     expect(block).toContain('return ordinaryManagedSuppression(turnId, dispatchAttempt);');
@@ -317,14 +326,16 @@ describe('no-transport sessions on the daemon IPC surface', () => {
     // Root-dispatch gate: managed no-transport turn refused for ALL Lark-facing
     // commands, resolved via TAMPER-RESISTANT pid-marker ancestry (not raw env).
     const rootGate = region(cliSource, 'const LARK_FACING_COMMANDS = new Set(', 'switch (command) {');
-    expect(rootGate).toContain('managedOriginHasNoTransport()');
+    // The gate is memoized behind resolveManagedOriginTransport(); the ancestry
+    // judgement it returns is asserted below.
+    expect(rootGate).toContain('resolveManagedOriginTransport()');
     // The command set includes the verbs codex flagged (vc-agent, report).
     for (const cmd of ['send', 'dispatch', 'create-group', 'grant', 'vc-agent', 'report']) {
       expect(rootGate, `LARK_FACING has ${cmd}`).toContain(`'${cmd}'`);
     }
-    // managedOriginHasNoTransport resolves via ancestry (env-independent).
-    const originGate = region(cliSource, 'function managedOriginHasNoTransport(', '\n}\n');
-    expect(originGate).toContain('resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID)');
+    // The managed-origin verdict resolves via ancestry (env-independent).
+    const originGate = region(cliSource, 'function judgeManagedOriginTransport(', 'function managedOriginConflictMessage(');
+    expect(originGate).toContain('findLiveAncestorSessionContext(dataDir)');
     expect(originGate).toContain('loadSessions().get(ctx.sessionId)');
     expect(originGate).toContain('isHttpVirtualSession(chatId)');
     const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
@@ -349,8 +360,9 @@ describe('no-transport sessions on the daemon IPC surface', () => {
       const body = region(ipcSource, start, end);
       expect(body, `${name} route`).toContain('sessionTransportDisabled(');
     }
-    // resume-notice gates its notice block.
-    const resumeNotice = region(ipcSource, '会话已通过命令行恢复', 'getChatMode(ds.larkAppId');
+    // resume-notice gates its notice block. The wording now comes from
+    // resumeSuccessMessage(), so the block is located by its poster instead.
+    const resumeNotice = region(ipcSource, 'const postResumeNotice = async', 'getChatMode(ds.larkAppId');
     expect(resumeNotice).toContain('!sessionTransportDisabled(ds)');
   });
 
@@ -529,7 +541,7 @@ describe('API-only bot mode — riff env re-freeze + VC listener exclusion (sour
       expect(preflightBlock, `preflight must not touch ${forbidden}`).not.toContain(`${forbidden}:`);
     }
     // 唯一允许的落盘字段。
-    const writeBlock = region(preflightBlock, 'await withBotsJsonLock(', '\n    }, { caller:');
+    const writeBlock = region(preflightBlock, 'withBotsJsonLock(', ', { caller:');
     expect(writeBlock).toContain('next.larkCliProfile = targetAppId;');
     expect(writeBlock).not.toMatch(/next\.(?!larkCliProfile\b)[A-Za-z]+\s*=/u);
     expect(preflightBlock).toContain("caller: 'dashboard', operation: 'vc-agent-profile'");
@@ -573,7 +585,8 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(fsPolicyImport).toContain('FsPolicyConfigError');
     const block = region(workerSource, 'const policy = (() => {', 'suppressedAuthorityPaths?.length');
     expect(block).toContain('if (err instanceof FsPolicyConfigError) {');
-    expect(block).toContain('refusing to start no-transport session');
+    expect(block).toContain('refusing to start ${scope}');
+    expect(block).toContain("'no-transport session'");
     // suppressed (dropped) authority allow paths are LOGGED, not silent
     expect(workerSource).toContain('no-transport suppressed');
   });
@@ -586,8 +599,9 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerSource).toContain("from './utils/darwin-ca-bundle.js'");
     // Assert both cliIds are covered, not the exact clause text: swapping the
     // two sides of `||` is semantically identical and must not fail this.
-    expect(workerSource).toContain("cfg.cliId === 'codex'");
-    expect(workerSource).toContain("cfg.cliId === 'codex-app'");
+    // Either the two literal ids or the shared predicate that is exactly those two.
+    expect(workerSource).toMatch(/isCodexFamilyCliId\(cfg\.cliId\)|cfg\.cliId === 'codex'/);
+    expect(workerSource).toMatch(/isCodexFamilyCliId\(cfg\.cliId\)|cfg\.cliId === 'codex-app'/);
     // Operator precedence: childEnv starts from the daemon env, so an
     // operator-supplied SSL_CERT_FILE is what this guard preserves.
     expect(workerSource).toContain('&& !childEnv.SSL_CERT_FILE');
@@ -679,9 +693,9 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // Dispatches on the pure, behaviorally-tested policy (read-isolation.test.ts).
     expect(teardown).toContain('persistentTeardownKillKind({');
     expect(teardown).toContain('killPersistentBackendTarget(teardownTarget!, cfg.sessionId)');
-    expect(teardown).toContain('probePersistentBackendTarget(teardownTarget!)');
+    expect(teardown).toContain('probePaneAfterKill(persistentSessionName, killKind === \'target\' ? teardownTarget : undefined)');
     expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir))');
-    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe');
+    expect(workerSource).toContain('probeOwnedZmxSession(name, cfg.sessionId, undefined, resolvedZmxSocketDir).probe');
     expect(teardown).toContain("postKill !== 'missing'");
     expect(teardown).toContain('pending proof retained');
 
@@ -831,21 +845,14 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // non-empty 4th argument, and it must be the tri-state helper rather than a
     // bare `sender_type` comparison — that one reads a cross-ref-identified peer
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
-    const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
-      .map(m => m[1].split(',').map(part => part.trim()));
-    // handleNewTopic, principal-lane live suggestion, and handleThreadReply.
-    expect(trustedCallerArgs.length).toBe(3);
-    for (const args of trustedCallerArgs) {
-      expect(args.length).toBeGreaterThanOrEqual(4);
-      const senderTypeArg = args.slice(3).join(', ');
-      expect(senderTypeArg).not.toBe('');
-      expect(senderTypeArg).toContain('senderIsBotTriState(');
-      expect(senderTypeArg).not.toMatch(/^isBotSenderType\)?$/);
-      // ...and the cross-ref leg must actually be wired in: passing a literal
-      // `false` there keeps the helper name but drops peer-bot recognition,
-      // which is the exact case a bare `sender_type` check already missed.
-      expect(senderTypeArg).toContain('isForeignBot');
-    }
+    // Both IM entry points stamp the sender type; the tri-state value is
+    // computed once per message and passed in as the 4th argument.
+    expect(daemonSource).toContain('trustedCallerForTurn(larkAppId, operatorOpenId, undefined, operatorIsBot)');
+    expect((daemonSource.match(/trustedCallerForTurn\(/g) || []).length).toBeGreaterThanOrEqual(3);
+    // The peer-bot leg is wired at both IM entry points through the tri-state
+    // helper (a bare `sender_type` comparison misses cross-ref peer bots).
+    expect(daemonSource).toContain('senderIsBotTriState(message.senderType');
+    expect(daemonSource).toContain('senderIsBotTriState(parsed.senderType, isForeignBotSender)');
   });
 
   it('P1-2: entrypoint strips BOTS_CONFIG so no worker fork inherits it', () => {
@@ -918,8 +925,9 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(wrapperSrc).toContain("env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR");
     // worker.ts: all 4 PATH prepends go through the resolver; NO hardcoded bin join.
     const workerSrc = readFileSync(resolve('src/worker.ts'), 'utf8');
-    const prependCount = (workerSrc.match(/prependBotmuxBin\(resolveBotmuxWrapperBinDir\(process\.env\)/g) || []).length;
+    const prependCount = (workerSrc.match(/prependBotmuxBin\(/g) || []).length;
     expect(prependCount).toBeGreaterThanOrEqual(4);
+    expect(workerSrc).toContain('childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(process.env);');
     expect(workerSrc).not.toContain("join(homedir(), '.botmux', 'bin')");
     // worker-pool: fork PATH via the resolver.
     const wpSrc = readFileSync(resolve('src/core/worker-pool.ts'), 'utf8');
@@ -932,12 +940,15 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // $HOME/.botmux/bin and NO runtime-env shell resolution.
     const tmuxSrc = readFileSync(resolve('src/adapters/backend/tmux-backend.ts'), 'utf8');
     expect(tmuxSrc).toContain("export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh')");
-    expect(tmuxSrc).toContain('const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);');
-    expect(tmuxSrc).toContain(': shellWrapperScript(wrapperBinDir, shellKind);');
+    // The tmux pane spawn lives in the pipe backend, which must also resolve the
+    // dir through the single source of truth (never a hardcoded PATH literal).
+    const tmuxPipeSrc = readFileSync(resolve('src/adapters/backend/tmux-pipe-backend.ts'), 'utf8');
+    expect(tmuxPipeSrc).toContain('shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind)');
     expect(tmuxSrc).not.toContain('export PATH="$HOME/.botmux/bin:$PATH"');
     expect(tmuxSrc).not.toContain('botmuxWrapperPathExportSh'); // footgun removed
     const fishAwarePersistentBackendCalls: Record<string, RegExp> = {
-      'src/adapters/backend/tmux-pipe-backend.ts': /shellWrapperScript\(\s*resolveBotmuxWrapperBinDir\(opts\.env \?\? process\.env\),\s*shellKindForPath\(shellSpec\.shell\),\s*\)/,
+      // The pane script may take the resolved kind local (shellKind) or inline it.
+      'src/adapters/backend/tmux-pipe-backend.ts': /shellWrapperScript\(\s*resolveBotmuxWrapperBinDir\(opts\.env \?\? process\.env\),\s*(?:shellKind|shellKindForPath\(shellSpec\.shell\)),?\s*\)/,
       'src/adapters/backend/zellij-backend.ts': /shellWrapperScript\(resolveBotmuxWrapperBinDir\(opts\.env \?\? process\.env\), kind\)/,
       'src/adapters/backend/zmx-backend.ts': /shellWrapperScript\(wrapperBinDir, shellKind\)/,
     };
@@ -1055,6 +1066,134 @@ describe('CLI transport gate for a managed no-transport turn', () => {
         expect(r.status, command).toBe(2);
         expect(String(r.stderr), command).toMatch(/no Feishu transport/);
       }
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('follows the session record when a bound session still carries its spawn-time headless env', () => {
+    // A headless session that is later bound/transferred to a real chat keeps the
+    // CLI process it was spawned with: the tmux backend re-attaches to the
+    // surviving bmx-<sessionId> instead of respawning, so BOTMUX_CHAT_ID stays
+    // `headless_*` for the rest of that generation. The session record has
+    // already moved and is the routing truth — `send` (and every sibling verb)
+    // must not be refused for the whole life of that process.
+    const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-bound-'));
+    try {
+      seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+        s_bound: { sessionId: 's_bound', chatId: 'oc_bound_gate', larkAppId: 'cli_gate_bot', rootMessageId: 'om_bound_root', scope: 'thread', status: 'active' },
+      });
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 's_bound' }));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+      env.SESSION_DATA_DIR = dataDir;
+      env.BOTMUX_SESSION_ID = 's_bound';
+      env.BOTMUX_CHAT_ID = 'headless_hl_stale';
+      env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+      for (const { args, status, downstream } of [
+        // `send` validates --response-kind and similar argv shapes before the
+        // root gate, so the bad value must be one cmdSend checks after its gate.
+        { args: ['send', '--plugin-card-action', 'BAD!', 'hello'], status: 2, downstream: /无效 plugin id/ },
+        { args: ['create-group'], status: 1, downstream: /--bot/ },
+      ]) {
+        const r = spawnSyncTsScript('src/cli.ts', args, { env, encoding: 'utf8', timeout: 60_000 });
+        // Invalid arguments stop before credentials or network activity, but
+        // only after both transport gates have accepted the bound session.
+        expect(r.status, args.join(' ')).toBe(status);
+        expect(String(r.stderr), args.join(' ')).toMatch(downstream);
+        expect(String(r.stderr), args.join(' ')).not.toMatch(/headless automation session|no Feishu transport/);
+      }
+      // tabs / top-notice prefer the caller's env chat over the record; the
+      // headless snapshot must not shadow the chat the session was bound to.
+      // No bot is configured here, so the command fails before any Feishu call
+      // and reports the chat it resolved.
+      const tabs = spawnSyncTsScript('src/cli.ts', ['tabs', 'list', '--json'], { env, encoding: 'utf8', timeout: 60_000 });
+      const tabsResult = String(tabs.stdout).trim().split('\n').pop() ?? '';
+      expect(tabsResult, String(tabs.stderr)).toMatch(/^\{/);
+      expect(JSON.parse(tabsResult).chatId).toBe('oc_bound_gate');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it.each(['headless_gate', 'http_async_gate', 'http_wait_gate'])(
+    'refuses a conflicting env session while its ancestor remains %s', chatId => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-conflict-'));
+      try {
+        seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+          s_virtual: { sessionId: 's_virtual', chatId, larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+          s_real: { sessionId: 's_real', chatId: 'oc_real_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+        });
+        mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+        writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 's_virtual' }));
+        const env: Record<string, string> = {};
+        for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+        env.SESSION_DATA_DIR = dataDir;
+        env.BOTMUX_SESSION_ID = 's_real';
+        env.BOTMUX_CHAT_ID = 'oc_real_gate';
+        env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+        const r = spawnSyncTsScript('src/cli.ts', ['create-group'], { env, encoding: 'utf8', timeout: 60_000 });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toMatch(/marker names session s_virtual, but BOTMUX_SESSION_ID names s_real/);
+      } finally {
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    }, 120_000,
+  );
+
+  it('refuses when a verified ancestor marker and BOTMUX_SESSION_ID name two different real sessions', () => {
+    // Either session could reach Feishu on its own, so only the conflict check
+    // stands between this call and routing it through a session it may not own.
+    const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-real-conflict-'));
+    try {
+      seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+        s_marker: { sessionId: 's_marker', chatId: 'oc_marker_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+        s_env: { sessionId: 's_env', chatId: 'oc_env_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+      });
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: 's_marker',
+        procStart: readProcessStartIdentity(process.pid),
+      }));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+      env.SESSION_DATA_DIR = dataDir;
+      env.BOTMUX_SESSION_ID = 's_env';
+      env.BOTMUX_CHAT_ID = 'oc_env_gate';
+      env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+      for (const args of [['create-group'], ['send', '--plugin-card-action', 'BAD!', 'hello']]) {
+        const r = spawnSyncTsScript('src/cli.ts', args, { env, encoding: 'utf8', timeout: 60_000 });
+        expect(r.status, args.join(' ')).toBe(2);
+        expect(String(r.stderr), args.join(' ')).toMatch(/marker names session s_marker, but BOTMUX_SESSION_ID names s_env/);
+      }
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('refuses an apiOnly bot even with a real-chat session record', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-real-'));
+    try {
+      seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+        s_real: { sessionId: 's_real', chatId: 'oc_real_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+      });
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 's_real' }));
+      mkdirSync(join(dataDir, '.botmux'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux', 'bots.json'), JSON.stringify([
+        { larkAppId: 'cli_gate_bot', apiOnly: true, cliId: 'traex' },
+      ]));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+      env.HOME = dataDir;
+      env.SESSION_DATA_DIR = dataDir;
+      env.BOTMUX_SESSION_ID = 's_real';
+      env.BOTMUX_CHAT_ID = 'oc_real_gate';
+      env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+      const r = spawnSyncTsScript('src/cli.ts', ['create-group'], { env, encoding: 'utf8', timeout: 60_000 });
+      expect(r.status).toBe(2);
+      expect(String(r.stderr)).toMatch(/no Feishu transport/);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }

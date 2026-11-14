@@ -229,12 +229,15 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       || (typeof j?.codexBrowser === 'object' && j.codexBrowser?.enabled === true),
     codexBrowserAutoApproveOrigins: j?.codexBrowserAutoApproveOrigins === true,
     writableTerminalLinkInCard: j?.writableTerminalLinkInCard === true,
+    goalStatusCard: j?.goalStatusCard === true,
     privateCard: j?.privateCard === true,
     replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),
     replyCardShowTools: j?.replyCardShowTools !== false,
+    replyCardNativeCot: j?.replyCardNativeCot === true,
     senderTag: j?.senderTag !== false,
     senderTagHideEmail: j?.senderTagHideEmail === true,
+    hideLocalAddresses: j?.hideLocalAddresses === true,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
@@ -247,6 +250,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
     chatManagerEnabled: j?.chatManagerEnabled === true,
+    chatManagerSharedTopic: j?.chatManagerSharedTopic === true,
+    groupSecretaryEnabled: j?.groupSecretaryEnabled === true,
     autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
@@ -287,6 +292,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',
     replyDeliverySupported: j?.replyDeliverySupported === true,
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+    // Per-bot 关闭/清理时原生归档 Codex 的覆盖：null = 继承全局。全局当前值随行下发，
+    // 页面在「跟随全局」里直接写出它，避免看不出本 Bot 实际会不会归档。
+    archiveCodex: typeof j?.archiveCodex === 'boolean' ? j.archiveCodex : null,
+    archiveCodexDefault: readGlobalConfig().sessionCleanup?.archiveCodex === true,
     // Trigger-user CLI auth policy. No secrets in it — just which tools it
     // covers and what to do when the sender has not authorized. Run through the
     // SHARED parser so this door cannot drift from bots.json / /botconfig: a
@@ -308,6 +317,9 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     longTaskReminder: normalizeLongTaskReminderConfig(j?.longTaskReminder) ?? null,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     customPassthroughCommands: typeof j?.customPassthroughCommands === 'string' ? j.customPassthroughCommands : '',
+    defaultPassthroughCommands: Array.isArray(j?.defaultPassthroughCommands)
+      ? j.defaultPassthroughCommands.filter((command: unknown): command is string => typeof command === 'string' && command.startsWith('/'))
+      : undefined,
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
@@ -340,6 +352,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
+  archiveCodex: boolean | undefined;
 } {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
@@ -352,6 +365,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     grantDelegateBots: Array.isArray(rawEntry?.grantDelegateBots)
       ? rawEntry.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string')
       : undefined,
+    // 显式开/关原样带回（否则 daemon 离线时会显示成「跟随全局」）；缺省或非法值不带，按跟随全局显示。
+    archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
   };
 }
 

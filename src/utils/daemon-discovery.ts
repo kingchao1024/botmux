@@ -59,6 +59,15 @@ export interface OnlineDaemonInfo {
   /** Applies a workflow run's Gate-2 working dir to its node sessions
    *  (design 2026-11-03 §15.4). Absent = an older daemon that ignores it. */
   workflowNodeWorkingDir?: 'v1';
+  /** Reads a run.json carrying the launching draft's project and starts a
+   *  node of a bot without a default working dir there (§15.4). Absent = an
+   *  older daemon, which rejects such a run.json: the project is not
+   *  written for a run it executes. */
+  workflowNodeProjectDir?: 'v1';
+  /** Handles a workflow handoff in the run's main topic (design 2026-11-03
+   *  §5.5: queued as its own turn, attempt-scoped session marker). Absent =
+   *  an older daemon, which gets node-topic handoffs only. */
+  workflowMainPlacement?: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
   sessionStoreProtocol?: string;
   /** Running binary version. Copy only; never compared by size. */
@@ -402,6 +411,8 @@ function parseDescriptor(
       ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
       : {}),
     ...(d.workflowNodeWorkingDir === 'v1' ? { workflowNodeWorkingDir: d.workflowNodeWorkingDir } : {}),
+    ...(d.workflowNodeProjectDir === 'v1' ? { workflowNodeProjectDir: d.workflowNodeProjectDir } : {}),
+    ...(d.workflowMainPlacement === 'v1' ? { workflowMainPlacement: d.workflowMainPlacement } : {}),
     // 上游新增能力字段（8271df51 会话库协议收口）：透传给 dashboard 的版本/
     // 协议展示与升级可见性，fork 的 generation 发现架构不能把它们吃掉。
     ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol

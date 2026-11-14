@@ -62,7 +62,7 @@ describe('worker → codex buildArgs wiring (source lock)', () => {
     // The module vars are populated inside engageCodexRpc; spawnCli (→ buildArgs)
     // must run after, or the fields would always be undefined at the call site.
     const engageAt = workerSource.indexOf('engage: () => engageCodexRpc(msg),');
-    const spawnAt = workerSource.indexOf("await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });");
+    const spawnAt = workerSource.indexOf("await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared");
     expect(engageAt).toBeGreaterThan(0);
     expect(spawnAt).toBeGreaterThan(engageAt);
   });

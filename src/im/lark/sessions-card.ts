@@ -25,6 +25,9 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
+import { config } from '../../config.js';
+import { localHttpOrigin } from '../../core/dashboard-url.js';
+import { sendableCardLink } from './local-address-context.js';
 import { logger } from '../../utils/logger.js';
 
 import { terminalMultiUrl } from './card-builder.js';
@@ -575,6 +578,25 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
   }
 }
 
+/** Direct Web-Terminal URL for a SessionRow, used when the daemon cannot issue a
+ *  capability view link. Mirrors \`src/dashboard/web/sessions.ts:terminalHref\`:
+ *  proxy port wins (with the \`/s/{sessionId}\` suffix); otherwise the direct worker
+ *  port. A closed row can carry a stale port, so closed rows are rejected here.
+ *
+ *  The direct-port link carries no capability, so a bot that hides local addresses
+ *  would have the whole card rejected; it is left out there. */
+export function buildSessionTerminalUrl(row: SessionRow, larkAppId: string): string | null {
+  if (row.status === 'closed') return null;
+  if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
+    return `${localHttpOrigin(config.web.externalHost, row.proxyPort)}/s/${encodeURIComponent(row.sessionId)}`;
+  }
+  if (typeof row.webPort === 'number' && row.webPort > 0) {
+    const url = localHttpOrigin(config.web.externalHost, row.webPort);
+    return sendableCardLink(url, larkAppId) ? url : null;
+  }
+  return null;
+}
+
 function formatRelativeForDetail(fromMs: number, nowMs: number): string {
   const diff = nowMs - fromMs;
   if (!Number.isFinite(diff) || diff < 0) return 'just now';
@@ -680,7 +702,7 @@ export async function handleSessionsCardAction(
     }
     const detail = composeDetail(row, now());
     const terminalUrl = detail.actions.openTerminal.enabled
-      ? await safeGetSessionViewLink(client, sessionId, pathSuffix)
+      ? (await safeGetSessionViewLink(client, sessionId, pathSuffix)) ?? buildSessionTerminalUrl(row, larkAppId)
       : null;
     const cardJson = buildSessionsDetailCard(detail, {
       invokerOpenId: operatorOpenId,
@@ -917,7 +939,7 @@ export async function handleSessionsCardAction(
     }
     const detail = composeDetail(after, now());
     const terminalUrl = detail.actions.openTerminal.enabled
-      ? await safeGetSessionViewLink(client, sessionId, pathSuffix)
+      ? (await safeGetSessionViewLink(client, sessionId, pathSuffix)) ?? buildSessionTerminalUrl(after, larkAppId)
       : null;
     const cardJson = buildSessionsDetailCard(detail, {
       invokerOpenId: operatorOpenId,

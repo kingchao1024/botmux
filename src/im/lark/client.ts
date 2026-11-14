@@ -1,6 +1,7 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
 import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
@@ -20,6 +21,8 @@ import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
+import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
@@ -37,7 +40,7 @@ import {
   type DefinitiveContactErrorCode,
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
-import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
+import { downloadResourceWithRange, getResourceErrorCode, isResourceSizeLimitError, LARK_RESOURCE_SIZE_LIMIT_CODE, type ResourceStream } from './resource-range-download.js';
 
 // larkGet lives in a dependency-free module so setup/owner-identity.ts (shared
 // by every onboarding / allowedUsers write path) can use the same no-body GET
@@ -339,6 +342,17 @@ async function recordPublishedGroupContext(larkAppId: string, data: any, body: s
   } catch { logger.warn('[group-context] outbound observation failed; publication remains successful'); }
 }
 
+/**
+ * Dedupe token for one logical send. The api-gate re-runs the whole closure on
+ * 429/5xx/network errors, and a request that landed server-side before the
+ * response was lost would be posted a second time. Generating the token OUTSIDE
+ * the closure keeps it stable across gate retries so Feishu returns the original
+ * message_id. Caller-supplied uuids win; the generated one is never exposed to hooks.
+ */
+function dedupeUuid(uuid?: string): string {
+  return uuid || randomUUID();
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -349,6 +363,8 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     // A retry gets a new cache after the gate wait, never a previous attempt's
     // available result. Destination and source checks may share this lookup.
@@ -365,7 +381,7 @@ export async function sendMessage(
         receive_id: chatId,
         msg_type: msgType as any,
         content: body,
-        ...(uuid ? { uuid } : {}),
+        uuid: wireUuid,
       };
       res = options?.signal || options?.timeoutMs
         ? await c.request({
@@ -423,6 +439,8 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -439,7 +457,7 @@ export async function replyMessage(
         msg_type: msgType as any,
         content: body,
         ...(replyInThread ? { reply_in_thread: true } : {}),
-        ...(uuid ? { uuid } : {}),
+        uuid: wireUuid,
       };
       res = options?.signal || options?.timeoutMs
         ? await c.request({
@@ -532,6 +550,24 @@ export async function urgentMessage(
  * Emits no outbound hook (same as {@link sendUserMessage}): the hook event
  * union is closed and a forward is not one of its members.
  */
+/** Merge up to 100 original messages using Lark's native forwarding API. */
+export async function mergeForwardMessages(larkAppId: string, messageIds: string[], chatId: string, uuid?: string): Promise<{ messageId: string; invalidMessageIds: string[] }> {
+  assertLarkTransport(larkAppId, 'mergeForwardMessages');
+  if (!messageIds.length || messageIds.length > 100) throw new Error('Merge forwarding requires 1–100 messages');
+  const wireUuid = dedupeUuid(uuid);
+  return executeWithLarkGate(larkAppId, 'mergeForwardMessages', async () => {
+    for (const id of messageIds) await assertMessageWriteAllowed(larkAppId, id);
+    const response = await getBotClient(larkAppId).im.v1.message.mergeForward({
+      params: { receive_id_type: 'chat_id', uuid: wireUuid },
+      data: { receive_id: chatId, message_id_list: messageIds },
+    });
+    if (response.code !== 0) throw larkApiError('merge forward messages', response);
+    const messageId = response.data?.message?.message_id;
+    if (!messageId) throw new Error('No message_id in merge forward response');
+    return { messageId, invalidMessageIds: response.data?.invalid_message_id_list ?? [] };
+  });
+}
+
 export async function forwardMessage(
   larkAppId: string,
   messageId: string,
@@ -790,12 +826,17 @@ export async function sendUserMessage(
   msgType: string = 'text',
   uuid?: string,
   requestOptions?: LarkRequestOptions,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(
     larkAppId,
     'sendUserMessage',
     async () => {
+      // The permission proof must follow every gate wait, including retries.
+      if (options?.beforeWrite) await options.beforeWrite();
       const c = getBotClient(larkAppId);
       // Stamp callback-button ownership markers on interactive DMs too: this is the
       // FIFTH card egress surface (config / write-link / substitute / overload / …
@@ -812,7 +853,7 @@ export async function sendUserMessage(
         receive_id: openId,
         msg_type: msgType as any,
         content: body,
-        ...(uuid ? { uuid } : {}),
+        uuid: wireUuid,
       };
 
       const res = requestOptions
@@ -909,8 +950,91 @@ export async function listChatUserMembers(larkAppId: string, chatId: string): Pr
   return members;
 }
 
+export async function isBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'isBotInChat');
+  return executeWithLarkGate(larkAppId, 'isBotInChat', async () => {
+    const response = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+    if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
+    return response.data.is_in_chat;
+  });
+}
+
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
   return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
+}
+
+/** Pages {@link findCurrentChatUserMembers} reads before giving up (100/page). */
+export const CURRENT_CHAT_USER_MEMBER_PAGE_CAP = 100;
+
+/** The member list was still `has_more` at the page cap with someone unconfirmed. */
+export class ChatMemberListTooLargeError extends Error {
+  constructor(chatId: string) {
+    super(
+      `Chat ${chatId} has more than ${CURRENT_CHAT_USER_MEMBER_PAGE_CAP * 100} members; `
+      + 'could not read the member list to the end to rule anyone out',
+    );
+    this.name = 'ChatMemberListTooLargeError';
+  }
+}
+
+/**
+ * Authorization-grade: which of `openIds` are current human members of the
+ * chat, per `larkAppId`'s live `/members` list (app-scoped open_ids; the list
+ * never contains bots). Stops paging as soon as everyone is found — a row in
+ * any live page proves membership — but only rules someone out after reading
+ * the list to the end. Anything that would make the list look shorter than it
+ * is throws instead: an API error, a page without an `items` array, a
+ * non-boolean `has_more`, `has_more` without a fresh page token (missing or
+ * already used), or hitting the page cap ({@link ChatMemberListTooLargeError}).
+ * Unlike {@link listChatUserMembers} it never returns a silently partial list.
+ */
+export async function findCurrentChatUserMembers(
+  larkAppId: string,
+  chatId: string,
+  openIds: readonly string[],
+): Promise<Set<string>> {
+  if (openIds.length === 0) return new Set();
+  const c = getBotClient(larkAppId);
+  return scanChatMemberPages(chatId, openIds, pageToken => larkGet(
+    c,
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`,
+    { member_id_type: 'open_id', page_size: '100', ...(pageToken ? { page_token: pageToken } : {}) },
+  ));
+}
+
+/** The paging rules of {@link findCurrentChatUserMembers}, over any page source. */
+export async function scanChatMemberPages(
+  chatId: string,
+  openIds: readonly string[],
+  fetchPage: (pageToken: string | undefined) => Promise<any>,
+): Promise<Set<string>> {
+  const wanted = new Set(openIds);
+  const found = new Set<string>();
+  if (wanted.size === 0) return found;
+  const usedTokens = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < CURRENT_CHAT_USER_MEMBER_PAGE_CAP; page++) {
+    const res = await fetchPage(pageToken);
+    if (res?.code !== 0) throw larkApiError('list chat members', res);
+    const items = res.data?.items;
+    if (!Array.isArray(items)) throw new Error(`list chat members: page ${page + 1} has no items array`);
+    for (const it of items) {
+      const id = it?.member_id;
+      if (typeof id === 'string' && wanted.has(id)) found.add(id);
+    }
+    if (found.size === wanted.size) return found;
+    const hasMore = res.data?.has_more;
+    if (typeof hasMore !== 'boolean') throw new Error(`list chat members: page ${page + 1} has no boolean has_more`);
+    if (!hasMore) return found;
+    const next = res.data?.page_token;
+    if (typeof next !== 'string' || !next) {
+      throw new Error(`list chat members: page ${page + 1} has more members but no page_token`);
+    }
+    if (usedTokens.has(next)) throw new Error(`list chat members: page ${page + 1} repeats an earlier page_token`);
+    usedTokens.add(next);
+    pageToken = next;
+  }
+  throw new ChatMemberListTooLargeError(chatId);
 }
 
 /**
@@ -1292,6 +1416,7 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
     let card: unknown;
@@ -1357,6 +1482,7 @@ export async function updateMessage(
   const beforeWrite = typeof optionsOrAck === 'object' ? optionsOrAck.beforeWrite : undefined;
   const returnAcknowledgement = optionsOrAck === true || (typeof optionsOrAck === 'object' && optionsOrAck.returnAcknowledgement === true);
   assertLarkTransport(larkAppId, 'updateMessage');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -1427,6 +1553,31 @@ export async function resolveCardKitId(larkAppId: string, messageId: string): Pr
   });
 }
 
+/** Sequenced whole-card updates prevent a delayed pre-restart frame overwriting a newer status. */
+export async function updateCardJson(larkAppId: string, cardId: string, messageId: string, content: string,
+  sequence: number, uuid: string, options?: OutboundMessageOptions): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardJson');
+  content = prepareLocalAddressContent(content, 'interactive', linkFieldContext(larkAppId));
+  return executeWithLarkGate(larkAppId, 'updateCardJson', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    if (options?.beforeWrite) await options.beforeWrite();
+    let response: any;
+    try {
+      response = await getBotClient(larkAppId).cardkit.v1.card.update({
+        path: { card_id: cardId }, data: { card: { type: 'card_json', data: content }, sequence, uuid },
+      });
+    } catch (err) {
+      // Same withdrawn signal resolveCardKitId maps for the CardKit API.
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw err;
+    }
+    if (response.code !== 0) {
+      if (response.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw larkApiError('update CardKit card', response);
+    }
+  });
+}
+
 /** Enable/finalize native CardKit streaming without replacing the whole card. */
 export async function updateCardStreamingSettings(
   larkAppId: string,
@@ -1434,6 +1585,7 @@ export async function updateCardStreamingSettings(
   settings: CardStreamingSettings,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
+  settings = sanitizeLocalAddressNode(settings, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
     await assertMessageWriteAllowed(larkAppId, settings.messageId);
     const c = getBotClient(larkAppId);
@@ -1497,6 +1649,7 @@ export async function patchCardStreamElement(
   messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'patchCardStreamElement');
+  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -1513,7 +1666,7 @@ export async function patchCardStreamElement(
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
-  options: { userCardContent?: boolean } & LarkRequestOptions = {},
+  options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
   const c = getBotClient(larkAppId);
   // card_msg_content_type=user_card_content returns the original card JSON
@@ -1530,6 +1683,8 @@ export async function getMessageDetail(
     // user AND bot senders); without it the server omits them. Matters here for
     // merge_forward sub-messages, whose senders appear nowhere else.
     with_sender_name: 'true',
+    // Explicit ID type makes Feishu return app_id for bot mentions.
+    ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
   }, options);
   if (res.code !== 0) {
     throw larkApiError('get message', res);
@@ -1657,7 +1812,7 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean; fallbackMessageIds?: readonly string[] }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1671,37 +1826,54 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     mkdirSync(dir, { recursive: true });
   }
 
+  // Resolve resource ownership with the same app identity before borrowing a
+  // user's token. A forward's outer ID, owning leaf and enclosing forward can
+  // differ; retry only the IDs supplied by its parsed message tree.
+  const messageIds = [...new Set([messageId, ...(options?.fallbackMessageIds ?? [])])];
+  let resourceMessageId = messageId;
   // Try App Token first
-  try {
-    await downloadWithAppToken(larkAppId, messageId, fileKey, apiType, savePath);
-    logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
-    return;
-  } catch (appErr: any) {
-    // 234037 is a transfer-size limit, not an identity/permission failure.
-    // Retry with the SAME app token, including passive-history downloads.
-    // A failed Range transfer must propagate, never turn into a /login prompt.
-    if (await isResourceSizeLimitError(appErr)) {
-      const c = getBotClient(larkAppId);
-      await downloadResourceWithRange((start, end) => (c as any).request({
-        method: 'GET',
-        url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}`,
-        params: { type },
-        headers: { Range: `bytes=${start}-${end}` },
-        responseType: 'stream',
-        timeout: 30_000,
-      }), savePath);
-      logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
+  for (const [index, candidateId] of messageIds.entries()) {
+    resourceMessageId = candidateId;
+    try {
+      await downloadWithAppToken(larkAppId, resourceMessageId, fileKey, apiType, savePath);
+      logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
       return;
+    } catch (appErr: any) {
+      // SDK errors can contain a one-shot JSON stream. Decode it once for both
+      // ownership and size classification.
+      const errorCode = await getResourceErrorCode(appErr);
+      if (errorCode === 234003) {
+        if (index + 1 < messageIds.length) continue;
+        // "File not in msg." is not evidence that a personal token is missing.
+        throw appErr;
+      }
+      // 234037 is a transfer-size limit, not an identity/permission failure.
+      // Retry with the SAME app token, including passive-history downloads.
+      // A failed Range transfer must propagate, never turn into a /login prompt.
+      if (errorCode === LARK_RESOURCE_SIZE_LIMIT_CODE) {
+        const c = getBotClient(larkAppId);
+        await downloadResourceWithRange((start, end) => (c as any).request({
+          method: 'GET',
+          url: `/open-apis/im/v1/messages/${encodeURIComponent(resourceMessageId)}/resources/${encodeURIComponent(fileKey)}`,
+          params: { type: apiType },
+          headers: { Range: `bytes=${start}-${end}` },
+          responseType: 'stream',
+          timeout: 30_000,
+        }), savePath);
+        logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
+        return;
+      }
+      // Passive history is only entitled to the observing app's visibility.
+      // It must never borrow a historical sender's OAuth credentials.
+      if (options?.allowUserTokenFallback === false) throw appErr;
+      // AxiosError status can be at various paths depending on SDK version
+      const status = appErr?.response?.status ?? appErr?.response?.statusCode
+        ?? appErr?.status ?? appErr?.statusCode;
+      // Only fall through to User Token for 400/403; other errors (network, etc.) re-throw
+      if (status && status !== 400 && status !== 403) throw appErr;
+      logger.debug(`App Token download failed (${status ?? 'unknown'}), trying User Token fallback...`);
+      break;
     }
-    // Passive history is only entitled to the observing app's visibility.
-    // It must never borrow a historical sender's OAuth credentials.
-    if (options?.allowUserTokenFallback === false) throw appErr;
-    // AxiosError status can be at various paths depending on SDK version
-    const status = appErr?.response?.status ?? appErr?.response?.statusCode
-      ?? appErr?.status ?? appErr?.statusCode;
-    // Only fall through to User Token for 400/403; other errors (network, etc.) re-throw
-    if (status && status !== 400 && status !== 403) throw appErr;
-    logger.debug(`App Token download failed (${status ?? 'unknown'}), trying User Token fallback...`);
   }
 
   // Fallback: User Token from botmux OAuth (/login)
@@ -1725,7 +1897,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, apiType, savePath, brand);
+  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -2634,7 +2806,7 @@ export type ChatBotMember = {
 type ChatBotListApiItem = { botId: string; botName: string };
 type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
-  | { ok: false; reason: string; cacheable: boolean };
+  | { ok: false; reason: string; cacheable: boolean; timeoutMs?: number };
 
 /**
  * A bot row returned directly by Feishu's live `/members/bots` endpoint.
@@ -2668,13 +2840,22 @@ export type CurrentChatBotAppResolution =
         | 'subject_lark_app_ambiguous';
       message: string;
       invalidSubjectLarkAppIds?: string[];
+      /** 仅当实时成员查询按 listBotsApiTimeoutMs 本地超时时存在，值为当时生效的上限。 */
+      timeoutMs?: number;
     };
+
+class LarkCallTimeoutError extends Error {
+  constructor(label: string, readonly timeoutMs: number) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = 'LarkCallTimeoutError';
+  }
+}
 
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => reject(new LarkCallTimeoutError(label, timeoutMs)), timeoutMs);
   });
   return Promise.race([p, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
@@ -2704,7 +2885,12 @@ async function listChatBotsViaMembersBots(
       .filter((it: ChatBotListApiItem) => it.botId && it.botName);
     return { ok: true, items };
   } catch (err: any) {
-    return { ok: false, reason: err?.message ?? String(err), cacheable: true };
+    return {
+      ok: false,
+      reason: err?.message ?? String(err),
+      cacheable: true,
+      ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
+    };
   }
 }
 
@@ -2753,6 +2939,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
       ok: false,
       error: 'live_membership_unavailable',
       message: `live_chat_bot_members_unavailable: ${live.reason}`,
+      ...(live.timeoutMs !== undefined ? { timeoutMs: live.timeoutMs } : {}),
     };
   }
 
@@ -2837,6 +3024,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
         error: 'live_membership_unavailable',
         message: `is_in_chat failed for ${appId}: ${err?.message ?? String(err)}`,
         invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+        ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
       };
     }
   }
@@ -3192,6 +3380,25 @@ export async function getChatRoutingFacts(
   const mode = rawMode === 'p2p' ? 'p2p' : rawMode === 'group' || rawMode === 'topic' ? 'group' : null;
   if (!mode || typeof res.data?.external !== 'boolean') throw new Error('chat_facts_unknown');
   return { external: res.data.external, mode };
+}
+
+/** Native invite links let non-members join without BotMux user authorization. */
+export async function getChatInviteLink(larkAppId: string, chatId: string): Promise<string> {
+  const response = await getBotClient(larkAppId).request({
+    method: 'POST', url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/link`,
+    data: { validity_period: 'permanently' }, ...larkRequestDeadline({ timeoutMs: 10_000 }),
+  });
+  if (response.code !== 0 || !response.data?.is_permanent || !response.data.share_link) {
+    throw new Error('人工群入群邀请暂不可用，请确认机器人在人工群中并有分享群权限');
+  }
+  const link = new URL(response.data.share_link);
+  const brand = normalizeBrand(getBot(larkAppId).config.brand);
+  const officialHost = link.hostname === larkHosts(brand).applink
+    || (brand === 'feishu' && link.hostname === 'applink.larkoffice.com');
+  if (link.protocol !== 'https:' || !officialHost
+    || link.pathname !== '/client/chat/chatter/add_by_link' || !link.searchParams.get('link_token')
+    || link.username || link.password) throw new Error('人工群未返回有效入群邀请');
+  return response.data.share_link;
 }
 
 export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {

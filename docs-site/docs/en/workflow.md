@@ -255,7 +255,7 @@ The main bot then decides to retry, reassign (within the run's approved bots), e
 - Each event wakes it once, even across daemon restarts.
 - A node handed to a human stops and shows "waiting for a human"; a blocked card (retry / reassign / cancel) appears in the main topic with no timeout. After that, a submission from the executing bot no longer counts.
 
-**Checkpoints** suit nodes where "we need to see the result before deciding what's next". Compilation marks them automatically, and you can ask to add or remove one before Gate-2; changing it mid-run applies directly. When a checkpoint finishes, nodes that depend on it pause until the main bot has looked and its turn ends. If the wake-up can't be delivered, the main bot's session is closed, or it doesn't finish within an hour, the flow continues as planned and the node card and board say so. Checkpoints only work in runs whose nodes are handed to bots in the chat. A checkpoint needs at least one node depending on it: if it is the last node to finish, the run simply ends and the main bot is never called, so compilation, approval and mid-run edits all refuse a checkpoint with nothing after it (drop the mark, or add a summary node after it).
+**Checkpoints** suit nodes where "we need to see the result before deciding what's next". Compilation marks them automatically, and you can ask to add or remove one before Gate-2; changing it mid-run applies directly. When a checkpoint finishes, nodes that depend on it pause until the main bot has looked and its turn ends. When the main bot runs Claude Code on this machine with botmux's prompt hook installed (the usual setup), only an end after its CLI has actually taken the wake-up message counts: an idle screen while the message still sits in the input box does not end the turn. If the wake-up can't be delivered, the main bot's session is closed, or it doesn't finish within an hour (including never confirming it took the message), the flow continues as planned and the node card and board say so. Checkpoints only work in runs whose nodes are handed to bots in the chat. A checkpoint needs at least one node depending on it: if it is the last node to finish, the run simply ends and the main bot is never called, so compilation, approval and mid-run edits all refuse a checkpoint with nothing after it (drop the mark, or add a summary node after it).
 
 ### What's checked before approval
 
@@ -269,13 +269,13 @@ Every node's executing bot must be configured on this machine, already in this c
 - **The initiator can operate that bot**: they could use `/cd` in its topics right now (e.g. they are its admin) **and are still in the group**. Then the directory only has to exist, as with `/cd` and `/repo <path>`.
 - **The initiator can't operate that bot** (e.g. a colleague's bot, or they have left the group): the directory must be in its allowed range — its default working directory (or Oncall directory), or its repo directories (`workingDir` / `workingDirs`) themselves or anything under them.
 - The executing bot decides "can operate" itself, from its own configuration, grants and group members, after the initiator's identity is converted into that bot's Feishu app.
-- **Can't be confirmed right now** (the identity conversion or member lookup fails or times out, a daemon is offline or too old): it decides like "can't operate" — directories inside the range still work; one outside is refused with "couldn't confirm" and the reason, so retrying later may help.
+- **Can't be confirmed right now** (the identity conversion or member lookup fails or times out, a daemon is offline or too old, or the run's approval record or event log can't be read when the node starts): it decides like "can't operate" — directories inside the range still work; one outside is refused with "couldn't confirm" and the reason, so retrying later may help.
 
 Other rules:
 
 - The directory must already exist; it isn't created. Before comparing, `~` is expanded, a trailing `/` removed and symlinks resolved, so a symlink inside the allowed range pointing outside doesn't count.
 - If not allowed, approval is refused with "node → bot: reason" for each one. Without the flag, each bot uses its own default directory.
-- The directory is fixed at approval. Before an executing bot opens a node session it checks again against its configuration and grants **at that time**: if the directory is gone, or the initiator can no longer operate it and the directory is outside its range, the node becomes blocked (it never silently falls back to the default directory). Add the directory to its configuration and click "Retry", or reassign.
+- The directory is fixed at approval. Before an executing bot opens a node session it checks again against its configuration and grants **at that time**: if the directory is gone, or the initiator can no longer operate it and the directory is outside its range, the node becomes blocked (it never silently falls back to the default directory). Add the directory to its configuration and click "Retry", or reassign. For the main bot's own nodes, the directory and whether the initiator may use `/cd` are checked before the node card is posted, and whether they are still in the group when the node starts: if they have left and the directory is outside the range, the cards are posted first and the node then becomes blocked.
 - New bots brought in by mid-run edits are checked the same way when they open a session.
 - The main bot's own main-topic nodes run in the main session itself, which was already started in its own directory when `/workflow` was sent, so such nodes can only use that directory. Approval with any other directory is refused, suggesting a node topic, no directory, or the main session's directory; a mid-run edit that turns a node into one of these (moving it to the main topic, reassigning it to the main bot, adding one) and a blocked-card reassignment to the main bot are refused the same way. A main session that never pinned a directory counts as running in the main bot's default directory. If the main session's directory can't be read, approval isn't blocked; the node is checked when it starts. If the main session moves elsewhere with `/cd` after approval, the node still becomes blocked at runtime; switch it to a node topic or reassign it from the blocked card.
 - If the node topic already has a session of that bot running in another directory (someone @-mentioned it earlier, or ran `/cd`), the node is blocked too; close that session and retry.
@@ -386,9 +386,14 @@ botmux goal run "Collect the stale links under docs/ into a list" --run-id docs-
 | `--bot <id\|name>` | Which bot (App ID or name); defaults to the first bot in `bots.json` |
 | `--working-dir <dir>` | Where to run; defaults to the bot's default working directory |
 | `--timeout <seconds>` | Overall time limit, at most 14370 seconds; hitting it counts as a cancel. Without it, the default node timeout (30 minutes) applies |
-| `--json` | On exit, print one line of JSON to stdout (`schemaVersion` is `botmux.goal-run-result/v1`) with `state`, `summary`, `artifacts`, `error` |
+| `--codex-home <absolute-dir>` | A Codex home (`CODEX_HOME`) you prepared yourself; this run uses its credentials and config. Must be passed together with `--model` and `--reasoning-effort` |
+| `--model <id>` | Codex model for this run, overriding the bot and the home's default |
+| `--reasoning-effort <level>` | `low`, `medium`, `high`, `xhigh`, `max` or `ultra`; must be a level the model supports |
+| `--json` | On exit, print one line of JSON to stdout (`schemaVersion` is `botmux.goal-run-result/v1`) with `state`, `summary`, `artifacts`, `error`, and `runtime` (the model and effort the CLI actually reported, when it reports them) |
 
 It is a single node with no approval card and no Feishu messages. It runs the same way as temporary-process nodes, so only the CLIs listed under "Limitations" above are supported. Data also lands in `~/.botmux/v3-runs/<runId>`.
+
+**Choosing the Codex home, model and effort**: the three options go together and only work with a Codex bot that has no wrapper and no sandbox. The home must be a directory you own with mode 0700, given by its real path (no symlinks along the way); `config.toml` must be a regular 0600 file; `auth.json` may be a symlink to a shared credential file, but the target must be a regular 0600 file you own that contains a credential. If any of this does not hold, or the model does not support the level, the run is refused before it starts with `RUN_AUTHORIZATION_FAILED`. When the run ends, botmux compares the model and effort Codex actually used with what you asked for: a difference gives `GOAL_RUNTIME_MISMATCH`, and a run that never reported them gives `GOAL_RUNTIME_UNVERIFIED`. Both count as failed (exit code 10).
 
 **Read the result from the exit code**:
 
@@ -401,7 +406,7 @@ It is a single node with no approval card and no Feishu messages. It runs the sa
 | 13 | `conflict` | Run ID conflict, or another process is driving this run |
 | 14 | `error` | Bad arguments, Workflow off, no bots configured, etc. |
 
-**Running again with the same `--run-id`** requires exactly the same arguments as the first time (goal, `--bot`, `--working-dir`, `--timeout`):
+**Running again with the same `--run-id`** requires exactly the same arguments as the first time (goal, `--bot`, `--working-dir`, `--timeout`, `--codex-home`, `--model`, `--reasoning-effort`):
 
 - Finished run: nothing reruns; you get the original result and exit code back, even if `bots.json` has since changed or been removed.
 - Unfinished run (the process crashed, the machine rebooted): it resumes where it stopped, keeping the bot, directory and settings fixed on the first run rather than re-picking from current config. It still needs that bot's credentials in `bots.json`.

@@ -83,11 +83,14 @@ interface PersistedAskFields {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人（daemon 已核实），跨重启保留以保证重发卡片仍带通知。 */
+  mentionedOpenId?: string;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   customAnswers?: ReadonlyArray<string | null>;
   customRevision?: number;
   createdAt: number;
+  /** Absolute epoch milliseconds; paired with timeoutMs=0 for no deadline. */
   deadlineAt: number;
   /** Original absolute S1 activation window; both are absent for non-S1 asks. */
   notBeforeMs?: number;
@@ -105,6 +108,7 @@ interface PersistedAskFields {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
+  cardDeliveredAt?: number;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
@@ -1244,6 +1248,11 @@ export function createAskPersistStore(
         continue;
       }
       if (!ask || ask.v !== 2 || !ask.askKey || !ask.requestId || !Array.isArray(ask.questions)) continue;
+      if ((ask.timeoutMs === 0 || ask.deadlineAt === 0)
+        && !(ask.originKind === 'host_explicit' && ask.timeoutMs === 0 && ask.deadlineAt === 0)) {
+        try { unlinkSync(path); } catch { /* best effort */ }
+        continue;
+      }
       if (ask.answeredResult !== undefined) {
         const stashedAt = typeof ask.answeredAt === 'number' ? ask.answeredAt : ask.createdAt;
         if (ask.originKind !== 'host_explicit' && now - stashedAt > HANDOFF_RETENTION_MS) {

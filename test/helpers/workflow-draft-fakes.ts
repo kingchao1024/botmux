@@ -24,6 +24,8 @@ export const DOC = 'cli_doc';
 export const OFFLINE = 'cli_off';
 export const STEWARD = 'cli_steward';
 export const PI = 'cli_pi';
+/** The default dir every fake orchestrator has unless a test says otherwise. */
+export const DEFAULT_PROJECT = '/work/main-repo';
 
 export const BOTS = [
   { larkAppId: MAIN, larkAppSecret: 's-main', name: 'main', cliId: 'claude-code' },
@@ -82,12 +84,15 @@ export function fakeArchitect() {
   const calls: RunArchitectInput[] = [];
   let mode: 'ok' | 'fail' | 'hang' = 'ok';
   let nodes: unknown[] = DAG_NODES;
+  /** Called with the attempt dir before the fake worker answers (to leave logs). */
+  let onRun: ((attemptDir: string) => void) | undefined;
   const run: ArchitectDeps['runArchitect'] = async (input) => {
     calls.push(input);
     return runArchitect({
       ...input,
       runNode: async (req) => {
         const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH]!;
+        onRun?.(req.attemptDir);
         if (mode === 'hang') {
           await new Promise<void>((resolve) => {
             if (req.cancelSignal?.aborted) return resolve();
@@ -110,6 +115,7 @@ export function fakeArchitect() {
     calls,
     set mode(next: 'ok' | 'fail' | 'hang') { mode = next; },
     set nodes(next: unknown[]) { nodes = next; },
+    set onRun(next: ((attemptDir: string) => void) | undefined) { onRun = next; },
   };
 }
 
@@ -121,8 +127,13 @@ export function fakeClarifier() {
   const turns = new Map<string, { sessionId: string; result: DraftClarifyResult }>();
   const suspended: string[] = [];
   const order: string[] = [];
+  const controls = { createError: undefined as string | undefined, closeError: undefined as string | undefined, creates: 0, closes: [] as string[] };
+  const createInputs: Array<Parameters<DraftClarifier['create']>[0]> = [];
   const clarifier: DraftClarifier = {
-    async create() {
+    async create(input) {
+      controls.creates += 1;
+      createInputs.push(input);
+      if (controls.createError) return { ok: false, error: controls.createError };
       n += 1;
       const sessionId = `sess-${n}`;
       sessions.set(sessionId, { headlessId: `hl_draft_${String(n).padStart(8, '0')}`, prompts: [], closed: false, gone: false });
@@ -148,6 +159,8 @@ export function fakeClarifier() {
       return true;
     },
     async close({ sessionId }) {
+      if (controls.closeError) throw new Error(controls.closeError);
+      controls.closes.push(sessionId);
       const session = sessions.get(sessionId);
       if (session) session.closed = true;
     },
@@ -164,6 +177,25 @@ export function fakeClarifier() {
     },
     /** The session disappears (e.g. its record was lost). */
     lose(sessionId: string) { sessions.get(sessionId)!.gone = true; },
+    /** End the latest running turn with exactly this result (e.g. what the
+     *  production clarifier made of a real trigger result). */
+    settle(result: DraftClarifyResult) {
+      const triggerId = order[order.length - 1]!;
+      turns.get(triggerId)!.result = result;
+    },
+    /** Fail the latest running turn as the worker reports it. */
+    fail(errorCode?: string, error?: string) {
+      const triggerId = order[order.length - 1]!;
+      turns.get(triggerId)!.result = { state: 'failed', ...(error ? { error } : {}), ...(errorCode ? { errorCode } : {}) };
+    },
+    /** create() answers this error (undefined: works again). */
+    set createError(value: string | undefined) { controls.createError = value; },
+    /** close() throws this (undefined: works again). */
+    set closeError(value: string | undefined) { controls.closeError = value; },
+    get creates() { return controls.creates; },
+    /** What each create() was asked for (bot, title, working dir), in order. */
+    get createInputs() { return createInputs; },
+    get closes() { return controls.closes; },
   };
 }
 
@@ -199,6 +231,7 @@ export function makeService(baseDir: string, overrides: Partial<WorkflowDraftSer
     nameOf: () => (appId) => NAMES[appId] ?? appId,
     isDaemonOnline: (appId) => online.has(appId),
     clarifier: clarify.clarifier,
+    projects: { defaultDir: () => DEFAULT_PROJECT, candidates: () => [] },
     runArchitect: architect.run,
     randomSuffix: () => (suffix += 1).toString(16).padStart(8, '0'),
     ...overrides,

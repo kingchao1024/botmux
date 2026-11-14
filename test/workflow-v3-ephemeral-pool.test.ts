@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -44,12 +45,17 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 
 let dir: string;
+const originalDataDir = config.session.dataDir;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
+  config.session.dataDir = join(dir, 'data');
+  vi.stubEnv('SESSION_DATA_DIR', config.session.dataDir);
 });
 
 afterEach(async () => {
+  config.session.dataDir = originalDataDir;
+  vi.unstubAllEnvs();
   // The pool deliberately fire-and-forgets its diagnostic log writes
   // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
   // the attempt dir). A straggler landing after runNode resolves can RECREATE
@@ -409,6 +415,160 @@ describe('v3 ephemeral pool', () => {
     expect(worker.init?.wrapperCli).toBe('wrapper codex');
     worker.emitExit(0);
     await promise;
+  });
+
+  it('passes a goal-scoped Codex runtime to worker init and attests the observed runtime', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'xhigh';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-verifier',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init).toMatchObject({
+      cliId: 'codex',
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'xhigh',
+      cliInstanceBinding: { source: 'goal', codexHome: '/private/codex-verifier' },
+    });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'ok',
+      runtime: {
+        cliId: 'codex',
+        source: 'worker-active-runtime',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'xhigh',
+        codexHome: '/private/codex-verifier',
+      },
+    });
+  });
+
+  it('fails a goal-scoped Codex run when the worker reports a different runtime', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'high';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-repairer',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      error: { code: 'GOAL_RUNTIME_MISMATCH', message: expect.stringContaining('gpt-5.6-sol/high') },
+      runtime: { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    });
+  });
+
+  function goalBoundRun(worker: ScriptedWorker) {
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'xhigh';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-goal',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+    return pool.runNode(req);
+  }
+
+  it('fails an otherwise successful goal-scoped Codex run that never attested its runtime', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    const result = await promise;
+    expect(result).toMatchObject({ status: 'fail', error: { code: 'GOAL_RUNTIME_UNVERIFIED' } });
+    expect(result.runtime).toBeUndefined();
+  });
+
+  it('fails a goal-scoped Codex run whose observed reasoning effort differs', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-6.1-sol', reasoningEffort: 'medium' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      error: { code: 'GOAL_RUNTIME_MISMATCH', message: expect.stringContaining('gpt-6.1-sol/medium') },
+    });
+  });
+
+  it('keeps a goal-scoped worker failure instead of reporting it as an unverified runtime', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'error', message: 'Codex instance routing does not support sandbox/readIsolation' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(1);
+
+    const result = await promise;
+    expect(result.status).toBe('fail');
+    expect(result.error).toBeUndefined();
   });
 
   it('does not carry the PM2 graceful-exit sentinel into the ephemeral worker env', async () => {
@@ -1172,6 +1332,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly rawInputs: string[] = [];
   readonly autoReadyAfterInit: boolean;
   init: any;
+  private contractScope?: WorkerSessionEventScope;
   readyEmitted = false;
   private initResolve?: () => void;
   private initPromise = new Promise<void>((resolve) => { this.initResolve = resolve; });
@@ -1184,6 +1345,14 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   send(msg: unknown): void {
     if ((msg as any)?.type === 'init' && !this.init) {
       this.init = msg;
+      const contract = (msg as any).sessionContract;
+      if (contract) {
+        this.contractScope = new WorkerSessionEventScope(contract.session, contract.worker);
+        const binding = this.contractScope.beginRuntime();
+        this.contractScope.enterRuntime(binding);
+        this.emitMessage({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+        this.emitMessage({ type: 'runtime_binding', bindingId: binding.bindingId, identity: { backend: 'tmux', physicalId: 'fake-worker', proof: 'opaque' } });
+      }
       this.initResolve?.();
       if (this.autoReadyAfterInit) {
         setImmediate(() => {
@@ -1192,6 +1361,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
         });
       }
     }
+    if ((msg as any)?.type === 'runtime_contract_assigned') this.contractScope?.assign((msg as any).bindingId, (msg as any).runtime);
     if ((msg as any)?.type === 'raw_input') {
       this.rawInputs.push((msg as any).content);
     }
@@ -1206,7 +1376,8 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   }
 
   emitMessage(msg: unknown): void {
-    this.emit('message', msg);
+    const binding = this.contractScope?.currentBinding();
+    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
   }
 
   emitExit(code: number | null): void {

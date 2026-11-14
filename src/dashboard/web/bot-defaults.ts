@@ -29,6 +29,7 @@ export const BOT_DEFAULTS_TAB_LABEL_KEYS: Readonly<Record<BotDefaultsTab, string
 };
 
 export function parseBotDefaultsTab(value: string | null | undefined): BotDefaultsTab | null {
+  if (value === 'oncall') return 'cards';
   return value && (BOT_DEFAULTS_TABS as readonly string[]).includes(value) ? value as BotDefaultsTab : null;
 }
 
@@ -89,7 +90,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionSessionMode',
     fieldKeys: [
       'botDefaults.groupP2p', 'botDefaults.groupRegular', 'botDefaults.groupMention', 'botDefaults.sgTag',
-      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.sgTagAuthPasteLabel',
+      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.chatManagerSharedTopicTitle', 'botDefaults.groupSecretaryTitle', 'botDefaults.sgTagAuthPasteLabel',
       'botDefaults.sgTagName', 'botDefaults.sgClosedTagName',
     ],
   },
@@ -98,7 +99,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'steward',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
-    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardGuide'],
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardTaskHints', 'botDefaults.stewardGuide'],
   },
   {
     id: 'substitute',
@@ -108,6 +109,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.substituteEnabled', 'botDefaults.substituteTargets', 'botDefaults.substituteChats',
       'botDefaults.substituteExcludedChats', 'botDefaults.substituteReplyMode', 'botDefaults.substituteDisclosure',
       'botDefaults.substituteControlCard', 'botDefaults.substituteTopicGroups', 'botDefaults.substituteTopicActive',
+      'botDefaults.substituteKeywords',
     ],
   },
   {
@@ -121,6 +123,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   },
   { id: 'cross-bot', tab: 'sessions', titleKey: 'botDefaults.sectionCrossBot', fieldKeys: ['botDefaults.botToBotSameDir'] },
   { id: 'session-cap', tab: 'sessions', titleKey: 'botDefaults.sectionSessionCap', fieldKeys: ['botDefaults.maxLiveWorkers', 'botDefaults.idleSuspendMinutes'] },
+  // codex / codex-app（或留有显式覆盖的 Bot）才渲染，见 codexArchiveSectionVisible；覆盖全局 sessionCleanup.archiveCodex。
+  { id: 'codex-archive', tab: 'sessions', titleKey: 'botDefaults.sectionCodexArchive', fieldKeys: ['botDefaults.archiveCodexLabel'] },
   { id: 'prompt-cache', tab: 'sessions', titleKey: 'botDefaults.sectionPromptCache', fieldKeys: [
       'promptCache.ttl', 'promptCache.keepalive', 'promptCache.idleMinutes', 'promptCache.maxPings',
       'promptCache.activeHours', 'promptCache.minContextTokens',
@@ -157,7 +161,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'cards',
     titleKey: 'botDefaults.sectionCard',
     fieldKeys: [
-      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.pinStreamingCard',
+      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
       'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
@@ -181,8 +185,10 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.replyStyleColor', 'botDefaults.replyStyleTag', 'botDefaults.replyStyleCustomTag',
     ],
   },
+  { id: 'local-address', tab: 'cards', titleKey: 'botDefaults.sectionLocalAddress', fieldKeys: ['botDefaults.hideLocalAddresses'] },
   { id: 'ask-option-layout', tab: 'cards', titleKey: 'botDefaults.sectionAskOptionLayout' },
   { id: 'brand', tab: 'cards', titleKey: 'botDefaults.sectionBrand', fieldKeys: ['botDefaults.brandLabel'] },
+  { id: 'oncall', tab: 'cards', titleKey: 'botDefaults.sectionOncall' },
   { id: 'backend', tab: 'advanced', titleKey: 'botDefaults.sectionBackend', fieldKeys: ['botDefaults.backendLabel'] },
   {
     id: 'herdr',
@@ -242,6 +248,26 @@ export function findBotDefaultsSection(id: string | null | undefined): BotDefaul
  * `#/bot-defaults?bot=<appId>&tab=<分类>&section=<区块>&field=<配置项>` 深链；都不给就是 Bot 配置页本身。
  * 给了区块就不必再给分类，页面按区块所在的分类切过去。
  */
+/** 为什么这个 Bot 的会话不会做 Codex 原生归档（与 daemon 侧 ownedLocalCodex 的 Bot 级条件对齐）；
+ *  null = 会按本设置归档。只用于提示，不拦保存：显式值仍作用于切换前启动、尚未关闭的旧会话。 */
+export type CodexArchiveInapplicable = 'not-codex' | 'wrapper' | 'scratch' | 'backend';
+
+export function codexArchiveInapplicableReason(
+  bot: Pick<BotDefaultsRow, 'cliId' | 'wrapperCli' | 'effectiveSandboxMode' | 'sandboxMode' | 'sandbox' | 'backendType' | 'defaultBackendType'>,
+): CodexArchiveInapplicable | null {
+  if (bot.cliId !== 'codex' && bot.cliId !== 'codex-app') return 'not-codex';
+  if (bot.wrapperCli) return 'wrapper';
+  if ((bot.effectiveSandboxMode ?? bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off')) === 'scratch') return 'scratch';
+  const backend = bot.backendType || bot.defaultBackendType;
+  if (backend && backend !== 'pty' && backend !== 'tmux') return 'backend';
+  return null;
+}
+
+/** Codex Bot 总是显示；其它 CLI 只在还留着显式覆盖时显示，保证残留值看得见、清得掉。 */
+export function codexArchiveSectionVisible(bot: Pick<BotDefaultsRow, 'cliId' | 'archiveCodex'>): boolean {
+  return bot.cliId === 'codex' || bot.cliId === 'codex-app' || typeof bot.archiveCodex === 'boolean';
+}
+
 export function botDefaultsHref(target: { bot?: string; tab?: BotDefaultsTab; section?: string; field?: string } = {}): string {
   const params = new URLSearchParams();
   if (target.bot) params.set('bot', target.bot);
@@ -291,6 +317,7 @@ export type NativeSubagentRuntimePolicy = {
 };
 
 export type BotSubstituteTarget = {
+  appId?: string;
   openId?: string;
   userId?: string;
   unionId?: string;
@@ -302,6 +329,7 @@ export type BotSubstituteTarget = {
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
+  keywords?: string[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
   excludedChats?: string[];
@@ -390,6 +418,10 @@ export type BotDefaultsRow = {
    *  (null: older daemon). Advice only; never blocks saving. */
   scratchCapability?: ScratchCapability | null;
   codexAuthSync?: 'shared' | 'isolated';
+  /** Per-bot override of the global close/cleanup Codex archive switch; null = inherit. */
+  archiveCodex?: boolean | null;
+  /** Current global `sessionCleanup.archiveCodex`, shown on the inherit option. */
+  archiveCodexDefault?: boolean;
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).
    *  gitHost / gitTokenExchangeUrl have no editor in the UI — they round-trip
@@ -450,6 +482,7 @@ export type BotDefaultsRow = {
   codexBrowser?: boolean;
   codexBrowserAutoApproveOrigins?: boolean;
   writableTerminalLinkInCard?: boolean;
+  goalStatusCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
@@ -458,10 +491,13 @@ export type BotDefaultsRow = {
   /** Show tool calls/commands/results in unified reply cards. Default ON;
    *  only meaningful for replyCardMode 'unified'. */
   replyCardShowTools?: boolean;
+  replyCardNativeCot?: boolean;
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
   senderTagHideEmail?: boolean;
+  /** Keep development-host addresses out of Lark replies. Default off. */
+  hideLocalAddresses?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   quotaFallbackBot?: {
@@ -522,6 +558,7 @@ export type BotDefaultsRow = {
   } | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
+  defaultPassthroughCommands?: string[];
   canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
@@ -541,6 +578,8 @@ export type BotDefaultsRow = {
   groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
   chatManagerEnabled?: boolean;
+  chatManagerSharedTopic?: boolean;
+  groupSecretaryEnabled?: boolean;
   autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
@@ -801,6 +840,7 @@ export async function fetchBotDefaults(): Promise<LoadBotsResult> {
 export type SubstituteTargetResolution = {
   input?: string;
   ok?: boolean;
+  appId?: string;
   openId?: string;
   name?: string;
   avatarUrl?: string;

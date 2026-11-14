@@ -11,11 +11,13 @@ import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-tar
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
+import { readProjectGroup } from '../src/services/project-group-store.js';
 
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { drainTraexRollout } from '../src/services/traex-transcript.js';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
+import { dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
 import {
   isDispatchOriginNotSendableError,
@@ -65,11 +67,24 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     dispatchUserForTurn: vi.fn(async () => undefined),
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
     fallbackTurnId, frozenReplyContextForTurn,
-    authorityForDispatch, scheduleCreateCapabilities, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
+    authorityForDispatch, scheduleCreateCapabilities, dispatchCallerFromReply, dispatchOnlyToolsForTurn,
+    pickTurnReplyTarget: () => undefined,
     matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
+    readProjectGroup,
+    // Daemon-local helpers the merged delivery route references; the fixture keeps
+    // them inert unless a case opts into the task-control path.
+    daemonProjectTaskControlCanaryFence: () => undefined,
+    taskControlProviderAttemptCoordinates: () => ({
+      wallTime: '2026-09-30T00:00:00.000Z', bootId: 'boot-1',
+      processStartIdentity: 'process-start-1', monotonicMs: 60_000,
+    }),
+    deliverProjectTaskControlKickoff: vi.fn(async () => ({ state: 'delivered', messageId: 'om_kickoff' })),
+    resolveTargetAppOpenId: vi.fn(async () => ({ status: 'resolved', openId: 'ou_alice' })),
+    inheritWorkflowDelegation: vi.fn(async () => ({ inherit: false, workflow: undefined })),
+    v3DefaultBaseDir: () => '/runs',
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };
@@ -90,6 +105,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
   const released = Symbol('released');
   const release = vi.fn(() => { throw released; });
   const scope = {
+    workerSessionEventScope: undefined,
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
     idleDetector: { isStartupPending: () => false, reset: vi.fn(), isReadyEvidenceWeak: () => false },
@@ -97,7 +113,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     traexQuotaPending: quotaPending,
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
-    stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,
+    stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false, cliSubmissionInFlight: null,
     // This fixture exercises lifecycle/delegation, not a live process tree.
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),
@@ -105,6 +121,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
+    backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredRejectedReadyEvidenceGeneration: undefined, log: vi.fn(),
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
     // These cases all run AFTER the first prompt was admitted
@@ -130,6 +147,90 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
 }
 
 describe('dispatch user IPC end-to-end identity binding', () => {
+  const dispatchOnly = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_target'] };
+  const restrictSource = (h: ReturnType<typeof harness>) => {
+    h.scope.getBot = () => ({ config: { triggerUserAuth: {
+      enabled: true, tools: ['lark-cli'], dispatchOnly,
+    } } });
+  };
+  it('signs the direct sender for one allowed dispatch without changing the source CLI policy', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    restrictSource(h);
+    expect((await h.run()).status).toBe(200);
+    expect((await read())?.authority).toMatchObject({
+      appId: 'cli_source', openId: 'ou_alice', unionId: 'on_alice', tools: ['lark-cli', 'bytedcli'],
+    });
+  });
+  it('keeps the human tool grant when an automatic schedule grant also matches', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    restrictSource(h);
+    h.scope.getDashboardAdminOpenIds = () => [];
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
+      defaultOnDispatchFromBotAppIds: ['cli_source'], runScopes: ['bytedcli'],
+      botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+        chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }],
+    } });
+    expect((await h.run()).status).toBe(200);
+    expect((await read())?.authority).toMatchObject({ openId: 'ou_alice', unionId: 'on_alice',
+      tools: ['lark-cli', 'bytedcli'] });
+    expect(scheduleCreateCapabilities((await read())!.authority)).toEqual([]);
+  });
+  it('keeps an administrator\'s default schedule grant alongside dispatch-only tools', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    h.scope.getBot = () => ({ config: { triggerUserAuth: {
+      enabled: true, tools: [], dispatchOnly,
+    } } });
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      createEnabled: true, defaultOnDispatchFromBotAppIds: ['cli_source'],
+    } });
+    expect((await h.run()).status).toBe(200);
+    const authority = (await read())?.authority;
+    expect(authority).toMatchObject({ openId: 'ou_alice', tools: ['bytedcli'] });
+    expect(scheduleCreateCapabilities(authority!)).toEqual([
+      expect.objectContaining({ action: 'schedule:create', targetAppId: 'cli_target' }),
+    ]);
+  });
+  it.each(['source-chat', 'target-chat', 'target-app', 'mixed-target', 'bot', 'recovered-caller', 'inherited'])(
+    'does not add dispatch-only credentials for %s', async scenario => {
+      const h = harness();
+      h.ds.chatId = 'oc_target';
+      restrictSource(h);
+      if (scenario === 'source-chat') h.ds.chatId = 'oc_other';
+      if (scenario === 'target-chat') h.body.chatId = 'oc_other';
+      if (scenario === 'target-app') h.body.targetAppIds = ['cli_other'];
+      if (scenario === 'mixed-target') h.body.targetAppIds = ['cli_target', 'cli_other'];
+      if (scenario === 'bot') h.ds.activeInteractiveTurn.caller = {
+        senderType: 'bot', requestLarkAppId: 'cli_source',
+      };
+      if (scenario === 'recovered-caller') h.ds.session.failedTurnRecovery = {
+        turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' },
+      };
+      if (scenario === 'inherited') h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+        appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['lark-cli'],
+      } }));
+      h.scope.lookupMessageChatId = vi.fn(async () => h.body.chatId);
+      expect((await h.run()).status).toBe(200);
+      const signed = await resolveDispatchUser({ dataDir, secret,
+        appId: h.body.targetAppIds[0], chatId: h.body.chatId, rootId: 'om_root',
+        turnId: 'om_kickoff', waitMs: 0 });
+      if (scenario === 'bot' || scenario === 'recovered-caller') expect(signed).toBeUndefined();
+      else expect(signed?.authority.tools).toEqual(['lark-cli']);
+    });
+  it('does not add dispatch-only credentials when the shared chat is outside the chatIds allowlist', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_other_group';
+    h.body.chatId = 'oc_other_group';
+    restrictSource(h);
+    h.scope.lookupMessageChatId = vi.fn(async () => 'oc_other_group');
+    expect((await h.run()).status).toBe(200);
+    const signed = await resolveDispatchUser({ dataDir, secret,
+      appId: h.body.targetAppIds[0], chatId: 'oc_other_group', rootId: 'om_root',
+      turnId: 'om_kickoff', waitMs: 0 });
+    expect(signed?.authority.tools).toEqual(['lark-cli']);
+  });
   it.each(['completed', 'failed', 'aborted'] as const)('keeps TRAE human delegation through transient screen-idle until %s', async outcome => {
     const h = harness({}, true); // sandbox off: host IPC authentication is available
     const path = join(dataDir, 'rollout.jsonl');

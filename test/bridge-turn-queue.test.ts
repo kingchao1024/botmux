@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, isHeldPendingMark, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -1214,6 +1214,39 @@ describe('BridgeTurnQueue', () => {
       expect(q.size()).toBe(0);
     });
 
+    it('an API error that ends the host turn keeps its text, and the absorbed turn ends with the same error', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'second request while busy';
+      const text = 'API Error: 403 {"error":{"type":"permission_error","message":"Access denied for model x"}}';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', 'first request'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        {
+          type: 'assistant', uuid: 'a-403', isApiErrorMessage: true, error: 'authentication_failed', apiErrorStatus: 403,
+          message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text }] },
+        } as TranscriptEvent,
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => [t.turnId, t.terminalOutcome?.status, t.terminalErrorDetail])).toEqual([
+        ['tA', 'failed', text],
+        ['tB', 'failed', text],
+      ]);
+    });
+
+    it('a completed turn carries no error text', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('hi'), 100, normaliseForFingerprint('hi'), 1);
+      q.ingest([user('uA', 'hi'), assistant('a-final', 'hello'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent]);
+      const [turn] = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(turn).toMatchObject({ turnId: 'tA', terminalOutcome: { status: 'completed' } });
+      expect(turn!.terminalErrorDetail).toBeUndefined();
+    });
+
     it('absorbed input stays queued until its host turn closes', () => {
       const q = new BridgeTurnQueue();
       const promptB = 'second request while busy';
@@ -2073,6 +2106,53 @@ describe('input held in Claude\'s own queue', () => {
     expect(q.peek().map(isHeldInCliQueue)).toEqual([true, true]);
   });
 
+  // Real sequence (transcript e13e85d1, 2026-11-05): a long step wrote nothing
+  // from 12:43:08 to 12:50:38; the enqueue of input typed at 12:46:53 first
+  // appeared at 12:50:38 next to its dequeue, after the 120 s TTL had passed.
+  function busyWith(onStart?: (id: string) => void): BridgeTurnQueue {
+    const q = new BridgeTurnQueue(undefined, undefined, turn => { onStart?.(turn.turnId); });
+    q.mark('t0', makeFingerprint('<input running>'), markAt - 60_000, normaliseForFingerprint('<input running>'));
+    q.ingest([user('u-running', '<input running>', iso(-60_000))]);
+    return q;
+  }
+
+  it('holds a mark written while an earlier turn runs, then binds the late-flushed queue records', () => {
+    const started: string[] = [];
+    const q = busyWith(id => started.push(id));
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    expect(q.pruneExpired(TTL, markAt + 220_000)).toEqual([]);
+    q.ingest([
+      queueOp('enqueue', 3_700, text),
+      queueOp('remove', 225_200, text, 'absorbed_mid_turn'),
+      absorbed('q1', text, 3_300),
+    ]);
+    expect(started).toEqual(['t0', 't1']);
+  });
+
+  it('runs the normal TTL again from the moment the earlier turn ended', () => {
+    const q = busyWith();
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    expect(q.pruneExpired(TTL, markAt + 300_000)).toEqual([]);
+    q.ingest([{ type: 'system', subtype: 'turn_duration', uuid: 'd-running' } as TranscriptEvent]);
+    expect(q.pruneExpired(TTL, markAt + 300_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 300_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('a busy-held mark uses the rare fallback-scan cadence', () => {
+    const q = busyWith();
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    expect(isHeldPendingMark(q.peek().find(t => t.turnId === 't1')!)).toBe(false);
+    q.pruneExpired(TTL, markAt + 1_000);
+    expect(isHeldPendingMark(q.peek().find(t => t.turnId === 't1')!)).toBe(true);
+  });
+
+  it('bounds the busy hold, so a lost input cannot stay pending for good', () => {
+    const q = busyWith();
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    expect(q.pruneExpired(TTL, markAt + CLI_QUEUE_HOLD_MAX_MS)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + CLI_QUEUE_HOLD_MAX_MS + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
   it('stops holding at the upper bound, so a dropped input cannot block the queue for good', () => {
     const q = marked();
     q.ingest([queueOp('enqueue', 1_000, text)]);
@@ -2201,6 +2281,47 @@ describe('input held in Claude\'s own queue', () => {
     q.ingest([queueOp('enqueue', 3_000, text), queueOp('dequeue', 3_500)]);
     expect(q.peek().map(turn => [turn.turnId, isHeldInCliQueue(turn)]))
       .toEqual([['t1', false], ['t2', false]]);
+  });
+});
+
+describe('input the worker is still writing', () => {
+  // Under tmux overload each chunk of a long first message waits on its own
+  // send-keys, so typing it can outlast the TTL that runs from the mark.
+  const TTL = 120_000;
+  const markAt = Date.parse('2026-11-07T12:30:52.000Z');
+  const text = '<user_message>a long first message typed into the composer chunk by chunk</user_message>';
+  function marked(turnId = 't1', dispatchAttempt?: number): BridgeTurnQueue {
+    const q = new BridgeTurnQueue();
+    q.mark(turnId, makeFingerprint(text), markAt, normaliseForFingerprint(text), dispatchAttempt);
+    return q;
+  }
+
+  it('keeps the mark while its write outlasts the TTL, so the submitted input still binds', () => {
+    const started: string[] = [];
+    const q = new BridgeTurnQueue(undefined, undefined, turn => { started.push(turn.turnId); });
+    q.mark('t1', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    q.holdForWrite('t1');
+    expect(q.pruneExpired(TTL, markAt + 150_000)).toEqual([]);
+    q.releaseWriteHold('t1', undefined, markAt + 155_000);
+    expect(q.pruneExpired(TTL, markAt + 156_000)).toEqual([]);
+    q.ingest([user('u1', text, new Date(markAt + 157_000).toISOString())]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it('runs the TTL from the moment the write settled', () => {
+    const q = marked();
+    q.holdForWrite('t1');
+    q.releaseWriteHold('t1', undefined, markAt + 150_000);
+    expect(q.pruneExpired(TTL, markAt + 150_000 + TTL)).toEqual([]);
+    expect(q.pruneExpired(TTL, markAt + 150_000 + TTL + 1).map(t => t.turnId)).toEqual(['t1']);
+  });
+
+  it('holds only the exact turn and attempt being written', () => {
+    const q = marked('t1', 2);
+    q.mark('t2', makeFingerprint(text), markAt, normaliseForFingerprint(text));
+    q.holdForWrite('t1', 1);
+    q.holdForWrite('t3');
+    expect(q.pruneExpired(TTL, markAt + TTL + 1).map(t => t.turnId)).toEqual(['t1', 't2']);
   });
 });
 

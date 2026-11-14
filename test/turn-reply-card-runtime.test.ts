@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
@@ -8,7 +8,10 @@ import { getBot } from '../src/bot-registry.js';
 import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, supersedeTurnReplyCard, sweepInterruptedReplyCards, queueTurnReplyTools, flushTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { MessageWithdrawnError, updateMessage, uploadFile, replyMessage, sendMessage } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
-import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+import { TurnReplyCardStore, replyCardIsTerminal } from '../src/services/turn-reply-card.js';
+import { getSession } from '../src/services/session-store.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
 import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 import type { CotEntry } from '../src/types.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
@@ -19,8 +22,12 @@ import { piBridgeSpec } from '../src/adapters/cli/pi.js';
 import { traexBridgeSpec } from '../src/adapters/cli/traex.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
+import { KimiActivityObserver } from '../src/services/kimi-cot.js';
+import { makeKimiSession, toolTurn } from './helpers/kimi-wire-fixture.js';
 
-vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
+vi.mock('../src/config.js', () => ({ config: {
+  session: { dataDir: '' }, web: { externalHost: 'localhost' }, dashboard: { externalHost: 'localhost', port: 7891 },
+} }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn(() => ({ context: null, tokens: null })) }));
 vi.mock('../src/im/lark/card-handler.js', () => ({ resolveCardOperatorUnionId: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: vi.fn(), normalizeUsageDisplay: () => 'off' }));
@@ -30,6 +37,10 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh', t: (key: string) => key }));
 vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
+vi.mock('../src/services/session-store.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/services/session-store.js')>();
+  return { ...actual, getSession: vi.fn(actual.getSession) };
+});
 
 function session(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
@@ -38,6 +49,14 @@ function session(overrides: Partial<DaemonSession> = {}): DaemonSession {
     ...overrides,
   } as DaemonSession;
 }
+
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
 
 describe('reply-card runtime eligibility and recovery', () => {
   let dir: string;
@@ -52,6 +71,204 @@ describe('reply-card runtime eligibility and recovery', () => {
     vi.mocked(observePublishedGroupMessage).mockClear();
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+
+  it('sanitizes rendered cards, patches and generated overflow while preserving raw transcript facts', async () => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_sanitized');
+    vi.mocked(uploadFile).mockReset().mockResolvedValue('file_overflow');
+    vi.mocked(replyMessage).mockReset().mockResolvedValue('om_overflow');
+    const raw = '[协作技能](/home/alice/.agents/skills/a/SKILL.md)\n/custom/project/src/main.ts:12\n' + '完整结果\n'.repeat(2_000);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: raw, source: 'bridge',
+      card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: raw }] } }) }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+    const cards = [...send.mock.calls.map(call => call[0]), ...vi.mocked(updateMessage).mock.calls.map(call => call[2])];
+    expect(cards.length).toBeGreaterThan(1);
+    for (const body of cards) {
+      expect(body).not.toContain('/home/alice/');
+      expect(body).not.toContain('/custom/project/');
+    }
+    expect(uploadFile).toHaveBeenCalledOnce();
+    const overflow = readFileSync(vi.mocked(uploadFile).mock.calls[0][1], 'utf8');
+    expect(overflow).not.toContain('/home/alice/');
+    expect(overflow).not.toContain('/custom/project/');
+    expect(overflow).toContain('src/main.ts:12');
+    const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' });
+    expect(record?.finalText).toBe(raw);
+  });
+
+  it.each(['bridge', 'explicit'] as const)('removes local addresses from a %s reply that fits in the card', async source => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_inline');
+    const raw = '见 [协作技能](/home/alice/.agents/skills/a/SKILL.md)，改动在 /custom/project/src/main.ts:12';
+    const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: raw }] } });
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: raw, source, card }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+    const cards = [...send.mock.calls.map(call => call[0]), ...vi.mocked(updateMessage).mock.calls.map(call => call[2])];
+    expect(cards.some(body => body.includes('协作技能') && body.includes('src/main.ts:12'))).toBe(true);
+    for (const body of cards) {
+      expect(body).not.toContain('/home/alice/');
+      expect(body).not.toContain('/custom/project/');
+    }
+  });
+
+  it.each(['bridge', 'explicit'] as const)('sends a %s reply with its host paths for a bot that has not turned on hideLocalAddresses', async source => {
+    const restore = setHideLocalAddressesResolver(() => false);
+    try {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_inline');
+      const raw = '见 [协作技能](/home/alice/.agents/skills/a/SKILL.md)，改动在 /custom/project/src/main.ts:12';
+      const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: raw }] } });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: raw, source, card }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      const cards = [...send.mock.calls.map(call => call[0]), ...vi.mocked(updateMessage).mock.calls.map(call => call[2])];
+      expect(cards.some(body => body.includes('[协作技能](/home/alice/.agents/skills/a/SKILL.md)')
+        && body.includes('/custom/project/src/main.ts:12'))).toBe(true);
+      for (const body of cards) expect(body).not.toContain('内部文件');
+    } finally {
+      restore();
+    }
+  });
+
+  // A model card accepted while the bot had hideLocalAddresses off keeps its
+  // link fields when the card is rendered again after the switch is turned on;
+  // prose follows the switch from then on. Otherwise the turn never settles.
+  describe('hideLocalAddresses turned on while a turn is in flight', () => {
+    const localButton = 'http://127.0.0.1:3000/report';
+    const prose = '报告见 /custom/project/out/report.html';
+    const explicitCard = JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'markdown', content: prose },
+      { tag: 'button', text: { tag: 'plain_text', content: '打开报告' }, behaviors: [{ type: 'open_url', default_url: localButton }] },
+    ] } });
+    let on = false;
+    let restore: () => void = () => {};
+    beforeEach(() => { on = false; restore = setHideLocalAddressesResolver(() => on); });
+    afterEach(() => restore());
+    const keyOf = (ds: DaemonSession) => ({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' });
+
+    it('settles the terminal update, keeping the accepted button and rewriting prose', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_card');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send);
+      on = true;
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      const record = new TurnReplyCardStore(dir).read(keyOf(ds))!;
+      expect(record).toMatchObject({ phase: 'completed', finalDelivered: true });
+      expect(record.publishPending).toBeFalsy();
+      const last = vi.mocked(updateMessage).mock.calls.at(-1)![2] as string;
+      expect(last).toContain(localButton);
+      expect(last).not.toContain('/custom/project/out');
+    });
+
+    it('lets a restart re-render the interrupted card', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_card');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send);
+      on = true;
+      const store = new TurnReplyCardStore(dir);
+      const record = store.read(keyOf(ds))!;
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(keyOf(ds))}.json`), JSON.stringify(record));
+      vi.mocked(updateMessage).mockClear();
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).toHaveBeenCalledOnce();
+      expect(vi.mocked(updateMessage).mock.calls[0]![2]).toContain(localButton);
+      expect(store.read(keyOf(ds))?.publishPending).toBeFalsy();
+    });
+
+    it('retries an unacknowledged first send after the switch is turned on during the backoff', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const uuids: string[] = [];
+      let first = true;
+      const send = vi.fn(async (_body: string, _type: string, uuid?: string) => {
+        uuids.push(uuid!);
+        if (first) {
+          first = false;
+          on = true; // turned on while the result of the first POST is unknown
+          throw new Error('socket hang up');
+        }
+        return 'om_card';
+      });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send as any);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(new Set(uuids).size).toBe(1);
+      expect(new TurnReplyCardStore(dir).read(keyOf(ds))).toMatchObject({ messageId: 'om_card', finalDelivered: true });
+    });
+  });
+
+  it.each(['disconnect', 'restart'] as const)('removes local addresses when a %s re-renders the reply card', async how => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_reply');
+    const raw = '读了 [协作技能](/home/alice/.agents/skills/a/SKILL.md)，改动在 /custom/project/src/main.ts:12';
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'progress', text: raw }, send);
+    vi.mocked(updateMessage).mockClear();
+    if (how === 'disconnect') {
+      await settleTurnReplyCards(ds);
+    } else {
+      const store = new TurnReplyCardStore(dir);
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      const record = store.read(key)!;
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+      vi.mocked(getSession).mockReturnValueOnce({ ...ds.session, workingDir: '/custom/project' } as ReturnType<typeof getSession>);
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(getSession).toHaveBeenLastCalledWith(ds.session.sessionId);
+    }
+    expect(updateMessage).toHaveBeenCalledOnce();
+    const body = vi.mocked(updateMessage).mock.calls[0][2];
+    expect(body).toContain('协作技能');
+    expect(body).not.toContain('/home/alice/');
+    expect(body).not.toContain('/custom/project/');
+    expect(body).toContain('src/main.ts:12');
+  });
+
+  it('settles an interrupted reply card when the session store is unavailable at startup', async () => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_reply');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'progress', text: '读了 /home/alice/.agents/skills/a/SKILL.md' }, send);
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+    const record = store.read(key)!;
+    record.createdAtMs = record.updatedAtMs = 1;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+    vi.mocked(updateMessage).mockClear();
+    vi.mocked(getSession).mockImplementationOnce(() => { throw new Error('session store unavailable'); });
+    await sweepInterruptedReplyCards(ds.larkAppId);
+    expect(updateMessage).toHaveBeenCalledOnce();
+    expect(vi.mocked(updateMessage).mock.calls[0][2]).not.toContain('/home/alice/');
+    expect(replyCardIsTerminal(store.read(key)!)).toBe(true);
+  });
+
+  it('removes local addresses from an overflow attachment that startup recovery sends', async () => {
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: 'app_mode', sessionId: 'sid_mode', turnId: 'om_mode' };
+    await store.prepare(key, { mode: 'unified', chatId: 'oc_mode', rootId: 'om_root' });
+    const io = {
+      render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, { canStop: true }),
+      beforeEffect: vi.fn(), isWithdrawn: () => false,
+      send: vi.fn(async () => 'om_reply'), patch: vi.fn(async () => {}),
+      sendOverflow: vi.fn(async () => { throw new Error('upload unavailable'); }),
+    };
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'progress', text: '读了 /home/alice/.agents/skills/a/SKILL.md\n' + 'Long process '.repeat(600) }, io);
+    await expect(store.update(key, { kind: 'terminal', phase: 'completed' }, io)).rejects.toThrow('upload unavailable');
+    const record = store.read(key)!;
+    record.createdAtMs = record.updatedAtMs = 1;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+    vi.mocked(uploadFile).mockReset().mockResolvedValue('file_recovered');
+    vi.mocked(replyMessage).mockReset().mockResolvedValue('om_file_recovered');
+    await sweepInterruptedReplyCards(key.larkAppId);
+    expect(uploadFile).toHaveBeenCalledOnce();
+    const overflow = readFileSync(vi.mocked(uploadFile).mock.calls[0][1], 'utf8');
+    expect(overflow).toContain('Long process');
+    expect(overflow).not.toContain('/home/alice/');
+  });
 
   it.each(['oc_mode', 'om_root'])('recovers a failed overflow with stable delivery identity for root %s', async rootId => {
     const store = new TurnReplyCardStore(dir);
@@ -145,6 +362,63 @@ describe('reply-card runtime eligibility and recovery', () => {
       expect(updateMessage).toHaveBeenCalledTimes(calls);
     },
   );
+
+  describe('host links across processes and restarts', () => {
+    const card = (link: string) => JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'done' },
+      { tag: 'button', text: { tag: 'plain_text', content: 'open' }, behaviors: [{ type: 'open_url', default_url: link }] }] } });
+    const storeIo = () => ({
+      render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, { canStop: true }),
+      beforeEffect: vi.fn(), isWithdrawn: () => false,
+      send: vi.fn(async () => 'om_reply'), patch: vi.fn(async () => {}),
+    });
+    // The mocked client stands in for Feishu's write boundary, which judges every body.
+    beforeEach(() => {
+      vi.stubEnv('HOME', dir);
+      vi.mocked(updateMessage).mockImplementation(async (appId: string, _id: string, body: string) => {
+        prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(appId));
+      });
+    });
+    afterEach(() => { (config.dashboard as any).port = 7891; vi.unstubAllEnvs(); });
+
+    it('startup replays an unacknowledged PATCH whose Dashboard link was vetted before the Dashboard moved', async () => {
+      const ds = session();
+      const store = new TurnReplyCardStore(dir);
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      await store.prepare(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
+      const link = 'http://localhost:7891/';
+      const io = storeIo();
+      await store.update(key, { kind: 'start' }, io);
+      await store.update(key, { kind: 'final', text: 'done', card: card(link), source: 'explicit' }, io);
+      io.patch.mockRejectedValueOnce(new Error('PATCH unavailable'));
+      await expect(store.update(key, { kind: 'terminal', phase: 'completed', durationMs: 1 }, io)).rejects.toThrow();
+      const record = store.read(key)!;
+      expect(record.pendingPatch?.content).toContain(link);
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+      (config.dashboard as any).port = 7892;
+      expect(() => prepareLocalAddressContent(record.pendingPatch!.content, 'interactive', localAddressContextForBot(ds.larkAppId)))
+        .toThrow(LocalAddressOutboundError);
+
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).toHaveBeenLastCalledWith(ds.larkAppId, 'om_reply', record.pendingPatch!.content,
+        { returnAcknowledgement: true });
+      expect(store.read(key)?.pendingPatch).toBeUndefined();
+    });
+
+    it('re-renders an explicit final card that a separate `botmux send` process stored with a host link', async () => {
+      const ds = session();
+      const send = vi.fn(async () => 'om_reply');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      const link = 'http://localhost:7891/workflow/app_main/run-1';
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      await new TurnReplyCardStore(dir).update(key, { kind: 'final', text: 'done', card: card(link), source: 'explicit' }, storeIo());
+      vi.mocked(updateMessage).mockClear();
+
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      expect(updateMessage).toHaveBeenCalledOnce();
+      expect(vi.mocked(updateMessage).mock.calls[0][2]).toContain(link);
+    });
+  });
 
   describe.each(['traex', 'pi'] as const)('%s transcript to reply card', cliId => {
     function harness() {
@@ -499,6 +773,17 @@ describe('reply-card runtime eligibility and recovery', () => {
       // original + one masked copy; the identical-payload retry loop is skipped.
       expect(updateMessage).toHaveBeenCalledTimes(2);
     });
+
+    it('does not retry a local jump-target rejection', async () => {
+      const ds = session();
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, async () => 'om_reply');
+      vi.mocked(updateMessage).mockClear();
+      vi.mocked(updateMessage).mockRejectedValue(new LocalAddressOutboundError());
+      await expect(updateTurnReplyCard(ds, 'om_mode', final, async () => 'unused')).rejects.toMatchObject({
+        code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED',
+      });
+      expect(updateMessage).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('does not observe a final card when its patch is withdrawn', async () => {
@@ -602,7 +887,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(patched).toContain('README.md');
   });
 
-  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
+  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     ds.session.sandbox = true;
@@ -615,7 +900,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(existsSync(new TurnReplyCardStore(dir).directory)).toBe(false);
   });
 
-  it.each(['new-bot', 'worker-sandbox', 'legacy-isolation', 'worker-isolation', 'global'] as const)(
+  it.each(['new-bot', 'worker-sandbox', 'legacy-isolation', 'worker-isolation', 'global', 'global-oncall', 'global-scratch'] as const)(
     'rejects %s isolation even with a persisted unified reservation', source => {
       const ds = session();
       new TurnReplyCardStore(dir).prepareSync({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' }, {
@@ -626,6 +911,8 @@ describe('reply-card runtime eligibility and recovery', () => {
       if (source === 'worker-sandbox') ds.initConfig = { sandbox: true } as DaemonSession['initConfig'];
       if (source === 'worker-isolation') ds.initConfig = { readIsolation: true } as DaemonSession['initConfig'];
       if (source === 'global') vi.stubEnv('BOTMUX_SANDBOX', '1');
+      if (source === 'global-oncall') vi.stubEnv('BOTMUX_SANDBOX', 'oncall');
+      if (source === 'global-scratch') vi.stubEnv('BOTMUX_SANDBOX', 'scratch');
       expect(replyCardModeFor(ds)).toBe('legacy');
     },
   );
@@ -654,7 +941,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(replyCardModeFor(legacyIsolated)).toBe('legacy');
   });
 
-  it.each(['claude-code', 'traex', 'pi'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
+  it.each(['claude-code', 'traex', 'pi', 'kimi'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     expect(replyCardModeFor(ds)).toBe('unified');
@@ -717,7 +1004,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' })?.durationMs).toBe(2500);
   });
 
-  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi'] as const)('keeps %s live narration when queued snapshots end in tool calls', async cliId => {
+  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'] as const)('keeps %s live narration when queued snapshots end in tool calls', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     const send = vi.fn(async (_body: string) => 'om_reply');
@@ -748,6 +1035,46 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(liveText()).not.toContain('NARRATION_A');
     expect(send).toHaveBeenCalledTimes(1);
     expect(vi.mocked(updateMessage).mock.calls.every(call => call[1] === 'om_reply')).toBe(true);
+  });
+
+  it('turns a Kimi wire log into one dynamic card with activity and a single explicit final', async () => {
+    const ds = session();
+    ds.session.cliId = 'kimi';
+    expect(replyCardModeFor(ds)).toBe('unified');
+    const home = mkdtempSync(join(tmpdir(), 'botmux-kimi-card-'));
+    try {
+      const marker = `<session_id>${ds.session.sessionId}</session_id>`;
+      const kimi = makeKimiSession(home, { id: 'session_k', workDir: home, lastPrompt: `${marker}\nold`, records: toolTurn(0, `${marker}\nold`) });
+      const observer = new KimiActivityObserver({
+        botmuxSessionId: ds.session.sessionId, workingDir: home, env: { KIMI_CODE_HOME: home },
+        resume: true, onEntries: () => {}, pollIntervalMs: 60_000,
+      });
+      observer.start();
+      const send = vi.fn(async (_body: string) => 'om_reply');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      kimi.append(toolTurn(1, `${marker}\ninspect`));
+      const entries = observer.drain();
+      observer.stop();
+      queueTurnReplyTools(ds, { turnId: 'om_mode', entries }, send, () => true);
+      await flushTurnReplyTools(ds, 'om_mode');
+      const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+      expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'working',
+        tools: [{ id: 'tool_a', name: 'Bash', subject: 'ls -la src', completed: true }] });
+      const live = vi.mocked(updateMessage).mock.calls.at(-1)![2];
+      expect(live).toContain('Need to look at the repo first.');
+      expect(live).toContain('**Bash** ✓ · ls -la src');
+      // The closing answer arrives once, through `botmux send` (explicit).
+      const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'FINAL_ANSWER' }] } });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: 'FINAL_ANSWER', card, source: 'explicit' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed', durationMs: 1200 }, send);
+      const done = vi.mocked(updateMessage).mock.calls.at(-1)![2];
+      expect(done.match(/FINAL_ANSWER/g)).toHaveLength(1);
+      expect(done).not.toContain('There are two files');
+      expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'completed', finalText: 'FINAL_ANSWER' });
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('uses the replacement worker sender and ownership when coalescing tool updates', async () => {

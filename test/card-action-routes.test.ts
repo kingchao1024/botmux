@@ -210,15 +210,16 @@ describe('敏感动作清单', () => {
   // 逐项钉死：漏登记 = 该动作绕过 canOperate、任何人都能点。新增 / 删除必须同步改这里。
   const EXPECTED = [
     'cleanup_session_worktree', 'close', 'compact_session', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli', 'open_local_terminal',
-    'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
+    'purge_images_continue', 'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
     'retry_last_task', 'retry_turn', 'session_effort_apply', 'session_effort_pick', 'session_model_pick', 'session_model_unpin', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
-    'toggle_display', 'toggle_idle_compact', 'toggle_stream', 'toggle_substitute', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
+    'toggle_display', 'toggle_idle_compact', 'toggle_keys_panel', 'toggle_kimi_expiry_compact', 'toggle_stream', 'toggle_substitute', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];
 
-  it('清单逐项一致（含工作目录恢复卡的重建 worktree）', () => {
+  it('清单逐项一致（含工作目录恢复卡和 purge_images_continue）', () => {
     expect([...SENSITIVE_CARD_ACTIONS.keys()].sort()).toEqual(EXPECTED);
+    expect(SENSITIVE_CARD_ACTIONS.size).toBe(EXPECTED.length);
   });
 
   it('wf_approve / wf_reject / wf_cancel 仍过权限门（墓碑排在这道门之后）', () => {
@@ -231,7 +232,7 @@ describe('敏感动作清单', () => {
     }
   });
 
-  it('拒绝时给 toast 的只有「取权 / 打开」类动作、闲置自动压缩开关和关闭卡的清理 worktree，key 与原实现一致', () => {
+  it('拒绝时给 toast 的只有「取权 / 打开」类动作、两个自动压缩开关和关闭卡的清理 worktree，key 与原实现一致', () => {
     const withToast = [...SENSITIVE_CARD_ACTIONS].filter(([, m]) => m.denyToastKey).map(([a, m]) => [a, m.denyToastKey]);
     expect(withToast.sort()).toEqual([
       ['cleanup_session_worktree', 'card.worktree_cleanup.no_permission'],
@@ -239,6 +240,7 @@ describe('敏感动作清单', () => {
       ['open_local_cli', 'card.action.local_cli_no_permission'],
       ['open_local_terminal', 'card.action.local_terminal_no_permission'],
       ['toggle_idle_compact', 'card.idle_compact.no_permission'],
+      ['toggle_kimi_expiry_compact', 'card.kimi_expiry_compact.no_permission'],
       ['toggle_substitute', 'cmd.substitute.owner_only'],
     ]);
   });

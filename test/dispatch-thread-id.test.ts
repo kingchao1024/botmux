@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
   buildRepoPrimeText, parseDispatchBotSpec, partitionProjectDispatchRoles, resolveSendTarget } from '../src/core/dispatch.js';
@@ -13,7 +14,8 @@ import { normalizeDispatchWriteScopes } from '../src/core/dispatch-write-scope.j
 function extract(path: string, names: string[]): string {
   const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
   return names.map(name => {
-    const declaration = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+    const declaration = source.statements.find(node =>
+      (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === name);
     if (!declaration) throw new Error('Missing function: ' + name);
     return ts.transpileModule(declaration.getText(source).replace(/^export /, ''), {
       compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
@@ -41,6 +43,7 @@ function harness(mode: Mode, options: {
   registrationFailure?: 'commit';
   taskControlKickoffState?: 'delivered' | 'pending' | 'ambiguous' | 'permanent_reject_before_send';
   taskTreeCardEnabled?: boolean;
+  resolveBotApps?: (receiver: string, chatId: string, appIds: string[]) => Promise<unknown>;
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
   const stdout: string[] = [];
@@ -116,7 +119,7 @@ function harness(mode: Mode, options: {
   const state = {
     parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
     buildRepoPrimeText, parseDispatchBotSpec, partitionProjectDispatchRoles, normalizeDispatchWriteScopes,
-    resolveSendTarget, pickTurnReplyTarget,
+    resolveSendTarget, pickTurnReplyTarget, isSilentMessageListenerSession, messageListenerSendBlocked,
     resolveSessionContext: () => undefined,
     process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
       exit: (code: number) => { throw new Error('exit:' + code + '\n' + stderr.join('\n')); } },
@@ -132,6 +135,9 @@ function harness(mode: Mode, options: {
     // pre-card shape (no attemptAt, no /dispatch-tree IPC). An explicit
     // taskTreeCardEnabled:true exercises the on path.
     isDispatchTaskTreeCardEnabled: () => options.taskTreeCardEnabled === true,
+    // Extracted cmdDispatch checks for a group-secretary patrol turn; these
+    // harness turns are ordinary bot turns, so no patrol root applies.
+    parseSecretaryPatrolRoot: () => undefined,
     loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     requireSessionById: async (sid: string) => ({
       sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',
@@ -160,12 +166,12 @@ function harness(mode: Mode, options: {
       };
       if (path === './im/lark/client.js') return {
         getMessageThreadId, replyMessage,
-        resolveCurrentChatBotOpenIdsByLarkAppIds: async () => ({
+        resolveCurrentChatBotOpenIdsByLarkAppIds: options.resolveBotApps ?? (async () => ({
           ok: true, mappings: [
             { larkAppId: 'cli_target', subjectOpenId: 'ou_target' },
             { larkAppId: 'cli_reviewer', subjectOpenId: 'ou_reviewer' },
           ],
-        }),
+        })),
       };
       if (path === './core/role-resolver.js') return { readRoleDispatchCompletionEnabled: () => false };
       throw new Error('Unexpected import: ' + path);
@@ -174,7 +180,7 @@ function harness(mode: Mode, options: {
   const command = new Function('state', 'with (state) { ' + cliCode + '; return cmdDispatch; }')(state);
   const args = ['--session-id', 'source', ...(options.projectMode && options.access === 'write'
     ? ['--bot-app', 'cli_target:worker', '--bot-app', 'cli_reviewer:reviewer']
-    : options.acceptance ? ['--bot-app', 'cli_target'] : ['--bot', 'ou_target'])];
+    : options.acceptance || options.resolveBotApps ? ['--bot-app', 'cli_target'] : ['--bot', 'ou_target'])];
   if (mode === 'into') args.push('--into', root, '--brief', '完成任务');
   else if (mode === 'standby') args.push('--title', '任务', '--repo', '/repo', '--standby');
   else args.push('--title', '任务', '--brief', '完成任务');
@@ -397,4 +403,45 @@ it('fails a committed audit-only dispatch only on a permanent pre-send rejection
   expect(h.state.trySyncProjectDispatch).toHaveBeenCalledWith(expect.objectContaining({
     action: { action: 'fail_dispatch', dispatchRoot: h.root, reason: 'dispatch delivery failed' },
   }));
+});
+describe('dispatch --bot-app live membership failures', () => {
+  // 真实的严格解析器，只替换 larkGet 与本机 Bot 配置。
+  function liveResolver(larkGet: (client: { appId: string }, url: string) => Promise<unknown>) {
+    const code = extract('src/im/lark/client.ts',
+      ['LarkCallTimeoutError', 'promiseWithTimeout', 'listChatBotsViaMembersBots', 'resolveCurrentChatBotOpenIdsByLarkAppIds']);
+    const client = (appId: string) => ({ appId });
+    const scope = {
+      config: { chatBotDiscovery: { listBotsApiTimeoutMs: 20 }, session: { dataDir: '/isolated/data' } },
+      getBotClient: client,
+      getAllBotClients: () => ['cli_source', 'cli_target'].map(appId => ({ appId, client: client(appId) })),
+      readFileSync: () => JSON.stringify([{ larkAppId: 'cli_target', botName: 'Target' }]),
+      join: (...parts: string[]) => parts.join('/'),
+      larkGet,
+    };
+    return new Function('scope', 'with (scope) { ' + code + '; return resolveCurrentChatBotOpenIdsByLarkAppIds; }')(scope);
+  }
+  const hang = () => new Promise<never>(() => {});
+  const liveRows = async () => ({ code: 0, data: { items: [{ bot_id: 'ou_target', bot_name: 'Target' }] } });
+
+  it.each([
+    ['/members/bots', (_c: { appId: string }, url: string) => (url.endsWith('/members/bots') ? hang() : liveRows())],
+    ['is_in_chat', (_c: { appId: string }, url: string) => (url.endsWith('/members/bots') ? liveRows() : hang())],
+  ])('names the timeout env var when %s is slower than the deadline', async (_label, larkGet) => {
+    const h = harness('dispatch', { resolveBotApps: liveResolver(larkGet) });
+    await expect(h.run()).rejects.toThrow('exit:1');
+    expect(h.stderr.join('\n')).toContain('BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS');
+    expect(h.replyMessage).not.toHaveBeenCalled();
+    expect(h.postCurrentSessionDaemonRoute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { code: 99991672, msg: 'permission denied' },
+    { code: 232011, msg: 'upstream timed out after 20ms' },
+  ])('does not suggest the timeout env var for Feishu business error $code', async body => {
+    const h = harness('dispatch', { resolveBotApps: liveResolver(async () => body) });
+    await expect(h.run()).rejects.toThrow('exit:1');
+    const stderr = h.stderr.join('\n');
+    expect(stderr).toContain(String(body.code));
+    expect(stderr).not.toContain('BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS');
+  });
 });

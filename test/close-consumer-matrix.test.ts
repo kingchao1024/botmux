@@ -137,6 +137,11 @@ const CONSUMERS: Record<string, Rule> = {
   },
 
   // ── background: no UI, so refusal/residual must be logged ────────────────
+  'core/dismiss-command.ts::closeSessionsInGoneChat::closeSession': {
+    category: 'background',
+    why: 'The chat was disbanded or the bot was removed, so there is no surface left to report to; '
+      + 'a refusal or residual is logged per session and never counted as closed.',
+  },
   'core/session-manager.ts::closeActiveSessionIfCliMismatch::closeSession': {
     category: 'background',
     why: 'Returns close_failed / closed_with_residual to the sweep; a refusal is '
@@ -212,6 +217,19 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Admission failure cleanup; wrapper logs both.',
     count: 4,
+  },
+  'daemon.ts::closePatrolSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Group-secretary patrol cleanup: only a session the patrol itself created, '
+      + 'with no human activity during the round, is closed after its ledger is written; '
+      + 'nobody is waiting on it, the wrapper logs refusal and residual, and the next '
+      + 'patrol re-opens a fresh session from the ledger.',
+  },
+  'daemon.ts::handleThreadReplyAdmitted::closeSession': {
+    category: 'user_surface',
+    why: '`@session fresh` (dispatch --into --session-mode fresh) on a live topic session: a refusal '
+      + 'keeps the session and replies error + remote taskId in the topic; a residual is replied with '
+      + 'describeCloseResidual before the fresh session starts (topic-session-continuity).',
   },
   'daemon.ts::closeSession::closeSessionForBackgroundCleanup': {
     category: 'background',

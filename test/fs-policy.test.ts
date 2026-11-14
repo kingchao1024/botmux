@@ -465,6 +465,9 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-port').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin/x').access).toBe('readOnly');
+    // Dedicated lead-only guard plugin: must be readable or a sandboxed lead-only session
+    // silently loads no PreToolUse hook and Bash stays unrestricted (same grant as the shared dir).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin-lead-only/hooks/hooks.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/cursor-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/omp-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/x').access).toBe('readOnly');
@@ -2225,6 +2228,16 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false }));
     expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access)
       .not.toBe('readOnly');
+  });
+  it('grants a verified headless tool only its current session identity read-only', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false, larkToolIdentityEnabled: true }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-tool-binding.json`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/bytedcli.env`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/.data/lark-tool-binding.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dataDir}/user-token-other.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config.json').access).toBe('deny');
+    expect(p.rules.some(r => r.path === `${dataDir}/cli-identity`)).toBe(false);
   });
 });
 

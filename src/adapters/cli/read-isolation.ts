@@ -230,7 +230,9 @@ export interface CredentialIsolationContext {
   homeDir: string;
   botmuxHome: string;
   defaultBotmuxHome?: string;
-  sessionDataDir: string;
+  /** Active data root when the caller knows it; legacy callers omit it and the
+   *  default root alone is masked. */
+  sessionDataDir?: string;
 }
 
 export interface AskAuthorityActivationPaths {
@@ -250,9 +252,10 @@ export function askAuthorityActivationPaths(
   const botmuxHome = ctx.botmuxHome.replace(/\/+$/, '');
   const defaultBotmuxHome = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
   const roots = dedupe([defaultBotmuxHome, botmuxHome]);
+  const sessionDataRoot = ctx.sessionDataDir?.replace(/\/+$/, '');
   const dataRoots = dedupe([
     `${defaultBotmuxHome}/data`,
-    ctx.sessionDataDir.replace(/\/+$/, ''),
+    ...(sessionDataRoot ? [sessionDataRoot] : []),
   ]);
   return {
     signingKeys: roots.map(askReceiptSigningKeyPath),
@@ -291,7 +294,8 @@ export function askReceiptHostAuthorityPaths(ctx: CredentialIsolationContext): s
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
   const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
   const roots = dedupe([defaultBh, bh]);
-  const dataRoots = dedupe([`${defaultBh}/data`, ctx.sessionDataDir.replace(/\/+$/, '')]);
+  const sessionDataRoot = ctx.sessionDataDir?.replace(/\/+$/, '');
+  const dataRoots = dedupe([`${defaultBh}/data`, ...(sessionDataRoot ? [sessionDataRoot] : [])]);
   return dedupe([
     ...roots.map(root => `${root}/${ASK_RECEIPT_AUTHORITY_DIRECTORY}`),
     ...dataRoots.map(askCardEventClaimDirectory),
@@ -301,7 +305,10 @@ export function askReceiptHostAuthorityPaths(ctx: CredentialIsolationContext): s
 
 /** Legacy credential-only Seatbelt/bwrap rule shape. Full fs-policy sessions
  * consume the same authority paths through buildFsPolicy instead. */
-export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): {
+export function buildCredentialIsolationRules(
+  ctx: CredentialIsolationContext,
+  protectedPaths: readonly string[] = [],
+): {
   roots: string[];
   askReceiptAuthorityPaths: string[];
   denyPaths: string[];
@@ -317,18 +324,25 @@ export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): 
   const credentialPaths = roots.flatMap(hostDeviceAuthorityPaths);
   const askReceiptAuthorityPaths = askReceiptHostAuthorityPaths(ctx);
   const markerPath = `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+  // Daemon-frozen authority directories (e.g. project journals/grants) outside
+  // Home are appended by the caller; a generic protected-path list deliberately
+  // accepts Home entries only here, the same way device authority is scoped.
+  const protectedHomePaths = dedupe(protectedPaths
+    .map(normalizeIsolationPath)
+    .filter((path): path is string => !!path && path.startsWith(`${h}/`)));
   const denyRegexes = roots.flatMap(root =>
     HOST_DEVICE_CREDENTIAL_FILES.map(file =>
       `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`));
   denyRegexes.push(
     `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
+    ...protectedHomePaths.map(path => `^${escapeForRegex(path)}(?:\\.|$)`),
   );
   return {
     roots,
     askReceiptAuthorityPaths,
-    denyPaths: dedupe([...credentialPaths, ...askReceiptAuthorityPaths, markerPath]),
+    denyPaths: dedupe([...credentialPaths, ...askReceiptAuthorityPaths, markerPath, ...protectedHomePaths]),
     denyRegexes: dedupe(denyRegexes),
-    denyWritePaths: dedupe([...credentialPaths, ...askReceiptAuthorityPaths, markerPath]),
+    denyWritePaths: dedupe([...credentialPaths, ...askReceiptAuthorityPaths, markerPath, ...protectedHomePaths]),
     denyWriteRegexes: dedupe(denyRegexes),
     denyWriteLiterals: roots,
   };
@@ -480,7 +494,10 @@ export function buildSeatbeltProfile(
 // sandbox=true). Both are new mounts: a warm reattach keeps the v17 process with
 // its ORIGINAL mount set and skips skill generation, so such a pane could never
 // read either — it must cold-spawn once.
-export const ISOLATION_PANE_MARKER_VERSION = 18;
+// 19 adds whole-directory read/write masks for project attachment, source-grant
+// and import-outbox authority below dataDir. A credential-only pane launched
+// before those mounts must not warm-reattach and retain access to the new WAL.
+export const ISOLATION_PANE_MARKER_VERSION = 19;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

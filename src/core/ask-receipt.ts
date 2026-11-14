@@ -233,7 +233,9 @@ function snapshotAskCallbackDataUnbranded(
     throw new Error('Ask callback exceeds snapshot bounds');
   }
   if (depth > MAX_CALLBACK_SNAPSHOT_DEPTH) throw new Error('Ask callback exceeds snapshot bounds');
-  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
+  // `undefined` is a plain JSON-compatible absence (normalized card callbacks
+  // carry optional `header` / `event_id` / `uuid` keys with that value).
+  if (value === undefined || value === null || typeof value === 'boolean' || typeof value === 'number') return value;
   if (typeof value === 'string') {
     budget.stringBytes += Buffer.byteLength(value, 'utf8');
     if (budget.stringBytes > MAX_CALLBACK_SNAPSHOT_STRING_BYTES) {

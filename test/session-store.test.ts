@@ -16,6 +16,8 @@ import {
 } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { tmpdir } from 'os';
+import { readCodexModelLaunchReceipt, recordCodexModelLaunch, refreshCodexModelSelection, spawnWithCodexModelLaunch } from '../src/services/codex-model-selection.js';
+import { resolveSessionLaunchModel } from '../src/core/session-model.js';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -119,9 +121,11 @@ import {
   readTrustedMessageProvenance,
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
+import { topicResumeBlockReason } from '../src/core/topic-session-continuity.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { sessionContractStore } from '../src/services/session-contract-store.js';
 import {
   clearCodexInstanceBots,
   registerCodexInstanceBot,
@@ -195,6 +199,49 @@ afterEach(() => {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+describe('native Codex model preference persistence', () => {
+  it('keeps a native choice through a real SQLite store reopen', () => {
+    const session = createSession('chat-model', 'root-model', 'native model');
+    Object.assign(session, { cliId: 'codex', cliSessionId: 'native-1', model: 'A', backendType: 'tmux' });
+    recordCodexModelLaunch(session, 'A', 1000);
+    updateSession(session);
+    const path = join(tempDir, 'rollout-model.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(2000).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'B' } },
+    }) + '\n');
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 3000);
+    updateSession(session);
+    init('test-app');
+    const restored = getSession(session.sessionId)!;
+    expect(resolveSessionLaunchModel({ session: restored }, { cliId: 'codex', model: 'C' })).toBe('B');
+    expect(readPersistedRows(tempDir, 'test-app')[session.sessionId].codexModelSelection.override).toBe('B');
+  });
+
+  it('rolls back a failed row write and can recover the choice from native settings on retry', () => {
+    const session = createSession('chat-model-fail', 'root-model-fail', 'native model');
+    Object.assign(session, { cliId: 'codex', cliSessionId: 'native-1', model: 'A' });
+    recordCodexModelLaunch(session, 'A', 1000);
+    updateSession(session);
+    const path = join(tempDir, 'rollout-model-fail.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(2000).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'B' } },
+    }) + '\n');
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 3000);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('injected row failure'); });
+    expect(() => updateSession(session)).toThrow('injected row failure');
+    expect(session.codexModelSelection?.override).toBeUndefined();
+    expect(session.codexModelSelection?.launchStartedAtMs).toBe(1000);
+    __testOnly_setBeforeRowPersist(undefined);
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 4000);
+    updateSession(session);
+    init('test-app');
+    expect(getSession(session.sessionId)?.codexModelSelection?.override).toBe('B');
+  });
 });
 
 describe('principal lane durable store', () => {
@@ -2714,6 +2761,22 @@ describe('write health gate', () => {
 });
 
 describe('closeSession()', () => {
+  it('preserves the first durable close time and usage when cleaning a stale active cache', () => {
+    const session = createSession('chat1', 'root1', 'stale active cache');
+    session.previewTarget = { host: '127.0.0.1', port: 4173, registeredAt: new Date().toISOString() };
+    updateSession(session);
+    const ref = { appId: 'test-app', sessionId: session.sessionId }; const contract = sessionContractStore(tempDir, ref.appId);
+    contract.ensure(ref); const { operation } = contract.beginOperation(ref, 'close');
+    contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+    const first = readPersistedRows(tempDir, 'test-app')[session.sessionId];
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(Date.parse(first.closedAt!) + 3_600_000)); closeSession(session.sessionId);
+      const after = getSession(session.sessionId)!;
+      expect(after.closedAt).toBe(first.closedAt); expect(after.previewTarget).toBeUndefined();
+      expect(after.tokenUsage).toEqual(first.tokenUsage); expect(after.status).toBe('closed');
+    } finally { vi.useRealTimers(); }
+  });
   it.each(['active', 'closed'] as const)('cancels staged XPI work when closing a %s session', (status) => {
     const session = createSession('chat-xpi-close', 'root-xpi-close', 'Cancel protocol work');
     session.status = status;
@@ -2765,6 +2828,24 @@ describe('closeSession()', () => {
     expect(existsSync(unread.path)).toBe(false);
     expect(existsSync(paneLaunchDir(tempDir, closing.sessionId))).toBe(false);
     expect(existsSync(sibling.path)).toBe(true);
+  });
+
+  it('removes the Codex launch receipt of the closed session only', () => {
+    const closing = createSession('chat1', 'root-receipt-close', 'Close With Receipt');
+    const other = createSession('chat1', 'root-receipt-other', 'Stays Open');
+    const writeReceipt = (sessionId: string): void => spawnWithCodexModelLaunch({
+      dataDir: tempDir, sessionId,
+      launch: { model: 'gpt-test', startedAtMs: 1234 },
+      spawn: () => {}, reattached: () => false, publish: () => {},
+    });
+    writeReceipt(closing.sessionId);
+    writeReceipt(other.sessionId);
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeDefined();
+
+    closeSession(closing.sessionId);
+
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeUndefined();
+    expect(readCodexModelLaunchReceipt(tempDir, other.sessionId)).toBeDefined();
   });
 
   it('snapshots token usage in the same durable close write', () => {
@@ -4080,6 +4161,37 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     expect(onDisk.s1.status).toBe('closed');
     expect(onDisk.s1.closedAt).toBeTruthy();
     expect(onDisk.s1.workerGeneration).toBe(7);
+  });
+
+  it('a host close (offline `botmux delete`) stamps userClosedAt so the topic cannot auto-resume it', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
+
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    );
+
+    expect(published).toMatchObject({ outcome: 'applied' });
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
+    expect(onDisk.s1.userClosedAt).toBeTruthy();
+    expect(topicResumeBlockReason(onDisk.s1 as any)).toBe('user_closed');
+  });
+
+  it('a host prune (ledger-empty cleanup, not a human close) does not stamp userClosedAt', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
+
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'prune' },
+      { dataDir: tempDir },
+    );
+
+    expect(published).toMatchObject({ outcome: 'applied' });
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
+    expect(onDisk.s1.status).toBe('closed');
+    expect(onDisk.s1.userClosedAt).toBeUndefined();
+    expect(topicResumeBlockReason(onDisk.s1 as any)).toBeUndefined();
   });
 
   it('reads the fresh row without writing', () => {

@@ -2,13 +2,15 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { withFileLockSync } from '../utils/file-lock.js';
+import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 import type { ProjectProgressCardConfig } from './project-progress-card-config.js';
 import {
   canonicalProjectTaskControlCanaryFence,
+  mutateProjectGroup,
   mutateProjectGroupSync,
   projectTaskControlCanaryFenceFingerprint,
   TASK_CONTROL_CANARY_QUARANTINE_CODE,
+  withProjectTaskControlChatLock,
   withProjectTaskControlChatLockSync,
   type ProjectGroupState,
   type ProjectTaskControlCanaryFence,
@@ -39,6 +41,9 @@ export interface GroupCollaborationModeConfig {
     acceptorAppId: string;
     maxActiveMappings: 1;
   };
+  /** Opt-in metadata-only notification of imported sessions. Missing means
+   * ignore; this preference is retained while project mode is disabled. */
+  importedSessionPolicy?: 'ignore' | 'notify';
   progressCard?: ProjectProgressCardConfig;
   /** Internal projection state for the pinned "waiting to start" guide. */
   onboardingCard?: ProjectOnboardingCardState;
@@ -125,7 +130,7 @@ function validTaskControlPlaneGroupRelation(config: {
 
 const GROUP_CONFIG_KEYS = new Set([
   'schemaVersion', 'chatId', 'mode', 'coordinatorAppId', 'workerAppIds', 'autoEnrollWorkers',
-  'taskControlPlane', 'progressCard', 'onboardingCard', 'createdAt', 'updatedAt',
+  'taskControlPlane', 'progressCard', 'onboardingCard', 'importedSessionPolicy', 'createdAt', 'updatedAt',
 ]);
 
 function validTaskControlPlaneTopLevelConfig(config: Record<string, unknown>, expectedChatId?: string): boolean {
@@ -135,6 +140,8 @@ function validTaskControlPlaneTopLevelConfig(config: Record<string, unknown>, ex
     && (!expectedChatId || config.chatId === expectedChatId)
     && typeof config.createdAt === 'string' && Number.isFinite(Date.parse(config.createdAt))
     && typeof config.updatedAt === 'string' && Number.isFinite(Date.parse(config.updatedAt))
+    && (config.importedSessionPolicy === undefined
+      || config.importedSessionPolicy === 'ignore' || config.importedSessionPolicy === 'notify')
     && validTaskControlPlaneGroupRelation(config);
 }
 
@@ -319,10 +326,24 @@ export async function writeGroupCollaborationMode(
     autoEnrollWorkers?: boolean;
     taskControlPlane?: GroupCollaborationModeConfig['taskControlPlane'] | null;
     taskControlPlaneCas?: GroupTaskControlPlaneConfigCas;
+    importedSessionPolicy?: 'ignore' | 'notify';
     progressCard?: ProjectProgressCardConfig;
   },
+  beforeWrite?: () => void,
 ): Promise<GroupCollaborationModeConfig> {
-  return withLockedGroupConfig(dataDir, input.chatId, (registry, current, project) => {
+  if (input.importedSessionPolicy !== undefined
+    && input.importedSessionPolicy !== 'ignore' && input.importedSessionPolicy !== 'notify') {
+    throw new Error('invalid_imported_session_policy');
+  }
+  const path = registryPath(dataDir);
+  const applyWrite = (
+    registry: GroupCollaborationModeRegistry,
+    current: GroupCollaborationModeConfig | undefined,
+    project: ProjectGroupState | undefined,
+  ): GroupCollaborationModeConfig => {
+    // Runs under the task-control chat lock, mode file lock and project lock,
+    // before this write mutates anything (public's pre-write validation hook).
+    beforeWrite?.();
     const now = input.taskControlPlaneCas?.now === undefined
       ? new Date().toISOString()
       : new Date(input.taskControlPlaneCas.now).toISOString();
@@ -334,6 +355,8 @@ export async function writeGroupCollaborationMode(
       schemaVersion: 1,
       chatId: input.chatId,
       mode: input.mode,
+      importedSessionPolicy: input.importedSessionPolicy
+        ?? (current?.importedSessionPolicy === 'notify' ? 'notify' : 'ignore'),
       ...(input.mode === 'project'
         ? {
             coordinatorAppId: input.coordinatorAppId,
@@ -370,7 +393,7 @@ export async function writeGroupCollaborationMode(
         throw new Error('project_task_control_config_cas_field_scope');
       }
       registry.configs[input.chatId] = exactPostimage;
-      writeRegistry(registryPath(dataDir), registry);
+      writeRegistry(path, registry);
       return structuredClone(exactPostimage);
     }
     if (input.taskControlPlaneCas?.operation === 'disable') {
@@ -399,7 +422,7 @@ export async function writeGroupCollaborationMode(
         throw new Error('project_task_control_config_cas_field_scope');
       }
       registry.configs[input.chatId] = exactPostimage;
-      writeRegistry(registryPath(dataDir), registry);
+      writeRegistry(path, registry);
       return structuredClone(exactPostimage);
     }
     if (canonicalJson(current?.taskControlPlane) !== canonicalJson(result.taskControlPlane)) {
@@ -410,9 +433,20 @@ export async function writeGroupCollaborationMode(
       throw new Error('project_task_control_canary_fence_rejects_config_mutation');
     }
     registry.configs[input.chatId] = result;
-    writeRegistry(registryPath(dataDir), registry);
+    writeRegistry(path, registry);
     return structuredClone(result);
-  });
+  };
+  // Async locks here: a concurrent holder must not block the daemon event loop
+  // for the lock's whole wait budget. The lock order stays chat → mode → project.
+  return withProjectTaskControlChatLock(dataDir, input.chatId, () => withFileLock(path, async () => {
+    let result!: GroupCollaborationModeConfig;
+    await mutateProjectGroup(dataDir, input.chatId, project => {
+      const registry = readRegistry(path);
+      result = applyWrite(registry, registry.configs[input.chatId], project);
+      return project;
+    });
+    return result;
+  }));
 }
 
 /** Enroll a Bot that has just joined a project group configured for automatic enrollment.

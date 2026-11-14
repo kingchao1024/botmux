@@ -1,4 +1,10 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件的会话启动链路会经 ensureCliSkills 往 homedir() 推导的目录装 CLI 钩子和配置
+// （~/.config/opencode/plugin/botmux-ask.js、~/.trae/traecli.toml、~/.codex/config.toml）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，真实的 opencode 插件就是这样被改写的。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { EventEmitter, once } from 'node:events';
+import type { ChildProcess } from 'node:child_process';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
@@ -164,6 +170,16 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSessionPid: vi.fn(),
 }));
 
+// These synthetic workers model unscoped legacy IPC. Keep contract storage out
+// of this unit fixture; v2 bootstrap/admission runs through real components in
+// session-contract-gateway and the real Worker integration tests. Only the
+// worker-start operation test installs a controller.
+const contractController = vi.hoisted(() => ({ value: undefined as unknown }));
+vi.mock('../src/core/session-controller.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/core/session-controller.js')>(),
+  controllerForSession: () => contractController.value,
+}));
+
 vi.mock('../src/services/frozen-card-store.js', () => ({
   loadFrozenCards: vi.fn(() => new Map()),
   saveFrozenCards: vi.fn(),
@@ -264,6 +280,9 @@ import {
   suspendWorker,
   currentGatewayCallerOpenId,
   __testOnly_setSuspendBackingVerifier,
+  __testOnly_resetTurnTerminalReportingClis,
+  manualSuspendWaits,
+  queueManualSuspend,
 } from '../src/core/worker-pool.js';
 import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
 import {
@@ -282,6 +301,9 @@ import {
   readManagedOriginCapability,
 } from '../src/core/managed-origin-capability.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { SessionController } from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import type { TrustedCaller, WorkerToDaemon } from '../src/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 import { resolveDaemonCurrentActor } from '../src/core/current-actor-attestation.js';
@@ -300,6 +322,11 @@ import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-ap
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+
+// 上面那些钩子和配置都按 homedir() 落盘：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 // The session working directory these fixtures point at. It must exist:
 // forkWorker refuses to start a CLI whose directory is gone (it no longer falls
@@ -414,6 +441,128 @@ afterEach(() => {
   disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
   setActiveSessionsRegistry(undefined);
   setLinkRefRuntime(undefined);
+});
+
+describe('worker start operation', () => {
+  it.each([false, true])('keeps the adopted screenshot after capture identity precedes execution start (pre-admitted=%s)', async preAdmitted => {
+    vi.useFakeTimers();
+    const data = mkdtempSync(join(tmpdir(), 'botmux-adopt-screenshot-'));
+    const store = new SessionContractStore(data, 'app_test');
+    try {
+      const ds = makeDs({
+        adoptedFrom: { tmuxTarget: 'adopt-screenshot:0.0', originalCliPid: 23456, cliId: 'codex', cwd: REPO },
+        displayMode: 'screenshot',
+      });
+      const controller = new SessionController(ds, store);
+      contractController.value = controller;
+      const child: ChildProcess = makeFakeWorker();
+      forkMock.mockImplementationOnce(() => child);
+      forkAdoptWorker(ds);
+      const contract = ds.initConfig?.sessionContract;
+      if (!contract) throw new Error('Adopt init did not include the session contract');
+      const scope = new WorkerSessionEventScope(contract.session, contract.worker);
+      const binding = scope.beginRuntime();
+      controller.reserveBinding(binding.bindingId, contract.worker);
+      const runtime = controller.bindRuntime(binding.bindingId, contract.worker, {
+        backend: 'tmux', physicalId: '23456:start', nativeSessionId: 'adopt-screenshot', proof: 'process_start',
+      });
+      scope.assign(binding.bindingId, runtime.ref);
+      const turnId = 'om_adopt_screenshot';
+      const execution = preAdmitted ? controller.admitInput(turnId) : undefined;
+      const emit = async (message: WorkerToDaemon): Promise<void> => {
+        child.emit('message', scope.run(binding, () => ({ ...message, sessionContract: scope.envelope() }), execution));
+        await vi.advanceTimersByTimeAsync(0);
+      };
+
+      await emit({ type: 'capture_identity', revision: 1, turnId });
+      expect(ds.captureIdentity).toMatchObject({ revision: 1, turnId });
+      expect(store.executions(controller.ref, turnId)[0]).toMatchObject({ phase: 'queued' });
+      expect(store.executions(controller.ref, turnId)[0].runtime).toBeUndefined();
+      await emit({ type: 'turn_execution_started', turnId, startedAtMs: Date.now() });
+      await emit({ type: 'screenshot_uploaded', imageKey: 'img_adopt', status: 'working', turnId, captureRevision: 1 });
+      expect(ds.currentImageKey).toBe('img_adopt');
+      expect(ds.currentImageSource).toMatchObject({ imageKey: 'img_adopt', turnId });
+    } finally {
+      contractController.value = undefined;
+      store.close();
+      rmSync(data, { recursive: true, force: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { cliId: 'codex', restored: false },
+    { cliId: 'codex', restored: true },
+    { cliId: 'claude-code', restored: false },
+    { cliId: 'claude-code', restored: true },
+  ])('confirms the first adopted runtime without a retry ($cliId, restored=$restored)', async ({ cliId, restored }) => {
+    vi.useFakeTimers();
+    const data = mkdtempSync(join(tmpdir(), 'botmux-adopt-contract-'));
+    const store = new SessionContractStore(data, 'app_test');
+    try {
+      const ds = makeDs({
+        adoptedFrom: { tmuxTarget: 'adopt-contract:0.0', originalCliPid: 23456, sessionId: 'fixture-adopted', cliId, cwd: REPO },
+      });
+      const controller = new SessionController(ds, store);
+      contractController.value = controller;
+      const child: ChildProcess = makeFakeWorker();
+      const sent: unknown[] = [];
+      vi.spyOn(child, 'send').mockImplementation(message => { sent.push(message); return true; });
+      forkMock.mockImplementationOnce(() => child);
+
+      expect(ds.initConfig).toBeUndefined();
+      expect(forkAdoptWorker(ds, { restoredFromMetadata: restored })).toBe('accepted');
+      const contract = ds.initConfig?.sessionContract;
+      if (!contract) throw new Error('Adopt init did not include the session contract');
+      const scope = new WorkerSessionEventScope(contract.session, contract.worker);
+      const binding = scope.beginRuntime(ds.initConfig?.restartAttemptId);
+      const message: WorkerToDaemon = scope.run(binding, () => ({
+        type: 'runtime_binding_started',
+        bindingId: binding.bindingId,
+        ...(binding.operationId ? { operationId: binding.operationId } : {}),
+        sessionContract: scope.envelope(),
+      }));
+      child.emit('message', message);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: 'runtime_contract_reserved', bindingId: binding.bindingId, mayStart: true,
+      }));
+      expect(store.binding(controller.ref, binding.bindingId)?.phase).toBe('starting');
+      expect(forkMock).toHaveBeenCalledOnce();
+    } finally {
+      contractController.value = undefined;
+      store.close();
+      rmSync(data, { recursive: true, force: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['normal', 'adopt'])('starts a %s worker under a restart that takes over an unverified Stop', mode => {
+    const data = mkdtempSync(join(tmpdir(), 'botmux-start-operation-'));
+    const store = new SessionContractStore(data, 'app_test');
+    try {
+      const ds = makeDs(mode === 'adopt' ? {
+        adoptedFrom: { tmuxTarget: 'bmx-start-operation:0.0', originalCliPid: 23456, sessionId: 'fixture-adopted', cliId: 'codex', cwd: REPO },
+      } : undefined);
+      const controller = new SessionController(ds, store); const worker = controller.bindWorker(1).worker;
+      controller.reserveBinding('binding-old', worker);
+      controller.bindRuntime('binding-old', worker, { backend: 'tmux', physicalId: '111:start', nativeSessionId: 'native-old', proof: 'process_start' });
+      const execution = controller.admitInput('om_stopped_turn');
+      const stop = controller.beginControl('cancel', undefined, execution).operation;
+      controller.controlStarted(stop.operationId); controller.controlResult(stop.operationId, 'uncertain');
+      contractController.value = controller;
+      const child = makeFakeWorker(); const send = child.send; forkMock.mockImplementationOnce(() => child);
+      if (mode === 'adopt') forkAdoptWorker(ds, { prompt: '' });
+      else forkWorker(ds, '');
+      const init = send.mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(controller.operation()).toMatchObject({ kind: 'restart', operationId: init.restartAttemptId });
+      expect(controller.operation(stop.operationId)).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
+    } finally {
+      contractController.value = undefined; store.close(); rmSync(data, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('protected MCP env stays out of ordinary worker IPC', () => {
@@ -2518,10 +2667,10 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   it('reports an unstageable pre-admission rejection as a known non-execution', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
-    // The daemon declines the handoff — this is the real fallback path: the XPI
-    // switch is off, or the rejection lacked a safe reroute envelope/owner. The
-    // delivery then falls back to retry/fail, and its terminal notice must still
-    // describe a KNOWN outcome: the turn never entered the worker queue.
+    // The daemon declines the handoff — the XPI switch TTL-skew path (the daemon
+    // already reads the switch off). The delivery falls back to retry/fail, and
+    // its terminal notice must still describe a KNOWN outcome: the turn never
+    // entered the worker queue.
     const onOrdinaryImInputRejected = vi.fn(async () => false);
     initWorkerPool({
       sessionReply,
@@ -2686,6 +2835,63 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(1);
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('fails a deterministic rejection the daemon cannot reroute at once as not executed, without retrying', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onOrdinaryImInputRejected = vi.fn(async () => 'not_executed' as const);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    // A peer bot's message arrives while a caller-less scheduled turn runs, so
+    // the daemon has no principal to ask for confirmation.
+    const peerBot = {
+      requestUserOpenId: 'ou_peer_bot',
+      requestUserUnionId: 'on_peer_bot',
+      requestLarkAppId: 'app_test',
+      senderType: 'bot' as const,
+    };
+    expect(sendWorkerInput(ds, 'business turn', 'om_business', { trustedCaller: peerBot })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'schedule:abcd1234:00000000-0000-4000-8000-000000000000',
+    };
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    worker.emit('message', rejection);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1);
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const terminal = String(sessionReply.mock.calls[0]?.[1]);
+    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain('om_business');
+    expect(terminal).toContain('cross_principal_requires_owner_confirmation');
+    expect(terminal).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
   });
 
   it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
@@ -4847,7 +5053,7 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_adopted',
-      { sourceSessionId: 'sid-start-test' },
+      expect.objectContaining({ sourceSessionId: 'sid-start-test' }),
     ));
     expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
     expect(ds.agentAttention).toEqual(expect.objectContaining({
@@ -5357,6 +5563,71 @@ describe('persistent backend target handoff', () => {
     } finally {
       delete daemon.herdr;
     }
+  });
+});
+
+// The full local-address rule in the CLI system prompt is decided per bot when
+// the worker is forked; bots that have not turned the switch on get no flag.
+describe('hideLocalAddresses rides the worker init for the system prompt', () => {
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('is absent for a bot with the default (off)', () => {
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().hideLocalAddresses).toBeUndefined();
+  });
+
+  it('is set for a bot that turned it on', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ hideLocalAddresses: true }));
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().hideLocalAddresses).toBe(true);
+  });
+});
+
+// The native goal status card is opt-in per bot; only a worker forked while it
+// is on reads the CLI goal store.
+describe('goalStatusCard rides the worker init', () => {
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('is absent for a bot with the default (off)', () => {
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().goalStatusCard).toBeUndefined();
+  });
+
+  it('is set for a bot that turned it on', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ goalStatusCard: true }));
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().goalStatusCard).toBe(true);
+  });
+});
+
+// 缓存过期自动压缩 is a per-session setting on the session row: a forked
+// worker (new topic, restore, cold resume) reads it from init.
+describe('kimiCacheExpiryAutoCompact rides the worker init from the session row', () => {
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('is absent while the session has not opted in', () => {
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().kimiCacheExpiryAutoCompact).toBeUndefined();
+    const off = makeDs();
+    off.session.kimiCacheExpiryAutoCompact = { enabled: false };
+    forkWorker(off, 'hello', false);
+    expect(readInit().kimiCacheExpiryAutoCompact).toBeUndefined();
+  });
+
+  it('is set for a session that turned it on', () => {
+    const ds = makeDs();
+    ds.session.kimiCacheExpiryAutoCompact = { enabled: true };
+    forkWorker(ds, 'hello', false);
+    expect(readInit().kimiCacheExpiryAutoCompact).toBe(true);
   });
 });
 
@@ -7329,8 +7600,33 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     }));
   });
 
-  it('cleans up and reports a synchronous adopt init send failure', () => {
+  it.each([false, true])('preserves previous env risk before adopt init dispatch, including send failure (fail=%s)', failSend => {
     const ds = makeAdoptDs();
+    ds.mojoAppliedUnprovableEnvKeys = ['LD_PRELOAD'];
+    ds.mojoRetiringUnprovableEnvKeys = ['PATH'];
+    const child: ChildProcess = makeFakeWorker();
+    vi.spyOn(child, 'send').mockImplementation(() => {
+      expect(ds.mojoRetiringUnprovableEnvKeys?.slice().sort()).toEqual(['LD_PRELOAD', 'PATH']);
+      expect(ds.mojoAppliedUnprovableEnvKeys).toBeUndefined();
+      if (failSend) throw new Error('Init dispatch failed');
+      return true;
+    });
+    forkMock.mockReturnValueOnce(child);
+
+    if (failSend) {
+      expect(() => forkAdoptWorker(ds)).toThrow('Init dispatch failed');
+      expect(ds.initConfig).toBeUndefined();
+    } else {
+      expect(forkAdoptWorker(ds)).toBe('accepted');
+    }
+    expect(ds.mojoRetiringUnprovableEnvKeys?.slice().sort()).toEqual(['LD_PRELOAD', 'PATH']);
+    expect(child.send).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('cleans up and reports a synchronous adopt init send failure (previous init=%s)', hasPreviousInit => {
+    const ds = makeAdoptDs();
+    if (hasPreviousInit) forkAdoptWorker(ds);
+    const previousInitConfig = ds.initConfig;
     const worker = makeFakeWorker();
     worker.send.mockImplementationOnce(() => {
       throw new Error('init send failed');
@@ -7343,7 +7639,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     })).toThrow('init send failed');
 
     expect(ds.worker).toBeNull();
-    expect(ds.initConfig).toBeUndefined();
+    expect(ds.initConfig).toBe(previousInitConfig);
     expect(worker.kill).toHaveBeenCalledTimes(1);
   });
 });
@@ -8802,6 +9098,155 @@ describe('managed turn authority worker generations', () => {
 });
 
 describe('worker startup failure delivery', () => {
+  it.each([
+    { source: 'tmux', tmuxTarget: undefined },
+    { tmuxTarget: undefined },
+    { source: 'tmux', tmuxTarget: '   ' },
+    { source: 'zellij', zellijSession: 'original', zellijPaneId: undefined },
+    { source: 'zellij', zellijSession: undefined, zellijPaneId: '2' },
+    { source: 'herdr', herdrSessionName: 'original', herdrTarget: undefined },
+    { source: 'herdr', herdrSessionName: undefined, herdrTarget: 'pane-2' },
+    { source: 'orca', orcaTerminalHandle: undefined },
+  ])('refuses partial adopted terminal metadata on startup retry ($source)', async damaged => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    ds.session.adoptedFrom = ds.adoptedFrom;
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    // Model a partial recovered metadata object without any cross-source
+    // fallback fields that could accidentally select a different terminal.
+    ds.adoptedFrom = { originalCliPid: 4242, cliId: 'traex', cwd: REPO, ...damaged } as any;
+    ds.session.adoptedFrom = ds.adoptedFrom;
+    await vi.advanceTimersByTimeAsync(240_000);
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { source: 'tmux', cliId: 'traex', tmuxTarget: 'original:0.0', persistedOnly: false },
+    { source: undefined, cliId: 'traex', tmuxTarget: 'original:0.0', persistedOnly: true },
+    { source: 'tmux', cliId: 'traex', tmuxTarget: 'original:0.0', persistedOnly: true },
+    { source: 'tmux', cliId: 'claude-code', tmuxTarget: 'original:0.0' },
+    { source: 'zellij', cliId: 'codex', zellijSession: 'original', zellijPaneId: '2' },
+    { source: 'herdr', cliId: 'traex', herdrSessionName: 'original', herdrTarget: 'pane-2' },
+    { source: 'orca', cliId: 'claude-code', orcaTerminalHandle: 'term-original' },
+  ])('retries an adopted $source/$cliId bridge against its original terminal (persisted-only=$persistedOnly)', async target => {
+    vi.useFakeTimers();
+    const adopted = { ...target, originalCliPid: 4242, sessionId: 'original-cli-session', cwd: REPO } as any;
+    const ds = makeDs({ adoptedFrom: adopted });
+    ds.session.adoptedFrom = adopted;
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', {
+      type: 'error', message: 'CLI runtime reservation was not confirmed by the daemon within 120s',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    if ('persistedOnly' in target && target.persistedOnly) ds.adoptedFrom = undefined;
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    const replacement = ds.worker as any;
+    expect(replacement).not.toBe(worker);
+    expect(replacement.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init', adoptMode: true, adoptSource: target.source ?? 'tmux',
+      adoptCliPid: 4242, cliId: target.cliId, prompt: '',
+      // A retry re-attaches; it must not re-post the "last turn before /adopt" preamble.
+      adoptRestoredFromMetadata: true,
+    }));
+    if (target.cliId !== 'claude-code') {
+      expect(ds.initConfig?.cliSessionId).toBe('original-cli-session');
+    }
+    expect(ds.adoptedFrom).toEqual(adopted);
+  });
+
+  it('keeps an adopted startup retry bounded without launching a managed CLI', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    forkAdoptWorker(ds);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const worker = ds.worker as any;
+      worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+      await vi.advanceTimersByTimeAsync(0);
+      worker.emit('exit', 1);
+      await vi.advanceTimersByTimeAsync(240_000);
+    }
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(4);
+    for (const result of forkMock.mock.results) {
+      expect(result.value.send).toHaveBeenCalledWith(expect.objectContaining({
+        adoptMode: true, adoptTmuxTarget: 'original:0.0', adoptCliPid: 4242,
+      }));
+    }
+  });
+
+  it('does not revive an adopted bridge closed during startup backoff', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    ds.session.status = 'closed';
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('still retries an ordinary CLI startup through the managed launch path', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    forkWorker(ds, '', true);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect((ds.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', resume: true }));
+    expect(ds.initConfig?.adoptMode).not.toBe(true);
+  });
+
+  it.each(['missing-target', 'sandbox-enabled'])('reports an adopted retry that cannot proceed (%s)', async failure => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    ds.session.adoptedFrom = ds.adoptedFrom;
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    if (failure === 'missing-target') {
+      ds.adoptedFrom = undefined;
+      ds.session.adoptedFrom = undefined;
+    } else {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ sandbox: true }));
+    }
+    await vi.advanceTimersByTimeAsync(240_000);
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the clean init payload and reports a structured failure once to its exact originating turn', async () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const sessionReply = vi.fn(async () => 'om_error_reply');
@@ -10497,5 +10942,186 @@ describe('worker pid record', () => {
 
       expect(sessionStore.updateSessionPid).toHaveBeenCalledWith('sid-start-test', pid, readWorkerProcessStart(pid));
     });
+  });
+});
+
+describe('turn failure diagnostics: only a workflow draft clarify session asks its worker for them', () => {
+  const headless = { id: 'hl_draft', createdAt: '2026-11-06T00:00:00.000Z', source: 'cli' as const };
+  const initOf = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls.map(call => call[0]).find(message => message.type === 'init');
+  };
+
+  it('a draft clarify session (marker persisted on session.headless): the init asks for them', () => {
+    const ds = makeDs({ hasHistory: true, chatId: 'headless_hl_draft' });
+    ds.session.chatId = 'headless_hl_draft';
+    ds.session.headless = { ...headless, failureDiagnostics: true };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    expect(initOf()).toMatchObject({ type: 'init', captureTurnFailureDiagnostics: true });
+  });
+
+  it.each([
+    ['an ordinary topic session', undefined, 'oc_chat'],
+    ['a `botmux headless` session', headless, 'headless_hl_draft'],
+    // The transfer into the main topic forks the topic's worker before the
+    // binding is recorded (or the recording never lands): the chat decides.
+    ['a draft clarify session whose transfer into its topic forks the worker', { ...headless, failureDiagnostics: true as const }, 'oc_topic'],
+    ['a draft clarify session already bound into its topic', { ...headless, failureDiagnostics: true as const, boundChatId: 'oc_topic' }, 'oc_topic'],
+  ] as const)('%s: the init does not carry the field at all', (_name, headlessBlock, chatId) => {
+    const ds = makeDs({ hasHistory: true, chatId });
+    ds.session.chatId = chatId;
+    if (headlessBlock) ds.session.headless = { ...headlessBlock };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    const init = initOf();
+    expect(init).toMatchObject({ type: 'init' });
+    expect(Object.keys(init)).not.toContain('captureTurnFailureDiagnostics');
+  });
+});
+
+describe('settledTurnTerminals on worker init', () => {
+  const initOf = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls.map(call => call[0]).find(message => message.type === 'init');
+  };
+
+  it('passes completed ordinaryTurnRecovery ids on forkWorker and forkAdoptWorker', () => {
+    const ds = makeDs({ hasHistory: true });
+    ds.session.ordinaryTurnRecovery = {
+      version: 1,
+      logicalTurnId: 'om_prev_logical',
+      currentTurnId: 'bmx-recovery-prev',
+      status: 'completed',
+      updatedAt: '2026-11-11T00:00:00.000Z',
+    } as any;
+    expect(forkWorker(ds, '', true)).toBe(true);
+    expect(initOf()?.settledTurnTerminals).toEqual([
+      { turnId: 'om_prev_logical', status: 'completed' },
+      { turnId: 'bmx-recovery-prev', status: 'completed' },
+    ]);
+
+    const adopted = makeDs({
+      adoptedFrom: { tmuxTarget: 'adopt-settled:0.0', originalCliPid: 23456, sessionId: 'sess-adopt', cliId: 'claude-code', cwd: REPO },
+    });
+    adopted.session.ordinaryTurnRecovery = {
+      version: 1,
+      logicalTurnId: 'om_adopt_done',
+      currentTurnId: 'om_adopt_done',
+      status: 'completed',
+      updatedAt: '2026-11-11T00:00:00.000Z',
+    } as any;
+    expect(forkAdoptWorker(adopted, { restoredFromMetadata: true })).toBe('accepted');
+    expect(initOf()?.settledTurnTerminals).toEqual([{ turnId: 'om_adopt_done', status: 'completed' }]);
+  });
+
+  it('omits settledTurnTerminals when ordinaryTurnRecovery is running, cancelled, or matches the opening turn', () => {
+    for (const status of ['running', 'cancelled'] as const) {
+      const ds = makeDs({ hasHistory: true });
+      ds.session.ordinaryTurnRecovery = {
+        version: 1,
+        logicalTurnId: `om_${status}`,
+        currentTurnId: `om_${status}`,
+        status,
+        ...(status === 'cancelled' ? { cancelledByTurnId: 'stop' } : {}),
+        updatedAt: '2026-11-11T00:00:00.000Z',
+      } as any;
+      expect(forkWorker(ds, '', true)).toBe(true);
+      expect(initOf()?.settledTurnTerminals).toBeUndefined();
+    }
+
+    const matching = makeDs({ hasHistory: true });
+    matching.session.ordinaryTurnRecovery = {
+      version: 1,
+      logicalTurnId: 'om_same_turn',
+      currentTurnId: 'om_same_turn',
+      status: 'completed',
+      updatedAt: '2026-11-11T00:00:00.000Z',
+    } as any;
+    expect(forkWorker(matching, 'hello', 'om_same_turn')).toBe(true);
+    expect(initOf()?.settledTurnTerminals).toBeUndefined();
+  });
+});
+
+// `botmux suspend` while a re-forked worker starts on the message that woke
+// the session: the previous worker crashed while idle, so that idle is still
+// on the session. The opening input of a CLI that takes it on its command line
+// is committed without ever being queued, so no backlog report precedes the
+// commit. The suspend must wait for the new CLI's own idle, not cut the turn
+// off right at the commit on the old idle.
+describe('a suspend queued while a re-forked worker takes its opening input', () => {
+  const ticks = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+  it('waits for the new CLI to go idle after its first turn, not the previous worker\'s idle', async () => {
+    __testOnly_resetTurnTerminalReportingClis();
+    const ds = makeDs();
+    expect(forkWorker(ds, 'first', 'om_first')).toBe(true);
+    const first = forkMock.mock.results.at(-1)!.value;
+    first.emit('message', { type: 'worker_ipc_ready' });
+    first.emit('message', { type: 'turn_input_received', turnId: 'om_first' });
+    first.emit('message', { type: 'turn_input_committed', turnId: 'om_first' });
+    first.emit('message', { type: 'ready', port: 0, token: 'tok' });
+    first.emit('message', { type: 'prompt_ready' });
+    first.emit('message', { type: 'screen_update', status: 'idle', content: '' });
+    await ticks();
+    first.emit('exit', 1, null);
+    await ticks();
+    expect(ds.lastScreenStatus).toBe('idle');
+
+    expect(forkWorker(ds, 'wake me', 'om_wake')).toBe(true);
+    const next = forkMock.mock.results.at(-1)!.value;
+    next.emit('message', { type: 'worker_ipc_ready' });
+    const waits = manualSuspendWaits(ds);
+    expect(waits.waitingFor).toEqual(['input']);
+    queueManualSuspend(ds, waits);
+    next.emit('message', { type: 'turn_input_received', turnId: 'om_wake' });
+    next.emit('message', { type: 'ready', port: 0, token: 'tok2' });
+    next.emit('message', { type: 'turn_input_committed', turnId: 'om_wake' });
+    await ticks();
+    expect(ds.worker).toBe(next);
+
+    next.emit('message', { type: 'screen_update', status: 'working', content: '' });
+    await ticks();
+    expect(ds.worker).toBe(next);
+    next.emit('message', { type: 'prompt_ready' });
+    next.emit('message', { type: 'screen_update', status: 'idle', content: '' });
+    await ticks();
+    expect(ds.worker).toBeNull();
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  // A follow-up the new worker refuses before it has reported a screen status
+  // of its own: its CLI may already show a prompt, but the status on the
+  // session is still the previous worker's idle, so the claim is not
+  // re-checked against it.
+  it('keeps the claim when a follow-up fails before the new worker has reported its screen', async () => {
+    __testOnly_resetTurnTerminalReportingClis();
+    const ds = makeDs();
+    expect(forkWorker(ds, 'first', 'om_first')).toBe(true);
+    const first = forkMock.mock.results.at(-1)!.value;
+    first.emit('message', { type: 'worker_ipc_ready' });
+    first.emit('message', { type: 'turn_input_committed', turnId: 'om_first' });
+    first.emit('message', { type: 'ready', port: 0, token: 'tok' });
+    first.emit('message', { type: 'prompt_ready' });
+    first.emit('message', { type: 'screen_update', status: 'idle', content: '' });
+    await ticks();
+    first.emit('exit', 1, null);
+    await ticks();
+
+    expect(forkWorker(ds, 'wake me', 'om_wake')).toBe(true);
+    const next = forkMock.mock.results.at(-1)!.value;
+    next.emit('message', { type: 'worker_ipc_ready' });
+    next.emit('message', { type: 'ready', port: 0, token: 'tok2' });
+    next.emit('message', { type: 'turn_input_committed', turnId: 'om_wake' });
+    next.emit('message', { type: 'prompt_ready' });
+    await ticks();
+    expect(ds.cliReady).toBe(true);
+    expect(sendWorkerInput(ds, 'one more thing', 'om_more')).toBe(true);
+    queueManualSuspend(ds, manualSuspendWaits(ds));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      next.emit('message', { type: 'turn_input_rejected', turnId: 'om_more', reason: 'busy', rejectedBeforeAdmission: true });
+      await ticks();
+    }
+    expect(next.send.mock.calls.filter(([message]: [any]) => message?.type === 'message' && message.turnId === 'om_more')).toHaveLength(2);
+    expect(ds.worker).toBe(next);
+    expect(ds.pendingSuspendReason).toBe('manual_suspend');
   });
 });

@@ -9,8 +9,10 @@ import type { WorkspaceMetadata } from './workspace-metadata.js';
 // module so worker-pool can import the composer without pulling in the IPC
 // server (which itself imports worker-pool — that would be a cycle).
 import type { DaemonSession } from './types.js';
+import type { SessionLastTurn } from './session-task-status.js';
 import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { topicResumeBlockReason } from './topic-session-continuity.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBot, getBotBrand } from '../bot-registry.js';
@@ -33,6 +35,12 @@ import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
   modelPin?: ReturnType<typeof modelPinView>;
+  /** Closed rows only: whether a new message in the topic will resume this session. */
+  resumable?: boolean;
+  /** Closed rows only: why it will not be resumed (e.g. user_closed). */
+  resumeBlockedReason?: string;
+  /** See Session.continuity. */
+  continuity?: Session['continuity'];
   /** Present only when the session's frozen sandbox mode differs from what the
    *  bot's CURRENT config would give a new session (dashboard badge). */
   sandboxDrift?: { session: SandboxMode; current: SandboxMode };
@@ -92,6 +100,8 @@ export interface SessionRow extends SessionMessagePreview {
   /** 看板视图的手动放置（列 id / 列内排序位置），用户拖拽后持久化在 Session 上。
    *  未设置时前端按运行状态推导默认列。 */
   kanbanColumn?: string;
+  /** 手动放置列的时刻；之后任务状态变化即失效（见 web/kanban-model.ts）。 */
+  kanbanColumnAt?: number;
   kanbanPosition?: number;
   /** Locked sessions are protected from dashboard idle cleanup. */
   locked?: boolean;
@@ -125,7 +135,11 @@ export interface SessionRow extends SessionMessagePreview {
    *  board/overview can show *why* at a glance, plus `at` (epoch ms when it
    *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
    *  which a silent raise never bumps. Feeds the needs-you column. */
-  agentAttention?: { kind: string; reason: string; at: number };
+  agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
+  /** 最近一轮的结果（core/session-task-status.ts）。缺失 = 读不到，前端归空闲。 */
+  lastTurn?: SessionLastTurn;
+  /** 当前忙碌段的起点（进入 starting/working/analyzing 的边沿），只在活跃会话上有。 */
+  busySinceAt?: number;
   /** 任务态（会话状态重设计 P2）：从 CLI transcript 读到的当前 TODO 完成度。
    *  与运行态正交——「运行态=空闲 + 有未完成 todo」正是要抓的「机器停了活没干完」。
    *  仅 Claude / Codex 家族能提取；其它 CLI、无 transcript、从未建 todo 时为 undefined
@@ -294,6 +308,11 @@ function backendSessionNameForRow(s: Session): string | undefined {
   ).sessionName;
 }
 
+function closedResumabilityFields(s: Session): Pick<SessionRow, 'resumable' | 'resumeBlockedReason'> {
+  const blocked = s.scope === 'chat' ? 'chat_scope' : topicResumeBlockReason(s);
+  return blocked ? { resumable: false, resumeBlockedReason: blocked } : { resumable: true };
+}
+
 function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runtimeDisplayName'> {
   if (s.cliRuntime) {
     return { runtimeId: s.cliRuntime.id, runtimeDisplayName: s.cliRuntime.displayName };
@@ -350,6 +369,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...(ds.session.continuity ? { continuity: ds.session.continuity } : {}),
     ...(ds.session.dispatchLaunchSpec ? {
       requestedLaunch: ds.session.dispatchLaunchSpec.requested,
       ...(ds.session.dispatchLaunchSpec.effectiveRuntime
@@ -393,6 +413,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     backendType: ds.session.backendType,
     backendSessionName: backendSessionNameForRow(ds.session),
     kanbanColumn: ds.session.kanbanColumn,
+    kanbanColumnAt: ds.session.kanbanColumnAt,
     kanbanPosition: ds.session.kanbanPosition,
     locked: !!ds.session.locked,
     // Read from the persisted Session — single source of truth.
@@ -414,8 +435,15 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     queued: !!ds.session.queued,
     tuiPromptActive: !!ds.tuiPromptCardId,
     agentAttention: ds.agentAttention
-      ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+      ? {
+          kind: ds.agentAttention.kind,
+          reason: ds.agentAttention.reason,
+          at: ds.agentAttention.at,
+          ...(ds.agentAttention.source ? { source: ds.agentAttention.source } : {}),
+        }
       : undefined,
+    ...(ds.session.lastTurn ? { lastTurn: ds.session.lastTurn } : {}),
+    ...(ds.busySinceAt !== undefined ? { busySinceAt: ds.busySinceAt } : {}),
     ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
@@ -447,6 +475,8 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     ...sessionRuntimeFields(s),
     ...modelPinField(s),
     status: 'closed',
+    ...closedResumabilityFields(s),
+    ...(s.continuity ? { continuity: s.continuity } : {}),
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),
     lastMessageAt: s.closedAt ? (parseSessionTime(s.closedAt) ?? sessionLastActivityAtMs(s)) : sessionLastActivityAtMs(s),
@@ -466,6 +496,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     backendType: s.backendType,
     backendSessionName: backendSessionNameForRow(s),
     kanbanColumn: s.kanbanColumn,
+    kanbanColumnAt: s.kanbanColumnAt,
     kanbanPosition: s.kanbanPosition,
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
@@ -527,6 +558,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     backendType: s.backendType,
     backendSessionName: backendSessionNameForRow(s),
     kanbanColumn: s.kanbanColumn,
+    kanbanColumnAt: s.kanbanColumnAt,
     kanbanPosition: s.kanbanPosition,
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
@@ -535,6 +567,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     ...(topicId ? { threadId: topicId } : {}),
     queued: !!s.queued,
+    ...(s.lastTurn ? { lastTurn: s.lastTurn } : {}),
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
     ...sandboxDriftField(s),

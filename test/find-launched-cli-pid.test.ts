@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { cliIdForComm, findLaunchedCliPid, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -63,6 +63,8 @@ function loadRealLeafFns(deps: { readComm: (pid: number) => string | undefined; 
     isZombieProcess: () => false,
     cliIdForComm,
     findLaunchedCliPid: deps.findReal,
+    CODEX_LEAF_SEARCH_DEPTH,
+    snapshotChildPids: () => () => [],
   });
   return sandbox.__exports as {
     codexProcessIsNativeLeaf: (pid: number, filter?: string) => boolean;
@@ -103,9 +105,14 @@ function runWorkerWiring(late: boolean, options: {
   scopePayloadAfterProbe?: number;
   /** Children of pids other than the pane (100); a synthetic launch chain. */
   children?: Record<number, number[]>;
+  /** A TRAE child first becomes visible after this much launcher time. */
+  traexChildAfterMs?: number;
   /** Herdr/ZMX shape: getChildPid() reports the MUTABLE cliPid, which gets
    *  rewired to the discovered leaf, rather than the stable pane/launcher pid. */
   aliasedChildPid?: boolean;
+  /** Run the real BFS over the synthetic table (`children` / `childComms`)
+   *  with the depth the worker passes, instead of the canned result. */
+  realCodexSearch?: boolean;
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
@@ -113,8 +120,15 @@ function runWorkerWiring(late: boolean, options: {
     cliPid: 100,
     getChildPid: () => (options.aliasedChildPid ? backend.cliPid : 100),
   };
-  const findLaunchedCliPidMock = vi.fn(function (this: unknown, ..._args: unknown[]) {
+  const findLaunchedCliPidMock = vi.fn(function (this: unknown, ...args: unknown[]) {
     if (scheduler.now() < (options.launchedCliAfterMs ?? 0)) return null;
+    if (options.realCodexSearch) {
+      const [pid, cliId, depth, probes, filter] = args as Parameters<typeof findLaunchedCliPid>;
+      return findLaunchedCliPid(pid, cliId, depth, {
+        ...probes, childrenOf: context.getChildPids, commOf: context.readComm,
+        cmdlineOf: () => [], isZombie: () => false,
+      }, filter);
+    }
     return options.launchedCliPid === undefined ? 200 : options.launchedCliPid;
   });
   // The pane process's comm: 'node' models the npm launcher (descendant must be
@@ -132,12 +146,17 @@ function runWorkerWiring(late: boolean, options: {
     },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    // Module-level spawn counter read by the TRAE leaf-resolve guard; the sliced
+    // wiring runs in this VM without worker.ts's declaration, so supply its
+    // initial value. It is only read inside the slice, never assigned.
+    cliSpawnGeneration: 0,
     scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,
     lastSpawnCodexLauncherPid: undefined,
     codexOwnershipAttestationPending: false,
     FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
+    CODEX_LEAF_SEARCH_DEPTH, snapshotChildPids: () => () => [],
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
     process: { env: {} }, cliPidMarker: undefined,
@@ -160,7 +179,10 @@ function runWorkerWiring(late: boolean, options: {
         return options.paneCmdline ?? ['launcher'];
       };
     })(),
-    getChildPids: (pid: number) => (pid === 100 ? (options.relayChildren ?? [150]) : (options.children?.[pid] ?? [])),
+    getChildPids: vi.fn((pid: number) => {
+      if (options.traexChildAfterMs !== undefined && scheduler.now() < options.traexChildAfterMs) return [];
+      return pid === 100 ? (options.relayChildren ?? [150]) : (options.children?.[pid] ?? []);
+    }),
     readComm: (pid: number) => (pid === 100 ? (options.comm ?? 'node') : (options.childComms?.[pid] ?? 'claude')),
     isProgramStatusRelayArgv,
     programStatusRelayLaunched: options.relayLaunched ?? false,
@@ -197,6 +219,92 @@ function runWorkerWiring(late: boolean, options: {
 }
 
 describe('worker wrapper PID wiring', () => {
+  it.each([false, true])('binds the native TRAE child of an ordinary Node launcher (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false,
+      relayChildren: [200], childComms: { 200: 'traex' },
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('discovers a delayed TRAE child without a sandbox or wrapperCli setting (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false,
+      relayChildren: [200], childComms: { 200: 'traex' }, traexChildAfterMs: 12_000,
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(12_000);
+  });
+
+  it.each([false, true])('publishes the TRAE child when the backend aliases its child accessor to the bound PID (late PID=%s)', late => {
+    // Observe right after the PID binding (synchronous, or the 120ms late-PID
+    // callback) and before the retry's first 500ms tick: the binding itself
+    // must publish, not leave the bridge/attestation on the launcher meanwhile.
+    let atBinding: { cliPid: number; bridgeCliPid: unknown; attested: unknown[] } | undefined;
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false, aliasedChildPid: true,
+      relayChildren: [200], childComms: { 200: 'traex' },
+      beforeTimers: scope => {
+        scope.setTimeout(() => {
+          atBinding = {
+            cliPid: scope.backend.cliPid,
+            bridgeCliPid: scope.bridgeCliPid,
+            attested: scope.publishLocalProcessAttestation.mock.calls.map((call: unknown[]) => call[0]),
+          };
+        }, late ? 121 : 0);
+      },
+    });
+    expect(atBinding).toEqual({ cliPid: 200, bridgeCliPid: 200, attested: late ? [100, 200] : [200] });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('binds a later-forked TRAE leaf when an aliased child accessor already names the scope payload (late PID=%s)', late => {
+    // Herdr/ZMX shape behind the owned session scope: the payload binding moves
+    // the aliased cliPid from the pane supervisor (100) to the Node launcher
+    // (150) before the retry's first tick, and the native TRAE (200) forks only
+    // after that tick. Discovery must keep running for the captured root.
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', aliasedChildPid: true,
+      scopeLaunched: true, scopePayloadPid: 150,
+      relayChildren: [150], children: { 150: [200] }, childComms: { 150: 'node', 200: 'traex' },
+      traexChildAfterMs: 2_000,
+    });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(2_000);
+  });
+
+  it.each([false, true])('keeps a directly launched TRAE root rather than its TRAE subagent (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false, comm: 'traex',
+      relayChildren: [200], childComms: { 200: 'traex' },
+    });
+    expect(result.backend.cliPid).toBe(100);
+    // Initial marker/attestation publication is outside this sliced wiring.
+    // The behaviour under test is not descending into this root's subagent.
+    expect(result.getChildPids).not.toHaveBeenCalled();
+  });
+
+  it('does not let delayed TRAE discovery overwrite a newer spawn generation', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'traex', wrapperCli: '', scopeLaunched: false,
+      relayChildren: [200], childComms: { 200: 'traex' }, traexChildAfterMs: 12_000,
+      beforeTimers: scope => { scope.cliSpawnGeneration++; },
+    });
+    expect(result.backend.cliPid).toBe(100);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+    // The superseded spawn's discovery ends at its next tick instead of
+    // rescanning the process table until the old launcher's leaf appears.
+    expect(result.elapsedMs).toBeLessThan(12_000);
+  });
+
   it.each([false, true])('binds and attests an owned-scope payload rather than its pane supervisor (late PID=%s)', late => {
     const result = runWorkerWiring(late, {
       cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude',
@@ -222,6 +330,24 @@ describe('worker wrapper PID wiring', () => {
     expect(result.backend.cliPid).toBe(157);
     expect(result.bridgeCliPid).toBe(157);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(157);
+  });
+
+  it.each([false, true])('binds the npm Codex leaf under the network-policy sandbox chain (late PID=%s)', late => {
+    // The same measured chain below the scope supervisor (100), with the npm
+    // Node launcher (157) between bwrap's init and the native codex (158): the
+    // leaf sits eight levels below the scope payload and nine below the pane.
+    const result = runWorkerWiring(late, {
+      wrapperCli: '', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153], 153: [154], 154: [155], 155: [156], 156: [157], 157: [158] },
+      childComms: { 150: 'node', 151: 'unshare', 152: 'node', 153: 'sh', 154: 'sh', 155: 'bwrap', 156: 'bwrap', 157: 'node', 158: 'codex' },
+      // The synchronous ownership bind must already reach the leaf: the first
+      // turn can read the observed pid before any retry tick rewrites it.
+      beforeTimers: late ? undefined : scope => expect(scope.backend.cliPid).toBe(158),
+    });
+    expect(result.backend.cliPid).toBe(158);
+    expect(result.bridgeCliPid).toBe(158);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(158);
   });
 
   it.each([false, true])('follows a scope payload that appears after the initial PID wiring (late PID=%s)', late => {
@@ -402,7 +528,7 @@ describe('worker wrapper PID wiring', () => {
     // The gate must be ACTIVE for managed Codex even without a sandbox
     // (regression guard: passing outerBwrapActive here silently reverts the fix).
     expect(result.resolveCodexOwnershipPid).toHaveBeenCalledWith(100, true, undefined);
-    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex', 6, expect.any(Object), undefined);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex', CODEX_LEAF_SEARCH_DEPTH, expect.any(Object), undefined);
     expect(result.backend.cliPid).toBe(200);
     expect(result.bridgeCliPid).toBe(200);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
@@ -528,7 +654,7 @@ describe('worker wrapper PID wiring', () => {
 
   it.each([false, true])('keeps the launcher pid while the native child has not forked yet (late PID=%s)', late => {
     const result = runWorkerWiring(late, { wrapperCli: '', launchedCliPid: null });
-    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex', 6, expect.any(Object), undefined);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex', CODEX_LEAF_SEARCH_DEPTH, expect.any(Object), undefined);
     expect(result.backend.cliPid).toBe(100);
     expect(result.bridgeCliPid).toBeUndefined();
     expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);

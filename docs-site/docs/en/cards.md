@@ -16,7 +16,7 @@ Botmux uses Lark cards to show what the CLI is doing, and lets you control it ri
 A few notes:
 
 - Status marks and the status card are **either/or**: with the status card on, no reactions are added; with it off, the reaction is the only lightweight progress signal. Swap the two emoji with `receivedReactionEmoji` / `doneReactionEmoji` (see [bots.json](/en/bots-json)).
-- The thinking process needs Lark PC ≥ 7.70 or mobile ≥ 7.74, and only appears for CLIs that emit thinking (Claude Code, Codex, TraeX, Pi and others).
+- The thinking process needs Lark PC ≥ 7.70 or mobile ≥ 7.74, and only appears for CLIs that emit thinking (Claude Code, Codex, TraeX, Pi, Kimi and others).
 - To get "one card per turn" instead, see the "Dynamic single cards" section below.
 
 ## Terminal status card
@@ -46,13 +46,16 @@ The card body is a **live screenshot** of the terminal: xterm renders the CLI's 
 
 ### Card buttons
 
+Frequently used buttons sit on the card's main row. The low-frequency buttons marked "More Actions" below live in the "More Actions" collapsible panel under the main row; tap the panel title to open it.
+
 | Button | What it does |
 |--------|--------------|
-| 📖 Show Output / 📕 Hide Output | Expand or collapse the terminal screenshot; when expanded you also get 📝 Export Text and 🔃 Refresh |
+| 📖 Show Output / 📕 Hide Output | More Actions. Expand or collapse the terminal screenshot; when expanded the panel also has 📝 Export Text and 🔃 Refresh |
+| ⌨️ Terminal Keys ▾ / ▴ | Appears when output is shown; shows or hides the terminal keys at the bottom of the card (see [Interrupting or correcting a turn](#interrupting-or-correcting-a-turn) below) |
 | 🖥️ Open Web Terminal | **Read-only** terminal view |
-| 🔑 Get Write Link | Get a **writable** terminal link. Flat groups first try a "visible only to you" card; topics, private chats, or a failed send fall back to a DM |
+| 🔑 Get Write Link | More Actions. Get a **writable** terminal link. Flat groups first try a "visible only to you" card; topics, private chats, or a failed send fall back to a DM |
 | 🗜️ Compact | Send `/compact` to the CLI to compress context (shown only when the CLI supports it) |
-| ⏲️ Idle auto-compact: on/off | Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
+| ⏲️ Idle auto-compact: on/off | More Actions. Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
 | ⏹ Stop | Interrupt the current turn (same as ^C); the session stays. Only shown while the turn is still running |
 | ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here |
 | 🔁 Retry Last Task | Appears when the quota recovers and the status becomes "Ready to retry" |
@@ -62,10 +65,10 @@ You can hide buttons you don't need in the Dashboard (see "Hiding card buttons" 
 
 ### Interrupting or correcting a turn
 
-**You don't have to wait for it to finish.** With output shown, the bottom of the card has quick keys: Esc, ^C, Tab, Space, Enter, arrow keys, ⇞ Page ½ Up, ⇟ Page ½ Down. Tapping Esc presses Esc in the terminal; after interrupting, just send a new instruction.
+**You don't have to wait for it to finish.** With output shown, tap "⌨️ Terminal Keys ▾" and a set of terminal keys appears at the bottom of the card: × (Esc), ^C, ⇥ (Tab), ␣ (Space), ↵ (Enter), arrow keys, ▲ half page up, ▼ half page down. Tapping × presses Esc in the terminal; after interrupting, just send a new instruction.
 
-- The quick keys only appear when **output is shown**, and remote backends (Riff / Mojo) don't have them.
-- By default, messages you send while a turn is running are queued and fed in after it ends. To correct course immediately, tap Esc or ⏹ Stop first.
+- The terminal keys are only available when **output is shown**, and remote backends (Riff / Mojo) don't have them. They start hidden; once you show them, later cards of the same session keep them shown until you hide them again.
+- By default, messages you send while a turn is running are queued and fed in after it ends. To correct course immediately, tap × (Esc) or ⏹ Stop first.
 
 ### Card lifecycle
 
@@ -130,7 +133,8 @@ Want only one card? Choose dynamic single card and turn off "**Show a separate s
 
 ### Which sessions are supported
 
-- Supported: ordinary Lark conversations with Claude Code, Codex, Grok, TraeX and Pi **without a file sandbox** (both regular groups and topics).
+- Supported: ordinary Lark conversations with Claude Code, Codex, Grok, TraeX, Pi and Kimi **without a file sandbox** (both regular groups and topics).
+- Kimi's process comes from its local session log, which Kimi writes once per completed model step: thinking and tools update step by step rather than token by token, and the closing answer is delivered by `botmux send` rather than repeated in the process.
 - Not supported, still using the default mode: file-sandbox sessions (including `readIsolation` and global `BOTMUX_SANDBOX=1`), API-only, non-Lark channels, remote Riff/Mojo, adopt, local terminal sync, doc comments, video meetings, scheduled tasks, and v3 workflows.
 - Sandbox state is fixed when the session starts; changing the bot's sandbox switch does not affect running sessions.
 
@@ -198,6 +202,7 @@ Values: `output` (show output, export text, refresh), `terminal`, `writeLink`, `
 | `writableTerminalLinkInCard` | Puts a writable terminal button in the card; anyone who sees the card can operate the terminal, so only enable it in trusted chats | Off |
 | `privateCard` | In regular groups, `/card` sends an admin-only static snapshot (it does not keep updating) | Off |
 | `replyCardActions` | Shows an "Open terminal / Switch model / Close session" menu at the bottom right of ordinary reply cards | Off |
+| `goalStatusCard` | When a Codex / TRAE session sets a native goal (`/goal`), posts one goal status card and updates it in place with the status and the CLI-counted elapsed time. Turning it on applies to new sessions (or after a session restarts); turning it off stops updating existing cards right away | Off |
 
 All of these can be changed in the Dashboard or with `/botconfig set <setting> on|off`.
 

@@ -186,7 +186,9 @@ describe('cmdSend hook context wiring', () => {
       /const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget\s*\? frozenTurnReplyTarget/,
     );
     expect(cliSource).toContain('?? frozenTurnDispatch?.replyTargetSenderOpenId');
-    expect(cliSource).toContain('?? frozenTurnDispatch?.quoteTargetId');
+    // The current reply-context branch may sit between the explicit quote and the
+    // frozen fallback; the frozen turn's quote target must still be the fallback.
+    expect(cliSource).toMatch(/\?\? \(selectedReplyContext \? turnBoundQuoteTarget : frozenTurnDispatch\?\.quoteTargetId\)|\?\? frozenTurnDispatch\?\.quoteTargetId/);
     expect(cliSource).toContain('lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId');
     expect(cliSource).toContain('lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot');
   });

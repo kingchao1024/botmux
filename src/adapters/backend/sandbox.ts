@@ -23,7 +23,7 @@ import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
 import type { ProtectedHttpEgressLoopbackPlan, ProtectedLocalServiceLoopbackPlan } from '../../core/protected-http-egress-loopback.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
-import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
+import { envSandboxMode, resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -610,10 +610,11 @@ export function botmuxCliInvocation(cliPathOverride?: string): { command: string
   return { command: process.execPath, args: [distCliJs()] };
 }
 
-/** Is the file sandbox globally forced for this daemon? The real per-bot
- *  BotConfig.sandbox flag is decided by the caller. */
+/** Is the file sandbox globally forced for this daemon (BOTMUX_SANDBOX=1/oncall/
+ *  scratch)? The real per-bot BotConfig.sandbox flag is decided by the caller.
+ *  An invalid value counts as forced: the worker refuses to spawn with it. */
 export function sandboxEnabled(): boolean {
-  return process.env.BOTMUX_SANDBOX === '1';
+  try { return envSandboxMode(process.env.BOTMUX_SANDBOX) !== 'off'; } catch { return true; }
 }
 
 /**
@@ -1750,6 +1751,7 @@ const RELAY_FLAGS_NOVAL = new Set([
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
+  '--reply-to',
   '--response-kind',
   '--expected-link',
   '--as',
@@ -2043,6 +2045,7 @@ export function buildRelayHostEnv(
   delete env.BOTMUX_ORIGIN_CHANNEL_ID;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
   delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+  delete env.BOTMUX_REPLY_MESSAGE_ID;
   // Every host re-exec of a sandbox relay carries the route gate: routing
   // flags it forwards must be decided by the daemon, never trusted as given.
   env[SANDBOX_RELAY_ROUTE_GATE_ENV] = '1';
@@ -2099,6 +2102,7 @@ export function startOutboxWatcher(
           ok: true;
           origin: {
             turnId?: string;
+            replyMessageId?: string;
             dispatchAttempt?: number;
             /** The worker matched an unsettled Codex App ledger entry. The
              * host child must still find that exact entry before any provider
@@ -2257,6 +2261,8 @@ export function startOutboxWatcher(
       // the exact receipt/IM origin carried below.
       requestEnv.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
       delete requestEnv.BOTMUX_TURN_ID;
+      delete requestEnv.BOTMUX_REPLY_MESSAGE_ID;
+      if (trustedOrigin?.replyMessageId) requestEnv.BOTMUX_REPLY_MESSAGE_ID = trustedOrigin.replyMessageId;
       delete requestEnv.BOTMUX_DISPATCH_ATTEMPT;
       if (trustedOrigin?.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
       if (trustedOrigin?.dispatchAttempt !== undefined) {
