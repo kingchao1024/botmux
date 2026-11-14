@@ -25,9 +25,9 @@ Claude、Codex 的模型选择依据是本机当天的 LLMbox 缓存。缓存只
 
 文档 bot 使用 GLM 的 low 档，其余六个 Claude／Codex bot 使用 high。三个 TraeX bot 的模型、上下文档位和原生子代理策略保持不变。
 
-四个 Claude bot 通过现有环境变量接口设置 `ANTHROPIC_BASE_URL=https://llmbox.bytedance.net`，主模型、原生子代理模型及 Haiku／Sonnet／Opus 默认映射都指向各自选定的 LLMbox 模型。原有环境变量保留，新增项不含鉴权字段。
+四个 Claude bot 通过现有环境变量接口，将 `ANTHROPIC_BASE_URL` 设置为当时配置的 LLMbox 网关地址，主模型、原生子代理模型及 Haiku／Sonnet／Opus 默认映射都指向各自选定的 LLMbox 模型。原有环境变量保留，新增项不含鉴权字段。
 
-root 原先没有 Codex 供应商配置，本轮新增 `/root/.codex/config.toml`，默认供应商为 `llmgw`，地址为 `https://llmbox.bytedance.net`，协议为 `responses`。模型目录来自本机 LLMbox 的非凭据模型元数据，保存为 `/root/.codex/llmbox-models.json`。两个新增文件均为 0600，配置不含 token、API key 或登录设置；root 用户新启动的 Codex 默认使用这个入口。
+root 原先没有 Codex 供应商配置，本轮新增 `/root/.codex/config.toml`，默认供应商为 `llmgw`，使用当时配置的 LLMbox 网关地址，协议为 `responses`。模型目录来自本机 LLMbox 的非凭据模型元数据，保存为 `/root/.codex/llmbox-models.json`。两个新增文件均为 0600，配置不含 token、API key 或登录设置；root 用户新启动的 Codex 默认使用这个入口。
 
 使用现有 `PUT /api/bot-agent` 完成 7 次模型更新，使用 `PUT /api/bot-env` 完成 4 次 Claude 路由更新，再独立回读。最终保存均成功，关闭失配会话、残留会话和关闭失败数量均为 0。首次执行因 Codex 可用性检查未通过而中止，完整恢复配置后重试成功；过程记录保存在 `attempt-1.json`。
 

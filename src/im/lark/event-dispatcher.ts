@@ -115,7 +115,7 @@ import { readBotsInfoJson } from '../../services/bots-info-cache.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, type BotsInfoObjectEntry } from '../../services/bots-info-shape.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
-import { hasExactAskCallbackValueKeys, hasOnlyLarkCardActionKeys, snapshotLarkCardActionCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
+import { validateAskCallbackShape, snapshotLarkCardActionCallbackData, type AskAnswerProvenanceIssue, type AskAnswerProvenanceIssuer, type AskAnswerProvenanceToken } from '../../core/ask-receipt.js';
 import type { AskCardActionOutcome } from './ask-card.js';
 import type { DurableInboxEvent, DurableInboxStore } from '../../services/durable-coordination.js';
 import {
@@ -1276,50 +1276,6 @@ function serializeRawCardForPatch(cardData: any): string | undefined {
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
     && Object.getPrototypeOf(value) === Object.prototype;
-}
-
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0;
-}
-
-function safeQuestionIndex(value: unknown): boolean {
-  const parsed = typeof value === 'number' ? value
-    : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
-  return Number.isSafeInteger(parsed) && parsed >= 0;
-}
-
-function validateAskCallbackShape(data: unknown): boolean {
-  if (!isPlainRecord(data)) return false;
-  const event = data;
-  const actionRecord = isPlainRecord(event.action) ? event.action : undefined;
-  const valueRecord = isPlainRecord(actionRecord?.value) ? actionRecord.value : undefined;
-  const action = typeof valueRecord?.action === 'string' ? valueRecord.action : undefined;
-  if (action !== 'ask_select' && action !== 'ask_toggle' && action !== 'ask_submit') return false;
-  if (!actionRecord || !valueRecord) return false;
-  if (!nonEmptyString(valueRecord.ask_id) || !nonEmptyString(valueRecord.nonce)) return false;
-
-  if (action === 'ask_select') {
-    return hasOnlyLarkCardActionKeys(actionRecord, false)
-      && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
-      && nonEmptyString(valueRecord.key);
-  }
-  if (action === 'ask_toggle') {
-    return hasOnlyLarkCardActionKeys(actionRecord, false)
-      && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
-      && nonEmptyString(valueRecord.key)
-      && safeQuestionIndex(valueRecord.question_index);
-  }
-  const expectedValueKeys = Object.prototype.hasOwnProperty.call(valueRecord, 'confirm_empty')
-    ? ['action', 'ask_id', 'nonce', 'confirm_empty']
-    : ['action', 'ask_id', 'nonce'];
-  const formValueOwn = Object.prototype.hasOwnProperty.call(actionRecord, 'form_value');
-  const formValue = actionRecord.form_value;
-  return hasOnlyLarkCardActionKeys(actionRecord, formValueOwn)
-    && hasExactAskCallbackValueKeys(valueRecord, expectedValueKeys)
-    && (valueRecord.confirm_empty === undefined
-      || valueRecord.confirm_empty === true
-      || valueRecord.confirm_empty === 'true')
-    && (!formValueOwn || isPlainRecord(formValue));
 }
 
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {

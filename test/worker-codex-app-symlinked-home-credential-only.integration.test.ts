@@ -27,6 +27,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import WebSocket from 'ws';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
@@ -91,6 +92,8 @@ describe.skipIf(!credentialOnlyBwrap)(
       // unparseable marker still means "enrolled" (fail closed) — do not replace
       // it with a well-formed pending marker, which would probe a different rule.
       writeFileSync(deviceCredentialIsolationMarkerPath(linkHome), '');
+      // The host lock keeps reader leases in a directory, not a regular file.
+      mkdirSync(`${deviceCredentialIsolationMarkerPath(linkHome)}.lock.readers`, { mode: 0o700 });
       const fakeCodex = join(base, 'fake-codex');
       copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
       chmodSync(fakeCodex, 0o755);
@@ -123,7 +126,17 @@ describe.skipIf(!credentialOnlyBwrap)(
       children.add(child);
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
       child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-      child.on('message', raw => messages.push(raw as WorkerToDaemon));
+      child.on('message', raw => {
+        const message = raw as WorkerToDaemon;
+        messages.push(message);
+        if (message.type === 'turn_terminal') logs.push(JSON.stringify(message));
+        if (message.type === 'ready') {
+          const terminal = new WebSocket(`ws://127.0.0.1:${message.port}/?viewToken=${message.viewToken}`);
+          terminal.on('message', data => logs.push(data.toString()));
+          terminal.on('error', error => logs.push(`terminal: ${error.message}`));
+          child.once('exit', () => terminal.close());
+        }
+      });
       child.send({
         type: 'init',
         sessionId,
@@ -136,6 +149,7 @@ describe.skipIf(!credentialOnlyBwrap)(
         prompt: 'hello',
         turnId: 'om_p5_turn',
         promptCodexAppInput: { text: 'hello', clientUserMessageId: 'om_p5_turn' },
+        captureTurnFailureDiagnostics: true,
         larkAppId: 'app_p5_symlinked_home',
         larkAppSecret: 'secret',
       } satisfies DaemonToWorker);

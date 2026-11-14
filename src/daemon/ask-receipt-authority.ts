@@ -20,8 +20,7 @@ import {
   canonicalAskReceiptBytes,
   canonicalJson,
   exportAskReceiptPublicKey,
-  hasExactAskCallbackValueKeys,
-  hasOnlyLarkCardActionKeys,
+  validateAskCallbackShape,
   importAskReceiptPublicKey,
   normalizeAskSubmitValue,
   snapshotAskCallbackData,
@@ -265,34 +264,6 @@ export function createAskAnswerProvenanceAuthority(input: {
     }
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
   };
-  const validSubmitConfirmEmpty = (value: unknown): boolean =>
-    value === undefined || value === true || value === 'true';
-  const validateAskCallbackShape = (
-    action: Captured['action'],
-    actionRecord: Record<string, unknown>,
-    valueRecord: Record<string, unknown>,
-    formValueOwn: boolean,
-    formValueRecord: Record<string, unknown> | undefined,
-  ): boolean => {
-    if (action === 'ask_select') {
-      return hasOnlyLarkCardActionKeys(actionRecord, false)
-        && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key'])
-        && nonEmptyString(valueRecord.key);
-    }
-    if (action === 'ask_toggle') {
-      return hasOnlyLarkCardActionKeys(actionRecord, false)
-        && hasExactAskCallbackValueKeys(valueRecord, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
-        && nonEmptyString(valueRecord.key)
-        && integer(valueRecord.question_index) !== undefined;
-    }
-    const expectedValueKeys = Object.prototype.hasOwnProperty.call(valueRecord, 'confirm_empty')
-      ? ['action', 'ask_id', 'nonce', 'confirm_empty']
-      : ['action', 'ask_id', 'nonce'];
-    return hasOnlyLarkCardActionKeys(actionRecord, formValueOwn)
-      && hasExactAskCallbackValueKeys(valueRecord, expectedValueKeys)
-      && validSubmitConfirmEmpty(valueRecord.confirm_empty)
-      && (!formValueOwn || formValueRecord !== undefined);
-  };
   const consumeState = (token: unknown): RecordState | undefined => {
     if (!token || typeof token !== 'object') return undefined;
     const state = records.get(token);
@@ -357,9 +328,12 @@ export function createAskAnswerProvenanceAuthority(input: {
         return { kind: 'rejected', reason: 'invalid_event_id' };
       }
       if (!actionRecord || !valueRecord
-          || !validateAskCallbackShape(action, actionRecord, valueRecord, formValueOwn, formValueRecord)) {
+          || !validateAskCallbackShape(event)) {
         return { kind: 'rejected', reason: 'invalid_event_id' };
       }
+      // Custom drafts deliberately settle with receiptEligible=false. They
+      // must not claim a signed event that the form broker cannot redeem.
+      if (valueRecord.custom_form === 'v1') return { kind: 'not_ask' };
       const optionKey = text(valueRecord.key);
       const questionIndex = integer(valueRecord.question_index);
       const callback: Captured = Object.freeze({

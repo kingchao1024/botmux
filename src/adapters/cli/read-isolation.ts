@@ -137,6 +137,8 @@ export const HOST_DEVICE_CREDENTIAL_FILES = [
   DEVICE_ENROLLMENT_JOURNAL_FILE,
 ] as const;
 export const DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME = '.device-credential-isolation';
+/** Reader leases are stored below this exact host lock directory. */
+export const DEVICE_CREDENTIAL_ISOLATION_READERS_DIRECTORY = `${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}.lock.readers`;
 
 function hostDeviceAuthorityPaths(root: string): string[] {
   return [

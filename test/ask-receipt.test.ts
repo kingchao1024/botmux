@@ -235,6 +235,40 @@ describe('signed Ask receipt', () => {
     expect(claimEvent).toHaveBeenCalledTimes(5);
   });
 
+  it('keeps valid custom forms unsigned and rejects malformed custom shapes before claim', async () => {
+    const { signer } = fixture();
+    const claimEvent = vi.fn(async () => ({ ok: true, recovered: false } as const));
+    const authority = createAskAnswerProvenanceAuthority({
+      signer, daemonBootId: 'custom-form', claimEvent,
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    const base = { ask_id: 'ask-1', nonce: 'nonce-1', custom_form: 'v1', revision: '0' };
+    const callback = (value: Record<string, unknown>, formValue: unknown = { custom_0: 'answer' }) => ({
+      event_id: 'evt-custom', operator: { open_id: 'ou-reviewer' }, context: { open_message_id: 'om-card' },
+      action: { value, form_value: formValue },
+    });
+    for (const value of [
+      { ...base, action: 'ask_toggle', key: 'approve', question_index: '0' },
+      { ...base, action: 'ask_toggle', custom_choice: 'true', question_index: '0' },
+      { ...base, action: 'ask_submit' },
+      { ...base, action: 'ask_submit', confirm_empty: 'true' },
+    ]) expect(await authority.issue('cli-app', callback(value))).toEqual({ kind: 'not_ask' });
+    for (const value of [
+      { ...base, action: 'ask_submit', revision: '-1' },
+      { ...base, action: 'ask_submit', revision: '9007199254740992' },
+      { ...base, action: 'ask_submit', custom_form: 'v2' },
+      { ...base, action: 'ask_submit', unexpected: true },
+      { ...base, action: 'ask_toggle', question_index: '0', custom_choice: 'false' },
+      { ...base, action: 'ask_toggle', question_index: '0', key: 'approve', custom_choice: 'true' },
+      { ...base, action: 'ask_select', key: 'approve' },
+    ]) expect(await authority.issue('cli-app', callback(value))).toEqual({ kind: 'rejected', reason: 'invalid_event_id' });
+    for (const fields of [null, [], { custom_0: 42 }, { q0: 'approve' }, { custom_0: 'x'.repeat(1001) }]) {
+      expect(await authority.issue('cli-app', callback({ ...base, action: 'ask_submit' }, fields)))
+        .toEqual({ kind: 'rejected', reason: 'invalid_event_id' });
+    }
+    expect(claimEvent).not.toHaveBeenCalled();
+  });
+
   it('binds one submit event to normalized form answers and confirm-empty intent', async () => {
     const { signer } = fixture();
     const claims = new Map<string, string>();

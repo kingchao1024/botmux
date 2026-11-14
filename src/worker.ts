@@ -84,6 +84,7 @@ import {
   isolationPanePolicyDigest,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
+import { collectCredentialIsolationEntries } from './adapters/cli/credential-isolation-entries.js';
 import {
   buildsSandboxWrapperLaunch,
   cliNameLink,
@@ -28787,11 +28788,6 @@ async function spawnCliBody(
     const hideDirectories = new Set<string>();
     const hideFiles = new Set<string>();
     const processedRoots = new Set<string>();
-    const isDashboardAuthorityBasename = (name: string): boolean =>
-      name === '.dashboard-secret'
-      || name.startsWith('.dashboard-secret.')
-      || name === '.dashboard-token'
-      || name.startsWith('.dashboard-token.');
     for (const rawRoot of [defaultBotmuxHome, configuredBotmuxHome]) {
       let root = rawRoot;
       try { root = realpathSync(rawRoot); } catch { /* gate authority root is checked below */ }
@@ -28822,29 +28818,9 @@ async function spawnCliBody(
         mkdirSync(deviceAuthorityDirectory, { mode: 0o700 });
       }
       hideDirectories.add(realpathSync(deviceAuthorityDirectory));
-      for (const name of readdirSync(root)) {
-        if (name === DEVICE_AUTHORITY_DIRECTORY) continue;
-        if (!isCredentialIsolationReservedBasename(name)
-          && !isDashboardAuthorityBasename(name)) continue;
-        const entry = join(root, name);
-        try {
-          const stat = lstatSync(entry);
-          if (!stat.isFile()) {
-            // Never follow a host-authority symlink or special file. Exact mask
-            // destinations must be stable regular files or the launch fails
-            // closed before an untrusted CLI starts.
-            throw new Error(
-              `[device-credential-isolation] authority entry is not a regular file: ${entry}`,
-            );
-          }
-          hideFiles.add(entry);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-          // A racing removal needs no mask; a later exact credential rotation
-          // is host-only and the long-lived device secret namespace itself is
-          // protected wholesale above.
-        }
-      }
+      const entries = collectCredentialIsolationEntries(root);
+      for (const directory of entries.directories) hideDirectories.add(directory);
+      for (const file of entries.files) hideFiles.add(file);
     }
     const askAuthorityPaths = askReceiptHostAuthorityPaths({
       homeDir: canonical(hostHomeDir),

@@ -15,6 +15,7 @@ import {
 import { isProxy } from 'node:util/types';
 
 import type { AskQuestion } from './ask-types.js';
+import { ASK_CUSTOM_MAX_LENGTH } from './ask-custom-input.js';
 
 export const ASK_RECEIPT_SCHEMA = 'botmux.ask-receipt.v1' as const;
 export const ASK_RECEIPT_ALGORITHM = 'Ed25519' as const;
@@ -474,6 +475,57 @@ export function hasExactAskCallbackValueKeys(
     : [...expected, BOTMUX_ASK_CALLBACK_MARKER_KEY];
   return exactKeys(value, expectedKeys)
     && (marker === undefined || marker === BOTMUX_ASK_CALLBACK_MARKER_VERSION);
+}
+
+/** One closed schema for both WS ingress and optional receipt issuance. */
+export function validateAskCallbackShape(data: unknown): boolean {
+  if (!isPlainRecord(data) || !isPlainRecord(data.action) || !isPlainRecord(data.action.value)) return false;
+  const actionRecord = data.action;
+  const value = actionRecord.value as Record<string, unknown>;
+  if (!nonEmptyString(value.ask_id) || !nonEmptyString(value.nonce)) return false;
+  const index = (input: unknown): boolean => {
+    const parsed = typeof input === 'number' ? input
+      : typeof input === 'string' && /^\d+$/.test(input) ? Number(input) : NaN;
+    return Number.isSafeInteger(parsed) && parsed >= 0;
+  };
+  const formOwn = Object.prototype.hasOwnProperty.call(actionRecord, 'form_value');
+  if (Object.prototype.hasOwnProperty.call(value, 'custom_form')) {
+    if (value.custom_form !== 'v1'
+        || typeof value.revision !== 'string' || !/^(0|[1-9]\d*)$/.test(value.revision)
+        || !index(value.revision)
+        || !hasOnlyLarkCardActionKeys(actionRecord, true)
+        || !isPlainRecord(actionRecord.form_value)
+        || Object.entries(actionRecord.form_value).some(([name, text]) =>
+          !/^custom_(0|[1-9]\d*)$/.test(name) || !index(name.slice(7))
+          || typeof text !== 'string' || text.length > ASK_CUSTOM_MAX_LENGTH)) return false;
+    const keys = ['action', 'ask_id', 'nonce', 'custom_form', 'revision'];
+    if (value.action === 'ask_toggle') {
+      const custom = Object.prototype.hasOwnProperty.call(value, 'custom_choice');
+      return hasExactAskCallbackValueKeys(value, [...keys, 'question_index', custom ? 'custom_choice' : 'key'])
+        && index(value.question_index)
+        && (custom ? value.custom_choice === 'true' : nonEmptyString(value.key));
+    }
+    return value.action === 'ask_submit'
+      && hasExactAskCallbackValueKeys(value, Object.prototype.hasOwnProperty.call(value, 'confirm_empty')
+        ? [...keys, 'confirm_empty'] : keys)
+      && (value.confirm_empty === undefined || value.confirm_empty === 'true');
+  }
+  if (value.action === 'ask_select') {
+    return hasOnlyLarkCardActionKeys(actionRecord, false)
+      && hasExactAskCallbackValueKeys(value, ['action', 'ask_id', 'nonce', 'key'])
+      && nonEmptyString(value.key);
+  }
+  if (value.action === 'ask_toggle') {
+    return hasOnlyLarkCardActionKeys(actionRecord, false)
+      && hasExactAskCallbackValueKeys(value, ['action', 'ask_id', 'nonce', 'key', 'question_index'])
+      && nonEmptyString(value.key) && index(value.question_index);
+  }
+  return value.action === 'ask_submit'
+    && hasOnlyLarkCardActionKeys(actionRecord, formOwn)
+    && hasExactAskCallbackValueKeys(value, Object.prototype.hasOwnProperty.call(value, 'confirm_empty')
+      ? ['action', 'ask_id', 'nonce', 'confirm_empty'] : ['action', 'ask_id', 'nonce'])
+    && (value.confirm_empty === undefined || value.confirm_empty === true || value.confirm_empty === 'true')
+    && (!formOwn || isPlainRecord(actionRecord.form_value));
 }
 
 function nonEmptyString(value: unknown): value is string {

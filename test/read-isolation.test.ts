@@ -1294,6 +1294,9 @@ describe('worker read-isolation fences', () => {
     expect(credentialWrapperAt).toBeLessThan(spawnAt);
     expect(strippedSource).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(strippedSource).toContain('isCredentialIsolationReservedBasename(name)');
+    expect(strippedSource).toContain('const entries = collectCredentialIsolationEntries(root)');
+    expect(strippedSource).toContain('for (const directory of entries.directories) hideDirectories.add(directory)');
+    expect(strippedSource).toContain('for (const file of entries.files) hideFiles.add(file)');
     expect(strippedSource).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(strippedSource).toContain('isCredentialIsolationReservedBasename(name)');
     expect(strippedSource).toContain('} = detectAskAuthorityPresence({');

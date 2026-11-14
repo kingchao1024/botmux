@@ -19,6 +19,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { buildAskCustomForm } from '../src/im/lark/ask-custom-form.js';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
@@ -11899,6 +11900,56 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     setupBotState();
     handlers = makeHandlers();
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])(
+    'answers a generated custom form through the WS callback (authority=%s, custom=%s)', async (signed, custom) => {
+    const pair = generateKeyPairSync('ed25519');
+    const authority = createAskAnswerProvenanceAuthority({
+      signer: createAskReceiptSigner({
+        privateKey: pair.privateKey, publicKey: pair.publicKey, signerInstanceId: 'custom-form',
+      }),
+      daemonBootId: 'custom-form',
+      claimEvent: async () => ({ ok: true, recovered: false }),
+      completeEvent: async () => ({ ok: true, recovered: false }),
+    });
+    if (signed) setAskReceiptRedeemer(authority.redeemer);
+    setCanTalkChecker((_app, _chat, openId) => openId === USER_OPEN_ID);
+    let ask: import('../src/core/ask-types.js').PendingAsk | undefined;
+    setCardDispatcher({ async send(value) { ask = value; return { messageId: 'om-custom-card' }; } });
+    const pendingResult = registerAsk({
+      larkAppId: MY_APP_ID, sessionId: 'custom-form', chatId: 'oc-chat', rootMessageId: null,
+      originKind: 'explicit',
+      questions: [{ prompt: 'Proceed?', multiSelect: false, options: [
+        { key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' },
+      ] }],
+      timeoutMs: 60_000,
+    });
+    await Promise.resolve(); await Promise.resolve();
+    handlers.handleCardAction.mockImplementation((data, _appId, token) => handleAskCardActionWithOutcome(data, token));
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers, 'feishu', undefined, signed ? authority : undefined);
+    const actualLark = await vi.importActual<typeof import('@larksuiteoapi/node-sdk')>('@larksuiteoapi/node-sdk');
+    const dispatcher = new actualLark.EventDispatcher({});
+    dispatcher.register({ 'card.action.trigger': capturedHandlers['card.action.trigger'] as any });
+    const form = buildAskCustomForm(ask!, 'zh') as any;
+    const option = form.elements.filter((e: any) => e.tag === 'column_set')[custom ? 1 : 0].columns[0].elements[0];
+    const click = async (button: any, revision: string, eventId: string) => dispatcher.invoke({
+      schema: '2.0', header: { event_type: 'card.action.trigger', event_id: eventId },
+      event: {
+        operator: { open_id: USER_OPEN_ID }, context: { open_message_id: 'om-custom-card' },
+        action: { tag: 'button', name: button.name, value: { ...button.value, revision }, form_value: { custom_0: custom ? 'custom answer' : '' } },
+      },
+    }, { needCheck: false });
+    const toggled = await click(option, '0', 'custom-toggle');
+    expect(toggled?.toast?.type).not.toBe('error');
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    const submitted = await click(form.elements.at(-1), '1', 'custom-submit');
+    expect(submitted?.toast?.type).not.toBe('error');
+    const result = await pendingResult;
+    expect(result).toMatchObject({ kind: 'answered', answers: custom ? [[]] : [['yes']], by: USER_OPEN_ID });
+    if (custom) expect(result).toMatchObject({ customAnswers: ['custom answer'] });
+    expect(result.kind === 'answered' ? result.receipt : undefined).toBeUndefined();
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(2);
   });
 
   it('mints a one-shot Ask provenance capability only on the registered WS callback path', async () => {

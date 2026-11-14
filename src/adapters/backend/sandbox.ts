@@ -154,15 +154,20 @@ export function buildCredentialOnlySandboxArgs(input: {
   // Authority directory masks must be unreadable with respect to host data and
   // unwritable inside the sandbox. A bare tmpfs hides host contents but leaves
   // a writable replacement namespace, so seal each mask immediately.
+  const outbox = input.writableOutbox === undefined ? undefined
+    : assertCredentialIsolationPath(input.writableOutbox, 'writable outbox');
   for (const directory of hideDirectories.sort()) {
-    args.push('--tmpfs', directory, '--remount-ro', directory);
+    args.push('--tmpfs', directory);
+    // The owning outbox bind needs an existing destination after this fresh
+    // mask is sealed. Create only its empty path, never expose sibling relays.
+    if (outbox?.startsWith(`${directory}/`)) args.push('--dir', outbox);
+    args.push('--remount-ro', directory);
   }
   for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
   // AFTER the masks on purpose: `--tmpfs` over an ancestor of the outbox would
   // otherwise shadow this bind away and the confined `botmux send` would write
   // its request into a throwaway tmpfs no host watcher is reading.
-  if (input.writableOutbox !== undefined) {
-    const outbox = assertCredentialIsolationPath(input.writableOutbox, 'writable outbox');
+  if (outbox !== undefined) {
     args.push('--bind', outbox, outbox);
     // Deliver the relay path INSIDE the wrapper, exactly like the full sandbox
     // (prepareDirectSandbox's --setenv). The worker's childEnv alone does not
