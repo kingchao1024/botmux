@@ -30368,6 +30368,20 @@ async function spawnCliBody(
         );
       }
     }
+    let failedNonLarkTurnId: string | undefined;
+    if (!intentionalRestart && exitedTurnId && exitedDispatchAttempt === undefined
+      && lastInitConfig
+      && !sessionLarkTransportEnabled({ chatId: lastInitConfig.chatId, apiOnly: lastInitConfig.apiOnly })) {
+      // Ordinary HTTP/headless turns have no durable dispatch attempt. Their
+      // pollers still need a terminal when the CLI dies inside a live worker.
+      // Drain completed output first so an exit cannot overwrite real success.
+      drainReliableTerminalBeforeInterrupt();
+      drainArgvDurableInitialPromptCompletion();
+      if (!turnTerminalEmitted(exitedTurnId)) {
+        emitTurnTerminal(exitedTurnId, 'failed', `cli_exit_${code ?? signal ?? 'unknown'}`);
+        if (turnTerminalEmitted(exitedTurnId)) failedNonLarkTurnId = exitedTurnId;
+      }
+    }
     durableTurnInFlight = false;
     // Hybrid RPC mode: the `codex --remote` viewer just died — tear down the
     // paired app-server so it can't outlive the pane. A fresh spawn re-engages
@@ -30436,21 +30450,23 @@ async function spawnCliBody(
     // only it is excluded, from BOTH the inflight carry-over and the still-queued
     // pendingMessages.
     const stashed = inflightInputs.onCliExit(
-      item => item.dispatchAttempt === undefined && !item.noReplay,
+      item => item.dispatchAttempt === undefined && !item.noReplay
+        && (failedNonLarkTurnId === undefined || item.turnId !== failedNonLarkTurnId),
     );
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
     }
     const dropPendingOnExit = (item: PendingCliInput): boolean =>
-      item.noReplay === true && !(intentionalRestart && item.traexAutoModelRecovery);
+      (item.noReplay === true && !(intentionalRestart && item.traexAutoModelRecovery))
+      || (failedNonLarkTurnId !== undefined && item.turnId === failedNonLarkTurnId);
     const droppedPending = pendingMessages.filter(dropPendingOnExit).length;
     if (droppedPending > 0) {
-      // Remove ONLY the no-replay items still queued (never written); keep any
-      // ordinary follow-up input for the restart's normal flush.
+      // Drop no-replay items and the failed HTTP turn; keep later ordinary
+      // follow-up inputs for the restart's normal flush.
       for (let i = pendingMessages.length - 1; i >= 0; i--) {
         if (dropPendingOnExit(pendingMessages[i])) pendingMessages.splice(i, 1);
       }
-      log(`Dropped ${droppedPending} at-most-once pending message(s) on CLI exit (no replay)`);
+      log(`Dropped ${droppedPending} terminal/no-replay pending message(s) on CLI exit`);
     }
     backend = null;
     isPromptReady = false;

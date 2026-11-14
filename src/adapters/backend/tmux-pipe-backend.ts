@@ -34,6 +34,7 @@ import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast, tmuxSupportsRemainOnExitFailed, resolveTmuxVersionAtSessionBoundary, serverTmuxVersion } from '../../setup/ensure-tmux.js';
 import type { TmuxVersion } from '../../setup/ensure-tmux.js';
 import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
 import { strictPaneCommand } from './strict-env.js';
 import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
@@ -2229,14 +2230,15 @@ export class TmuxPipeBackend implements SessionBackend {
 
   captureInputState(): {
     viewport: string;
+    styledViewport?: string;
     cursor: { x: number; y: number };
   } | null {
     if (this.exited) return null;
     const cursor = this.getCursorPosition();
     if (!cursor) return null;
     try {
-      const viewport = execFileSync(
-        'tmux', [...this.tmuxArgs, 'capture-pane', '-p', '-t', this.paneTarget],
+      const styledViewport = execFileSync(
+        'tmux', [...this.tmuxArgs, 'capture-pane', '-e', '-p', '-t', this.paneTarget],
         {
           encoding: 'utf-8',
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -2245,7 +2247,7 @@ export class TmuxPipeBackend implements SessionBackend {
           env: tmuxEnv(),
         },
       );
-      return { viewport, cursor };
+      return { viewport: stripAnsiScreenText(styledViewport), styledViewport, cursor };
     } catch {
       return null;
     }

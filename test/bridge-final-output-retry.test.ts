@@ -1,4 +1,5 @@
 import * as registrationStore from '../src/services/idempotency-store.js';
+import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 /**
  * P2: daemon-side retry of `final_output` on transient Lark failures.
  *
@@ -345,6 +346,59 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     clearMessageListenerRunPreviewStore();
     linkRefRuntime.current = undefined;
     vi.useRealTimers();
+  });
+
+  it.each(['headless_exit', 'http_async_exit', 'http_wait_exit'])(
+    'persists a CLI exit failure for %s without failing another queued trigger',
+    async chatId => {
+      const ds = makeDs();
+      ds.chatId = ds.session.chatId = chatId;
+      const turnId = `turn-${chatId}`;
+      ds.asyncTriggerResults = new Map([
+        [turnId, { status: 'pending', createdAt: 1 }],
+        ['queued-followup', { status: 'pending', createdAt: 2 }],
+      ]);
+      asyncTriggerStore.recordPending(ds.session.sessionId, turnId, 1, ds.larkAppId);
+      const reject = vi.fn();
+      ds.pendingWaitPromises = new Map([[turnId, { resolve: vi.fn(), reject }]]);
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      ds.worker!.emit('message', {
+        type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId, status: 'failed', errorCode: 'cli_exit_78',
+      } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(ds.asyncTriggerResults.get(turnId)).toMatchObject({
+        status: 'failed', terminalErrorCode: 'cli_exit_78',
+      });
+      expect(asyncTriggerStore.lookup(ds.session.sessionId, turnId)?.result).toMatchObject({
+        status: 'failed', terminalErrorCode: 'cli_exit_78',
+      });
+      expect(ds.asyncTriggerResults.get('queued-followup')?.status).toBe('pending');
+      expect(reject).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('cli_exit_78') }));
+      expect(sessionReply).not.toHaveBeenCalled();
+    },
+  );
+
+  it('retains completed headless output if a later CLI exit terminal arrives', async () => {
+    const ds = makeDs();
+    ds.chatId = ds.session.chatId = 'headless_completed';
+    const turnId = 'completed-before-exit';
+    ds.asyncTriggerResults = new Map([[turnId, { status: 'completed', createdAt: 1, completedAt: 2, content: 'done' }]]);
+    asyncTriggerStore.recordPending(ds.session.sessionId, turnId, 1, ds.larkAppId);
+    asyncTriggerStore.recordCompleted(ds.session.sessionId, turnId, 'done', 2, ds.larkAppId);
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    ds.worker!.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId, status: 'failed', errorCode: 'cli_exit_78',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(ds.asyncTriggerResults.get(turnId)).toMatchObject({ status: 'completed', content: 'done' });
+    expect(asyncTriggerStore.lookup(ds.session.sessionId, turnId)?.result).toMatchObject({ status: 'completed', content: 'done' });
   });
 
   it('expands LinkRefs before markdown card rendering and keeps the worker IPC immutable', async () => {

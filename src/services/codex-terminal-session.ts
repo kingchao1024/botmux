@@ -29,6 +29,49 @@ export function codexTerminalSessionIsBound(terminal: PtyHandle, sessionId: stri
     && binding.sessionId === sessionId.toLowerCase();
 }
 
+/** Native starter hints are dim; user-authored text at Home is not. Require
+ * one capture's matching plain/styled cells and dim on every non-space hint
+ * character, rather than treating arbitrary text at cursor column 2 as empty. */
+function dimComposerPlaceholder(
+  state: NonNullable<ReturnType<NonNullable<PtyHandle['captureInputState']>>>,
+  startColumn: number,
+): boolean {
+  const styled = state.styledViewport;
+  if (!styled || stripAnsiScreenText(styled) !== state.viewport) return false;
+  let dim = false;
+  let row = 0;
+  let column = 0;
+  let found = false;
+  for (const token of styled.matchAll(/\x1b\[([0-9;]*)m|([^\x1b])/g)) {
+    if (token[1] !== undefined) {
+      const codes = token[1].split(';').map(Number);
+      for (let i = 0; i < codes.length; i++) {
+        const code = codes[i];
+        // Extended color parameters can contain 0, 2 or 22; they are colors,
+        // not intensity changes.
+        if (code === 38 || code === 48 || code === 58) {
+          i += codes[i + 1] === 2 ? 4 : codes[i + 1] === 5 ? 2 : 0;
+        } else if (code === 0 || code === 22) dim = false;
+        else if (code === 2) dim = true;
+      }
+      continue;
+    }
+    const char = token[2]!;
+    if (char === '\n') {
+      if (row === state.cursor.y) break;
+      row++;
+      column = 0;
+    } else {
+      if (row === state.cursor.y && column >= startColumn && /\S/.test(char)) {
+        if (!dim) return false;
+        found = true;
+      }
+      column++;
+    }
+  }
+  return found;
+}
+
 export function codexEmptyComposerFooter(
   state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
 ): string | undefined {
@@ -38,10 +81,13 @@ export function codexEmptyComposerFooter(
   const line = lines[state.cursor.y];
   if (line === undefined) return undefined;
   // Cursor position alone cannot distinguish a draft whose cursor is at Home.
-  // Accept only an empty row or the known native placeholder, plus a live
-  // initialized footer below it. Unknown placeholders fail closed.
-  const prompt = /^(\s*)[›»] (?:Ask Codex to do anything)?\s*$/.exec(line);
+  // Accept the legacy hint or a positively styled native hint, plus a live
+  // initialized footer below it. Plain unknown text remains fail closed.
+  const prompt = /^(\s*)[›»] (.*)$/.exec(line);
   if (!prompt || state.cursor.x !== (prompt[1]?.length ?? 0) + 2) return undefined;
+  const hint = prompt[2]!.trimEnd();
+  if (hint && hint !== 'Ask Codex to do anything'
+    && (/^\d+\./.test(hint) || !dimComposerPlaceholder(state, state.cursor.x))) return undefined;
   // Match native state rows, not words inside transcript prose or tool output.
   const below = lines.slice(state.cursor.y + 1);
   // Both layouts are native: an inline status/hints row, or a separate status

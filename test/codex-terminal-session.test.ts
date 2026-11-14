@@ -8,6 +8,7 @@ import {
   refreshCodexTerminalSession,
   codexTerminalSessionIsBound,
   bindCodexSessionFromCorrelatedInput,
+  codexNativeComposerState,
 } from '../src/services/codex-terminal-session.js';
 
 vi.mock('../src/services/codex-transcript.js', () => ({ findCodexRolloutSetByPid: vi.fn() }));
@@ -33,6 +34,31 @@ function terminal(id = sid) {
 afterEach(() => { vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe('Codex terminal session identity', () => {
+  it('accepts a dim native starter hint but holds identical user text at Home', () => {
+    // Codex 0.147 renders this empty-composer hint instead of the later
+    // "Ask Codex to do anything". A user's draft at Home has the same cursor
+    // and plain text, but Codex renders draft text without the dim attribute.
+    const viewport = '› Summarize recent commits\n\n  minimax-m3 default · ~/work\n';
+    const state = { viewport, cursor: { x: 2, y: 0 } };
+    expect(codexNativeComposerState({
+      ...state,
+      styledViewport: '\x1b[1m›\x1b[0m \x1b[2mSummarize recent commits\n\n\x1b[0m  minimax-m3 default · ~/work\n',
+    })).toBe('empty');
+    expect(codexNativeComposerState(state)).toBe('unknown');
+    expect(codexNativeComposerState({
+      ...state, styledViewport: '\x1b[1m›\x1b[0m Summarize recent commits\n\n  minimax-m3 default · ~/work\n',
+    })).toBe('unknown');
+    expect(codexNativeComposerState({
+      ...state,
+      styledViewport: '\x1b[1m›\x1b[0m \x1b[38;2;99;168;248mSummarize recent commits\n\n  minimax-m3 default · ~/work\n',
+    })).toBe('unknown');
+    expect(codexNativeComposerState({
+      ...state,
+      viewport: '› Summarize recent commits\n',
+      styledViewport: '\x1b[1m›\x1b[0m \x1b[2mSummarize recent commits\n',
+    })).toBe('unknown');
+  });
+
   it('uses the submitted ZMX handle when the worker checks correlated ownership without readable fds', () => {
     // Execute both real worker functions, rather than reimplementing their
     // handle selection here. Replacing the worker's wrapped lookup with the

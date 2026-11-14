@@ -190,6 +190,15 @@ const committed = (messages: WorkerToDaemon[], turnId: string) =>
 const activationAcked = (messages: WorkerToDaemon[], token: string) =>
   messages.some(m => m.type === 'queued_activation_submitted' && m.activationToken === token);
 
+it.skipIf(!tmuxAvailable)('delivers the opening through a dim native starter hint using real tmux cells', async () => {
+  const hint = READY.replace('Ask Codex to do anything', '\x1b[2mSummarize recent commits\x1b[0m');
+  await withWorker({ steps: [0, 200, 500].map(atMs => ({ atMs, frame: hint })) }, async h => {
+    await h.waitFor(() => committed(h.messages, 'om_first'), 20_000);
+    expect(pasted(h.input(), 'first-prompt')).toBe(1);
+    expect(h.messages.filter(m => m.type === 'user_notify'), h.logs()).toEqual([]);
+  });
+}, 45_000);
+
 it.skipIf(!tmuxAvailable)('holds the first message through the provisional startup frame, delivers it once, then drains the follow-up', async () => {
   // Re-paint the provisional frame until the pipe has surely attached, then
   // keep it long enough for the prompt-idle edge (2s quiet) to fire on it.

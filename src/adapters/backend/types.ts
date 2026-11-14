@@ -376,6 +376,8 @@ export interface SessionBackend {
    */
   captureInputState?(): {
     viewport: string;
+    /** Same viewport with native SGR attributes, when available. */
+    styledViewport?: string;
     cursor: { x: number; y: number };
   } | null;
   getPaneSize?(): { cols: number; rows: number } | null;

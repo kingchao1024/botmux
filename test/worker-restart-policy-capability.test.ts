@@ -64,7 +64,11 @@ function revokesSince(harness: Harness, index: number): OriginRevoke[] {
     .filter((message): message is OriginRevoke => message.type === 'managed_turn_origin_revoked');
 }
 
-function startWorker(backendType: 'pty' | 'tmux' | 'mojo', opts: { initialAtMostOnce?: boolean } = {}): Harness {
+function startWorker(backendType: 'pty' | 'tmux' | 'mojo', opts: {
+  initialAtMostOnce?: boolean;
+  chatId?: string;
+  exitBeforeReady?: number;
+} = {}): Harness {
   const root = mkdtempSync(join(tmpdir(), 'botmux-restart-policy-'));
   tempDirs.add(root);
   const launchCount = join(root, 'launch-count');
@@ -82,6 +86,7 @@ count=0
 if [ -f '${launchCount}' ]; then count=$(cat '${launchCount}'); fi
 count=$((count + 1))
 printf '%s' "$count" > '${launchCount}'
+${opts.exitBeforeReady !== undefined ? `exit ${opts.exitBeforeReady}` : ''}
 if [ "$count" -eq 1 ]; then
   while :; do
     if [ -f '${crashSignal}' ]; then exit 17; fi
@@ -124,7 +129,7 @@ fi
   child.send({
     type: 'init',
     sessionId,
-    chatId: 'oc_restart_policy',
+    chatId: opts.chatId ?? 'oc_restart_policy',
     rootMessageId: 'om_restart_policy',
     workingDir: root,
     cliId: backendType === 'mojo' ? 'mojo' : 'traex',
@@ -187,6 +192,27 @@ afterEach(async () => {
 });
 
 describe('worker restart policy capability lifecycle', () => {
+  it.skipIf(!tmuxAvailable)(
+    'fails an ordinary headless turn when the CLI exits before readiness',
+    async () => {
+      const harness = startWorker('tmux', { chatId: 'headless_login_probe', exitBeforeReady: 78 });
+      await waitFor(harness,
+        () => harness.messages.some(message => message.type === 'claude_exit'),
+        'pre-ready CLI exit');
+
+      expect(harness.messages).toContainEqual(expect.objectContaining({
+        type: 'turn_terminal',
+        sessionId: harness.sessionId,
+        turnId: 'turn-before-restart',
+        status: 'failed',
+        errorCode: 'cli_exit_78',
+      }));
+      const terminalIndex = harness.messages.findIndex(message => message.type === 'turn_terminal');
+      const exitIndex = harness.messages.findIndex(message => message.type === 'claude_exit');
+      expect(terminalIndex).toBeLessThan(exitIndex);
+    },
+  );
+
   it.skipIf(directPtyUnavailableInBun)(
     'keeps worker-generation policy authority across natural crash recovery',
     async () => {
