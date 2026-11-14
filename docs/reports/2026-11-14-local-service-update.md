@@ -1,10 +1,10 @@
 # 本机 Botmux 服务更新
 
-状态：更新完成，运行验收通过。完成时间：2026-11-14 17:03（北京时间）。
+状态：版本已对齐到 3.59.9，服务重启及运行验收通过。最近验收时间：2026-11-14 17:18（北京时间）。
 
-本机 root 用户级 `botmux.service` 已运行本次提交的 3.58.0 产物，10 个机器人和 Dashboard 全部在线。旧产物与 systemd 配置已保留，可回滚。
+本机 root 用户级 `botmux.service` 的 10 个机器人均回报 3.59.9，Dashboard 在线。旧产物与 systemd 配置已保留，可回滚。以下先记录 17:03 的构建部署，再记录版本号校准及 17:18 的重启验收。
 
-用户已授权更新本机服务。目标是 root 用户级 `botmux.service`，源码提交为 `a491b4c3fcb3ac95337b693efce89e09e752210a`，版本为 3.58.0。构建在独立 worktree 中执行，复用现有依赖。
+17:03 的部署经用户授权，目标是 root 用户级 `botmux.service`，源码提交为 `a491b4c3fcb3ac95337b693efce89e09e752210a`，当时版本标记为 3.58.0。构建在独立 worktree 中执行，复用现有依赖。
 
 更新前，supervisor PID 为 266794，10 个机器人和 Dashboard 均在线。旧运行时为 Bun 1.4.2，旧产物 `.runtime-build-id` 为 `c78aa92a1b2d5c05474cba63c1c215668faaf0d7b03acbcea5b2dd2d0c6fee57`。
 
@@ -53,4 +53,14 @@ Dashboard `/__health`、带 Cookie 鉴权的 `/api/bots`、`/api/sessions` 和 `
 
 后续版本号校准：按用户新增的 public 版本来源约定，将仓库 `package.json.version` 从 3.58.0 对齐到 3.59.9。远程 `deepcoldy/botmux` 的 annotated tag `v3.59.9` 对象为 `a8741ac10c2e1800ed597ea0c9f1a9a108fa9d69`，其 peeled commit 为 `f0b3a0e72587d3e7720781f67d61b0508d9b4168`，与本轮已合入的 public 提交完全一致。远程最新正式 tag 为 v3.59.12，其代码尚未合入，不用于本次版本号。
 
-这次只校准版本元数据，没有重建 dist 或重启服务。上文的 3.58.0 是部署当时回读到的版本标记；实际部署提交和 runtime build id 保持原值。
+版本号校准时只修改版本元数据，没有重建 dist 或重启服务。上文的 3.58.0 是 17:03 部署时回读到的版本标记。随后按用户授权执行了下面的提交、推送和服务重启。
+
+版本来源约定、3.59.9 校准及本报告已纳入提交 `488c453fc262da9cc9f90a05726e7f5cb26a8024`，推送到 origin/master 与 upstream/master；两端 `ls-remote` 独立回读均为该提交。重启前已跟踪文件无改动，发布屏障为 open，无 writer lease。
+
+本轮生产源码没有行为变更，复用 17:03 已验收的 dist，CLI/worker SHA-256 和 runtime build id 保持上述值。启动预检再次确认 10/10 凭据有效、SQLite 和宿主凭据读取通过。通过 root 用户 systemd manager 执行 `systemctl --user restart botmux.service`，没有从 Agent 会话直接启动 supervisor。
+
+17:18:22 验收通过：supervisor PID 从 3382497 变为 3435242，Dashboard PID 从 3382786 变为 3435478。10 个 daemon 均为 online、版本 3.59.9、重启计数 0；supervisor、全部 daemon 和 Dashboard 均使用服务专用 Bun 1.4.4，cgroup 归属 botmux.service。当前 PID 的 WebSocket connected 日志和外部 ESTABLISHED socket 均已核对，10 个签名鉴权 IPC `/api/sessions` 均返回 HTTP 200。
+
+Dashboard 的健康、机器人列表、会话列表和 summary 接口均返回 HTTP 200，列表为 10 个机器人、2397 条会话，service.status 为 healthy。逐库回读确认全部会话标识和状态与重启前一致，配置及凭据文件哈希不变；10 个 daemon 的 runtimeGeneration 均为 `e17e38d16e58d516fc052abbb792c3f98aca52534a1030dc306d453d17f0b665`。
+
+本轮证据保存于 `/data00/home/root/workspaces/botmux-local-service-restart-488c453fc-20261114`，目录由 root 持有，权限 0700，包含 `before.json`、`preflight.json`、`verify.json` 和 `after-integrity.json`。旧版本回滚目录、五份 stash 和既有未跟踪稿保留；真实飞书消息与 Ask 回调的验收边界仍按上文执行。
