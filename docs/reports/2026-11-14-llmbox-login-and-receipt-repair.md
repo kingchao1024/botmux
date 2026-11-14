@@ -144,4 +144,4 @@
 - `composer-deployment/`：输入识别修复、回归 red／green、既有失败对照、部署及回滚记录。
 - `final-seven/`：七个实际调用的结果、终端截图、测试配置恢复和最终完整性复核。
 
-旧运行产物保留在回滚目录。源码改动和报告尚未提交、推送，没有发布新版本。
+旧运行产物保留在回滚目录。源码与本报告已提交为 `33656043f72d689f2a6db081f5a216e9f94dcba3`，并推送到 `origin/master` 和 `upstream/master`，两个远程回读一致；没有发布新版本。后续真实飞书投递与 Ask 状态见 [飞书投递与 Ask 实测](2026-11-14-feishu-and-ask-validation.md)。
