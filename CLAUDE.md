@@ -8,6 +8,8 @@
 2. 从 [docs/agent/index.md](docs/agent/index.md) 进入，只打开相关叶子页。
 3. 改动本 overlay 后先运行 `bun run check:agent`，再运行任务相关检查。
 
+本地版本号的来源按 [LOCAL_OVERLAY.md 的 Version source 约定](LOCAL_OVERLAY.md#version-source)执行。
+
 ## 高风险硬约束
 
 - 包管理器与 CI 编译器固定为 Bun `1.4.3`；`trustedDependencies` 只能保留 `electron`、`node-pty`。详见 [质量与工具链](docs/agent/quality.md)。

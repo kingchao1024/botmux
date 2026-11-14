@@ -19,6 +19,14 @@ experiments, and temporary uncommitted changes may live here directly.
 Fetching or merging is an explicit action. Use a separate worktree for a clean
 comparison when needed; preserve in-progress changes in this checkout.
 
+## Version source
+
+本仓库版本号以实际从 `botmux-public`（`deepcoldy/botmux`）拉取的公共上游版本为基础。
+同步或部署时，核对本轮 public 提交和对应的版本信息，并记录来源提交及 tag。
+如果 public 源码中的 `package.json.version` 为 `0.0.0` 占位值，核对对应的公共上游
+tag / Release；无法确认时明确标记版本基准待确认，保留 public 提交标识。
+不要直接沿用历史本地版本或 `upstream` fork 的版本作为基准。
+
 ## Plugins first
 
 The S1 Ask receipt/authority path and the built-in Ask card renderer cannot be
