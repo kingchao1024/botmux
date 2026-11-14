@@ -1,6 +1,6 @@
 # Ask 与凭据隔离修复复测
 
-Ask 新表单校验、reader-lock 目录分类和补测发现的 outbox 挂载顺序错误均已修复并部署。952 个针对性用例和完整构建通过；7 个 LLMbox bot 的真实模型回复、飞书投递与内容回读全部通过，普通 Claude/Codex 私聊启动也已通过。两张新 Ask 卡片的真实选项回调已通过，但截至 21:29 尚未取得最终答案，两个 Ask 仍为 `pending`。修复提交为 `c4e98533a`，已推送到 `origin/master` 与 `upstream/master`，两个远程回读一致。
+Ask 新表单校验、reader-lock 目录分类和补测发现的 outbox 挂载顺序错误均已修复并部署。952 个针对性用例和完整构建通过；7 个 LLMbox bot 的真实模型回复、飞书投递与内容回读全部通过，普通 Claude/Codex 私聊启动也已通过。21:30 两张 Ask 卡片的真实最终提交均通过，CLI 返回退出码 0 和正确答案，测试会话已全部关闭。2450 条原记录及配置、凭据摘要保持一致。修复提交为 `c4e98533a`，已推送到 `origin/master` 与 `upstream/master`，两个远程回读一致。
 
 ## 修复内容
 
@@ -48,11 +48,11 @@ Ask 生成器发出 `custom_form: v1`、`revision` 和 `form_value`，旧入口�
 | review-validation | `1f1cf19a-577a-4081-82c6-a1eb098f296e` | `om_x100b60b24c231ca0cd1abd3672cb2d0` | `om_x100b60b246f9bca4b497dc754ef6cf7` |
 | implementation-builder | `60699d87-44d7-458f-a08b-000f97c5c288` | `om_x100b60b24f73aca0c1eb41c2531cc9c` | `om_x100b60b246fc40a4cf5689182035154` |
 
-21:22 两张新卡片发送后，回读确认实际表单、两项选项、自定义输入、“提交”按钮和各应用自己核对的答复人。CLI 等待窗口为 20 分钟，截止到北京时间 21:42；后台等待真实回调。请在 [评审验收 Botmux](https://applink.feishu.cn/client/chat/open?openChatId=oc_61bc430ca144add91cb0b873c91f5241) 和 [研发实现 Botmux](https://applink.feishu.cn/client/chat/open?openChatId=oc_2c67a07495b262ff18e2fde5b430cee1) 选择“已收到并确认测试”，再点击“提交”。
+21:22 两张新卡片发送后，回读确认实际表单、两项选项、自定义输入、“提交”按钮和各应用自己核对的答复人。CLI 设置 20 分钟等待窗口，截止到北京时间 21:42；卡片发到 [评审验收 Botmux](https://applink.feishu.cn/client/chat/open?openChatId=oc_61bc430ca144add91cb0b873c91f5241) 和 [研发实现 Botmux](https://applink.feishu.cn/client/chat/open?openChatId=oc_2c67a07495b262ff18e2fde5b430cee1)，需要先选择，再点击“提交”。实际提交于 21:30 完成，未超时。
 
 21:23 完整性复核：第二轮部署前的 2450 条记录，其 ID、状态、完整记录摘要均未变；总记录数 2459。第二轮新增 7 个 headless 会话已关闭，两个普通会话保留给 Ask 等待者，回调或超时后由等待脚本关闭。Codex 自动配置差异已按范围核对并恢复，所有被核对的配置和凭据摘要均匹配基线。10 个 bot、其原 PID/出生标识和 Dashboard 均正常。
 
-## 尚未通过的范围
+## 真实 Ask 回调验收
 
 用户报告已提交确认后，21:27 通过各应用回读卡片和宿主 Ask 状态：
 
@@ -62,7 +62,20 @@ Ask 生成器发出 `custom_form: v1`、`revision` 和 `form_value`，旧入口�
 
 21:29 复核：10 个原 daemon 和 Dashboard 正常，2450 条原记录的 ID、状态和完整记录摘要保持一致，总记录数仍为 2459；两个普通会话继续保留给 Ask 等待者。没有重发卡片、代答或重启服务。
 
-请在两张已选中的卡片底部各点击一次“提交”；如果客户端出现提示，需要结合提示判断提交是否被拒绝。后台脚本继续等待，并将在成功时核对退出码 0、真实答复人和 `answers=[["yes"]]`，随后关闭本轮普通会话。未伪造用户事件或签名，也未把选择草稿当作最终回答。
+用户随后点击卡片底部“提交”。21:30 两个原 CLI 等待者均成功返回，确认真实选择、最终提交、答案返回和测试会话关闭完整通过：
+
+| bot | 完成时间（UTC+8） | CLI 结果 | 会话关闭 |
+| --- | --- | --- | --- |
+| implementation-builder | 21:30:46.073 | 退出码 0，`selected=yes`、`answers=[["yes"]]`、`timedOut=false` | HTTP 200，`outcome=closed` |
+| review-validation | 21:30:47.495 | 退出码 0，`selected=yes`、`answers=[["yes"]]`、`timedOut=false` | HTTP 200，`outcome=closed` |
+
+两个返回结果的 `by` 分别匹配各应用此前实时核验的答复人；stderr 均为空。`receipt=null` 符合本轮未启用可选签名及新表单不生成签名回执的契约，不作为失败项。未伪造用户事件、代答或签名。
+
+21:31 再次回读飞书：两张卡片均变为绿色“botmux ask 已结束”，正文显示“已收到并确认测试”和对应操作人；两个会话均已从 pending Ask 列表移除。回读保存于私有证据目录的 `final-callback-cards.json`。
+
+21:31 最终完整性复核：2450 条原记录的 ID、状态和完整记录摘要全部保持一致，总记录数 2459；本轮新增 9 个会话均已关闭。配置和凭据摘要全部匹配，Codex 配置复核与恢复完成。10 个原 daemon 的 PID/出生标识未变，Dashboard 为 `healthy`。
+
+## 尚未覆盖的范围
 
 前述 6 个扩展签名持久化用例仍受工具沙箱文件写权限限制；本轮没有修改这些门禁。Claude 原生权限交互、Codex 工具执行和模型质量不在本轮成功项内。
 
