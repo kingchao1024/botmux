@@ -535,6 +535,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'EBSD_BOTMUX_SUBJECT',
   'EBSD_BOTMUX_REPOSITORY_ROOT',
   'EBSD_NO_UPDATE_CHECK',
+  // Doubao npm launcher: without this it prompts `Update now? [Y/N]` on an
+  // interactive start and botmux's first prompt is eaten as the answer, so no
+  // session/transcript is ever created. Set by the doubao adapter's spawnEnv;
+  // like EBSD_NO_UPDATE_CHECK it only reaches a tmux/bwrap pane via this list.
+  'DOUBAO_CLI_NO_UPDATE_CHECK',
   // Kimi Code: emit OSC 7501 turn state inside a tmux pane (it skips the
   // support probe there). Set by the kimi adapter's spawnEnv.
   'PI_PROGRAM_STATUS',

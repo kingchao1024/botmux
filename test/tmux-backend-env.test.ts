@@ -400,6 +400,22 @@ describe('buildBotmuxEnvAssignments()', () => {
     ]));
   });
 
+  it('forwards DOUBAO_CLI_NO_UPDATE_CHECK so the npm launcher skips its update prompt in the pane', () => {
+    // The doubao adapter sets spawnEnv.DOUBAO_CLI_NO_UPDATE_CHECK=1, but a tmux
+    // pane only receives allowlisted keys. Without forwarding, the launcher's
+    // `Update now? [Y/N]` prompt eats the first botmux message and no transcript
+    // is ever produced.
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      DOUBAO_CLI_NO_UPDATE_CHECK: '1',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('DOUBAO_CLI_NO_UPDATE_CHECK=1');
+    expect(out).not.toContain('PATH=/usr/bin');
+    // Non-doubao bots don't set it → it must not appear.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('DOUBAO_CLI_NO_UPDATE_CHECK='))).toBe(false);
+  });
+
   it('forwards list-bots API discovery flags so CLI bots list matches daemon behavior', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
