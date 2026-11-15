@@ -61,6 +61,7 @@ export class TraexContextThreadMismatchError extends Error {
 }
 
 const ROLE_BLOCK = /<role(?:\s[^>]*)?>[\s\S]*?<\/role>/;
+const PROJECT_GROUP_BLOCK = /<project_group_mode(?:\s[^>]*)?>[\s\S]*?<\/project_group_mode>/;
 const SKILL_REFRESH_BLOCK = /<botmux_skills_refresh>[\s\S]*?<\/botmux_skills_refresh>/;
 const SKILL_BLOCK = /<botmux_skills(?:\s[^>]*)?>[\s\S]*?<\/botmux_skills>/;
 const VARIABLE_BLOCK_START = /<(?:user_message|attachments|mentions|quoted_message|chat_context|shared_group_context|group_history|substitute_trigger)(?:\s|>)|<sender(?:\s|\/)/;
@@ -127,9 +128,11 @@ export function prepareTraexNativeContext(
   receipt?: TraexNativeContextReceipt,
 ): PreparedTraexNativeContext {
   const roleBlock = findFixedContextBlock(content, ROLE_BLOCK);
+  const projectGroupBlock = findFixedContextBlock(content, PROJECT_GROUP_BLOCK);
+  const roleContext = [roleBlock, projectGroupBlock].filter(Boolean).join('\n\n');
   const skillCatalogBlock = findFixedContextBlock(content, SKILL_REFRESH_BLOCK)
     ?? findFixedContextBlock(content, SKILL_BLOCK);
-  const roleDigest = digest(roleBlock);
+  const roleDigest = digest(roleContext);
   const skillCatalogDigest = digest(skillCatalogBlock);
   const sameThreadReceipt = receipt?.nativeThreadId === nativeThreadId ? receipt : undefined;
 
@@ -141,26 +144,29 @@ export function prepareTraexNativeContext(
       skillCatalogDigest,
       fixedContextBytes: fixedContextBytes(content),
       budgetBytes: TRAEX_INITIAL_FIXED_CONTEXT_BUDGET_BYTES,
-      includedRole: !!roleBlock,
+      includedRole: !!roleContext,
       includedSkillCatalog: !!skillCatalogBlock,
       blockedReason: 'context_receipt_unknown',
     };
   }
 
   let preparedContent = content;
-  const omitRole = !!roleBlock
+  const omitRole = !!roleContext
     && sameThreadReceipt?.status === 'accepted'
     && sameThreadReceipt.roleDigest === roleDigest;
   const omitSkillCatalog = !!skillCatalogBlock
     && sameThreadReceipt?.status === 'accepted'
     && sameThreadReceipt.skillCatalogDigest === skillCatalogDigest;
-  if (omitRole) preparedContent = withoutExactBlock(preparedContent, roleBlock);
+  if (omitRole) {
+    preparedContent = withoutExactBlock(preparedContent, roleBlock);
+    preparedContent = withoutExactBlock(preparedContent, projectGroupBlock);
+  }
   if (omitSkillCatalog) preparedContent = withoutExactBlock(preparedContent, skillCatalogBlock);
 
-  const includedRole = !!roleBlock && !omitRole;
+  const includedRole = !!roleContext && !omitRole;
   const includedSkillCatalog = !!skillCatalogBlock && !omitSkillCatalog;
   const contextChanged = includedRole || includedSkillCatalog;
-  const effectiveRoleDigest = roleBlock
+  const effectiveRoleDigest = roleContext
     ? roleDigest
     : sameThreadReceipt?.roleDigest ?? roleDigest;
   const effectiveSkillCatalogDigest = skillCatalogBlock
