@@ -28865,6 +28865,10 @@ async function spawnCliBody(
     }
     const credentialSandbox = prepareCredentialOnlySandbox({
       writableOutbox: credentialRelay.outbox,
+      // doubao's resident host service rejects user/PID-namespaced clients
+      // (service_unavailable, exit 3); keep both namespaces while retaining
+      // every mount mask. Root-only; prepareCredentialOnlySandbox fails closed.
+      sharedUserPidNamespace: cliAdapter.credentialBwrapSharedUserPidNamespace === true,
       // Hide every session's relay outbox (and its capability leaf); only this
       // session's outbox is re-bound on top, after all masks.
       hideDirectories: [...hideDirectories, credentialRelay.sessionsRoot],

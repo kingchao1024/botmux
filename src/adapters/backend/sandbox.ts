@@ -98,6 +98,11 @@ export function buildCredentialOnlySandboxArgs(input: {
    *  binds is read-only; see prepareCredentialOnlySandbox for why the relay
    *  (not an in-pane file proof) is the only sound channel here. */
   writableOutbox?: string;
+  /** Keep the initial user/PID namespaces (omit --unshare-user/--unshare-pid).
+   *  Required by CLIs whose resident host service verifies peers via kernel
+   *  uid/pid (doubao). Mount masks are unchanged; root-only because creating
+   *  the mount namespace without a user namespace needs CAP_SYS_ADMIN. */
+  sharedUserPidNamespace?: boolean;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -187,9 +192,12 @@ export function buildCredentialOnlySandboxArgs(input: {
     // direct path that has no bot credentials to use.
     args.push('--setenv', 'BOTMUX_SEND_RELAY_SCOPE', 'send');
   }
+  // The user/PID unshares are the default isolation shape. Adapters whose
+  // resident host service authenticates via the peer's kernel uid/pid opt out
+  // via sharedUserPidNamespace; every other namespace and ALL mount masks above
+  // still apply, so the one-way credential boundary is preserved.
+  if (!input.sharedUserPidNamespace) args.push('--unshare-user', '--unshare-pid');
   args.push(
-    '--unshare-user',
-    '--unshare-pid',
     '--unshare-ipc',
     '--unshare-uts',
     '--unshare-cgroup-try',
@@ -430,6 +438,7 @@ export function prepareCredentialOnlySandbox(input: {
   readonlyPaths?: string[];
   privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   writableOutbox?: string;
+  sharedUserPidNamespace?: boolean;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -437,6 +446,15 @@ export function prepareCredentialOnlySandbox(input: {
   if (process.platform !== 'linux' || !ensureSandboxDeps()) return null;
   const probe = probeBubblewrapCredentialMasks();
   if (!probe.supported || probe.mechanism !== 'bwrap') return null;
+  if (input.sharedUserPidNamespace && process.getuid?.() !== 0) {
+    // Without --unshare-user only a privileged process can create the mount
+    // namespace that carries the credential masks. Never fall back to running
+    // unconfined: fail closed so the worker surfaces the misconfiguration.
+    throw new Error(
+      '[device-credential-isolation] sharedUserPidNamespace requires a root daemon: '
+      + 'a non-root daemon cannot establish the credential-only mount namespace without a user namespace',
+    );
+  }
   return linuxIsolationLaunch(probe.executable, buildCredentialOnlySandboxArgs(input));
 }
 

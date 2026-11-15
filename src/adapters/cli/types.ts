@@ -1166,6 +1166,17 @@ export interface CliAdapter {
    *  BOTMUX_INJECTED_ENV_KEYS). undefined → inherit the worker env unchanged. */
   readonly spawnEnv?: Readonly<Record<string, string>>;
 
+  /** Linux credential-only bubblewrap: keep the initial user and PID namespaces
+   *  instead of `--unshare-user` / `--unshare-pid`. CLIs with a resident host
+   *  background service (doubao's `--service-start`, verified over a unix socket
+   *  via the peer's kernel uid/pid) reject the sandboxed client as
+   *  "incompatible or unverifiable background service" (exit 3) once the uid is
+   *  remapped or the service pid disappears from /proc. The mount-namespace
+   *  masks still hide every host authority, so the credential boundary holds;
+   *  only a root daemon can create the mount namespace without a user namespace,
+   *  and the worker fails closed on a non-root daemon. */
+  readonly credentialBwrapSharedUserPidNamespace?: boolean;
+
   /** Optional: pre-flight check for resume targets.
    *
    *  Called with `resume=true` before spawn so a missing conversation JSONL /

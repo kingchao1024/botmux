@@ -263,6 +263,31 @@ describe('credential-only managed-origin carve-out', () => {
     }
   });
 
+  it('keeps the initial user/PID namespaces only when sharedUserPidNamespace is set', () => {
+    const common = {
+      hideDirectories: ['/srv/botmux/device-authority'],
+      hideFiles: ['/srv/botmux/.dashboard-secret'],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    };
+    const defaultArgs = buildCredentialOnlySandboxArgs(common);
+    expect(defaultArgs).toContain('--unshare-user');
+    expect(defaultArgs).toContain('--unshare-pid');
+
+    // doubao-shaped: resident host service rejects remapped uid / hidden pid.
+    const sharedArgs = buildCredentialOnlySandboxArgs({ ...common, sharedUserPidNamespace: true });
+    expect(sharedArgs).not.toContain('--unshare-user');
+    expect(sharedArgs).not.toContain('--unshare-pid');
+    // The remaining isolation and ALL credential masks stay in place.
+    expect(sharedArgs).toEqual(expect.arrayContaining([
+      '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try', '--new-session',
+    ]));
+    expect(sharedArgs.join(' ')).toContain('--tmpfs /srv/botmux/device-authority');
+    expect(sharedArgs).toContain('--ro-bind');
+    expect(sharedArgs).toContain('/dev/null');
+  });
+
   it('hides the shared parent before exposing only the owning rotating directory', () => {
     const parent = '/srv/botmux/data/read-isolation';
     const own = `${parent}/origin-${'a'.repeat(64)}`;

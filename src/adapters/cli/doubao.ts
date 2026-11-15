@@ -214,6 +214,13 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     // The npm launcher asks `Update now? [Y/N]` on an interactive start when a
     // newer version exists; botmux's first prompt would be eaten as the answer.
     spawnEnv: { DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
+    // The resident doubao service (system `doubao.service`, --service-start)
+    // authenticates CLI clients over /tmp/dcli-0/js-service.sock using their
+    // kernel uid/pid. Inside bwrap --unshare-user/--unshare-pid it rejects the
+    // client with service_unavailable (exit 3). Measured on Linux 2.36.2: either
+    // unshare alone triggers it; keeping both namespaces while retaining the
+    // mount masks lets the TUI start and still hides every host authority.
+    credentialBwrapSharedUserPidNamespace: true,
     // Login state (`~/.doubao-cli`, Linux data root). Kept writable inside the
     // file sandbox so token refresh persists; not yet verified end-to-end there.
     authPaths: ['~/.doubao-cli', '~/.local/share/doubao_cli'],

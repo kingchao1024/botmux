@@ -91,6 +91,12 @@ describe('doubao buildArgs', () => {
   it('disables the launcher update prompt that would swallow the first message', () => {
     expect(createDoubaoAdapter('/bin/doubao').spawnEnv).toEqual({ DOUBAO_CLI_NO_UPDATE_CHECK: '1' });
   });
+
+  it('keeps the initial user/PID namespaces so the resident doubao service can verify the client', () => {
+    // bwrap --unshare-user/--unshare-pid makes the resident service reject the
+    // client (service_unavailable, exit 3). Mount masks still apply.
+    expect(createDoubaoAdapter('/bin/doubao').credentialBwrapSharedUserPidNamespace).toBe(true);
+  });
 });
 
 describe('doubao screen patterns (captured from doubao 2.31.0)', () => {
