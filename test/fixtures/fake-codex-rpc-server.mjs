@@ -20,7 +20,6 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { appendFileSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
 
 // An ordinary tool descendant has no app-server/listen identity in its argv.
 // FAKE_GROUP_CHILD_DELAY_MS simulates a tool spawned by a later turn, i.e. after
@@ -79,17 +78,6 @@ const DELAY_TURN_ACK_MS = process.env.FAKE_DELAY_TURN_ACK_MS
 if (process.env.FAKE_EXTERNAL_PID_FILE) writeFileSync(process.env.FAKE_EXTERNAL_PID_FILE, String(process.pid));
 if (process.env.FAKE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
 if (process.env.FAKE_LEADER_EXITS_ON_SIGTERM === '1') process.on('SIGTERM', () => process.exit(0));
-if (process.env.FAKE_GROUP_CHILD_PID_FILE) {
-  const child = spawn(process.execPath, ['-e', [
-    (process.env.FAKE_GROUP_CHILD_UNVERIFIED === '1'
-      ? '// unrelated process\n'
-      : '// app-server --listen ' + listenArg + '\n'),
-    "process.on('SIGTERM', () => {})",
-    'setInterval(() => {}, 1_000)',
-  ].join(';')], { stdio: 'ignore' });
-  child.unref();
-  writeFileSync(process.env.FAKE_GROUP_CHILD_PID_FILE, String(child.pid));
-}
 const PREVIEW_DELAY_READS = Number(process.env.FAKE_PREVIEW_DELAY_READS ?? '0');
 const UPDATED_DELAY_READS = Number(process.env.FAKE_UPDATED_DELAY_READS ?? '0');
 const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');

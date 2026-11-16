@@ -339,7 +339,6 @@ export class CodexRpcEngine {
 
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
-  get activeNativeTurnId(): string | undefined { return this.turnOwners.keys().next().value; }
   get appServerPid(): number | undefined { return this.child?.pid; }
   /** The only native turn this engine currently owns. Multiple native turns are
    * never a valid state for Botmux RPC input, so callers must not guess when
@@ -462,7 +461,6 @@ export class CodexRpcEngine {
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
       .flatMap(value => ['-c', value]);
-    const globalArgs = this.opts.bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : [];
     this.child = this.dependencies.spawnProcess(this.opts.cliBin, [...globalArgs, 'app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
@@ -598,6 +596,34 @@ export class CodexRpcEngine {
     const nativeTurnId = this.takeNativeTurnId(identity);
     if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
     this.captureGroupIdentity();
+    return { nativeTurnId };
+  }
+
+  /** Deliver a pre-authorized control into one exact active native turn. This
+   * deliberately owns no second Botmux lifecycle: the existing owner remains
+   * authoritative for the native terminal and the caller must queue if it
+   * cannot prove the expected native id. */
+  async steerTurn(
+    content: string,
+    expectedTurnId: string,
+  ): Promise<{ nativeTurnId: string }> {
+    if (!this.threadId) throw new Error('steerTurn before startThread/resumeThread');
+    if (!expectedTurnId || this.activeNativeTurnId !== expectedTurnId) {
+      throw new Error(`refusing turn/steer: ${expectedTurnId || 'missing'} is not the current active native turn`);
+    }
+    const result = await this.request('turn/steer', {
+      threadId: this.threadId,
+      input: [{ type: 'text', text: content, text_elements: [] }],
+      expectedTurnId,
+    });
+    const nativeTurnId = String(result?.turnId ?? result?.turn?.id ?? '');
+    if (nativeTurnId !== expectedTurnId) {
+      const error = new Error(
+        `turn/steer response did not confirm expected native turn ${expectedTurnId}`,
+      );
+      this.failAll(error);
+      throw error;
+    }
     return { nativeTurnId };
   }
 

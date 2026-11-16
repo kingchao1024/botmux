@@ -243,6 +243,7 @@ import {
   projectTaskControlCanaryFenceFingerprint,
   projectTaskControlCanaryFenceRecord,
 } from '../src/services/project-group-store.js';
+import {
   nextStepIdle,
   noteNextStepCard,
   noteNextStepSuggestion,
@@ -402,6 +403,8 @@ function writeAbandonedTaskControlFixture(options: { legacy?: boolean } = {}) {
     },
   }));
   return { dispatchRoot, operationId, fence };
+}
+
 /** The previous turn ended with a「下一步」row on its card. */
 async function seedNextStepRow(ds: DaemonSession, turnId: string, messageId: string): Promise<void> {
   nextStepWrites.length = 0;

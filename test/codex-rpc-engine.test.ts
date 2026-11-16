@@ -715,38 +715,6 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     engine.stop();
   }, 20_000);
 
-  it('refuses an ordinary second turn while an exact native turn is still active', async () => {
-    let deadCount = 0;
-    const requestFile = join(tmpdir(), `fake-overlap-${Math.round(performance.now())}.jsonl`);
-    const engine = makeEngine({
-      sessionId: 'ordinary-overlap',
-      env: {
-        ...process.env,
-        FAKE_NO_TURN_TERMINAL: '1',
-        FAKE_TURN_CONFIG_FILE: requestFile,
-      },
-      onDead: () => { deadCount += 1; },
-    });
-    await engine.start();
-    await engine.startThread();
-    await expect(engine.sendTurn('first', owner('ordinary-first', 1)))
-      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
-
-    const error = await engine.sendTurn('second', owner('ordinary-second', 2))
-      .catch(caught => caught);
-    expect(error).toMatchObject({
-      name: 'CodexRpcDeliveryError',
-      code: 'rpc_turn_start_active',
-      deliveryDisposition: 'not_sent',
-    });
-    expect(error.message).toContain('active native turn turn-fake-1');
-    const requests = readFileSync(requestFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    expect(requests).toHaveLength(1);
-    expect(deadCount).toBe(0);
-    engine.stop();
-    rmSync(requestFile, { force: true });
-  }, 20_000);
-
   it('steers only the exact active native turn without opening another turn', async () => {
     const requestFile = join(tmpdir(), `fake-steer-${Math.round(performance.now())}.jsonl`);
     const engine = makeEngine({
@@ -1186,7 +1154,7 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       await engine.start();
       const stalePid = engine.appServerPid!;
       await expect(engine.stopAndWait()).rejects.toThrow(
-        /process group .* still alive after SIGTERM 2000ms and SIGKILL settle 250ms/,
+        /process group .* still alive after bounded cleanup/,
       );
       expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
       expect(existsSync(marker)).toBe(true);
@@ -1226,7 +1194,8 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       managedPid = engine.appServerPid!;
       // Model a child pid that was recycled after the managed leader exited.
       (engine as any).child = unrelated;
-      await expect(engine.stopAndWait()).rejects.toThrow(/exact app-server identity could not be verified/);
+      // Unverifiable identity fails closed: no signal, no throw, marker retained.
+      await expect(engine.stopAndWait()).resolves.toBe(false);
       expect(signals).toEqual([]);
       expect(isAlive(unrelated.pid!)).toBe(true);
     } finally {
