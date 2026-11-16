@@ -383,20 +383,6 @@ function trustedCallerForTurn(
   };
 }
 
-function traexRpcContextForSession(
-  ds: DaemonSession,
-  cliId: string | undefined,
-): { nativeThreadId: string; receipt?: Session['traexNativeContextReceipt'] } | undefined {
-  if (cliId !== 'traex'
-    || ds.initConfig?.codexRpcInput !== true
-    || !ds.session.cliSessionId) return undefined;
-  return {
-    nativeThreadId: ds.session.cliSessionId,
-    ...(ds.session.traexNativeContextReceipt
-      ? { receipt: ds.session.traexNativeContextReceipt }
-      : {}),
-  };
-}
 /**
  * Add a separately attested developer to an ordinary peer-bot turn. Missing
  * or ambiguous ownership leaves the annotation absent so credential consumers

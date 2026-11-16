@@ -292,7 +292,6 @@ const REQUEST_TIMEOUT_MS = 60_000;
  * fallback has landed. */
 const APP_SERVER_STOP_GRACE_MS = 2_000;
 const APP_SERVER_STOP_KILL_SETTLE_MS = 250;
-const APP_SERVER_STOP_POLL_INTERVAL_MS = 25;
 
 /** Floor for a metadata-poll iteration's per-request budget. Below this, the
  *  poll deadline is effectively reached: issuing a thread/read with a
