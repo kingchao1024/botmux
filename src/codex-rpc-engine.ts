@@ -27,6 +27,7 @@ import { get as httpGet } from 'node:http';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { readLinuxBootIdentity, readProcessStartIdentity } from './utils/process-identity.js';
 import { WebSocket } from 'ws';
 import { MIN_POLL_REQUEST_BUDGET_MS } from './core/codex-poll-budget.js';
 import {
@@ -71,21 +72,92 @@ async function findFreePort(): Promise<number> {
 
 const isAlive = pidIsSignalable;
 
-function isProcessGroupAlive(pid: number): boolean {
-  if (process.platform === 'win32') return isAlive(pid);
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
+interface GroupMemberIdentity {
+  pid: number;
+  group: number;
+  startTime: string;
+}
+
+function readGroupMember(pid: number): GroupMemberIdentity | undefined {
+  if (process.platform !== 'linux') {
+    const startTime = readProcessStartIdentity(pid);
+    if (!startTime) return undefined;
+    if (process.platform === 'win32') return { pid, group: pid, startTime };
+    try {
+      const [group, state] = execFileSync('ps', ['-o', 'pgid=,stat=', '-p', String(pid)], {
+        encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'],
+        env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+      }).trim().split(/\s+/);
+      if (state?.startsWith('Z') || !/^\d+$/.test(group ?? '')) return undefined;
+      return { pid, group: Number(group), startTime };
+    } catch { return undefined; }
   }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    if (fields[0] === 'Z' || fields[0] === 'X') return undefined;
+    const group = Number(fields[2]);
+    const startTime = fields[19];
+    if (!Number.isSafeInteger(group) || !/^\d+$/.test(startTime ?? '')) return undefined;
+    return { pid, group, startTime };
+  } catch (error) {
+    if (['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return undefined;
+    throw error;
+  }
+}
+
+function groupMembers(group: number): GroupMemberIdentity[] {
+  let pids: number[];
+  if (process.platform === 'linux') {
+    pids = readdirSync('/proc').filter(entry => /^\d+$/.test(entry)).map(Number);
+  } else if (process.platform === 'win32') {
+    pids = [group];
+  } else {
+    pids = execFileSync('ps', ['-axo', 'pid=,pgid='], {
+      encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER, env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+    }).trim().split('\n').map(line => line.trim().split(/\s+/).map(Number))
+      .filter(([pid, pgid]) => Number.isSafeInteger(pid) && pid > 1 && pgid === group)
+      .map(([pid]) => pid);
+  }
+  return pids.map(readGroupMember)
+    .filter((member): member is GroupMemberIdentity => member?.group === group);
+}
+
+interface GroupIdentity {
+  bootId: string;
+  members: GroupMemberIdentity[];
+}
+
+function bootId(): string | undefined {
+  return process.platform === 'linux' ? readLinuxBootIdentity() : process.platform;
+}
+
+function groupIdentityMatches(group: number, identity?: GroupIdentity): boolean {
+  if (!identity || !identity.bootId || identity.bootId !== bootId() || !Array.isArray(identity.members)) return false;
+  return identity.members.some(member => {
+    if (!Number.isSafeInteger(member?.pid) || member.pid <= 1 || member.group !== group
+      || typeof member.startTime !== 'string') return false;
+    const live = readGroupMember(member.pid);
+    return live?.group === group && live.startTime === member.startTime;
+  });
+}
+
+function isProcessGroupAlive(pid: number): boolean {
+  if (process.platform !== 'win32') return groupMembers(pid).length > 0;
+  if (process.platform === 'win32') return isAlive(pid);
+  return false;
 }
 
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */
 function killGroup(pid: number, signal: NodeJS.Signals): void {
-  if (process.platform === 'win32') process.kill(pid, signal);
-  else process.kill(-pid, signal);
+  try {
+    if (process.platform === 'win32') process.kill(pid, signal);
+    else process.kill(-pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
 }
 
 export interface CodexRpcEngineOpts {
@@ -232,6 +304,7 @@ const APP_SERVER_STOP_POLL_INTERVAL_MS = 25;
  *  200ms–10s budgets. */
 
 export class CodexRpcEngine {
+  private groupIdentity?: GroupIdentity;
   private child?: ChildProcess;
   private ws?: WebSocket;
   private nextId = 1;
@@ -344,6 +417,11 @@ export class CodexRpcEngine {
       if (oldest) this.terminalNativeTurns.delete(oldest);
     }
     this.turnOwners.delete(nativeTurnId);
+    // Refresh the recorded group membership at every turn boundary: tool
+    // children spawned during a turn are only provable as this app-server's
+    // descendants while the leader is alive. After a leader crash they are the
+    // exact members a successor needs to finish bounded cleanup (R4).
+    this.captureGroupIdentity();
     // Keep owner→native through the request continuation. A fast app-server can
     // send turn/completed in the same socket read as the turn/start response;
     // deleting here would make the awaiting sender falsely conclude that the
@@ -384,6 +462,7 @@ export class CodexRpcEngine {
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
       .flatMap(value => ['-c', value]);
+    const globalArgs = this.opts.bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : [];
     this.child = this.dependencies.spawnProcess(this.opts.cliBin, [...globalArgs, 'app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
@@ -409,6 +488,7 @@ export class CodexRpcEngine {
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized');
+    this.captureGroupIdentity();
   }
 
   /** Create a fresh session thread. Its id (== codex rollout session id) is what
@@ -516,41 +596,8 @@ export class CodexRpcEngine {
       );
     }
     const nativeTurnId = this.takeNativeTurnId(identity);
-    if (!nativeTurnId) {
-      throw new CodexRpcDeliveryError(
-        'turn/start ack did not bind a native turn id',
-        'rpc_turn_start_ambiguous',
-        'ambiguous',
-      );
-    }
-    return { nativeTurnId };
-  }
-
-  /** Deliver a pre-authorized control into one exact active native turn. This
-   * deliberately owns no second Botmux lifecycle: the existing owner remains
-   * authoritative for the native terminal and the caller must queue if it
-   * cannot prove the expected native id. */
-  async steerTurn(
-    content: string,
-    expectedTurnId: string,
-  ): Promise<{ nativeTurnId: string }> {
-    if (!this.threadId) throw new Error('steerTurn before startThread/resumeThread');
-    if (!expectedTurnId || this.activeNativeTurnId !== expectedTurnId) {
-      throw new Error(`refusing turn/steer: ${expectedTurnId || 'missing'} is not the current active native turn`);
-    }
-    const result = await this.request('turn/steer', {
-      threadId: this.threadId,
-      input: [{ type: 'text', text: content, text_elements: [] }],
-      expectedTurnId,
-    });
-    const nativeTurnId = String(result?.turnId ?? result?.turn?.id ?? '');
-    if (nativeTurnId !== expectedTurnId) {
-      const error = new Error(
-        `turn/steer response did not confirm expected native turn ${expectedTurnId}`,
-      );
-      this.failAll(error);
-      throw error;
-    }
+    if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
+    this.captureGroupIdentity();
     return { nativeTurnId };
   }
 
@@ -688,23 +735,21 @@ export class CodexRpcEngine {
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
-    let signalError: Error | undefined;
+    let signalError: unknown;
     if (pid) {
       // Bounded SIGTERM → SIGKILL: don't leave a stubborn child as an untracked
       // orphan. The marker is removed by the child 'exit' handler (confirmed
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
       try {
-        this.signalManagedProcessGroup(pid, 'SIGTERM');
-      } catch (error) {
-        signalError = error instanceof Error ? error : new Error(String(error));
-      }
+        this.captureGroupIdentity();
+        this.signalProcessGroup(pid, 'SIGTERM', this.wsUrl, this.groupIdentity);
+      } catch (error) { signalError = error; }
       if (!signalError && options.scheduleKill !== false) {
+        const identity = this.groupIdentity;
         const t = setTimeout(() => {
-          try { this.signalManagedProcessGroup(pid, 'SIGKILL'); }
-          catch (error) {
-            this.log('[codex-rpc] refusing SIGKILL for group ' + pid + ': ' + (error instanceof Error ? error.message : String(error)));
-          }
+          try { this.signalProcessGroup(pid, 'SIGKILL', this.wsUrl, identity); }
+          catch (error) { this.log(`[codex-rpc] refusing group cleanup: ${String(error)}`); }
         }, APP_SERVER_STOP_GRACE_MS);
         t.unref?.();
       }
@@ -712,33 +757,77 @@ export class CodexRpcEngine {
       this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
-    if (signalError) throw signalError;
+    // Unverifiable identity is a reason to leave the marker for the next
+    // incarnation, not to abort the caller: a throw here cascaded into
+    // process.exit(1) and made the session permanently unable to start RPC.
+    if (signalError) this.log(`[codex-rpc] refusing group cleanup: ${String(signalError)}`);
   }
 
-  /**
-   * Stop the managed app-server and keep the owning worker alive until its whole
-   * detached process group has exited, or until the SIGKILL fallback has had a
-   * short bounded chance to take effect. stop() remains synchronous for in-worker
-   * restart paths; this barrier prevents a native descendant outliving its Node
-   * wrapper during parent-process shutdown.
-   */
+  /** Keep the worker alive until all verified members of its detached group exit. */
   async stopAndWait(timeoutMs = APP_SERVER_STOP_GRACE_MS + APP_SERVER_STOP_KILL_SETTLE_MS): Promise<boolean> {
     this.stop({ scheduleKill: false });
     const pid = this.child?.pid;
     if (!pid) return false;
-    const graceMs = Math.min(timeoutMs, APP_SERVER_STOP_GRACE_MS);
-    if (await this.waitForProcessGroupExit(pid, graceMs)) {
-      this.removeMarkerIfOwned();
-      return true;
+    const grace = Math.min(timeoutMs, APP_SERVER_STOP_GRACE_MS);
+    if (!await this.waitForGroupExit(pid, grace)) {
+      try {
+        this.signalProcessGroup(pid, 'SIGKILL', this.wsUrl, this.groupIdentity);
+      } catch (error) {
+        this.log(`[codex-rpc] refusing group cleanup: ${String(error)}`);
+        return false;
+      }
+      if (!await this.waitForGroupExit(pid, Math.max(1, timeoutMs - grace))) {
+        throw new Error(`codex app-server process group ${pid} still alive after bounded cleanup`);
+      }
     }
-    this.signalManagedProcessGroup(pid, 'SIGKILL');
-    if (await this.waitForProcessGroupExit(pid, Math.max(1, timeoutMs - graceMs))) {
-      this.removeMarkerIfOwned();
-      return true;
+    this.removeMarkerIfOwned();
+    return true;
+  }
+
+  private waitForGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+    if (!this.isManagedProcessGroupAlive(pid)) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const finish = (exited: boolean): void => {
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolve(exited);
+      };
+      const poll = setInterval(() => {
+        try { if (!this.isManagedProcessGroupAlive(pid)) finish(true); }
+        catch { finish(false); } // missing evidence must go through the signal identity gate
+      }, 25);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+    });
+  }
+
+  private captureGroupIdentity(): void {
+    const pid = this.child?.pid;
+    if (!pid || !this.processIsOurAppServer(pid, this.wsUrl)) return;
+    const currentBoot = bootId();
+    if (!currentBoot) return;
+    this.groupIdentity = { bootId: currentBoot, members: groupMembers(pid) };
+    const mp = this.markerPath();
+    if (!mp) return;
+    try {
+      const [markedPid, markedUrl] = readFileSync(mp, 'utf8').split('\n');
+      if (markedPid === String(pid) && markedUrl === this.wsUrl) {
+        writeFileSync(mp, `${pid}\n${this.wsUrl}\n${JSON.stringify(this.groupIdentity)}`, { mode: 0o600 });
+      }
+    } catch { /* cleanup still uses the in-memory identities */ }
+  }
+
+  private signalProcessGroup(pid: number, signal: NodeJS.Signals, url?: string, identity?: GroupIdentity): void {
+    if (!this.isManagedProcessGroupAlive(pid)) return;
+    // A still-live original member proves PGID continuity even after the leader
+    // exits. PID + start time + boot ID must all match; PGID alone proves nothing.
+    if (!groupIdentityMatches(pid, identity) && !this.hasExactManagedProcessGroupIdentity(pid, url)) {
+      throw new Error(`exact app-server identity could not be verified for process group ${pid}`);
     }
-    throw new Error(
-      `codex app-server process group ${pid} still alive after SIGTERM ${APP_SERVER_STOP_GRACE_MS}ms and SIGKILL settle ${APP_SERVER_STOP_KILL_SETTLE_MS}ms`,
-    );
+    if (this.dependencies.signalProcessGroup) {
+      this.dependencies.signalProcessGroup(pid, signal);
+      return;
+    }
+    killGroup(pid, signal);
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------
@@ -754,14 +843,19 @@ export class CodexRpcEngine {
    *  argv against `app-server` AND, when recorded, the exact `--listen <url>` a
    *  reused pid could not carry (P1-2). */
   private processIsOurAppServer(pid: number, markedUrl?: string): boolean {
-    let argv = '';
-    try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
+    let args: string[];
+    try { args = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); }
     catch {
-      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER }); }
+      try {
+        args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+        }).trim().split(/\s+/);
+      }
       catch { return false; }
     }
-    if (!/\bapp-server\b/.test(argv)) return false;
-    if (markedUrl && !argv.includes(markedUrl)) return false;
+    if (!args.includes('app-server')) return false;
+    const listen = args.indexOf('--listen');
+    if (markedUrl && (listen < 0 || args[listen + 1] !== markedUrl)) return false;
     return true;
   }
 
@@ -795,37 +889,32 @@ export class CodexRpcEngine {
     const mp = this.markerPath();
     if (!mp || !existsSync(mp)) return;
     try {
-      const [pidStr, markedUrl] = readFileSync(mp, 'utf8').trim().split('\n');
-      const pid = parseInt(pidStr, 10);
-      if (!Number.isInteger(pid) || pid <= 0 || !this.isManagedProcessGroupAlive(pid)) {
+      const [pidStr, markedUrl, rawIdentity] = readFileSync(mp, 'utf8').trim().split('\n');
+      const pid = /^\d+$/.test(pidStr) ? Number(pidStr) : NaN;
+      if (!Number.isSafeInteger(pid) || pid <= 1 || !this.isManagedProcessGroupAlive(pid)) {
         rmSync(mp, { force: true });
         return;
       }
-      // A retained marker may outlive its Node wrapper while a native descendant
-      // remains in the same process group. The marker belongs to this session and
-      // is only retained by removeMarkerIfOwned while that exact group is alive.
-      if (isAlive(pid) && !this.processIsOurAppServer(pid, markedUrl)) {
-        // The original leader pid was reused by an unrelated process. It cannot
-        // be our detached group any longer, so discard the stale marker without
-        // signalling the recycled process or blocking a new session.
+      let identity: GroupIdentity | undefined;
+      try { identity = rawIdentity ? JSON.parse(rawIdentity) : undefined; } catch { /* legacy marker */ }
+      // Missing/legacy/corrupted identity is not evidence authorizing a signal.
+      // A surviving group we cannot prove is either an orphan from the prior
+      // incarnation or a recycled pid: deleting the marker is the safe outcome
+      // (baseline behavior) — aborting start() would turn fail-closed into a
+      // session that can never engage RPC again.
+      if (!groupIdentityMatches(pid, identity) && !this.processIsOurAppServer(pid, markedUrl)) {
         rmSync(mp, { force: true });
         return;
       }
-      if (!this.processGroupHasOurAppServer(pid, markedUrl)) {
-        throw new Error(`stale codex app-server process group ${pid} could not be identity-checked`);
+      this.signalProcessGroup(pid, 'SIGKILL', markedUrl, identity);
+      if (!await this.waitForGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
+        throw new Error(`stale codex app-server process group ${pid} still alive after bounded cleanup`);
       }
-      this.signalManagedProcessGroup(pid, 'SIGKILL', markedUrl);
-      if (await this.waitForProcessGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
-        rmSync(mp, { force: true });
-        this.log(`[codex-rpc] reaped stale app-server group ${pid}`);
-        return;
-      }
-      throw new Error(
-        `stale codex app-server process group ${pid} still alive after SIGKILL settle ${APP_SERVER_STOP_KILL_SETTLE_MS}ms`,
-      );
+      rmSync(mp, { force: true });
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('stale codex app-server process group')) throw error;
-      // A malformed or unreadable stale marker must not block a fresh session.
+      // Only a verified group that survived its own bounded cleanup is fatal.
+      if (error instanceof Error && /still alive after bounded cleanup/.test(error.message)) throw error;
+      // An unreadable marker is not evidence authorizing a signal.
     }
   }
 
@@ -852,21 +941,6 @@ export class CodexRpcEngine {
     } catch { /* no marker / unreadable → leave it (next reap handles it) */ }
   }
 
-  private waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
-    if (!this.isManagedProcessGroupAlive(pid)) return Promise.resolve(true);
-    return new Promise(resolve => {
-      const finish = (exited: boolean): void => {
-        clearTimeout(timeout);
-        clearInterval(poll);
-        resolve(exited);
-      };
-      const poll = setInterval(() => {
-        if (!this.isManagedProcessGroupAlive(pid)) finish(true);
-      }, APP_SERVER_STOP_POLL_INTERVAL_MS);
-      const timeout = setTimeout(() => finish(false), timeoutMs);
-    });
-  }
-
   private isManagedProcessGroupAlive(pid: number): boolean {
     return this.dependencies.isProcessGroupAlive?.(pid) ?? isProcessGroupAlive(pid);
   }
@@ -874,22 +948,6 @@ export class CodexRpcEngine {
   private hasExactManagedProcessGroupIdentity(pid: number, expectedUrl?: string): boolean {
     return this.dependencies.hasExactProcessGroupIdentity?.(pid, expectedUrl)
       ?? this.processGroupHasOurAppServer(pid, expectedUrl);
-  }
-
-  private signalManagedProcessGroup(
-    pid: number,
-    signal: NodeJS.Signals,
-    expectedUrl = this.wsUrl,
-  ): void {
-    if (!this.isManagedProcessGroupAlive(pid)) return;
-    if (!this.hasExactManagedProcessGroupIdentity(pid, expectedUrl)) {
-      throw new Error(`exact app-server identity could not be verified for process group ${pid}`);
-    }
-    if (this.dependencies.signalProcessGroup) {
-      this.dependencies.signalProcessGroup(pid, signal);
-      return;
-    }
-    killGroup(pid, signal);
   }
 
   // ---- internals -----------------------------------------------------------

@@ -409,7 +409,7 @@ import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './serv
 import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexModelLaunchObservation } from './services/codex-model-selection.js';
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
-import { traexRejectedArgument } from './adapters/cli/traex-version.js';
+import { probeTraexHookTrustSupport, traexRejectedArgument } from './adapters/cli/traex-version.js';
 import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
 import {
   readRunningExeIdentity,
@@ -37675,6 +37675,7 @@ function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
   if (parentExitShutdown) return;
   parentExitShutdown = shutdownWorkerForParentExitImpl(reason, exitCode).catch((error) => {
     log(`Parent-exit RPC teardown failed: ${error instanceof Error ? error.message : String(error)}`);
+    cleanup();
     process.exit(1);
   });
 }
