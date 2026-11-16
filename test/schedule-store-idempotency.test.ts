@@ -40,6 +40,7 @@ const BASE_PARAMS = {
   prompt: 'Run the build pipeline',
   workingDir: '/workspace/project',
   chatId: 'oc_test_chat',
+  owner: { kind: 'ownerless' as const },
 };
 
 const TEST_APP = 'cli_testapp0000000001';
@@ -109,6 +110,7 @@ describe('createTask — id provided, task exists with identical canonical input
     const id = 'wf_keyorder';
     const a = createTask({
       id,
+      owner: BASE_PARAMS.owner,
       // Order A: name → schedule → parsed → ...
       name: BASE_PARAMS.name,
       schedule: BASE_PARAMS.schedule,
@@ -119,6 +121,7 @@ describe('createTask — id provided, task exists with identical canonical input
     });
     const b = createTask({
       id,
+      owner: BASE_PARAMS.owner,
       // Order B: chatId first
       chatId: BASE_PARAMS.chatId,
       workingDir: BASE_PARAMS.workingDir,
@@ -195,20 +198,16 @@ describe('createTask — id provided, task exists with identical canonical input
   it('treats ownerOpenId and ownerUnionId as one canonical creator identity', async () => {
     const { createTask, IdempotencyConflictError } = await freshImport();
     const id = 'wf_owner_identity';
-    const first = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_old' });
-    // Both identity forms are persisted and later used by scheduled-turn
-    // authentication. A deterministic id must never silently reuse a task
-    // when either half of that creator identity changes.
-    expect(() => createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_new', ownerUnionId: 'on_new' })).toThrow(
+    const first = createTask({ ...BASE_PARAMS, id, owner: { kind: 'human', openId: 'ou_old', unionId: 'on_old' } });
+    // The creator open_id is the identity scheduled turns authenticate as, so
+    // the same workflow id re-run by a different creator must not silently
+    // reuse the existing task; it conflicts instead.
+    expect(() => createTask({ ...BASE_PARAMS, id, owner: { kind: 'human', openId: 'ou_new', unionId: 'on_new' } })).toThrow(
       IdempotencyConflictError,
     );
-    expect(() => createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_new' })).toThrow(
-      IdempotencyConflictError,
-    );
-
-    // An exact dual-identity retry remains idempotent and preserves the
-    // original durable task.
-    const second = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_old' });
+    // Same id + same creator stays idempotent and keeps the stored audit
+    // metadata (ownerUnionId is not part of the canonical input).
+    const second = createTask({ ...BASE_PARAMS, id, owner: { kind: 'human', openId: 'ou_old', unionId: 'on_new' } });
     expect(second.id).toBe(first.id);
     expect(second.ownerOpenId).toBe('ou_old');
     expect(second.ownerUnionId).toBe('on_old');
@@ -216,7 +215,7 @@ describe('createTask — id provided, task exists with identical canonical input
 
   it('rehydrates creator identity from disk (it is rebuilt field-by-field on load)', async () => {
     const { createTask } = await freshImport();
-    createTask({ ...BASE_PARAMS, id: 'wf_owner_reload', ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator' });
+    createTask({ ...BASE_PARAMS, id: 'wf_owner_reload', owner: { kind: 'human', openId: 'ou_creator', unionId: 'on_creator' } });
     // Every read path rebuilds the task from the raw JSON, so a field that is
     // written but not copied there survives only until the next reload. Without
     // this the task silently loses its creator on daemon restart.

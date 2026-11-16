@@ -13,6 +13,8 @@ export interface TraexNativeContextReceipt {
 
 export interface PreparedTraexNativeContext {
   content: string;
+  /** Preserve the exact fixed source across FIFO receipt changes, not just its digest. */
+  originalFixedPrefix?: string;
   nativeThreadId: string;
   roleDigest: string;
   skillCatalogDigest: string;
@@ -130,6 +132,8 @@ export function prepareTraexNativeContext(
   const roleBlock = findFixedContextBlock(content, ROLE_BLOCK);
   const projectGroupBlock = findFixedContextBlock(content, PROJECT_GROUP_BLOCK);
   const roleContext = [roleBlock, projectGroupBlock].filter(Boolean).join('\n\n');
+  const variableStart = content.match(VARIABLE_BLOCK_START)?.index;
+  const originalFixedPrefix = variableStart === undefined ? undefined : content.slice(0, variableStart);
   const skillCatalogBlock = findFixedContextBlock(content, SKILL_REFRESH_BLOCK)
     ?? findFixedContextBlock(content, SKILL_BLOCK);
   const roleDigest = digest(roleContext);
@@ -139,6 +143,7 @@ export function prepareTraexNativeContext(
   if (sameThreadReceipt?.status === 'unknown') {
     return {
       content,
+      originalFixedPrefix,
       nativeThreadId,
       roleDigest,
       skillCatalogDigest,
@@ -179,6 +184,7 @@ export function prepareTraexNativeContext(
 
   return {
     content: preparedContent,
+    originalFixedPrefix,
     nativeThreadId,
     roleDigest: effectiveRoleDigest,
     skillCatalogDigest: effectiveSkillCatalogDigest,
@@ -207,9 +213,13 @@ export function restorePreparedTraexNativeContext(
   if (metadata.nativeThreadId !== nativeThreadId) {
     throw new TraexContextThreadMismatchError(nativeThreadId, metadata.nativeThreadId);
   }
-  // A queued payload can outlive the receipt used to prepare it. Re-evaluate the
-  // actual fixed blocks immediately before turn/start so an earlier FIFO item
-  // that was accepted in the meantime suppresses the same context version here.
+  const variableStart = content.match(VARIABLE_BLOCK_START)?.index;
+  if (metadata.originalFixedPrefix !== undefined && variableStart !== undefined) {
+    const restored = metadata.originalFixedPrefix + content.slice(variableStart);
+    const prepared = prepareTraexNativeContext(restored, nativeThreadId, receipt);
+    if (!receipt && metadata.blockedReason) prepared.blockedReason = metadata.blockedReason;
+    return prepared;
+  }
   if (receipt) return prepareTraexNativeContext(content, nativeThreadId, receipt);
   const contextChanged = metadata.includedRole || metadata.includedSkillCatalog;
   const measuredFixedContextBytes = enforceBudget(content, metadata.budgetBytes);
@@ -259,6 +269,7 @@ export function appendTraexSkillCatalog(
   );
   return {
     content,
+    originalFixedPrefix: prepared.originalFixedPrefix,
     nativeThreadId: prepared.nativeThreadId,
     roleDigest: prepared.roleDigest,
     skillCatalogDigest,

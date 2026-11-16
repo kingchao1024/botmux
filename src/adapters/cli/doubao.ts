@@ -10,15 +10,16 @@ import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { doubaoTrajectoryPathForSession, drainDoubaoTranscript } from '../../services/doubao-transcript.js';
 
 import { delay } from '../../utils/timing.js';
+import { DOUBAO_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
 
 /** Doubao session ids are decimal snowflakes (`38450922917357570`). `--resume`
  *  with anything else fails at the IM layer (`Invalid request parameters` /
  *  `IM request failed`), so only this shape is ever passed through. */
 const DOUBAO_SESSION_ID = /^\d{10,24}$/;
 
-/** `--effort` values accepted by doubao 2.31 (`none|minimal|low|medium|high|xhigh|max`).
+/** `--effort` values accepted by doubao 2.36 (`none|minimal|low|medium|high|xhigh|max`).
  *  botmux's `ultra` has no equivalent and is dropped rather than failing the launch. */
-const DOUBAO_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const DOUBAO_EFFORTS = new Set(DOUBAO_REASONING_EFFORTS);
 
 /**
  * Busy footer drawn directly above the composer while a turn runs:
@@ -213,6 +214,8 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     // The npm launcher asks `Update now? [Y/N]` on an interactive start when a
     // newer version exists; botmux's first prompt would be eaten as the answer.
+    // Also listed in BOTMUX_INJECTED_ENV_KEYS: tmux/zellij/zmx panes only see
+    // adapter env that is on that allowlist.
     spawnEnv: { DOUBAO_CLI_NO_UPDATE_CHECK: '1' },
     // The resident doubao service (system `doubao.service`, --service-start)
     // authenticates CLI clients over /tmp/dcli-0/js-service.sock using their

@@ -14,6 +14,41 @@ const user = '<user_message>' + '用户正文'.repeat(3_000) + '</user_message>'
 const identity = '<sender type="user" open_id="ou_user" />';
 
 describe('TraeX native-thread context receipt', () => {
+  it('restores queued A after accepted A -> queued B -> queued A -> accepted B', () => {
+    const original = [role, skills, user, identity].join('\n\n');
+    const first = prepareTraexNativeContext(original, 'native-thread-1');
+    const acceptedA = settleTraexNativeContextReceipt(first, 'om_a', 'accepted')!;
+    const queuedA = prepareTraexNativeContext(original, 'native-thread-1', acceptedA);
+    const changed = prepareTraexNativeContext(
+      original.replace(role, '<role context="group">ROLE_B</role>')
+        .replace(skills, '<botmux_skills><skill name="B" /></botmux_skills>'),
+      'native-thread-1', acceptedA,
+    );
+    const acceptedB = settleTraexNativeContextReceipt(changed, 'om_b', 'accepted')!;
+    const { content, contextVersion: _version, ...metadata } = queuedA;
+    const restored = restorePreparedTraexNativeContext(
+      content, JSON.parse(JSON.stringify(metadata)), 'native-thread-1', acceptedB,
+    );
+    expect(restored.content).toBe(original);
+    expect(restored.roleDigest).toBe(acceptedA.roleDigest);
+    expect(restored.skillCatalogDigest).toBe(acceptedA.skillCatalogDigest);
+    expect(restored.content).not.toContain('ROLE_B');
+  });
+
+  it('tracks project-group context in the role version and omits it only after acceptance', () => {
+    const group = '<project_group_mode mode="planning">EXACT_GROUP_BOUNDARY</project_group_mode>';
+    const original = [role, group, user].join('\n\n');
+    const first = prepareTraexNativeContext(original, 'native-thread-1');
+    const receipt = settleTraexNativeContextReceipt(first, 'om_a', 'accepted')!;
+    const steady = prepareTraexNativeContext(original, 'native-thread-1', receipt);
+    expect(steady.content).not.toContain(group);
+    const changed = prepareTraexNativeContext(
+      original.replace('EXACT_GROUP_BOUNDARY', 'CHANGED_GROUP_BOUNDARY'), 'native-thread-1', receipt,
+    );
+    expect(changed.roleDigest).not.toBe(receipt.roleDigest);
+    expect(changed.content).toContain('CHANGED_GROUP_BOUNDARY');
+  });
+
   it('records the minimal accepted receipt and excludes variable payload from the fixed budget', () => {
     const prepared = prepareTraexNativeContext(
       [role, skills, '<session_id>sid</session_id>', user, identity].join('\n\n'),

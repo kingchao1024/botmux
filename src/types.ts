@@ -1,3 +1,4 @@
+import type { TurnSpeaker } from './core/turn-speakers.js';
 import type { BackendType, HerdrBackendConfig, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 // The IPC carries the USER-facing MojoConfig. EffectiveMojoConfig exists only
@@ -545,6 +546,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** Last settled fixed context for one TraeX native thread. */
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
   nativeGoalStatusCard?: import('./core/goal-status-card.js').GoalStatusCardRecord;
   nativeGoalCardOrigin?: import('./core/goal-status-card.js').GoalStatusCardOrigin;
   sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
@@ -582,8 +585,6 @@ export interface Session {
   };
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
   runnerBuildId?: string;
-  /** Last role/skill context version settled for one TraeX native thread. */
-  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
   chatId: string;
   chatType?: 'group' | 'p2p';
   /** Thread-scope: an actual root message id under which all replies thread.
@@ -657,6 +658,8 @@ export interface Session {
   nativeSessionTitleUserDefined?: boolean;
   /** 首轮只有机器人 mention 时，等待第一条有效正文生成原生标题。 */
   nativeSessionTitleAwaitingContent?: boolean;
+  /** Fingerprint of the join bootstrap, retained across configuration changes. */
+  automaticTitleBootstrap?: { digest: string; length: number };
   /** Last explicit title update. Undefined means the title is the legacy initial fallback. */
   titleUpdatedAt?: string;
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
@@ -756,6 +759,10 @@ export interface Session {
     committedAt: string;
     dispatchAttempt?: number;
   }>;
+  /** Exact closed lifecycle displaced by a primary-mode /repo switch. Persisted
+   * before worker startup so a delayed or restored first checkpoint cannot
+   * claim a different successor's closed lane. Absent means no takeover proof. */
+  durablePrimaryPredecessor?: { sessionId: string; contractRevision: number };
   /** Confirmed settings for an exact durable Inbox task that may retry before
    * provider submission. Never itself authorizes a business-turn replay. */
   codexEffortTaskConfirmations?: import('./services/codex-effort-task-state.js').EffortTaskConfirmation[];
@@ -2118,8 +2125,8 @@ export interface CodexAppGenerationCommit {
 
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
+  traexNativeContext?: import('./core/traex-native-context.js').TraexNativeContextMetadata;
   content: string;
-  traexNativeContext?: Omit<import('./core/traex-native-context.js').PreparedTraexNativeContext, 'content' | 'contextVersion'>;
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
   codexAppInput?: CodexAppTurnInput;
@@ -2140,6 +2147,9 @@ export interface CliTurnPayload {
   rerouteEnvelope?: CrossPrincipalInterruptionMessage;
 }
 
+/** Exact provider control text plus the host-authenticated caller; no CLI sidecars. */
+export type AcceptedCommandInput = Pick<CliTurnPayload, 'content' | 'trustedCaller'>;
+
 /** Exact ordered successor retained behind an adapter-ACKed activation. */
 export interface QueuedActivationTailEntry {
   id: string;
@@ -2155,6 +2165,7 @@ export interface QueuedActivationTailEntry {
  * this record after restart; the record is cleared only with the activation
  * journal's adapter-level ACK. */
 export interface PendingRepoSetup {
+  acceptedInput?: AcceptedCommandInput;
   mode: 'picker' | 'auto_worktree';
   linkRefMode?: import('./services/link-ref-types.js').LinkRefMode;
   prompt: string;
@@ -2185,6 +2196,8 @@ export interface CodexAppEffortResult {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
+  /** One small-model recap of `prompt`, answered by recap_result. */
+  | { type: 'recap_request'; requestId: string; prompt: string }
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
@@ -2339,7 +2352,11 @@ type DaemonToWorkerBase =
     dispatchAttempt?: number;
   };
 
-export type DaemonToWorker = DaemonToWorkerTransport & { sessionCommand?: import('./services/session-contract.js').SessionCommandContext };
+export type DaemonToWorker = DaemonToWorkerTransport & {
+  sessionCommand?: import('./services/session-contract.js').SessionCommandContext;
+  traexNativeContext?: CliTurnPayload['traexNativeContext'];
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
+};
 
 type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
@@ -2592,6 +2609,7 @@ export type WorkerToDaemonBase =
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
   | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'traex_native_context_receipt'; receipt: import('./core/traex-native-context.js').TraexNativeContextReceipt }
   /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
@@ -2742,6 +2760,19 @@ export type WorkerToDaemonBase =
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number }
+  /** The CLI's own next-input suggestion on an idle screen (Claude Code's
+   *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
+   *  the turn that just ended; the daemon shows it on that turn's last card. */
+  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
+  /** The CLI's own recap of the session (Claude Code's transcript away
+   *  summary), written while idle after a turn; turnId is that turn. */
+  | { type: 'cli_recap'; text: string; turnId?: string; dispatchAttempt?: number }
+  /** What a completed turn did (「本轮回顾」), sent just before its terminal:
+   *  facts and the latest activity, recorded apart from the capped CoT buffer. */
+  | { type: 'recap_input'; turnId: string; dispatchAttempt?: number } & import('./services/turn-recap.js').RecapTurnInput
+  /** Answer to a recap_request: the recap, or why none was made. */
+  | { type: 'recap_result'; requestId: string; text?: string; error?: string;
+      costUsd?: number; inputTokens?: number; outputTokens?: number }
   /** Redacted execution observation for the daemon notification clock only. */
   | { type: 'turn_progress'; turnId: string; dispatchAttempt?: number; stage: import('./services/cli-progress-notice.js').ProgressStage }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.
@@ -2845,7 +2876,7 @@ export type WorkerToDaemonBase =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; linkRefMode?: 'observe' | 'enabled' }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; trustedCaller?: TrustedCaller | null; identityTurnId?: string; speakers?: TurnSpeaker[]; linkRefMode?: 'observe' | 'enabled' }
   /** Worker→daemon single-source identity storage decision, sent right after
    *  the worker resolved the actual spawn (or RPC engine): the effective model
    *  plus the spawn facts it was derived from. The daemon publishes identity
@@ -2929,6 +2960,15 @@ export type WorkerToDaemonBase =
       /** Non-completed terminals only: the CLI screen's last rows when the
        *  turn ended, masked and clipped. */
       screenTail?: string;
+      /** Retryable failures only: epoch ms at which the provider's own error
+       *  text said the request may be retried (gateway "available at …",
+       *  Retry-After, "try again in 30s"). A scheduling hint for the daemon's
+       *  ordinary-turn recovery, which re-validates it. */
+      providerRetryAtMs?: number;
+      /** Non-completed terminals only: transcript time of the last request the
+       *  provider answered before this failure — when its prompt cache was last
+       *  refreshed. Bounds how long a recovery is worth waiting. */
+      providerLastSuccessAtMs?: number;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

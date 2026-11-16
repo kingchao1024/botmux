@@ -436,6 +436,10 @@ describe('Codex App clean prompt sidecar', () => {
   it('wraps a legacy TraeX refork when the native thread exists without a receipt', () => {
     const built = buildReforkCliInput({
       larkAppId: 'unused-for-build',
+      initConfig: {
+        cliId: 'traex', codexRpcInput: true, backendType: 'tmux',
+        resume: true, cliSessionId: 'native-traex-refork',
+      },
       session: {
         sessionId: 'sid-traex-refork',
         chatId: 'oc_traex_refork',

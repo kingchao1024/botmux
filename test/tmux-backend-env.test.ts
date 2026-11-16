@@ -32,6 +32,7 @@ import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
 import { isBunRuntime } from './helpers/ts-runner.js';
 import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
 import { installAidenCodexShim } from '../src/services/aiden-codex-shim.js';
+import { ALL_CLI_IDS, createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
@@ -400,20 +401,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     ]));
   });
 
-  it('forwards DOUBAO_CLI_NO_UPDATE_CHECK so the npm launcher skips its update prompt in the pane', () => {
-    // The doubao adapter sets spawnEnv.DOUBAO_CLI_NO_UPDATE_CHECK=1, but a tmux
-    // pane only receives allowlisted keys. Without forwarding, the launcher's
-    // `Update now? [Y/N]` prompt eats the first botmux message and no transcript
-    // is ever produced.
-    const out = buildBotmuxEnvAssignments({
-      BOTMUX: '1',
-      DOUBAO_CLI_NO_UPDATE_CHECK: '1',
-      PATH: '/usr/bin',
-    });
-    expect(out).toContain('DOUBAO_CLI_NO_UPDATE_CHECK=1');
-    expect(out).not.toContain('PATH=/usr/bin');
-    // Non-doubao bots don't set it → it must not appear.
-    expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('DOUBAO_CLI_NO_UPDATE_CHECK='))).toBe(false);
+  // 适配器 spawnEnv 只写进 worker 的 childEnv；tmux / zellij / zmx 的 pane 不继承
+  // childEnv，只认这条白名单注入。漏登记 = 只有 PTY 后端生效：豆包的
+  // DOUBAO_CLI_NO_UPDATE_CHECK 曾因此在默认的 tmux 后端失效，每次启动都卡在
+  // 启动器的 `Update now? [Y/N]`，只能打开 Web 终端手动输 N。
+  it.each(ALL_CLI_IDS)('forwards every spawnEnv key of the %s adapter into the pane', (id) => {
+    const spawnEnv = createCliAdapterSync(id, '/usr/bin/true').spawnEnv ?? {};
+    const out = buildBotmuxEnvAssignments({ BOTMUX: '1', ...spawnEnv });
+    for (const [key, value] of Object.entries(spawnEnv)) {
+      expect(out).toContain(`${key}=${value}`);
+    }
   });
 
   it('forwards list-bots API discovery flags so CLI bots list matches daemon behavior', () => {

@@ -294,6 +294,27 @@ describe('buildNewTopicPrompt team-role injection', () => {
 });
 
 describe('buildFollowUpContent role injection', () => {
+  it('does not apply RPC budget to a frozen non-RPC TraeX refork under a true global default', async () => {
+    const { writeRoleFile } = await fresh();
+    const { config } = await import('../src/config.js');
+    const globalDefault = vi.spyOn(config, 'codexRpcInputDefault', 'get').mockReturnValue(true);
+    try {
+      const role = 'R8_EXACT_ROLE\n' + 'r'.repeat(26_000);
+      writeRoleFile('app1', 'oc_r8', role);
+      const { buildReforkCliInput } = await import('../src/core/session-manager.js');
+      const ds = {
+        larkAppId: 'app1',
+        initConfig: { codexRpcInput: false },
+        session: { sessionId: 'sid-r8', chatId: 'oc_r8', cliId: 'traex', cliSessionId: 'native-r8' },
+      } as any;
+      const built = buildReforkCliInput(ds, 'R8_USER', { cliId: 'traex' });
+      expect(built.traexNativeContext).toBeUndefined();
+      expect(built.content).toContain(role);
+      expect(built.content).toContain('R8_USER');
+    } finally {
+      globalDefault.mockRestore();
+    }
+  });
   it('places stable role context before the follow-up user message', async () => {
     await fresh();
     const { writeRoleFile } = await import('../src/core/role-resolver.js');
@@ -445,6 +466,7 @@ describe('buildFollowUpContent role injection', () => {
         cliId: 'traex', cliSessionId: 'native-thread-1',
         traexNativeContextReceipt: changedReceipt,
       },
+      initConfig: { cliId: 'traex', codexRpcInput: true, backendType: 'tmux', resume: true, cliSessionId: 'native-thread-1' },
       larkAppId: 'app1', chatId: 'oc_traex', chatType: 'group', scope: 'thread',
       worker: null, workerPort: null, workerToken: null, spawnedAt: 0,
       cliVersion: '1.0.0', lastMessageAt: 0, hasHistory: true,
@@ -498,6 +520,30 @@ describe('buildFollowUpContent role injection', () => {
     });
 
     expect(second.content).toContain(`<user_message>\n${user}\n</user_message>`);
+  });
+
+  it.each([
+    { backendType: 'pty' },
+    { sandbox: true },
+    { readIsolation: true },
+    { disableCliBypass: true },
+    { startupCommands: ['/effort high'] },
+    { wrapperCli: 'wrapper' },
+  ])('does not budget a configured RPC refork excluded by runtime gates: %j', async (exclusion) => {
+    await fresh();
+    const { writeRoleFile } = await import('../src/core/role-resolver.js');
+    writeRoleFile('app1', 'oc_rpc_excluded', 'BOUNDARY'.repeat(4000));
+    const { buildReforkCliInput } = await import('../src/core/session-manager.js');
+    const ds = {
+      session: { sessionId: 'sid-excluded', cliId: 'traex', cliSessionId: 'native',
+        chatId: 'oc_rpc_excluded', status: 'active' },
+      initConfig: { cliId: 'traex', codexRpcInput: true, backendType: 'tmux',
+        resume: true, cliSessionId: 'native', ...exclusion },
+      larkAppId: 'app1', chatId: 'oc_rpc_excluded', scope: 'thread',
+    } as any;
+    const result = buildReforkCliInput(ds, 'keep the user', { cliId: 'traex' });
+    expect(result.traexNativeContext).toBeUndefined();
+    expect(result.content).toContain('keep the user');
   });
 
   it('budgets and deduplicates a fixed role that documents variable-tag examples', async () => {

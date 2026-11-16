@@ -266,6 +266,7 @@ export class CodexRpcEngine {
 
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
+  get activeNativeTurnId(): string | undefined { return this.turnOwners.keys().next().value; }
   get appServerPid(): number | undefined { return this.child?.pid; }
   /** The only native turn this engine currently owns. Multiple native turns are
    * never a valid state for Botmux RPC input, so callers must not guess when
@@ -484,17 +485,7 @@ export class CodexRpcEngine {
   ): Promise<{ nativeTurnId: string }> {
     if (!this.threadId) {
       throw new CodexRpcDeliveryError(
-        'sendTurn before startThread/resumeThread',
-        'rpc_turn_start_not_sent',
-        'not_sent',
-      );
-    }
-    const activeNativeTurnId = this.activeNativeTurnId;
-    if (activeNativeTurnId) {
-      throw new CodexRpcDeliveryError(
-        `refusing turn/start while active native turn ${activeNativeTurnId} has not reached terminal`,
-        'rpc_turn_start_active',
-        'not_sent',
+        'sendTurn before startThread/resumeThread', 'rpc_turn_start_not_sent', 'not_sent',
       );
     }
     const params: Json = {

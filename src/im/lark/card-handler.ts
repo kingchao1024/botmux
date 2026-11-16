@@ -1,3 +1,5 @@
+import { sessionContractPrimary } from '../../core/session-contract-primary.js';
+import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
@@ -17,6 +19,8 @@ import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
+import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
+import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { messageMentionsBot } from './message-parser.js';
@@ -203,7 +207,7 @@ export interface CardHandlerDeps {
     operatorUnionId?: string;
     payload?: string;
     sig?: string;
-  }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
+  }) => Promise<{ ok: true; chatId: string; anchorId?: string; prompt?: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -868,6 +872,7 @@ export async function commitRepoSelection(
               whiteboardId: ds.session.whiteboardId,
               substituteTrigger: ds.pendingSubstituteTrigger,
               codexAppText: ds.pendingCodexAppText,
+              acceptedInput: ds.pendingAcceptedInput,
               codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
               codexAppMessageContext: ds.pendingCodexAppMessageContext,
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -950,6 +955,7 @@ export async function commitRepoSelection(
       if (emptyStart) markInitialUserTurnPending(ds);
       ds.pendingPrompt = undefined;
       ds.pendingCodexAppText = undefined;
+      ds.pendingAcceptedInput = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
       ds.pendingCodexAppMessageContext = undefined;
       ds.pendingChatContext = undefined;
@@ -1092,6 +1098,7 @@ export async function commitRepoSelection(
         markRepoCardConsumed(current, cardToWithdraw);
         current.repoCardMessageId = undefined;
 
+        const predecessorRevision = current.session.sessionRuntimeContract?.session.revision ?? 0;
         const session = sessionStore.createSession(
           current.chatId,
           current.scope === 'chat' ? oldSession.rootMessageId : rootId,
@@ -1106,6 +1113,11 @@ export async function commitRepoSelection(
         current.workingDir = dirPath;
         session.workingDir = dirPath;
         session.larkAppId = current.larkAppId;
+        if (sessionContractPrimary(current.larkAppId)) {
+          session.durablePrimaryPredecessor = {
+            sessionId: oldSession.sessionId, contractRevision: predecessorRevision,
+          };
+        }
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;
         session.creatorOpenId = oldSession.creatorOpenId;
@@ -1601,6 +1613,12 @@ function buildMenuCloseConfirmCard(ds: DaemonSession, rootId: string, loc: Local
 }
 
 
+/** The suggestion echoed back as plain text: a text message would turn an
+ * `<at …>` tag in it into a real mention. */
+export function nextStepNoticeText(prompt: string): string {
+  return prompt.replace(/<(\/?at\b)/gi, '＜$1');
+}
+
 function cardClickTurnToastKey(reason: string): string {
   switch (reason) {
     case 'expired': return 'card.click_turn.expired';
@@ -2084,7 +2102,10 @@ export async function handleCardAction(
 
   if (value?.action === 'card_click_turn' && larkAppId) {
     const loc = localeForBot(larkAppId);
-    if (!deps.cardClickTurn) {
+    // A reply card's「下一步」row. Its notice is unsigned and only selects the
+    // acknowledgement below; turning the bot switch off disables earlier rows.
+    const nextStep = value.notice === NEXT_STEP_CLICK_NOTICE;
+    if (!deps.cardClickTurn || (nextStep && getBot(larkAppId).config.replyCardNextStep !== true)) {
       return { toast: { type: 'error', content: t('card.click_turn.unavailable', undefined, loc) } };
     }
     const accepted = await deps.cardClickTurn({
@@ -2101,8 +2122,16 @@ export async function handleCardAction(
       toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
       afterAck: () => accepted.run().then(async result => {
         const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
-        const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
         try {
+          if (nextStep && accepted.anchorId) {
+            // Stays in the session's own thread, like the reply it came from.
+            const notice = failed
+              ? t('card.click_turn.delivery_failed', undefined, loc)
+              : t('card.next_step.started', { text: nextStepNoticeText(accepted.prompt ?? '') }, loc);
+            await deps.sessionReply(accepted.anchorId, notice, 'text', larkAppId);
+            return;
+          }
+          const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
           await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
         } catch (err) {
           logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -2531,6 +2560,8 @@ export async function handleCardAction(
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
+    // Like beginNewTurn: the previous turn's「下一步」row and「本轮回顾」panel are retired.
+    noteReplyCardTurnStarted(ds, turnId);
     ds.currentTurnTitle = topicTitle.slice(0, 50);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
@@ -4160,12 +4191,13 @@ function substituteToggleRejection(content: string, ctx: SubstituteToggleNoticeC
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -4174,9 +4206,14 @@ function substituteToggleRejection(content: string, ctx: SubstituteToggleNoticeC
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      rememberLastCliInput(ds, ds.lastUserPrompt ?? cliInput, retryInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       // Only now consume the one-shot retry state and advertise working: live
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
@@ -4325,12 +4362,13 @@ function substituteToggleRejection(content: string, ctx: SubstituteToggleNoticeC
         // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -4339,12 +4377,16 @@ function substituteToggleRejection(content: string, ctx: SubstituteToggleNoticeC
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       // Start the cooldown only after acceptance: a rejected click must not
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, failedTurn.turnId);
+      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4439,6 +4481,8 @@ function substituteToggleRejection(content: string, ctx: SubstituteToggleNoticeC
       const retryReceipt = markRetryAttempt(ds.session);
       holdPurgeClickRollback(ds, retryTurnId, { ...(retryReceipt ? { receipt: retryReceipt } : {}), restoreTurnState });
       rememberLastCliInput(ds, failedTurn.userPrompt, continueInput, retryTurnId);
+      // The retry is this session's latest turn now: retire the previous card's rows.
+      noteReplyCardTurnStarted(ds, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
