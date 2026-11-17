@@ -216,6 +216,9 @@ export interface CodexRpcEngineDependencies {
     model?: string;
     serviceTier?: CodexServiceTier;
   }): Promise<CodexServiceTierCheck>;
+  /** Test seam: replace group signalling to simulate a verified group that
+   *  survives its bounded SIGKILL cleanup (an ordinary process cannot). */
+  killProcessGroup?(pid: number, signal: NodeJS.Signals): void;
 }
 
 const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
@@ -852,7 +855,7 @@ export class CodexRpcEngine {
       this.dependencies.signalProcessGroup(pid, signal);
       return;
     }
-    killGroup(pid, signal);
+    (this.dependencies.killProcessGroup ?? killGroup)(pid, signal);
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------
