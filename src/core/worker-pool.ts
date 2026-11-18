@@ -15869,9 +15869,6 @@ export function sendWorkerInput(
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
-          ...(normalized.traexNativeContext
-            ? { traexNativeContext: normalized.traexNativeContext }
-            : {}),
           ...(normalized.linkRefs ? { linkRefs: normalized.linkRefs } : {}),
           // R4-B1: freeze the admission-time steer authorization into the queued
           // tail's frozen payload so promote/repark/restore COPY it verbatim
@@ -15964,11 +15961,7 @@ export function sendWorkerInput(
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
-    ...(normalized.traexNativeContext
-      ? { traexNativeContext: normalized.traexNativeContext }
-      : {}),
     ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
-    ...(normalized.traexNativeContext ? { traexNativeContext: normalized.traexNativeContext } : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
@@ -17560,9 +17553,6 @@ function forkWorkerPrepared(
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),
-          ...(promptPayload.traexNativeContext
-            ? { traexNativeContext: promptPayload.traexNativeContext }
-            : {}),
           ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
           // R5-B1-2: preserve the frozen steer authorization on the double-fork
           // staged tail entry (only `=== true`).
@@ -18488,9 +18478,6 @@ function forkWorkerPrepared(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
-    ...(promptPayload.traexNativeContext
-      ? { traexNativeContext: promptPayload.traexNativeContext }
-      : {}),
     ...(ds.session.traexNativeContextReceipt
       ? { traexNativeContextReceipt: ds.session.traexNativeContextReceipt }
       : {}),

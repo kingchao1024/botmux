@@ -200,6 +200,10 @@ export interface CodexRpcEngineOpts {
    *  resolving the ack. The worker uses that identity to release only the
    *  matching rpcActive bridge entry. */
   onTurnTerminal?: (terminal: CodexRpcTurnTerminal) => void;
+  /** The native thread's history was compacted (`thread/compacted`, or a
+   *  `contextCompaction` item, from auto-compaction or `/compact`). Content an
+   *  earlier turn delivered may no longer be in the model's context. */
+  onContextCompacted?: (threadId: string | undefined) => void;
 }
 
 export interface CodexRpcEngineDependencies {
@@ -565,7 +569,13 @@ export class CodexRpcEngine {
   async sendTurn(
     content: string,
     identity: CodexRpcTurnIdentity,
-    opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
+    opts?: {
+      timeoutMs?: number;
+      fatalOnTimeout?: boolean;
+      /** Runs synchronously once the frame is on the socket, before any reply
+       *  can be processed. A `not_sent` rejection guarantees it never ran. */
+      onDispatch?: () => void;
+    },
   ): Promise<{ nativeTurnId: string }> {
     if (!this.threadId) {
       throw new CodexRpcDeliveryError(
@@ -581,12 +591,16 @@ export class CodexRpcEngine {
     };
     params.clientUserMessageId = identity.turnId;
     let dispatched = false;
+    const { onDispatch, ...requestOpts } = opts ?? {};
     try {
       await this.request(
         'turn/start',
         params,
-        opts,
-        () => { dispatched = true; },
+        requestOpts,
+        () => {
+          dispatched = true;
+          onDispatch?.();
+        },
         identity,
       );
     } catch (err) {
@@ -1273,6 +1287,12 @@ export class CodexRpcEngine {
       if (['turn/aborted', 'turn/cancelled', 'turn/canceled'].includes(msg.method) && nativeTurnId) {
         this.cancelUserInputRequests(nativeTurnId);
         this.emitTurnTerminal(nativeTurnId, 'aborted', msg.method.replace('turn/', 'rpc_turn_'));
+        return;
+      }
+      if (msg.method === 'thread/compacted'
+        || ((msg.method === 'item/started' || msg.method === 'item/completed')
+          && params.item?.type === 'contextCompaction')) {
+        this.opts.onContextCompacted?.(typeof params.threadId === 'string' ? params.threadId : this.threadId);
         return;
       }
       if (['turn/failed', 'turn/error'].includes(msg.method) && nativeTurnId) {

@@ -2125,7 +2125,6 @@ export interface CodexAppGenerationCommit {
 
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
-  traexNativeContext?: import('./core/traex-native-context.js').TraexNativeContextMetadata;
   content: string;
   /** Daemon-frozen LinkRef mode plus admission-only source material. */
   linkRefs?: LinkRefTurnEnvelope;
@@ -2354,7 +2353,6 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerTransport & {
   sessionCommand?: import('./services/session-contract.js').SessionCommandContext;
-  traexNativeContext?: CliTurnPayload['traexNativeContext'];
   traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
 };
 
@@ -2369,7 +2367,6 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
         cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
         terminalCardEpoch?: string;
-        traexNativeContext?: CliTurnPayload['traexNativeContext'];
         traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
         /** Daemon-owned durable headless provenance, never taken from CLI env. */
         headless?: Pick<NonNullable<Session['headless']>, 'id' | 'source'>;
@@ -2383,7 +2380,7 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
       }
     : Message extends { type: 'message' }
-      ? Message & { traexNativeContext?: CliTurnPayload['traexNativeContext'] }
+      ? Message
       : Message
   : never;
 
