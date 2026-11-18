@@ -1,6 +1,6 @@
 {
   "name": "botmux",
-  "version": "3.59.9",
+  "version": "3.59.19",
   "description": "Bridge between IM platforms and AI coding CLIs \u2014 one topic, one CLI session with live streaming",
   "type": "module",
   "bin": {
