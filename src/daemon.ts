@@ -33341,9 +33341,7 @@ async function handleThreadReplyAdmitted(
         build: async () => {
           const stagedSender = await getThreadSender();
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
-          const currentCliId = ds.session.cliLaunchSnapshot?.cliId
-            ?? ds.session.cliId
-            ?? dsBotCfgForFork.cliId;
+          const currentCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
           const traexRpcContext = traexRpcContextForSession(ds, currentCliId);
           const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },

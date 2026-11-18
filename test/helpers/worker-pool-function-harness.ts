@@ -4,23 +4,33 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
-import { executionObserverSupported } from '../../src/services/session-contract.js';
-import * as replyTargetModule from '../../src/core/reply-target.js';
+import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
+import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
+import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
+import { shouldBlockStructuredPromptReady } from '../../src/services/structured-bridge-clis.js';
 
-/** Names of top-level function declarations in worker-pool.ts, so a closure
- * executed through the `with (scope)` proxy can lazily resolve any pool-local
- * helper it references (the same perimeter the module itself would have). */
-let poolFunctionNames: Set<string> | undefined;
-function poolFunctionExists(name: string): boolean {
-  if (!poolFunctionNames) {
-    const source = ts.createSourceFile('worker-pool.ts',
-      readFileSync('src/core/worker-pool.ts', 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-    poolFunctionNames = new Set(source.statements
-      .filter(ts.isFunctionDeclaration)
-      .map(node => node.name?.text ?? '')
-      .filter(Boolean));
+/** Untracked handler fixtures still have the daemon's empty delivery registry.
+ * Resolve settlement through production functions so fixtures exercise its
+ * identity checks rather than substituting a no-op completion callback. */
+function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
+  if (key in scope) return scope[key as string];
+  if (key === 'controllerForSession') return controllerForSession;
+  if (key === 'isCodexAppCliId') return isCodexAppCliId;
+  if (key === 'executionObserverSupported') return executionObserverSupported;
+  if (key === 'contractTerminalStatus') return contractTerminalStatus;
+  if (key === 'sameExecution') return sameExecution;
+  if (key === 'hasConfirmedNativeGrokEffort') return hasConfirmedNativeGrokEffort;
+  if (key === 'noteExplicitEffortPreferenceEdit') return noteExplicitEffortPreferenceEdit;
+  if (key === 'assertSessionLaunchModelChoiceAllowed') return assertSessionLaunchModelChoiceAllowed;
+  if (key === 'shouldBlockStructuredPromptReady') return shouldBlockStructuredPromptReady;
+  if (key === 'config') return { terminalEffortWriteback: false };
+  if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
+  if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
+  if (typeof key === 'string' && ['ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
+    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn'].includes(key)) {
+    return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
-  return poolFunctionNames.has(name);
+  return (globalThis as any)[key];
 }
 
 export function loadWorkerPoolFunction<T extends (...args: any[]) => any>(
@@ -35,7 +45,7 @@ export function loadWorkerPoolFunction<T extends (...args: any[]) => any>(
   }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : key === 'controllerForSession' ? controllerForSession : key === 'isCodexAppCliId' ? isCodexAppCliId : key === 'executionObserverSupported' ? executionObserverSupported : key === 'ownsCodexAppFinalDelivery' ? loadWorkerPoolFunction('ownsCodexAppFinalDelivery', scope) : typeof key === 'string' && poolFunctionExists(key) ? loadWorkerPoolFunction(key, scope) : typeof key === 'string' && Object.hasOwn(replyTargetModule, key) ? (replyTargetModule as any)[key] : (globalThis as any)[key],
+    get: (target, key) => resolvePoolDependency(target, key),
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;
@@ -55,7 +65,7 @@ export function loadWorkerPoolClosure<T extends (...args: any[]) => any>(name: s
   const compiled = ts.transpileModule(`const ${declaration.getText(source)};`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : key === 'controllerForSession' ? controllerForSession : key === 'isCodexAppCliId' ? isCodexAppCliId : key === 'executionObserverSupported' ? executionObserverSupported : key === 'ownsCodexAppFinalDelivery' ? loadWorkerPoolFunction('ownsCodexAppFinalDelivery', scope) : typeof key === 'string' && poolFunctionExists(key) ? loadWorkerPoolFunction(key, scope) : typeof key === 'string' && Object.hasOwn(replyTargetModule, key) ? (replyTargetModule as any)[key] : (globalThis as any)[key],
+    get: (target, key) => resolvePoolDependency(target, key),
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;
