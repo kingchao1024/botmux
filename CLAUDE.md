@@ -12,10 +12,10 @@
 
 ## 高风险硬约束
 
-- 包管理器与 CI 编译器固定为 Bun `1.4.3`；`trustedDependencies` 只能保留 `electron`、`node-pty`。详见 [质量与工具链](docs/agent/quality.md)。
+- 包管理器与 CI 编译器固定为 Bun `1.4.4`，版本来源是 `package.json` 的 `packageManager`；`trustedDependencies` 只能保留 `electron`、`node-pty`。详见 [质量与工具链](docs/agent/quality.md)。
 - 禁止在 worktree 执行 install；依赖变化只能在 worktree 外处理。详见 [质量与工具链](docs/agent/quality.md)。
 - 编译态子进程必须走 `src/core/self-spawn.ts`，不得向子进程传递 `dist/` 或 `__dirname` 拼出的路径。详见 [运行可靠性](docs/agent/reliability.md)。
-- build 不会认领全局 CLI，也不改变 live daemon；认领、重启和 live 手测必须另行明确授权。详见 [运行可靠性](docs/agent/reliability.md)。
+- build 不会认领全局 CLI，也不改变 live daemon 的进程状态；但在生产 checkout 原地 build 会替换部署产物，构建验证应使用隔离副本。认领、重启和 live 手测必须有明确授权。详见 [运行可靠性](docs/agent/reliability.md)。
 - Linux 已启用 `botmux.service` 时，禁止从 BotMux/Trae 会话直接运行 fleet 启停命令；必须从会话外通过 systemd 管理。详见 [运行可靠性](docs/agent/reliability.md)。
 - owner 身份按应用隔离并 fail-closed；setup/onboarding 必须复用现有身份边界。详见 [安全边界](docs/agent/security.md)。
 
@@ -25,7 +25,7 @@
 
 ---
 
-<!-- 以下内容随上游合并引入，是上游仓库的完整研发文档，作为上面的按需 overlay 的补充参考。两边的硬约束是一致的（Bun 1.4.3、禁止 worktree install、self-spawn、身份 fail-closed 等），上游侧写得更细。 -->
+<!-- 以下内容随上游合并引入，作为按需 overlay 的补充参考；Bun 版本以 package.json 为准，本机生产部署遵循 LOCAL_OVERLAY.md 的授权与 systemd 规则。 -->
 
 # botmux
 
@@ -35,13 +35,13 @@
 
 ```bash
 bun run build                # tsc 编译
-bun run daemon:restart       # 重启 daemon（自动恢复 active sessions）
+bun run daemon:restart       # 仅用于未由 systemd 管理的环境，且须已获重启授权
 bun run daemon:logs          # 查看日志
 ```
 
-- 每次修改后需要 `bun run build` 然后 `bun run daemon:restart`
+- 代码改动按影响范围执行测试和构建验证；生产 checkout 的构建验证使用隔离副本。build/test 不构成全局认领、部署、重启或 live 手测的授权。Linux 已启用 `botmux.service` 时，获得重启授权后从会话外执行 `systemctl --user restart botmux.service`，详见 [本地部署规则](LOCAL_OVERLAY.md#build-and-deployment)。
 
-⚠️ **别用裸 `node` 起 daemon —— 用 `bun run daemon:*`。** 会话存储硬依赖 SQLite 引擎
+⚠️ **别用裸 `node` 起 daemon。** 未由 systemd 管理的环境使用 `bun run daemon:*`；已启用 `botmux.service` 的本机遵循上文的授权与 systemd 规则。会话存储硬依赖 SQLite 引擎
 （`node:sqlite` 需 Node ≥ 22.13，或任意 bun 的 `bun:sqlite`），而裸 `node` 由 exec 时的
 PATH 解析，那不是写它的环境：2026-09-08 某次 restart 的 PATH 把 `/usr/bin` 排在 fnm shim
 之前 ⟹ 解析成 v18.20.4 ⟹ **55 个 bot daemon 全部启动即崩**，飞书里所有话题看似全丢（57 个
@@ -127,13 +127,21 @@ namespace，新 worker 无权读取它的 `/proc/<pid>/fd`，会导致 transcrip
 
 ### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
 
-当改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完自测绿后执行：
+当改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），先完成本地检查，并确认部署、重启及 live 手测已有明确授权；已有授权按范围执行，无需重复确认。按运行环境选择：
+
+- Linux 已启用 `botmux.service`：核对 unit 的入口与目标部署产物，按 [本地部署规则](LOCAL_OVERLAY.md#build-and-deployment)完成构建和备份，再从会话外执行：
+
+```bash
+systemctl --user restart botmux.service
+```
+
+- 未由 systemd 管理的开发环境：获得全局认领和重启授权后，才执行：
 
 ```bash
 bun run switch:here && bun run daemon:restart
 ```
 
-这里故意用 `bun run daemon:restart`，确保从当前 checkout 的 `dist/cli.js` 重启；不要依赖裸 `botmux restart`，它可能被 PATH 中更靠前的 npm 全局安装抢先。否则用户测的还是旧代码（典型症状：新加的命令/配置「找不到」）。⚠️ 这会让**所有 bot** 都跑本 checkout 的 build；测试/合并完成后记得切回 canonical checkout，以免 review worktree 被删后全局 shim 失效。
+开发环境的 `bun run daemon:restart` 从当前 checkout 的 `dist/cli.js` 重启，避免裸 `botmux restart` 被 PATH 中其它安装抢先；此命令不适用于已启用 `botmux.service` 的本机生产环境。全局认领会影响所有 bot，验证后的回切也须在授权范围内完成，避免删除 review worktree 后全局 shim 失效。systemd 重启后核验 `botmux status` 和 `/proc/<supervisor-pid>/cgroup`，确认 supervisor 属于 `botmux.service`。
 
 ## 模块结构
 
@@ -206,7 +214,7 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 
 - 标题与 commit message 同格式：`type(scope): 中文描述`
 - 描述用**中文说明**：改了什么、为什么、影响面（涉及哪些模块/会话类型）
-- 附**实际测试验证**：贴出跑过的命令和关键结果（`bun run build`、`bun run test`、相关 e2e），不要只写「应该没问题」；需要 live 验证的先 `bun run switch:here && bun run daemon:restart` 在飞书里实测并注明结果
+- 附**实际测试验证**：贴出跑过的命令和关键结果（`bun run build`、`bun run test`、相关 e2e），不要只写「应该没问题」；需要 live 验证时，在明确授权后按上文「改动需用户手动测试时」的环境分支部署、重启，在飞书里实测并注明结果
 - UI 类改动（飞书卡片 / dashboard / web 终端）附**截图示意**，让 reviewer 不用跑代码就能看到效果
 - **不写飞书群内真人名字，也不写机器人协作花名/内部 review 编排**：commit message 与 PR 标题/描述进的是**公开 git 历史**，读者不需要知道群里谁参与、谁审的。① 不出现群成员真名——验证描述用中性客观表述（如「矮视口下成员/机器人行都能滚动可见」，而不是「某某/某某两行成员」）；② 不出现 `@Codex`、`Codex 复审`、`双审`、`首审`、`双审收敛` 这类多 bot 协作花名，验证只陈述**做了什么验证、结果如何**的客观事实，不写「谁审的」。（`Co-authored-by` git 署名 trailer 属正常署名规范，不在此列。）
 

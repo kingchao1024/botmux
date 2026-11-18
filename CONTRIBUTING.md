@@ -16,7 +16,7 @@ bun run daemon:start
 bun run daemon:logs
 ```
 
-> Every code change requires `bun run build` then `bun run daemon:restart`.
+> Validate code changes with the relevant tests and build. Use an isolated copy for build validation while production runs this checkout's `dist/cli.js`. Global CLI claiming, deployment, daemon restarts, and live testing require explicit authorization; a build/test request does not authorize them. On Linux hosts managed by `botmux.service`, perform an authorized restart outside the BotMux/Trae session with `systemctl --user restart botmux.service`. Use `bun run daemon:restart` only in environments not managed by systemd and with restart authorization. See [local deployment rules](LOCAL_OVERLAY.md#build-and-deployment).
 
 > **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.4`,
 > lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep

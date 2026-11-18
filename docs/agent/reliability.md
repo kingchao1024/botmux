@@ -2,7 +2,7 @@
 title: 运行可靠性与发版边界
 purpose: 保留 daemon、编译态、全局认领、live 验证和发版的安全边界。
 owner: maintainers
-last_reviewed: 2026-09-24
+last_reviewed: 2026-11-18
 source_of_truth: src/core/self-spawn.ts、scripts/claim-botmux-bin.mjs、scripts/smoke-bun-binary.mjs、package.json、workflow 与相关 runbook。
 ---
 
@@ -10,22 +10,23 @@ source_of_truth: src/core/self-spawn.ts、scripts/claim-botmux-bin.mjs、scripts
 
 ## daemon 与编译态事实
 
-- 不得用裸 `node` 启 daemon，必须使用 `bun run daemon:*`。会话存储依赖 SQLite 引擎；错误 PATH 可能解析到不支持 `node:sqlite` 的 Node，造成 daemon 子进程全崩。
+- 不得用裸 `node` 启 daemon。未由 systemd 管理的环境使用 `bun run daemon:*`；已启用 `botmux.service` 的 Linux 主机遵循下文的授权与 systemd 规则。会话存储依赖 SQLite 引擎；错误 PATH 可能解析到不支持 `node:sqlite` 的 Node，造成 daemon 子进程全崩。
 - supervisor 本身不依赖 SQLite，可能仍打印“已重启”而 daemon 实际全部失败；preflight 会在拆掉既有 fleet 前检查引擎能力。遇到这类形态先看实际日志，必要时使用 `BOTMUX_INTERPRETER=<abs>`。
 - 编译版模块位于 Bun 虚拟文件系统。子进程入口必须用 `src/core/self-spawn.ts` 中的 `isStandaloneBinary()`、`resolveEntrySpawn` 或 `spawnWorker`；不得把 `__dirname` 或 `dist/` 拼出的路径交给子进程。
 - `scripts/smoke-bun-binary.mjs` 使用空 `bots.json`，daemon 会在更早处拒绝 `BOTMUX_BOT_INDEX=0`；因此 smoke 通过不覆盖 daemon 深层路径。
 
 ## 全局认领与 live 验证事实
 
-- `bun run build` 不会认领全局 `botmux` wrapper。`bun run use:here` 才认领，`bun run switch:here` 才是 build 加认领。
-- 需要人工 live 验证时，必须使用 `bun run switch:here && bun run daemon:restart`；不要依赖裸 `botmux restart`，否则可能重启到 PATH 中其它安装。
-- Linux 主机已启用 `botmux.service` 时，不能从 BotMux/Trae 会话直接运行 `botmux start`、`botmux restart` 或 `bun run daemon:restart`：新 supervisor 会继承临时会话的 systemd scope，会话退出后可能被一并回收，而 oneshot unit 仍显示 `active (exited)`。生产重启必须在会话外执行 `systemctl --user restart botmux.service`，再用 `botmux status` 和 `/proc/<supervisor-pid>/cgroup` 确认进程归属。
-- 上述操作会让全部 bot 使用当前 checkout。测试或合并结束后应切回 canonical checkout，避免 review worktree 删除后全局 shim 失效。
+- `bun run build` 不会认领全局 `botmux` wrapper，也不会自动重启 daemon，但在生产 checkout 原地 build 会替换部署产物。构建验证应使用隔离副本。`bun run use:here` 才认领，`bun run switch:here` 才是 build 加认领。
+- 全局认领、部署、重启和人工 live 验证必须有明确授权；build/test 请求不包含这些授权。已有明确授权时按范围执行，无需重复确认。
+- 未由 systemd 管理的开发环境，在获得全局认领和重启授权后可使用 `bun run switch:here && bun run daemon:restart`；不要依赖裸 `botmux restart`，否则可能重启到 PATH 中其它安装。
+- Linux 主机已启用 `botmux.service` 时，不能从 BotMux/Trae 会话直接运行 `botmux start`、`botmux restart` 或 `bun run daemon:restart`：新 supervisor 会继承临时会话的 systemd scope，会话退出后可能被一并回收，而 oneshot unit 仍显示 `active (exited)`。获得生产重启授权后，先核对 unit 的入口与目标部署产物，再从会话外执行 `systemctl --user restart botmux.service`，并用 `botmux status` 和 `/proc/<supervisor-pid>/cgroup` 确认 supervisor 属于 `botmux.service`。
+- 全局认领会让全部 bot 使用当前 checkout；验证后的回切也须在授权范围内完成，避免 review worktree 删除后全局 shim 失效。systemd 管理的 fleet 以 unit 入口为准，详见 [本地部署规则](../../LOCAL_OVERLAY.md#build-and-deployment)。
 
 ## daemon 日志轮转事实
 
 - 日志轮转在子进程 spawn 边界执行（`openSync` 前 rename），默认单文件 10 MiB、保留 3 份备份（`.1`–`.3`），可通过 `FleetSupervisorOptions.logRotation` 调整或设 `maxSizeBytes <= 0` 禁用。源码：`src/core/log-rotation.ts`。
-- 启动边界轮转只在 child 启动/重启时触发。活跃子进程持有 fd 继续写入超过阈值时，supervisor 每 5 分钟 stat 一次只记录告警，不执行运行时轮转；实际截断发生在下次 child 退出后重新 spawn 时。运维如需加速释放，对目标 bot 执行 `botmux restart` 即可触发重 spawn 轮转。
+- 启动边界轮转只在 child 启动/重启时触发。活跃子进程持有 fd 继续写入超过阈值时，supervisor 每 5 分钟 stat 一次只记录告警，不执行运行时轮转；实际截断发生在下次 child 退出后重新 spawn 时。运维如需通过重启加速释放，须先获得授权，再按上文对应运行环境的重启规则执行。
 - `fleet-runtime` 启动 supervisor 时同样对 `supervisor-{out,err}.log` 执行一次轮转。
 - 跨平台安全：`renameReplaceSync` 先 `unlink` 已有目标再 `rename`（Windows 兼容），源文件缺失时安全跳过，不误删有效备份。
 

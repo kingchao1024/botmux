@@ -6,8 +6,22 @@
  * in worker-ordinary-im-init-concurrency.integration.test.ts.
  */
 import { basename } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import {
+  prepareTraexNativeContext,
+  settleTraexNativeContextReceipt,
+} from '../src/core/traex-native-context.js';
+
+const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+
+function caseRegion(type: string, nextType: string): string {
+  const start = workerSource.indexOf(`case '${type}':`);
+  const end = workerSource.indexOf(`case '${nextType}':`, start);
+  if (start < 0 || end < 0) throw new Error(`Missing worker cases: ${type}, ${nextType}`);
+  return workerSource.slice(start, end);
+}
 
 type Notify = (
   turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
@@ -48,25 +62,22 @@ describe('Claude transcript native input consumption receipt', () => {
   });
 
   it('queues pre-adapter follow-ups and preserves the init prompt at the head', () => {
-    const sendToPtyStart = workerSource.indexOf('function sendToPty(');
-    const sendToPtyEnd = workerSource.indexOf('// ─── Screen Update Timer', sendToPtyStart);
-    const sendToPty = workerSource.slice(sendToPtyStart, sendToPtyEnd);
-    const backendQueue = sendToPty.indexOf('if (cliRestartInProgress || !backend)');
-    const adapterReject = sendToPty.indexOf('if (!cliAdapter) return false;');
-    const init = caseRegion('init', 'message');
-    const initialPromptQueue = init.indexOf('pendingMessages.unshift(...recoveredAcceptedInputs, {');
-    const flushStart = workerSource.indexOf('async function flushPending()');
-    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
-    const flush = workerSource.slice(flushStart, flushEnd);
-
-    expect(backendQueue).toBeGreaterThanOrEqual(0);
-    expect(adapterReject).toBeGreaterThan(backendQueue);
-    expect(initialPromptQueue).toBeGreaterThanOrEqual(0);
-    expect(flush).toContain('if (initialInputOwnershipPending) return;');
-    expect(init.indexOf('initialInputOwnershipPending = !!msg.prompt;'))
-      .toBeLessThan(init.indexOf('await startWebServer('));
-    expect(init.indexOf('initialInputOwnershipPending = false;'))
-      .toBeGreaterThan(initialPromptQueue);
+    const pendingMessages = [{ content: 'initial prompt', turnId: 'om_initial' }];
+    const sendToPty = loadWorkerFunction<(content: string, turnId: string) => boolean>('sendToPty', {
+      pendingMessages,
+      rememberTurnLinkRefMode: vi.fn(),
+      traexAutoModelRuntimeEligible: () => false,
+      cliRestartInProgress: false, backend: null, cliAdapter: null,
+      freshnessInputQueue: { enqueueNormal: (item: typeof pendingMessages[number]) => pendingMessages.push(item) },
+      log: vi.fn(),
+    });
+    expect(sendToPty('follow-up B', 'om_b')).toBe(true);
+    expect(sendToPty('follow-up C', 'om_c')).toBe(true);
+    expect(pendingMessages).toEqual([
+      { content: 'initial prompt', turnId: 'om_initial' },
+      { content: 'follow-up B', turnId: 'om_b' },
+      { content: 'follow-up C', turnId: 'om_c' },
+    ]);
   });
 });
 
@@ -74,13 +85,19 @@ describe('Claude transcript native input consumption receipt', () => {
 // The receipt covers shared group background, so it may only be sent from
 // boundaries where the CLI itself evidenced this exact input. Pin the gates.
 describe('native input consumption receipt wiring', () => {
-  const emissions = [...workerSource.matchAll(/acknowledgeNativeInputConsumed\(/g)].map(m => m.index!)
-    .filter(index => !workerSource.slice(index - 20, index).includes('function '));
-
-  it('emits from exactly the five evidenced boundaries', () => {
-    // Codex paste (immediate + deferred history match), Codex RPC (steady
-    // turn/start + fresh first turn), Claude transcript full match.
-    expect(emissions).toHaveLength(5);
+  it('accepts history proof only for non-adopted Codex paste sessions', () => {
+    const cases: Array<[string, boolean, object | undefined, boolean]> = [
+      ['codex', false, undefined, true],
+      ['codex', true, undefined, false],
+      ['codex', false, {}, false],
+      ['traex', false, undefined, false],
+    ];
+    for (const [cliId, adoptMode, codexRpcEngine, expected] of cases) {
+      const provesConsumption = loadWorkerFunction<() => boolean>('codexHistoryMatchProvesConsumption', {
+        lastInitConfig: { cliId, adoptMode }, codexRpcEngine,
+      });
+      expect(provesConsumption()).toBe(expected);
+    }
   });
 
   it('Codex paste: only an exact owned history match, after session id persistence', () => {
@@ -124,7 +141,7 @@ describe('native input consumption receipt wiring', () => {
     expect(body).toContain('if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;');
     expect(body).toContain('if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) return;');
     expect(body).toContain("acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record'");
-    expect(workerSource).toContain('notifyNativeTranscriptConsumedLarkTurn,\n);');
+    expect(workerSource).toMatch(/,\s*notifyNativeTranscriptConsumedLarkTurn\s*,/);
   });
 
   it('never treats IPC receipt, queue commit or a generic submitted flag as consumption', () => {
@@ -166,28 +183,39 @@ describe('native input consumption receipt wiring', () => {
     expect(failed.indexOf("'unknown'")).toBeLessThan(failed.indexOf('installRpcLifecycleFailClosedOwner'));
   });
 
-  it('blocks an unknown same-thread context receipt before calling turn/start again', () => {
-    const prepare = workerSource.indexOf('rpcContext = item.traexNativeContext');
-    const sendTurn = workerSource.indexOf('writeRpcEngine.sendTurn(', prepare);
-    const guarded = workerSource.slice(prepare, sendTurn);
+  it('resends the full context when a same-thread receipt is unknown', () => {
+    const user = '<user_message>next turn</user_message>';
+    const content = [
+      '<role>authorization boundary</role>',
+      '<botmux_skills><skill name="review" /></botmux_skills>',
+      user,
+    ].join('\n\n');
+    const prepared = prepareTraexNativeContext(content, 'thread');
+    const accepted = settleTraexNativeContextReceipt(prepared, 'om_previous', 'accepted')!;
+    const unknown = settleTraexNativeContextReceipt(prepared, 'om_previous', 'unknown')!;
 
-    expect(prepare).toBeGreaterThanOrEqual(0);
-    expect(sendTurn).toBeGreaterThan(prepare);
-    expect(guarded).toContain("rpcContext.blockedReason === 'context_receipt_unknown'");
-    expect(guarded).toContain('pendingMessages.unshift(item);');
-    expect(guarded).toContain('break;');
+    expect(prepareTraexNativeContext(content, 'thread', accepted).content).toBe(user);
+    expect(prepareTraexNativeContext(content, 'thread', unknown).content).toBe(content);
   });
 
-  it('revalidates the prepared context metadata against the latest receipt', () => {
-    const prepare = workerSource.indexOf('rpcContext = item.traexNativeContext');
+  it('prepares queued context against the latest receipt inside the RPC write lock', () => {
+    const flush = workerSource.indexOf('async function flushPending(');
+    const writeLock = workerSource.indexOf('await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {', flush);
+    const fence = workerSource.indexOf('if (!writeContinuationIsCurrent()) {', writeLock);
+    const prepare = workerSource.indexOf('rpcContext = prepareTraexNativeContext(', writeLock);
     const sendTurn = workerSource.indexOf('writeRpcEngine.sendTurn(', prepare);
-    const guarded = workerSource.slice(prepare, sendTurn);
 
-    expect(guarded).toMatch(
-      /restorePreparedTraexNativeContext\(\s*msg,\s*item\.traexNativeContext,\s*nativeThreadId,\s*lastInitConfig\.traexNativeContextReceipt,\s*\)/,
+    expect(flush).toBeGreaterThanOrEqual(0);
+    expect(writeLock).toBeGreaterThan(flush);
+    expect(fence).toBeGreaterThan(writeLock);
+    expect(prepare).toBeGreaterThan(fence);
+    expect(sendTurn).toBeGreaterThan(prepare);
+    expect(workerSource.slice(prepare, sendTurn)).toMatch(
+      /prepareTraexNativeContext\(\s*msg,\s*nativeThreadId,\s*lastInitConfig\.traexNativeContextReceipt\s*\)/,
     );
-    expect(guarded.indexOf('restorePreparedTraexNativeContext'))
-      .toBeLessThan(guarded.indexOf(': prepareTraexNativeContext'));
+    expect(workerSource.slice(sendTurn)).toMatch(
+      /^writeRpcEngine\.sendTurn\(\s*rpcContext\?\.content \?\? msg,/,
+    );
   });
 });
 

@@ -2,7 +2,7 @@
 title: 质量与工具链
 purpose: 路由构建、测试、依赖、CI 和提交规范到可执行真源。
 owner: maintainers
-last_reviewed: 2026-09-22
+last_reviewed: 2026-11-18
 source_of_truth: package.json、bun.lock、.github/workflows/、scripts/ 与 test/。
 ---
 
@@ -10,7 +10,7 @@ source_of_truth: package.json、bun.lock、.github/workflows/、scripts/ 与 tes
 
 ## 工具链事实
 
-- `package.json` 将包管理器固定为 Bun `1.4.3`，`.github/workflows/` 使用相同编译版本。
+- `package.json` 的 `packageManager` 将包管理器固定为 Bun `1.4.4`，`.github/workflows/` 使用相同编译版本；版本来源以该字段为准。
 - `trustedDependencies` 刻意只含 `electron`、`node-pty`；未经单独评审不得删除、扩展或替换。
 - canonical 安装命令是 `bun install --frozen-lockfile`。绝不在 worktree 执行 `bun install`：共享或软链 `node_modules` 可能被删除，或被另一 checkout 静默覆盖版本。
 - 分支改动 `package.json` 或 lockfile 时，只能在 worktree 外解决依赖，例如 canonical checkout 或 CI；不能用 worktree install 规避。
@@ -29,7 +29,7 @@ source_of_truth: package.json、bun.lock、.github/workflows/、scripts/ 与 tes
 
 ## 建议
 
-先跑最窄的有效检查，再跑受影响测试和构建。本 overlay 先跑 `bun run check:agent`，再跑 `bun run build`；记录实际命令和结果，不得把失败或跳过写成通过。
+先跑最窄的有效检查，再按影响范围跑受影响测试和构建。修改本 overlay 后先跑 `bun run check:agent`；代码变更再跑相关检查和构建。生产使用当前 checkout 的 `dist/cli.js` 时，构建验证在隔离副本中执行；build/test 不构成部署或重启授权。记录实际命令和结果，不得把失败或跳过写成通过。
 
 ## PR 与提交规范
 
