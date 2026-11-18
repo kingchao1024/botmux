@@ -349,7 +349,6 @@ export class CodexRpcEngine {
 
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
-  get activeNativeTurnId(): string | undefined { return this.turnOwners.keys().next().value; }
   get appServerPid(): number | undefined { return this.child?.pid; }
   /** The only native turn this engine currently owns. Multiple native turns are
    * never a valid state for Botmux RPC input, so callers must not guess when

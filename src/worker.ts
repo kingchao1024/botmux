@@ -46,6 +46,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import type { Duplex } from 'node:stream';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
@@ -2341,6 +2342,52 @@ const pendingLinkRefModeRestores = new Map<string, {
   reject: (error: Error) => void;
 }>();
 
+const pendingProtectedSecretChannels = new Map<string, {
+  resolve: (channel: Duplex) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
+}>();
+
+function isDuplexHandle(value: unknown): value is Duplex {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<Duplex>;
+  return typeof candidate.write === 'function'
+    && typeof candidate.destroy === 'function'
+    && typeof candidate.on === 'function';
+}
+
+function requestProtectedSecretChannel(capabilityId: string): Promise<Duplex> {
+  const capabilityConfigured = lastInitConfig?.protectedMcpPolicy?.capabilities
+    .some(capability => capability.id === capabilityId) === true;
+  if (!capabilityConfigured || !process.send) {
+    return Promise.reject(new Error('protected MCP secret channel is unavailable'));
+  }
+  const requestId = randomUUID();
+  return new Promise<Duplex>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      const pending = pendingProtectedSecretChannels.get(requestId);
+      if (!pending) return;
+      pendingProtectedSecretChannels.delete(requestId);
+      pending.reject(new Error('protected MCP secret channel timed out'));
+    }, 10_000);
+    timeout.unref();
+    pendingProtectedSecretChannels.set(requestId, { resolve, reject, timeout });
+    process.send?.({
+      type: 'protected_mcp_secret_channel_request',
+      requestId,
+      capabilityId,
+    } satisfies WorkerToDaemon,
+      error => {
+        if (!error) return;
+        const pending = pendingProtectedSecretChannels.get(requestId);
+        if (!pending) return;
+        pendingProtectedSecretChannels.delete(requestId);
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+      });
+  });
+}
+
 function restoreLinkRefModeThroughHost(input: {
   turnId: string;
   dispatchAttempt?: number;
@@ -2790,6 +2837,8 @@ async function startAndRecordSessionMcpGatewayHost(sessionId: string): Promise<v
     trustedTurnIdentity: currentGatewayTrustedTurnIdentity,
     trustedResultDelivery: deliverPluginResultThroughHost,
     linkRefRegistration: registerMcpLinkRefsThroughHost,
+    requestProtectedSecretChannel: requestProtectedSecretChannel,
+    protectedMcpPolicy: lastInitConfig?.protectedMcpPolicy,
     onError: error => log(`[mcp-gateway] host error: ${error.message}`),
   });
   // The NEXT worker generation reads this record to decide whether a surviving
