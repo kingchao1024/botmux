@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   DOUBAO_BUSY_FOOTER,
+  DOUBAO_COMPOSER_EVIDENCE,
+  DOUBAO_QUEUE_PAUSED_PATTERN,
   DOUBAO_READY_PATTERN,
   createDoubaoAdapter,
   doubaoContentWithCaptureId,
@@ -178,6 +180,54 @@ describe('doubao screen patterns (captured from doubao 2.31.0)', () => {
 
   it('does not treat the login / startup banner as ready', () => {
     expect(DOUBAO_READY_PATTERN.test('Good morning\nmodel: GPT-6.1 Sol · High /model to change')).toBe(false);
+  });
+});
+
+describe('doubao paused input queue (2.36.2)', () => {
+  // Captured verbatim from a live pane after doubao rejected a submission with
+  // `The requested permission mode is unavailable.`: the composer stays up,
+  // which is why readyPattern alone published idle and released the turn.
+  const pausedScreen = [
+    '◆ BOTMUX_NOTHING_TO_SEND',
+    '◇ ERROR · The requested permission mode is unavailable.',
+    '◇ INFO · Message kept in queue. Ctrl+Q to retry or remove it.',
+    '─'.repeat(40),
+    '❯  Ask Doubao to do anything',
+    '─'.repeat(40),
+    '  Enter send · Ctrl+J newline · / commands',
+    'Queue paused · 5 queued · <session_id>d1334bda-9bb0-41ef-8aa2',
+  ].join('\n');
+  const resumedScreen = [
+    '◇ Responding… (3s • esc to interrupt)',
+    '─'.repeat(40),
+    '❯  Ask Doubao to do anything',
+    '─'.repeat(40),
+    '  Enter send · Ctrl+J newline · / commands',
+    '4 queued · <session_id>d1334bda-9bb0-41ef-8aa2',
+  ].join('\n');
+  const idleScreen = [
+    '◆ DONE-42',
+    '─'.repeat(40),
+    '❯  Ask Doubao to do anything',
+    '─'.repeat(40),
+    '  Enter send · Ctrl+J newline · / commands',
+  ].join('\n');
+
+  it('readyPattern cannot tell a paused queue from an idle prompt', () => {
+    // Premise of the latch: both screens look ready to a text-only probe.
+    expect(DOUBAO_READY_PATTERN.test(pausedScreen)).toBe(true);
+    expect(DOUBAO_READY_PATTERN.test(idleScreen)).toBe(true);
+  });
+
+  it('latches on the pause evidence and clears back into a composer', () => {
+    const adapter = createDoubaoAdapter();
+    expect(DOUBAO_QUEUE_PAUSED_PATTERN.test(pausedScreen)).toBe(true);
+    expect(DOUBAO_QUEUE_PAUSED_PATTERN.test(idleScreen)).toBe(false);
+    // The drained-but-still-queued footer must not look like a pause again.
+    expect(DOUBAO_QUEUE_PAUSED_PATTERN.test(resumedScreen)).toBe(false);
+    expect(adapter.staticBusyPattern).toBe(DOUBAO_QUEUE_PAUSED_PATTERN);
+    expect(adapter.staticBusyClearPattern).toBe(DOUBAO_COMPOSER_EVIDENCE);
+    expect(DOUBAO_COMPOSER_EVIDENCE.test(idleScreen)).toBe(true);
   });
 });
 

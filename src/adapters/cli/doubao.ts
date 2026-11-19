@@ -40,6 +40,26 @@ export const DOUBAO_BUSY_FOOTER = /esc to interrupt\)/;
  */
 export const DOUBAO_READY_PATTERN = /Ask Doubao to do anything|Enter send · Ctrl\+J newline/;
 
+/**
+ * Paused-input-queue evidence. Doubao rejects a submission (observed as
+ * `ERROR · The requested permission mode is unavailable.` on 2.36.2) and then
+ * parks every later write in its own queue instead of executing it:
+ * `INFO · Message kept in queue. Ctrl+Q to retry or remove it.` plus a
+ * persistent `Queue paused · N queued` footer. The composer stays rendered the
+ * whole time, so `readyPattern` alone cannot tell this screen from an idle
+ * prompt — quiescence here used to publish ready, release turn authority and
+ * leave the turn waiting on a transcript that could never start.
+ *
+ * The same evidence is consumed as a pre-idle static latch (see
+ * `staticBusyPattern`) so a quiet paused screen holds instead of going idle.
+ */
+export const DOUBAO_QUEUE_PAUSED_PATTERN = /Queue paused ·|Message kept in queue\./;
+
+/** Real composer evidence, used to clear the paused latch once doubao redraws
+ *  back into an accepting composer (`Responding…` while the drained queue runs
+ *  carries the same composer, and the busy footer then owns readiness). */
+export const DOUBAO_COMPOSER_EVIDENCE = /Ask Doubao to do anything|Enter send · Ctrl\+J newline/;
+
 /** Root holding doubao's per-account agent workspaces. Mirrors the npm
  *  launcher's `appRoot()` parent (scripts/runtime.cjs): the native runtime lives
  *  in `<root>/app`, sessions in `<root>/agent_mode/<uid>/workspace/.sessions`. */
@@ -447,6 +467,11 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     readyPattern: DOUBAO_READY_PATTERN,
     busyPattern: DOUBAO_BUSY_FOOTER,
+    // A paused input queue renders the composer AND the ready hint, so the
+    // screen-ready probe cannot be trusted there; latch on the pause evidence
+    // and clear only when a fresh composer redraw lands after it.
+    staticBusyPattern: DOUBAO_QUEUE_PAUSED_PATTERN,
+    staticBusyClearPattern: DOUBAO_COMPOSER_EVIDENCE,
     // Esc is the advertised interrupt (`esc to interrupt`); verified to stop the
     // running tool and return to the composer without exiting the CLI.
     interruptKey: 'esc',

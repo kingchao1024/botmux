@@ -4275,7 +4275,14 @@ function uncollectedStructuredTurnNotice(): string {
     return t('worker.structured_turn_not_started_blocked', { cliName: cliName(), blocker: startupBlockerLabel(blocked) });
   }
   const firstTurnOfFreshStart = promptReadyEdges === promptReadyEdgesAtFreshCliStart && !lastInitConfig?.adoptMode;
+  // Doubao parks rejected submissions in its own queue (`Queue paused`) instead
+  // of running them; the generic "transcript never showed the turn" wording
+  // would send the sender looking in the wrong place.
+  const pausedQueueHint = lastInitConfig?.cliId === 'doubao'
+    ? t('worker.structured_turn_not_collected_queue_paused', { cliName: cliName() })
+    : '';
   return t('worker.structured_turn_not_collected', { cliName: cliName() })
+    + pausedQueueHint
     + (firstTurnOfFreshStart ? startupUpgradeHint() : '');
 }
 

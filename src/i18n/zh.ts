@@ -2555,6 +2555,7 @@ export const messages: Record<string, string> = {
   'worker.cli_rejected_argument': '⚠️ {cliName} 启动失败：它不认识启动参数 {flag}（unexpected argument），一般是 CLI 版本太旧。请把 {cliName} 升级到最新版；PATH 上装了多份时，请确认 bot 用的是新版（`which -a traex traecli`）。',
   'worker.traex_resume_target_in_default_home': '⚠️ 这个话题上次的 TRAE 会话（{sessionId}）记在默认目录 {defaultHome} 里，但这个 bot 现在的 TRAE_HOME 是 {traeHome}，TRAE 在新目录里找不到这个会话，这次可能接不上之前的上下文。botmux 不会去读旧目录（在那里找到的会话，TRAE 也恢复不了）。要继续旧会话，可以把那条会话的记录迁到新目录，或者去掉这个 bot 的 TRAE_HOME；不需要的话直接继续用即可。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
+  'worker.structured_turn_not_collected_queue_paused': '（本轮很可能根本没执行：终端里若显示「Queue paused · N queued」或「Message kept in queue」，说明 {cliName} 把消息压进了自己的输入队列而没有提交，需要在 Web 终端按 Ctrl+R 重试队列，恢复后再重发一次。）',
   'worker.structured_turn_not_started_blocked': '⚠️ {cliName} 一直停在{blocker}，这条消息没有开始处理，botmux 已不再等这一轮的回复。在 Web 终端里处理完后请重发。',
   'worker.startup_upgrade_hint': '（{cliName} 刚升级到 {to}，之前是 {from}）',
   'worker.startup_blocker_label.folder_trust': '目录信任确认',
