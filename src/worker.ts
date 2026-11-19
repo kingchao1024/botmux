@@ -427,6 +427,7 @@ import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
+import { DOUBAO_QUEUE_HOLD_EVIDENCE } from './adapters/cli/doubao.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
 import { currentMtrSessionOffset, drainMtrSession, findLatestMtrSessionByDirectory, findMtrSessionById, type MtrTranscriptSource } from './services/mtr-transcript.js';
@@ -5049,6 +5050,24 @@ function viewportShowsReadyPattern(): boolean {
   const pattern = cliAdapter?.readyPattern;
   if (!pattern || !renderer) return false;
   try { return pattern.test(stripAnsiScreenText(renderer.rawSnapshot())); } catch { return false; }
+}
+
+/**
+ * Doubao parks an accepted write in its own input queue and only writes the
+ * transcript user record when the dequeued turn begins, so an unstarted head
+ * cannot be judged by the shared pre-start lease alone. This reads the current
+ * viewport for the CLI-owned queue evidence (`<n> queued · …` / `Queue paused ·
+ * …`) that proves the write is still parked rather than lost. Missing screen
+ * evidence returns false so the lease keeps its normal expiry.
+ */
+function doubaoQueueHoldEvidence(): boolean {
+  if (!backend) return false;
+  try {
+    const screen = stripAnsiScreenText(captureBackendScreen(backend));
+    return DOUBAO_QUEUE_HOLD_EVIDENCE.test(screen);
+  } catch {
+    return false;
+  }
 }
 
 function startupCommandExecuted(probe: (() => boolean) | undefined, submitOutputGeneration: number): boolean {
@@ -9822,6 +9841,12 @@ let lastResolvedSandboxMode: string | undefined;
  *  enough for a cold cursor-agent startup (store.db discovery alone is
  *  budgeted 30s) plus the late whole-turn mirror flush. */
 const CURSOR_BUSY_REFRESH_MAX_MS = 120_000;
+/** Hard cap for doubao's type-ahead lease refresh. Doubao parks an accepted
+ *  write in its own queue and only writes the transcript user record when that
+ *  queue item begins; with a long predecessor (or the secretary/patrol fan-out
+ *  behind it) that has been observed ~2 minutes after the submit. The cap keeps
+ *  a false queue/paused screen from wedging the head forever. */
+const DOUBAO_TYPEAHEAD_HOLD_MAX_MS = 180_000;
 let codexAdoptRecoveryAttempted = false;
 let structuredBridgeRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
@@ -13107,6 +13132,19 @@ function codexBridgeStartTimer(): void {
       // we expire an unstarted head, replay buffered successors, and emit any
       // completion created by that replay in the same call stack.
       try {
+        // Doubao acknowledges a write into its own input queue, not into a
+        // transcript: while an earlier turn runs (or the queue is paused the
+        // user record only appears when the dequeued turn begins. The shared
+        // 20s pre-start lease then retired heads whose turn started a minute
+        // later, and the reply could never be collected. Hold those leases
+        // while the screen shows the queue footer (or a running turn), bounded
+        // by DOUBAO_TYPEAHEAD_HOLD_MAX_MS so a false screen still prunes.
+        if (structuredBridgeIs('doubao') && !lastInitConfig?.adoptMode) {
+          const doubaoQueueHold = doubaoQueueHoldEvidence();
+          if (doubaoQueueHold) {
+            codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), DOUBAO_TYPEAHEAD_HOLD_MAX_MS);
+          }
+        }
         pruneExpiredStructuredHeadsAndEmit('structured bridge tick');
       } catch (err: any) {
         log(`Codex bridge tick expiry error: ${err.message}`);

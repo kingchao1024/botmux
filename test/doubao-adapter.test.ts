@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DOUBAO_BUSY_FOOTER,
   DOUBAO_COMPOSER_EVIDENCE,
+  DOUBAO_QUEUE_HOLD_EVIDENCE,
   DOUBAO_QUEUE_PAUSED_PATTERN,
   DOUBAO_READY_PATTERN,
   createDoubaoAdapter,
@@ -228,6 +229,17 @@ describe('doubao paused input queue (2.36.2)', () => {
     expect(adapter.staticBusyPattern).toBe(DOUBAO_QUEUE_PAUSED_PATTERN);
     expect(adapter.staticBusyClearPattern).toBe(DOUBAO_COMPOSER_EVIDENCE);
     expect(DOUBAO_COMPOSER_EVIDENCE.test(idleScreen)).toBe(true);
+  });
+
+  it('reads the type-ahead footer as queued hold evidence', () => {
+    // Doubao writes the transcript user record only when the queued turn
+    // begins, so the worker holds the pre-start lease while this footer is up.
+    expect(DOUBAO_QUEUE_HOLD_EVIDENCE.test(resumedScreen)).toBe(true);
+    expect(DOUBAO_QUEUE_HOLD_EVIDENCE.test(pausedScreen)).toBe(true);
+    // A single parked item and a running-turn footer report the same hold.
+    expect(DOUBAO_QUEUE_HOLD_EVIDENCE.test('1 queued · <session_id>abc')).toBe(true);
+    expect(DOUBAO_QUEUE_HOLD_EVIDENCE.test(idleScreen)).toBe(false);
+    expect(DOUBAO_QUEUE_HOLD_EVIDENCE.test(['◆ DONE-42', '1 queued item'].join('\n'))).toBe(false);
   });
 });
 

@@ -60,6 +60,17 @@ export const DOUBAO_QUEUE_PAUSED_PATTERN = /Queue paused ·|Message kept in queu
  *  carries the same composer, and the busy footer then owns readiness). */
 export const DOUBAO_COMPOSER_EVIDENCE = /Ask Doubao to do anything|Enter send · Ctrl\+J newline/;
 
+/**
+ * Footer evidence that doubao is holding an accepted-but-unstarted input in its
+ * own queue: `<n> queued · <session_id>…`, with `Queue paused` in front once a
+ * submission was rejected. Doubao writes no queue acknowledgement to disk, so
+ * the transcript user record only appears when the dequeued turn actually
+ * begins — observed tens of seconds to ~2 minutes after the submit when an
+ * earlier turn is still running. The worker uses this footer to hold the turn's
+ * pre-start lease instead of retiring a head whose turn starts later.
+ */
+export const DOUBAO_QUEUE_HOLD_EVIDENCE = /^(?:Queue paused · |· )?\s*\d+ queued · /m;
+
 /** Root holding doubao's per-account agent workspaces. Mirrors the npm
  *  launcher's `appRoot()` parent (scripts/runtime.cjs): the native runtime lives
  *  in `<root>/app`, sessions in `<root>/agent_mode/<uid>/workspace/.sessions`. */
